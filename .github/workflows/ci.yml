@@ -1,0 +1,70 @@
+# CI: the same three checks a laptop runs, on everything that can reach a
+# branch we deploy from.
+#
+# IT RUNS verify.sh RATHER THAN THE THREE NPM SCRIPTS, and that is the only
+# interesting decision in this file. Listing `typecheck`, `lint` and `test` as
+# three steps here would read better in the Actions UI and would be wrong the
+# first time a fourth check is added to verify.sh and not to this file — at
+# which point CI is greener than the repo and nothing anywhere says so. One
+# definition of "is this OK", used by CI and by whoever is about to open a pull
+# request.
+#
+# NO SECRETS, NO AWS CREDENTIALS, NO DISCORD TOKEN — and that is a property of
+# the test suite rather than a policy imposed on it. Every test injects its own
+# fakes and touches no network, so there is nothing for a credential to be for.
+# The absence is load-bearing in both directions: a test that reached the real
+# Discord API would fail on somebody else's outage, and would let a pull request
+# from a fork rate-limit the production bot. If a test ever needs a credential,
+# the test is wrong; do not add one here.
+
+name: verify
+
+on:
+  # `main` and `dev` are the only two branches origin is allowed to have (see
+  # README, "Branch policy"), so naming both here names all of them. If a third
+  # ever appears, the branch policy has been broken and that is the thing to
+  # fix, not this list.
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+# Nothing in this job writes anything. Read-only contents means a compromised
+# action somewhere in the dependency tree has no token worth stealing.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # 24 is not a preference. This process runs TypeScript from source
+          # through Node's own type stripping, with no build step anywhere, and
+          # an older major does not warn about that — it fails to parse the
+          # file. `engines` says `>=24` for the same reason.
+          node-version: '24'
+          # Reads package-lock.json, which is committed. Saves a minute per run
+          # and nothing else; it has no effect on what gets installed.
+          cache: npm
+
+      # `ci`, not `install`: it installs exactly what package-lock.json pins and
+      # fails if the lockfile and package.json disagree, instead of quietly
+      # resolving something newer than what was tested.
+      - run: npm ci
+
+      # `bash verify.sh`, NOT `./verify.sh`, and the difference is a red build on
+      # the first push. `./verify.sh` asks the kernel to execute the file, which
+      # needs the executable bit recorded in git — and this repo is developed on
+      # Windows with `core.filemode=false`, so the file goes in as 0644 and the
+      # runner gets "Permission denied", exit 126, before a single check runs.
+      # That reads in the Actions UI exactly like a broken test suite. Naming the
+      # interpreter does not consult the mode bit at all.
+      #
+      # `bash` rather than `sh` only because it is what the README and the local
+      # instructions say; verify.sh is POSIX sh and runs under either.
+      - run: bash verify.sh

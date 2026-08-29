@@ -1,0 +1,18 @@
+# LF in the repository, always, for everything text.
+#
+# THIS EXISTS BECAUSE OF verify.sh. Git on Windows converts LF to CRLF on
+# checkout by default, and a shell script committed with CRLF fails on the
+# Linux box and in CI as `bad interpreter: /bin/sh^M` -- an error that names
+# neither the file nor the real cause, and which nobody debugging a red build
+# guesses is about line endings. The bot is written on Windows and runs on
+# Ubuntu, so this is not a hypothetical.
+* text=auto eol=lf
+
+# Shell scripts are the ones that actually break, so they say it outright
+# rather than relying on the rule above still being there later.
+*.sh text eol=lf
+
+# Binary, never converted.
+*.png binary
+*.jpg binary
+*.ico binary

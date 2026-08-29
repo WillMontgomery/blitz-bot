@@ -1,0 +1,64 @@
+// TypeScript, configured for a process that Node runs FROM SOURCE.
+//
+// THERE IS NO BUILD STEP AND NO `dist/`. `npm start` is
+// `node src/index.ts` — Node 24 strips the types itself, so the deploy on the
+// EC2 box is `git pull && npm ci && systemctl restart blitz-bot` with nothing
+// in between. The two alternatives were both considered and both rejected:
+//
+//   `tsc` to `dist/` and run `node dist/index.js` — correct, but it adds a
+//   build step that can be forgotten, and a stale `dist/` is a bot running last
+//   week's code while `git log` says otherwise. That failure is silent.
+//
+//   `tsx src/index.ts` — also correct, and it is what the sibling console uses
+//   for its scripts, but it means shipping a TypeScript runtime as a
+//   PRODUCTION dependency so that `npm ci --omit=dev` still boots. Node 24
+//   already does the job for free.
+//
+// THE PRICE IS PAID HERE, IN THREE FLAGS, and it is worth understanding before
+// changing any of them. Node's stripper is syntactic: it deletes types without
+// ever type-checking, so anything it cannot recognise by shape alone must be
+// caught at `npm run typecheck` instead of at 2am on the box.
+//
+//   `erasableSyntaxOnly` — enums, namespaces and constructor parameter
+//   properties have runtime behaviour, so Node refuses them outright. This
+//   turns that runtime crash into a compile error.
+//
+//   `verbatimModuleSyntax` — the stripper cannot tell a type import from a
+//   value import, so it leaves `import { Config } from './config.ts'` in place
+//   and Node dies looking for an export that only ever existed to the compiler.
+//   This forces `import type` and the problem disappears.
+//
+//   `module: nodenext` — Node resolves ESM specifiers literally, so relative
+//   imports need their extension: `'./log.ts'`, not `'./log'`. Under `bundler`
+//   resolution the extensionless form type-checks and then fails at startup;
+//   under `nodenext` it fails in `tsc`, which is where you want to hear about
+//   it. `allowImportingTsExtensions` is what makes writing `.ts` legal, and it
+//   is only legal because nothing is emitted.
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+
+    "strict": true,
+    // Matches the console repo. An index into an array or a record yields
+    // `T | undefined`, which is the honest type — and this bot's hot path is a
+    // regex over hostile input, where "the capture group was there" is an
+    // assumption rather than a fact.
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src", "tests", "*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

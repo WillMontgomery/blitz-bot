@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.tsbuildinfo
+coverage/
+
+# Every dotenv file except the checked-in template. Ignoring `.env` and
+# `.env.local` by name alone leaves `.env.production` untracked but not
+# ignored, which is how a bot token reaches a public repo.
+.env
+.env.local
+.env.*
+!.env.example
