@@ -856,7 +856,7 @@ describe('the sink — a failure inside the reporting cannot become a loop', () 
 
     setSink((_level, msg) => {
       seen.push(msg)
-      log('error', 'could not post to the status channel')
+      log('error', 'status channel unusable, nothing more will be posted to it')
       return Promise.reject(new Error('send failed'))
     })
 
@@ -873,7 +873,7 @@ describe('the sink — a failure inside the reporting cannot become a loop', () 
       seen.push(msg)
       await Promise.resolve()
       await Promise.resolve()
-      log('error', 'could not post to the status channel')
+      log('error', 'status channel unusable, nothing more will be posted to it')
       throw new Error('send failed')
     })
 

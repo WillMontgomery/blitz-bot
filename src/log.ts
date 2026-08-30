@@ -126,6 +126,31 @@ export function log(level: Level, msg: string, fields?: Record<string, unknown>)
  * carries `ready` and a line per deleted message is a channel nobody reads —
  * so `info` never reaches it. Excluding it here rather than in a comment means
  * no sink can be written that expects to be handed one.
+ *
+ * SO THE RULE FOR PICKING A LEVEL IS ONE QUESTION: DOES THIS NEED A HUMAN?
+ * `warn` and `error` mean yes, and mean it literally — every one of them is
+ * copied into a Discord channel the owner reads, so writing one is asking him
+ * to go and look at something. `info` means no: it is the journal's business,
+ * there for whoever is already debugging and invisible otherwise. Nothing
+ * anywhere in this bot chooses a level for any other reason.
+ *
+ * ANYTHING ROUTINE, SELF-HEALING OR PURELY INFORMATIONAL IS `info`, however
+ * alarming the sentence sounds when you write it. A gateway that reconnects, a
+ * request the next attempt will make again, an invite that had expired: none of
+ * those need anybody, and each one that reaches the channel teaches the owner a
+ * little more that the channel can be scrolled past. The cost of getting this
+ * wrong is not noise, it is the alarm being ignored the day it is real —
+ * `gateway reconnecting` sat at `warn` for months and did exactly that.
+ *
+ * THE QUESTION IS ABOUT THE CONSEQUENCE, NOT THE CAUSE. "A Discord call failed"
+ * is not it; "and something stays broken until a person fixes it" is. The same
+ * failed call is `info` when the next one will succeed and `warn` when it means
+ * the bot has stopped moderating.
+ *
+ * `error` RATHER THAN `warn` WHEN THE BOT HAS STOPPED DOING SOMETHING IT IS
+ * FOR: moderation halted, a delete that did not happen, a channel it can no
+ * longer post to. Both reach the owner, so this is not the noise decision — it
+ * is `journalctl -p err`, and which of two lines gets read first.
  */
 export type Fault = Exclude<Level, 'info'>
 

@@ -10,6 +10,7 @@ import {
   Partials,
   RESTJSONErrorCodes,
   type Client,
+  type CloseEvent,
   type Message,
   type OmitPartialGroupDMChannel,
 } from 'discord.js'
@@ -2111,6 +2112,258 @@ describe('createClient — the wiring that would otherwise fail silently', () =>
 })
 
 /**
+ * REGRESSION, AND THE ONE THE OWNER RAISED HIMSELF. Three lines arrived in
+ * #bot-status across nine hours, identical, `level=warn msg="gateway
+ * reconnecting" shard=0`, and he asked what they were and whether they could
+ * stop. They could: Discord asks clients to reconnect as ordinary housekeeping,
+ * three in nine hours is a healthy bot, and every one of them was asking him to
+ * look at something that had already fixed itself.
+ *
+ * THE OTHER HALF IS THE POINT OF THIS BLOCK. Nothing detected the case that
+ * does need him — a gateway that goes and does not come back — so the channel
+ * was carrying the non-event and silent about the event. These cases pin both
+ * ends: the routine reconnect says nothing at all, and an absence past
+ * `GATEWAY_DOWN_MS` says something exactly once and then says when it is over.
+ *
+ * THE ALARM CANNOT BE DELIVERED WHILE IT IS TRUE, which is not a bug and is not
+ * fixable from inside a Discord bot: while the gateway is down there is no
+ * gateway to post over, the same gap `login failed` has. That is why the return
+ * line carries the duration — it is the one line that does arrive, and it has
+ * to say what happened while nobody could be told.
+ */
+describe('the gateway — a reconnect is not a fault, an absence is', () => {
+  /**
+   * Everything the sink is handed, as `level msg`.
+   *
+   * THROUGH THE REAL `log()` AND THE REAL SINK GATE, because "posts nothing to
+   * the channel" is a claim about the level filter in log.ts and not about this
+   * file's own idea of what a fault is. A test that inspected the journal lines
+   * would pass just as well against a build that posted every one of them.
+   */
+  function watching(): string[] {
+    const faults: string[] = []
+
+    setSink((level, msg) => {
+      faults.push(`${level} ${msg}`)
+      return Promise.resolve()
+    })
+
+    return faults
+  }
+
+  /** A close event, reduced to the code — the only part either side reads. */
+  const closed = (code: number): CloseEvent =>
+    ({ code, reason: '', wasClean: false }) as unknown as CloseEvent
+
+  it('posts nothing at all when a shard reconnects', async () => {
+    const faults = watching()
+    const client = createClient(cfg())
+
+    client.emit(Events.ShardReconnecting, 0)
+
+    expect(faults).toEqual([])
+    // Still in the journal, for whoever is debugging a connection.
+    expect(stdout.join('')).toContain('level=info msg="gateway reconnecting" shard=0')
+    expect(stderr.join('')).toBe('')
+
+    await client.destroy()
+  })
+
+  it('posts nothing when the gateway comes back promptly', async () => {
+    vi.useFakeTimers()
+
+    const faults = watching()
+    const client = createClient(cfg())
+
+    try {
+      client.emit(Events.ShardReconnecting, 0)
+      await vi.advanceTimersByTimeAsync(3_000)
+      client.emit(Events.ShardResume, 0, 12)
+
+      // Long past the window, to prove the clock was stopped and not merely
+      // not yet reached.
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000)
+
+      expect(faults).toEqual([])
+      expect(stderr.join('')).toBe('')
+    } finally {
+      vi.useRealTimers()
+      await client.destroy()
+    }
+  })
+
+  it('warns exactly once when the gateway does not come back', async () => {
+    vi.useFakeTimers()
+
+    const faults = watching()
+    const client = createClient(cfg())
+
+    try {
+      client.emit(Events.ShardReconnecting, 0)
+
+      await vi.advanceTimersByTimeAsync(59_000)
+      expect(faults).toEqual([])
+
+      await vi.advanceTimersByTimeAsync(2_000)
+      expect(faults).toEqual(['warn gateway has not come back'])
+      expect(stderr.join('')).toContain('msg="gateway has not come back" shard=0 seconds=60')
+
+      // An hour more of it, and still one alarm. The window is a threshold
+      // crossed once, not a heartbeat: a warning every minute for an outage
+      // nobody can be told about is the same training in reverse.
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000)
+      expect(faults).toEqual(['warn gateway has not come back'])
+    } finally {
+      vi.useRealTimers()
+      await client.destroy()
+    }
+  })
+
+  it('runs the clock from the first loss rather than from each retry', async () => {
+    // THE CASE THIS EXISTS FOR. discord.js emits `shardReconnecting` once per
+    // attempt, so a shard retrying every twenty seconds forever would, on a
+    // clock restarted by each attempt, never reach the window at all — the
+    // outage that most needs saying would be the one that never got said.
+    vi.useFakeTimers()
+
+    const faults = watching()
+    const client = createClient(cfg())
+
+    try {
+      client.emit(Events.ShardReconnecting, 0)
+
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await vi.advanceTimersByTimeAsync(20_000)
+        client.emit(Events.ShardReconnecting, 0)
+      }
+
+      // Sixty seconds after the first loss, not after the latest attempt.
+      expect(faults).toEqual(['warn gateway has not come back'])
+      expect(stderr.join('')).toContain('seconds=60')
+
+      // AND STILL ONE AN HOUR LATER, which is the half that catches the other
+      // way of getting this wrong: a clock that is restarted per attempt but
+      // leaves the abandoned windows armed still crosses the first one on time,
+      // and then warns again for every attempt after it.
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000)
+      expect(faults).toEqual(['warn gateway has not come back'])
+    } finally {
+      vi.useRealTimers()
+      await client.destroy()
+    }
+  })
+
+  it('says the gateway is back, and how long it was gone, once it has warned', async () => {
+    vi.useFakeTimers()
+
+    const faults = watching()
+    const client = createClient(cfg())
+
+    try {
+      client.emit(Events.ShardReconnecting, 0)
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000)
+
+      expect(faults).toEqual(['warn gateway has not come back'])
+
+      client.emit(Events.ShardReady, 0, undefined)
+
+      expect(faults).toEqual(['warn gateway has not come back', 'warn gateway is back'])
+
+      // THE WHOLE OUTAGE AND NOT THE WINDOW. This is the line that actually
+      // reaches the channel — the warning above was raised while there was no
+      // gateway to post it over — so `seconds` has to be how long the bot was
+      // really off Discord, not the threshold it crossed on the way.
+      expect(stderr.join('')).toContain('msg="gateway is back" shard=0 seconds=300')
+    } finally {
+      vi.useRealTimers()
+      await client.destroy()
+    }
+  })
+
+  it('takes a resumed session as the gateway being back', async () => {
+    // A shard that resumes its old session emits `shardResume` and never emits
+    // `shardReady` at all, so listening for only the second would leave the
+    // fastest recovery there is looking permanently down.
+    vi.useFakeTimers()
+
+    const faults = watching()
+    const client = createClient(cfg())
+
+    try {
+      client.emit(Events.ShardReconnecting, 0)
+      await vi.advanceTimersByTimeAsync(90_000)
+      client.emit(Events.ShardResume, 0, 3)
+
+      expect(faults).toEqual(['warn gateway has not come back', 'warn gateway is back'])
+      expect(stderr.join('')).toContain('msg="gateway is back" shard=0 seconds=90')
+    } finally {
+      vi.useRealTimers()
+      await client.destroy()
+    }
+  })
+
+  it('says nothing about a return that no alarm was raised about', async () => {
+    // The ordinary case, and the reason the return line is not itself noise: a
+    // gateway that came back inside the window has nothing to clear.
+    const faults = watching()
+    const client = createClient(cfg())
+
+    client.emit(Events.ShardReady, 0, undefined)
+    client.emit(Events.ShardResume, 0, 1)
+
+    expect(faults).toEqual([])
+    expect(stdout.join('')).toBe('')
+    expect(stderr.join('')).toBe('')
+
+    await client.destroy()
+  })
+
+  /**
+   * NOT DEMOTED WITH THE RECONNECT, AND THE NAME IS THE TRAP. `shardDisconnect`
+   * sounds like the other half of a routine reconnect and in discord.js v14 it
+   * is the opposite: it is emitted only for the close codes the library lists
+   * as unrecoverable — 4004 a bad token, 4013 and 4014 an intent that is not
+   * granted — and every close it will retry goes out as `shardReconnecting`
+   * instead. So this event means the shard will never come back on its own, and
+   * it is exactly what the channel is for.
+   */
+  it('still warns about a disconnect, which is the shard never coming back', async () => {
+    const faults = watching()
+    const client = createClient(cfg())
+
+    client.emit(Events.ShardDisconnect, closed(4014), 0)
+
+    expect(faults).toEqual(['warn gateway disconnected'])
+    expect(stderr.join('')).toContain('msg="gateway disconnected" shard=0 code=4014')
+
+    await client.destroy()
+  })
+
+  it('raises one alarm, not two, when a retrying shard is refused outright', async () => {
+    // A shard can be part-way through reconnecting when the identify comes back
+    // refused. The disconnect names the cause; a line a minute later saying it
+    // has not come back adds nothing to a line that already says it never will.
+    vi.useFakeTimers()
+
+    const faults = watching()
+    const client = createClient(cfg())
+
+    try {
+      client.emit(Events.ShardReconnecting, 0)
+      await vi.advanceTimersByTimeAsync(10_000)
+      client.emit(Events.ShardDisconnect, closed(4014), 0)
+
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000)
+
+      expect(faults).toEqual(['warn gateway disconnected'])
+    } finally {
+      vi.useRealTimers()
+      await client.destroy()
+    }
+  })
+})
+
+/**
  * REGRESSION, AND THE ONE THAT MATTERS MOST. A wrong DISCORD_GUILD_ID used to
  * log one error line and carry on moderating.
  *
@@ -2824,6 +3077,12 @@ describe('statusReporter — a channel that cannot be posted to', () => {
    * A RATE LIMIT IS NOT A REASON TO GIVE UP FOREVER. Latching on a transient
    * failure would turn a bad ten seconds into a bot that reports nothing until
    * the next restart, which is the failure this whole feature exists to stop.
+   *
+   * NOR IS IT A REASON TO ASK FOR A HUMAN, which is why the line it writes is
+   * `info`. The next fault tries again, discord.js queues behind a rate limit
+   * on its own, and nobody can do anything about a 500 at Discord's end; the
+   * line is for whoever is working out why a fault they expected never showed
+   * up in the channel. The permanent case latches at error, one line up.
    */
   it('keeps trying after a transient failure', async () => {
     const { client, send } = statusHarness({ sendRejects: new Error('rate limited') })
@@ -2833,7 +3092,7 @@ describe('statusReporter — a channel that cannot be posted to', () => {
     await report('error', 'delete failed', line('delete failed'))
 
     expect(send).toHaveBeenCalledTimes(2)
-    expect(stderr.join('')).toContain('could not post to the status channel')
+    expect(stdout.join('')).toContain('level=info msg="could not post to the status channel"')
     expect(stderr.join('')).not.toContain('status channel unusable')
   })
 
@@ -2841,6 +3100,10 @@ describe('statusReporter — a channel that cannot be posted to', () => {
    * An edit that fails means the message is gone — deleted by an admin tidying
    * up, most likely. Forgetting the entry is what stops the reporter editing a
    * dead message for the rest of the window.
+   *
+   * AND THAT REPAIR IS WHY THE LINE IS `info`. All that was lost is a repeat
+   * count; the next occurrence posts a fresh message, which is what happens
+   * once the window closes in any case. Nobody has to do anything about it.
    */
   it('forgets a message it could not edit, so the next occurrence posts fresh', async () => {
     const { client, sent } = statusHarness({ editRejects: new Error('Unknown Message') })
@@ -2851,7 +3114,7 @@ describe('statusReporter — a channel that cannot be posted to', () => {
     await report('error', 'delete failed', line('delete failed'))
 
     expect(sent).toHaveLength(2)
-    expect(stderr.join('')).toContain('could not update the status channel message')
+    expect(stdout.join('')).toContain('level=info msg="could not update the status channel message"')
   })
 })
 
@@ -3977,7 +4240,7 @@ describe('the manual — the channel is read back, never remembered', () => {
 
     expect(first.calls).toEqual(['read', 'post One', 'post Two', 'post Three'])
     expect(first.messages().map((message) => message.title)).toEqual(['One', 'Three'])
-    expect(stderr.join('')).toContain('could not post a manual section')
+    expect(stdout.join('')).toContain('level=info msg="could not post a manual section"')
 
     // The process died here. A new one comes up with no memory of any of it,
     // and the channel is the only thing that carried over.
@@ -4431,8 +4694,14 @@ describe('the manual — what it costs Discord', () => {
     // listener's signature says an `exit` listener is given.
     abandoned(0)
 
-    expect(stderr.join('')).toContain('going down between two manual writes')
-    expect(stderr.join('')).toContain('written=1')
+    // INFO — the journal and not the status channel. A restart part-way
+    // through a documentation sync is what `systemctl restart` looks like from
+    // in here, the next start finishes the job, and the line is for whoever is
+    // reading the journal afterwards wondering why the channel is half written.
+    expect(stdout.join('')).toContain('level=info')
+    expect(stdout.join('')).toContain('going down between two manual writes')
+    expect(stdout.join('')).toContain('written=1')
+    expect(stderr.join('')).toBe('')
 
     release()
     await run
@@ -4595,7 +4864,14 @@ describe('the manual — a channel the bot cannot use', () => {
 
     expect(docs.calls).toEqual(['read', 'post One', 'post Two', 'post Three'])
     expect(said('docs channel unusable')).toBe(0)
-    expect(stderr.join('')).toContain('could not post a manual section')
+
+    // INFO, AND THE TEST NAME IS THE ARGUMENT: it works next time. The next
+    // start reads the channel back and publishes whatever this run did not, so
+    // there is nothing for anybody to do and the status channel is not told.
+    // The failure that WOULD need a person — a channel this bot cannot write in
+    // at all — is the error line the assertion above says did not happen.
+    expect(stdout.join('')).toContain('level=info msg="could not post a manual section"')
+    expect(stderr.join('')).toBe('')
   })
 })
 

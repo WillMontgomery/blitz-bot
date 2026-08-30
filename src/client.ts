@@ -1366,23 +1366,159 @@ export function createClient(config: Config): Client {
    *
    * There is no `disconnect` listener here, though the brief asked for one:
    * discord.js v12 had a client `disconnect` event and v14 does not. The
-   * gateway lives on a shard now, and `shardDisconnect` is the same fact under
-   * its current name. Registering the old string would type-error, and if it
-   * did not it would be a handler that never fires.
+   * gateway lives on a shard now. Registering the old string would type-error,
+   * and if it did not it would be a handler that never fires.
+   *
+   * AND `shardDisconnect` IS NOT THAT EVENT UNDER A NEW NAME, which this
+   * comment used to say and which is the trap the shard listeners below are
+   * written around: in v14 it fires only for close codes the library will not
+   * retry. "The gateway went away" is `shardReconnecting`.
    */
   client.on(Events.Error, (error) => {
     log('error', 'client error', { error })
   })
 
+  /**
+   * How long each shard has been off Discord, while it is.
+   *
+   * THE FAULT IS THE ABSENCE, NOT THE RECONNECT. Discord asks clients to
+   * reconnect as ordinary housekeeping and a healthy bot does it several times
+   * a day; `gateway reconnecting` was logged at warn, so each of those arrived
+   * in the status channel as something to go and look at, and three of them
+   * across a night taught the owner that the channel can be scrolled past.
+   * What nothing detected was the case that actually needs him: a gateway that
+   * goes and does not come back. That is what this map is for — a clock per
+   * shard, started when the connection is lost and stopped when it returns.
+   *
+   * KEYED BY SHARD because the events are, even though this bot runs one. A
+   * single `let` would work today and would silently mean "whichever shard
+   * moved last" the day it does not.
+   */
+  const outages = new Map<number, Outage>()
+
+  /**
+   * The gateway is away. Start the clock, or leave one that is already running.
+   *
+   * THE CLOCK RUNS FROM THE FIRST LOSS AND EVERY RETRY AFTER IT IS THE SAME
+   * OUTAGE. discord.js emits `shardReconnecting` once per attempt, so restarting
+   * the clock on each one would mean a shard retrying every twenty seconds
+   * forever never reached the window at all — the exact failure this exists to
+   * catch would be the one it could not see.
+   *
+   * THE TIMER IS UNREFFED. A bot being shut down while its gateway is away must
+   * not make `systemctl stop` wait out this window for a line about a
+   * connection nobody is waiting for any more.
+   */
+  function gatewayAway(shardId: number): void {
+    if (outages.has(shardId)) return
+
+    const since = Date.now()
+
+    const timer = setTimeout(() => {
+      const outage = outages.get(shardId)
+      if (outage === undefined) return
+
+      // Recorded so the return can say the alarm is over. An alarm that never
+      // clears is one people learn to ignore, which is how this started.
+      outage.warned = true
+
+      // MEASURED RATHER THAN ASSUMED. This is `GATEWAY_DOWN_MS` in a healthy
+      // process and is not in a busy or suspended one, and the whole value of
+      // the line is that the number in it is true.
+      log('warn', 'gateway has not come back', { shard: shardId, seconds: awaySeconds(since) })
+    }, GATEWAY_DOWN_MS)
+
+    timer.unref()
+    outages.set(shardId, { since, timer, warned: false })
+  }
+
+  /**
+   * The gateway is back. Stop the clock, and say so only if we raised an alarm.
+   *
+   * THIS IS A `warn` AND THAT IS DELIBERATE, THOUGH IT IS GOOD NEWS. While the
+   * gateway is down there is no gateway to post over, so the warning above
+   * reaches the journal and nothing else — the same irreducible gap `login
+   * failed` has. This line is the first thing that CAN be delivered afterwards,
+   * so it is not a celebration: it is the outage report, and it carries how
+   * long the bot was off Discord because that is the fact nobody could be told
+   * at the time. `info` would put it where the sink cannot reach it, which
+   * would leave the alarm hanging open forever.
+   *
+   * SILENT WHEN NOTHING WAS RAISED, which is the ordinary case: a reconnect
+   * inside the window ends its outage here having never warned about it, and
+   * says nothing at either end.
+   */
+  function gatewayBack(shardId: number): void {
+    const outage = outages.get(shardId)
+    if (outage === undefined) return
+
+    outages.delete(shardId)
+    clearTimeout(outage.timer)
+
+    if (!outage.warned) return
+
+    log('warn', 'gateway is back', { shard: shardId, seconds: awaySeconds(outage.since) })
+  }
+
+  /**
+   * IN v14 THIS EVENT MEANS THE SHARD WILL NEVER RECONNECT, which is not what
+   * its name suggests and is the reverse of the v12 event it was named after.
+   * discord.js emits `shardDisconnect` only for the close codes it lists as
+   * unrecoverable — 4004 a bad token, 4013 and 4014 an intent that is not
+   * granted, 4010/4011/4012 a sharding or API-version mistake — and emits
+   * `shardReconnecting` for every close it will retry. So this is not the other
+   * half of a routine reconnect and does not become `info` with it: the bot is
+   * off Discord until somebody changes something and restarts it.
+   *
+   * IT IS ALSO THE END OF ANY OUTAGE CLOCK, because a shard can be retrying
+   * when the identify comes back refused. One fault gets one alarm, and this
+   * one names the cause; a second line a minute later saying it has not come
+   * back adds nothing to a line that already says it never will.
+   */
   client.on(Events.ShardDisconnect, (event, shardId) => {
-    // The close code is the whole diagnosis: 4014 is a privileged intent that
-    // was requested and not granted, 4004 is a bad token, 1000/1001 are
-    // ordinary. Everything else is worth looking up.
+    const outage = outages.get(shardId)
+
+    if (outage !== undefined) {
+      outages.delete(shardId)
+      clearTimeout(outage.timer)
+    }
+
+    // The close code is the whole diagnosis, and the only one of these that is
+    // ever a mistake in configuration rather than in code: 4014 is a privileged
+    // intent requested and not granted, 4004 is a bad token.
     log('warn', 'gateway disconnected', { shard: shardId, code: event.code })
   })
 
+  /**
+   * INFO, BECAUSE A RECONNECT THAT SUCCEEDS IS NOT A FAULT. Discord hands out
+   * close codes it expects clients to reconnect from as a matter of routine —
+   * a gateway node going out of service, an op 7 asking for a resume — and
+   * discord.js does exactly that without anything else in this process
+   * noticing. The line stays in the journal for whoever is debugging a
+   * connection; what it stops doing is asking for a person.
+   */
   client.on(Events.ShardReconnecting, (shardId) => {
-    log('warn', 'gateway reconnecting', { shard: shardId })
+    log('info', 'gateway reconnecting', { shard: shardId })
+    gatewayAway(shardId)
+  })
+
+  /**
+   * BOTH WAYS BACK, AND EITHER ONE ENDS THE OUTAGE. A shard that re-identifies
+   * emits `shardReady`; one that resumes its old session emits `shardResume`
+   * and never emits `shardReady` at all. Listening for only the first would
+   * leave a resumed session looking permanently down, which is a false alarm on
+   * the fastest and most common recovery there is.
+   *
+   * NEITHER IS LOGGED IN ITSELF. A gateway that came back inside the window is
+   * the routine case and says nothing; `gatewayBack` speaks only when an alarm
+   * is waiting to be cleared.
+   */
+  client.on(Events.ShardReady, (shardId) => {
+    gatewayBack(shardId)
+  })
+
+  client.on(Events.ShardResume, (shardId) => {
+    gatewayBack(shardId)
   })
 
   // The listener is synchronous and the promise is handled here, because an
@@ -1432,6 +1568,49 @@ export function createClient(config: Config): Client {
 
   return client
 }
+
+/** One shard's absence from Discord, while it lasts. See `gatewayAway`. */
+interface Outage {
+  /** When the connection was lost — the first loss, not the latest retry. */
+  readonly since: number
+
+  /** The window, waiting to fire. Unreffed. */
+  readonly timer: ReturnType<typeof setTimeout>
+
+  /** Whether the window fired, and therefore whether the return needs saying. */
+  warned: boolean
+}
+
+/** How long the gateway has been away, in the units a person reads. */
+function awaySeconds(since: number): number {
+  return Math.round((Date.now() - since) / 1000)
+}
+
+/**
+ * How long the gateway may be away before a person is asked to look.
+ *
+ * MEASURED AGAINST HOW LONG A HEALTHY RECONNECT ACTUALLY TAKES, which is the
+ * only thing that makes this number defensible rather than a guess. The fast
+ * path is a resume: one websocket connect and a RESUME frame, done in well
+ * under a second. The slow healthy path is a re-identify, and it has two real
+ * costs — Discord's identify bucket, which admits one identify per shard every
+ * five seconds, and discord.js's own `waitGuildTimeout`, fifteen seconds spent
+ * waiting for the GUILD_CREATE payloads before it calls the shard ready. So a
+ * reconnect that is going to work has done so inside about twenty seconds, and
+ * the great majority finish in one.
+ *
+ * SIXTY SECONDS IS THEREFORE THREE TIMES THE WORST HEALTHY CASE, which is the
+ * margin that keeps this from crying wolf over a slow night on Discord's side,
+ * and it is also the owner's own threshold: a bot that has been off Discord for
+ * a minute is not moderating and he wants to know. Nothing between twenty and
+ * sixty seconds is silently dropped — every one of those is in the journal as
+ * `gateway reconnecting` — it is only the ask for a human that waits.
+ *
+ * IT IS NOT A RETRY BUDGET AND CHANGES NOTHING ABOUT RECONNECTING. discord.js
+ * keeps trying on its own schedule whatever this says; this is only how long
+ * the bot stays quiet about it.
+ */
+const GATEWAY_DOWN_MS = 60_000
 
 /** What `client.fetchInvite` answers, reduced to the part this file reads. */
 export type InviteLookup = (code: string) => Promise<{ guild: { id: string } | null }>
@@ -1708,7 +1887,13 @@ export function statusReporter(client: Client, channelId: string): Sink {
       // the map still holds THIS entry — a trailing flush can land after the
       // window closed and a fresh message took its place.
       if (seen.get(entry.key) === entry) seen.delete(entry.key)
-      log('warn', 'could not update the status channel message', { error })
+
+      // INFO, BECAUSE THE LINE ABOVE IS THE REPAIR. All that was lost is a
+      // repeat count on one message; the next occurrence posts a fresh one, and
+      // the channel is no worse off than it is after the window closes anyway.
+      // Nothing here needs a person, and the failure that would — a channel
+      // this bot cannot post in at all — has `giveUp` and its own error line.
+      log('info', 'could not update the status channel message', { error })
     }
   }
 
@@ -1827,9 +2012,13 @@ export function statusReporter(client: Client, channelId: string): Sink {
         return
       }
 
-      // Rate limited, a 500, a network that went away. All transient, all worth
-      // one journal line and another attempt on the next fault.
-      log('warn', 'could not post to the status channel', { error })
+      // Rate limited, a 500, a network that went away. All transient, all
+      // retried by the next fault, and none of them a thing anybody can do
+      // something about — discord.js queues behind a rate limit on its own and
+      // a 500 is Discord's. So: one journal line for whoever is working out why
+      // a fault they expected never appeared, and no second alarm about the
+      // alarm. The permanent case latches through `giveUp` at error instead.
+      log('info', 'could not post to the status channel', { error })
     }
   }
 
@@ -2976,7 +3165,13 @@ export async function syncManual(
       // Transient: rate limited, a 500, a message somebody deleted underneath
       // us. The next start reads the channel back and reconciles whatever this
       // run did not manage, so there is nothing to retry here.
-      log('warn', CHANGE_FAILED[change], { heading, error })
+      //
+      // AND THEREFORE INFO. The sentence above is the definition of
+      // self-healing: nobody has to do anything, and the one section that did
+      // not land is published by the next restart. It is documentation, not
+      // moderation — the failure that WOULD need a person is a channel this bot
+      // cannot write in at all, which is the error line a few lines up.
+      log('info', CHANGE_FAILED[change], { heading, error })
     }
 
     return null
@@ -3003,7 +3198,13 @@ export async function syncManual(
    */
   async function paced(): Promise<void> {
     const abandoned = (): void => {
-      log('warn', 'the process is going down between two manual writes, the rest of the manual was not synchronised', {
+      // INFO, AND THE COMMENT ABOVE IS THE ARGUMENT FOR IT: this is what
+      // `systemctl restart` looks like from inside a documentation sync, the
+      // next start finishes the job, and the line exists for somebody reading
+      // the journal after a restart and wondering why the channel is half
+      // written. Nobody has to do anything. It could not have reached the
+      // status channel in any case — the process is on its way out.
+      log('info', 'the process is going down between two manual writes, the rest of the manual was not synchronised', {
         written: writes,
       })
     }
