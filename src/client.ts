@@ -2,6 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import {
+  AuditLogEvent,
   Client,
   DiscordAPIError,
   Events,
@@ -9,15 +10,27 @@ import {
   Partials,
   RESTJSONErrorCodes,
   type APIEmbed,
+  type Guild,
+  type GuildAuditLogsEntry,
   type SendableChannels,
 } from 'discord.js'
 
 import type { Config } from './config.ts'
-import { createDdb } from './ddb.ts'
+import {
+  createDdb,
+  isBanActive,
+  qualifyId,
+  type Ban,
+  type BanIssueOutcome,
+  type Ddb,
+  type DdbFailure,
+  type DdbResult,
+} from './ddb.ts'
 import { scanMessage, type InviteResolver, type ScanResult } from './invites.ts'
 import { scanLinks, type LinkReason } from './links.ts'
 import { log, type Fault, type Sink } from './log.ts'
 import { watchMaintenance } from './maintenance.ts'
+import { createRingmaster, KICK_TTL_MS, type KickResult, type Ringmaster } from './ringmaster.ts'
 import { installStickies } from './sticky.ts'
 
 /**
@@ -1776,10 +1789,28 @@ export function createClient(config: Config): Client {
      * privileged intent widens it again, for every consumer of the token, to
      * save one REST call.
      */
+    /**
+     * `GuildModeration` IS NEW AND IS NOT PRIVILEGED. It is the intent that
+     * delivers `guildAuditLogEntryCreate`, which is the whole of how this bot
+     * learns that a moderator banned, unbanned or kicked somebody — see
+     * `installBanMirror`. It needs no tick in the Developer Portal and no
+     * review; what it does need is the **View Audit Log** permission on the
+     * bot's role in the guild, which the owner has granted. Without the
+     * permission the intent is accepted, the gateway connects, and the event
+     * simply never arrives — a silence that looks exactly like a quiet guild.
+     *
+     * IT ALSO DELIVERS `guildBanAdd` AND `guildBanRemove`, WHICH THIS BOT
+     * DELIBERATELY DOES NOT LISTEN FOR. Those carry the user and no executor
+     * and no entry id, so a mirror built on them would have to correlate a ban
+     * against the audit log to find out who did it. The audit event carries
+     * target, executor and reason together and is therefore the one that needs
+     * no correlating.
+     */
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
       GatewayIntentBits.MessageContent,
+      GatewayIntentBits.GuildModeration,
     ],
 
     /**
@@ -2114,6 +2145,27 @@ export function createClient(config: Config): Client {
   if (config.docsChannelId !== null) {
     syncDocsChannel(client, config.docsChannelId)
   }
+
+  /**
+   * THE MODERATION MIRROR, AND IT IS THE ONE FEATURE HERE WITH NO OFF SWITCH.
+   *
+   * Every other optional half of this bot hangs off a channel id, and unset
+   * means the feature does nothing. This one has no id to hang off, because it
+   * is not a thing the bot says — it is the bot carrying a decision an admin
+   * already made in Discord into the game. blitz-bot#16 is that feature, so it
+   * is wired unconditionally and its two configurable parts degrade instead:
+   * no `COMMAND_SECRET` means the ban is still written and only the live kick is
+   * skipped, and the game-ban role has a default rather than an absence.
+   *
+   * REGISTERED AFTER THE GUILD CHECK, like everything else here. It is NOT taken
+   * off by the halt, and unlike the maintenance watcher that needs saying twice:
+   * `haltModeration` exists because a wrong `DISCORD_GUILD_ID` makes the message
+   * scanner delete the guild's own invites, and this listener has no such
+   * failure mode — it checks the guild id on every event and ignores anything
+   * from anywhere else, so a misconfigured bot mirrors nothing rather than
+   * mirroring the wrong guild's bans.
+   */
+  installBanMirror(client, config, createDdb())
 
   return client
 }
@@ -3290,56 +3342,51 @@ export function announceDeployedCommit(
  * has to remember to update a wiki, and the docs cannot drift from the code
  * without the drift being visible in a channel the admins already read.
  *
- * ONE EMBED PER TOP-LEVEL HEADING, IN FILE ORDER. The owner's decision. An
- * embed's description holds 4096 characters against a plain message's 2000, and
- * a section per message is what makes a change to one section a change to one
- * message.
+ * THE WHOLE MANUAL IS ONE EMBED IN ONE MESSAGE. THAT IS THE OWNER'S CORRECTION
+ * AND IT IS WHY THIS HALF IS A THIRD OF THE SIZE IT WAS. It used to be an embed
+ * per top-level heading — eleven messages in his channel — and the first time
+ * he read it: "Holy cow - those embeds are plain and LOOONNGGG. The manual
+ * should be no more than 1 embed". So the `# ` heading is the embed's title,
+ * the lead paragraph under it is the description, and every `## ` section is a
+ * FIELD. A reference card read in one screen, rather than a channel to scroll.
  *
- * MATCHED BY HEADING, NEVER BY POSITION, AND THAT IS THE WHOLE DESIGN. Matching
- * the n-th section to the n-th message is one line shorter and it means that
- * inserting a section near the top rewrites every message below it on the next
- * restart. In a project this careful about audit trails, a bot silently
- * rewriting its own history is a worse failure than a stale paragraph. So the
- * embed title IS the key: section three growing edits section three's message
- * and touches nothing else.
+ * AND EVERYTHING THAT ONLY EXISTED FOR MANY MESSAGES IS GONE: matching a
+ * section to a message by its heading, the per-section reconcile, two sections
+ * sharing a heading, the mark stamped on a section that could not be published,
+ * the per-section refusal, and the circuit breaker that refused to delete most
+ * of the channel. Every one of those was built because THE FILE IS
+ * AUTHORITATIVE AND THE CHANNEL IS THE STATE, so any misreading of the file
+ * came out of the far end as DELETIONS of sections that were still in it — an
+ * unclosed code fence, an empty file, a read that stopped at its own limit. Each
+ * of them limited the damage a parse bug could do to a channel full of
+ * documentation. With one message there is one message: the worst a misparse
+ * can now do is put a wrong version of the manual in front of a reader for as
+ * long as it takes to fix the file, and the next start writes it again.
  *
- * THE CHANNEL IS THE STATE, AND THERE IS NO LOCAL RECORD OF WHAT WAS POSTED.
- * A file saying "section four is message 123" is a claim about a channel any
- * admin can edit with a right-click, and the moment somebody deletes a message
- * by hand that claim is a lie which makes the bot skip the section forever. So
- * every start reads the channel back and derives everything from what is
- * actually there — which is also what makes a partially failed run reconcile
- * instead of duplicating.
+ * THE ONE GUARD WORTH KEEPING IS THE ONE WHERE ACTING ON A BAD PARSE STILL
+ * DESTROYS SOMETHING. A manual that cannot be READ, or that parses to nothing,
+ * leaves the channel EXACTLY as it was found: not read, not written, not
+ * emptied. A missing or unparseable file is a checkout of an older commit or a
+ * botched deploy, and "the manual is now empty" is the worst possible reading of
+ * one. See `readManual`, `parseManual` and the first lines of `syncManual`.
  *
  * AN IDENTICAL MANUAL IS COMPLETELY SILENT. No post, no edit, no info line.
  * This process restarts on every deploy and on every crash, and a channel that
  * stirs each time is a channel nobody reads — the same argument the deploy
- * notice above is built around.
+ * notice above is built around. The comparison is a plain equality between what
+ * Discord handed back and what the file says; see `unchanged`.
  *
- * AND THE PRICE OF THAT DESIGN, WHICH IS THE THING THE REST OF THIS HALF IS
- * SHAPED BY: the file is authoritative and the channel is the state, so ANY
- * misreading of the file becomes DELETIONS from the channel. An unclosed code
- * fence, a file that arrived empty, a read that stopped at its own limit — each
- * of those is a parse or a transport fault, and each of them used to come out
- * the far end as "these sections are no longer in the file", said about
- * sections that were still in it. The file cannot be trusted to be well formed
- * and the channel cannot be recovered from a git history, so the two are not
- * symmetrical: a run that is about to remove a large share of the channel is
- * far more likely to be this bot misreading a document than a human deleting
- * most of one. `syncManual` refuses the whole destructive half when that
- * happens, says so at error, and leaves the channel exactly as it found it.
- * Every individual guard below — the empty parse, the unclosed fence, the
- * truncated read — is a second line of defence in front of that one, not a
- * replacement for it.
- *
- * A SECTION THAT CANNOT BE PUBLISHED IS MARKED IN THE CHANNEL, AND THE MARK IS
- * THE MEMORY. There is no local record of anything here by design, so the only
- * thing that survives a restart is what is in the channel — which means a
- * refusal reported at error on every start is a refusal reported forever. A
- * section this bot cannot carry (too long for an embed, or refused outright by
- * Discord) therefore has its message stamped with `STALE_FOOTER`, so a reader
- * of the channel is told that message is not the file, and so the next start
- * can see it has already said so and stay quiet. See `unpublishable`.
+ * THE CHANNEL IS THE STATE, AND THERE IS NO LOCAL RECORD OF WHAT WAS POSTED.
+ * A file saying "the manual is message 123" is a claim about a channel any admin
+ * can edit with a right-click, and the moment somebody deletes that message by
+ * hand the claim is a lie that stops the manual ever being posted again. So
+ * every start reads the channel back and derives everything from what is
+ * actually there: a hand-deleted manual comes back, and every OTHER message of
+ * ours in the channel is a leftover to remove. That last clause is also the
+ * changeover — the eleven messages the old model left in the owner's channel
+ * become one on the first start after this, because ten of them are leftovers.
+ * The circuit breaker would have refused that as "deleting most of the channel",
+ * which is the other reason it is gone.
  *
  * NOTHING HERE MAY DELAY OR BREAK MODERATION. Every failure in this half is
  * caught, written down and dropped; a missing manual is one warn and the bot
@@ -3347,138 +3394,277 @@ export function announceDeployedCommit(
  * does.
  */
 
-/** One top-level section of the manual: the heading, and the text under it. */
+/** One `## ` section: the heading, and the text under it. Becomes a field. */
 export interface ManualSection {
-  /** The heading text without its `#`. Becomes the embed title, and the key. */
+  /** The heading text without its `##`. Becomes the field's name. */
   readonly heading: string
 
-  /** Everything until the next top-level heading. Becomes the description. */
+  /** Everything until the next `## `. Becomes the field's value. */
   readonly body: string
 }
 
 /**
- * One of the bot's messages already in the channel, reduced to what matching
- * needs: which section it is, and what it currently says.
+ * The document, parsed: the one `# ` heading, the lead under it, and the `## `
+ * sections in file order.
  *
- * `description` IS THE STORED STRING AND NOT A RENDERED VIEW. The comparison
- * that decides whether anything is sent is a plain `===` between this and the
- * file's body, so it has to be the same kind of string at both ends — what
- * Discord gave back for `embed.description`, verbatim. Comparing anything that
- * had been through a renderer would make every start a diff of two formattings
- * and every restart a channel full of edits.
+ * THE SHAPE IS THE EMBED'S SHAPE, and that is deliberate — title, description,
+ * fields. The parser's job is to say what the document IS, and under this model
+ * a document that cannot be described in those three parts is a document that
+ * cannot be published at all.
  */
-export interface PostedSection {
-  readonly id: string
+export interface Manual {
+  readonly title: string
+  readonly lead: string
+  readonly sections: readonly ManualSection[]
+}
+
+/**
+ * One field of the embed, as it goes out and as it is read back.
+ *
+ * `inline` IS PART OF THE VALUE AND NOT A RENDERING DETAIL, which is why it is
+ * on both sides of the comparison. Discord lays inline fields out three to a
+ * row; whether a section sits in a column or across the width is as much a
+ * property of the published manual as its text, and a change to it has to reach
+ * the channel like any other. See `INLINE_BODY_CAP`.
+ */
+export interface ManualField {
+  readonly name: string
+  readonly value: string
+  readonly inline: boolean
+}
+
+/**
+ * The manual as one embed: everything that goes out in one message.
+ *
+ * `colour` AND NOT `color`, matching the rest of this repo, with the American
+ * spelling confined to the two lines that speak to discord.js — `apiEmbed` and
+ * the read in `ours`.
+ *
+ * THERE IS NO THUMBNAIL AND THAT IS AN ANSWER RATHER THAN AN OMISSION. The
+ * owner was asked and said no: a thumbnail takes about a fifth of the width off
+ * every line of a reference card, and the bot's own avatar is already at the top
+ * of the message. Width is worth more than a second copy of the avatar.
+ */
+export interface ManualEmbed {
   readonly title: string
   readonly description: string
-
-  /**
-   * The embed's footer, verbatim, and never part of the comparison.
-   *
-   * IT IS READ BACK BECAUSE IT IS THE ONLY DURABLE MEMORY THIS FEATURE HAS.
-   * Nothing about the channel is written down anywhere else — that is the whole
-   * design — so a fault reported at start-up is a fault reported on every
-   * start-up unless the channel itself is carrying the fact that it was already
-   * said. A section this bot could not publish is stamped with `STALE_FOOTER`,
-   * and reading that stamp back is what makes the second report silent. See
-   * `unpublishable`.
-   */
+  readonly colour: number
+  readonly fields: readonly ManualField[]
   readonly footer: string
 }
 
 /**
- * What one read of the channel says: the bot's sections oldest first, and
- * whether that is the whole channel or only as much of it as one request
- * carries.
+ * One of the bot's messages already in the channel, reduced to what the
+ * comparison reads.
  *
- * `complete` IS NOT A DETAIL OF THE TRANSPORT, IT IS THE VALIDITY OF EVERYTHING
- * BELOW. Every decision here is derived from what the read came back with: a
- * section whose message is not in it looks deleted by hand and is posted again,
- * and a message no section claims looks removed from the file and is deleted.
- * A read that stopped at its own limit is therefore not a smaller answer to the
- * same question — it is a confident wrong answer to it, and the only safe thing
- * to do with one is nothing at all.
+ * EVERY FIELD HERE IS THE STORED STRING AND NOT A RENDERED VIEW. The comparison
+ * that decides whether anything is sent is a plain equality between this and the
+ * built embed, so both sides have to be the same kind of value: what Discord
+ * gave back, verbatim. Comparing anything that had been through a renderer would
+ * make every start a diff of two formattings and every restart an edit.
+ *
+ * THE FOOTER IS NOT HERE, because it is the `updated` stamp and is never
+ * compared — it is rebuilt on every start, so comparing it would rewrite the
+ * channel forever. It goes out only on a write, which is what makes it a
+ * last-CHANGED stamp rather than a last-checked one.
  */
-export interface ChannelRead {
-  readonly sections: PostedSection[]
-  readonly complete: boolean
-}
-
-/** One section as it goes out: the embed's three fields and nothing else. */
-export interface ManualEmbed {
+export interface PostedManual {
+  readonly id: string
   readonly title: string
   readonly description: string
-  readonly footer: string
+  readonly colour: number | null
+  readonly fields: readonly ManualField[]
 }
 
 /**
  * The channel, as the four operations this needs.
  *
- * STRUCTURAL, FOR THE REASON EVERY OTHER BOUNDARY IN THIS FILE IS. The hard
- * part here is the reconciliation — a hand-deleted message, a half-finished
- * run, two sections under one heading — and every one of those is worth
- * exercising against a fake built three lines above the assertion rather than
- * against a live channel that would have to be vandalised on purpose.
+ * STRUCTURAL, FOR THE REASON EVERY OTHER BOUNDARY IN THIS FILE IS. The awkward
+ * cases — a message somebody deleted by hand, a channel still holding the old
+ * model's eleven messages, a write Discord refuses — are worth exercising
+ * against a fake built three lines above the assertion rather than against a
+ * live channel that would have to be vandalised on purpose.
+ *
+ * `read` ANSWERS THE BOT'S OWN MESSAGES, OLDEST FIRST, and the order is
+ * load-bearing: the first of them is the manual and the rest are leftovers.
  */
 export interface DocsChannel {
-  /** The bot's own manual messages, and whether that is all of them. Rejects if unreadable. */
-  readonly read: () => Promise<ChannelRead>
-
+  readonly read: () => Promise<readonly PostedManual[]>
   readonly post: (embed: ManualEmbed) => Promise<void>
   readonly edit: (id: string, embed: ManualEmbed) => Promise<void>
   readonly remove: (id: string) => Promise<void>
 }
 
 /**
- * Discord's own limits on one embed, and on a message's embeds together.
+ * Discord's limits on one embed, in UTF-16 code units.
  *
- * COUNTED IN UTF-16 CODE UNITS, WHICH IS WHAT DISCORD COUNTS. See `fitEmbed`.
+ * COUNTED IN UTF-16 CODE UNITS, WHICH IS WHAT DISCORD COUNTS, and this had the
+ * failure backwards once already. The caps are on the JSON string as it
+ * arrives, which is UTF-16, so counting CODE POINTS understates every astral
+ * character by half: 4096 musical symbols passed a 4096 guard at 8192 units and
+ * the post came back 50035, which is the one outcome the check exists to
+ * prevent. `String.length` is the number Discord is checking against.
+ *
+ * ONE RECORD RATHER THAN SIX CONSTANTS, so `embedBudget` can walk them and so
+ * the test over the shipped document can hold docs/bot-manual.md to these
+ * numbers without writing any of them down a second time. A cap restated in a
+ * test is a cap that is wrong in one of the two places.
+ *
+ * THE DOCUMENT THAT SHIPS TODAY FITS ALL SIX WITH ROOM TO SPARE. This is here
+ * for the next edit, not for this one: a manual is a file anybody can add a
+ * paragraph to without ever running the bot, and the failure it would otherwise
+ * cause is a message Discord refuses outright, which is the whole manual gone
+ * from the channel rather than one long paragraph.
  */
-const EMBED_TITLE_CAP = 256
-const EMBED_DESCRIPTION_CAP = 4096
-const EMBED_TOTAL_CAP = 6000
+export const EMBED_CAPS = {
+  title: 256,
+  description: 4096,
+  fields: 25,
+  fieldName: 256,
+  fieldValue: 1024,
+  total: 6000,
+} as const
+
+export type EmbedCap = keyof typeof EMBED_CAPS
+
+/** One cap, what this embed spends against it, and the limit. */
+export interface CapSpend {
+  readonly cap: EmbedCap
+  readonly spent: number
+  readonly limit: number
+}
 
 /**
- * The footer on a message this bot could not bring into agreement with the
- * file, and the one piece of state it keeps anywhere but in its own source.
+ * What one embed spends against each of Discord's caps.
  *
- * WHAT A READER OF THE CHANNEL SHOULD SEE. A section that is too long for an
- * embed, or that Discord refuses outright, leaves the previous version of that
- * section standing — which is the right call, because a truncated section reads
- * like the whole of it. What is NOT right is leaving it standing with nothing
- * to say so: the channel's entire claim is that it says what the file says, and
- * a message that quietly does not is the exact drift this feature exists to
- * make visible. So the message keeps its text and its footer says the text is
- * not current.
+ * `fieldName` AND `fieldValue` ARE THE WORST SINGLE FIELD, not a total, because
+ * those two caps are per field. `total` IS the sum, and it counts the footer:
+ * Discord adds the title, the description, every field name, every field value
+ * and the footer text together against the 6000.
  *
- * IT REPLACES THE `updated` STAMP RATHER THAN SITTING BESIDE IT, because the
- * stamp is a claim about when this message last matched the file and that claim
- * is now false. The date is recoverable from the file's history, which is where
- * a record of a change belongs.
- *
- * AND IT IS THE MEMORY. `unpublishable` reports a refusal only when it puts
- * this mark up, so the second start finds the mark already there and says
- * nothing. Without it the same error is written to the journal and posted to
- * the status channel on every restart, forever, for a document nobody can fix
- * from Discord — a slow flood in the one channel that has to stay readable.
- *
- * A SECTION THAT COMES BACK UNDER THE LIMITS IS WRITTEN AND STAMPED AGAIN LIKE
- * ANY OTHER CHANGE, which is what clears this. `syncManual` therefore treats a
- * marked message as different from the file even when the description matches
- * — see the comparison there.
+ * EXPORTED SO THE SHIPPED DOCUMENT CAN BE MEASURED WITH THE SAME ARITHMETIC THE
+ * BOT USES. A test that added the lengths up itself would be a second
+ * implementation of this function, and the one that is wrong is always the one
+ * nobody runs against Discord.
  */
-const STALE_FOOTER = 'out of date: this section could not be published'
+export function embedBudget(embed: ManualEmbed): CapSpend[] {
+  const names = embed.fields.map((field) => field.name.length)
+  const values = embed.fields.map((field) => field.value.length)
+  const sum = (lengths: number[]): number => lengths.reduce((all, one) => all + one, 0)
+
+  const spent: Record<EmbedCap, number> = {
+    title: embed.title.length,
+    description: embed.description.length,
+    fields: embed.fields.length,
+    fieldName: Math.max(0, ...names),
+    fieldValue: Math.max(0, ...values),
+    total:
+      embed.title.length + embed.description.length + embed.footer.length + sum(names) + sum(values),
+  }
+
+  // `Object.keys` widens to `string[]`; these are this record's own keys and
+  // there is no way to say so that the compiler already knows.
+  return (Object.keys(EMBED_CAPS) as EmbedCap[]).map((cap) => ({
+    cap,
+    spent: spent[cap],
+    limit: EMBED_CAPS[cap],
+  }))
+}
+
+/**
+ * Why this embed cannot be sent at all, or null.
+ *
+ * A DEFECT IN ONE SECTION IS A DEFECT IN THE WHOLE MESSAGE NOW, and that is the
+ * consequence of one embed rather than eleven. There is no per-section refusal
+ * left to reach for: Discord takes the message or it does not, so the honest
+ * answer to a section that is too long is to leave the channel showing the last
+ * version it accepted and say so at error — which reaches the status channel,
+ * where a fault that repeats on every restart folds into one line (src/log.ts).
+ *
+ * TRUNCATION IS NEVER THE ANSWER. This channel's entire claim is that it says
+ * what the file says, and a shortened section reads like the whole of it, so the
+ * drift would be invisible and the bot would have caused it.
+ *
+ * AN EMPTY FIELD VALUE IS CHECKED HERE BECAUSE DISCORD REFUSES ONE OUTRIGHT
+ * (50035), and refuses the whole message with it. A `## ` heading with nothing
+ * under it is a section somebody has started writing, and under the old model it
+ * was a message with a title and no body — harmless. Under this one it would
+ * take the entire manual out of the channel, so it is named, at error, with the
+ * heading that has to be filled in or removed.
+ */
+export function unpublishable(
+  embed: ManualEmbed,
+): { readonly why: string; readonly fields: Record<string, unknown> } | null {
+  for (const { cap, spent, limit } of embedBudget(embed)) {
+    if (spent > limit) {
+      return {
+        why: 'the manual does not fit in one embed and was not published',
+        fields: { over: cap, length: spent, cap: limit },
+      }
+    }
+  }
+
+  const blank = embed.fields.find((field) => field.value === '')
+
+  if (blank !== undefined) {
+    return {
+      why: 'a manual section has nothing under it, which Discord will not take as a field, so nothing was published',
+      fields: { heading: named(blank.name) },
+    }
+  }
+
+  return null
+}
+
+/**
+ * The stripe down the left of the embed.
+ *
+ * "PLAIN" WAS HALF THE OWNER'S COMPLAINT and this is the cheapest half of the
+ * answer: an uncoloured embed is a grey bar, and a coloured one reads as a card
+ * somebody made on purpose. Blurple is Discord's own, which is the one choice
+ * that cannot clash with a server's theme or be mistaken for a warning colour —
+ * this document is a reference, not an alert.
+ *
+ * IT IS PART OF THE COMPARISON, so changing this constant actually reaches the
+ * channel on the next start instead of leaving the code and the message
+ * disagreeing about a colour nobody can see in the file.
+ */
+const MANUAL_COLOUR = 0x5865f2
+
+/**
+ * How long a section's body may be and still share a row.
+ *
+ * INLINE FIELDS SIT UP TO THREE TO A ROW, and a row of short sections in
+ * columns is the layout that makes a reference card out of what would otherwise
+ * be a stack of one-line paragraphs — the other half of "plain". A row holding
+ * one inline field renders at the full width, so a short section with long
+ * neighbours costs nothing; the gain is wherever two or three short ones happen
+ * to sit together in the file.
+ *
+ * A LENGTH, NOT A LIST OF HEADINGS. A hand-picked list is a second document to
+ * keep in step with the first, and it is wrong the moment somebody renames a
+ * heading or adds a section. The threshold judges the thing that actually
+ * decides whether a column reads well, which is how many lines the text wraps to
+ * in a third of the width.
+ *
+ * 280 IS CHOSEN AGAINST THE DOCUMENT AS IT STANDS. It takes five of the eleven
+ * sections — "Where it looks", "What the poster is told", "The removals
+ * channel", "Dry run" and "Maintenance notices" — and those are exactly the five
+ * that carry no bullet list, which is the same judgement arrived at from the
+ * other side: a list wrapped into a third of the width is unreadable, and a list
+ * is what makes a section long.
+ */
+const INLINE_BODY_CAP = 280
 
 /**
  * The shortest gap between two writes to the docs channel.
  *
- * A FIRST RUN ON A TEN-SECTION MANUAL IS TEN POSTS, and a rewritten one is ten
- * edits. Fired together that is a burst straight into Discord's per-channel
- * limit, at the one moment the bot has just started and has a gateway session
- * worth keeping. The writes are already serialised — every one is awaited
- * before the next is built — and this spaces them as well, which costs a
- * ten-second start on the rare run that changes everything and nothing at all
- * on the ordinary run that changes nothing.
+ * THE RUN THAT NEEDS THIS IS THE CHANGEOVER: one edit and ten deletions, fired
+ * together into Discord's per-channel limit at the moment the bot has just
+ * started and has a gateway session worth keeping. The writes are already
+ * serialised — every one is awaited before the next is built — and this spaces
+ * them as well, which costs ten seconds once and nothing at all on the ordinary
+ * start that writes nothing.
  */
 const DOCS_WRITE_GAP_MS = 1000
 
@@ -3486,48 +3672,19 @@ const DOCS_WRITE_GAP_MS = 1000
  * How many messages are read back from the channel.
  *
  * DISCORD'S OWN PER-REQUEST MAXIMUM, and one request is deliberately the whole
- * of it. A manual with more than a hundred top-level headings is not a manual,
- * and paginating would mean a bot that walks a channel's entire history on
+ * of it: paginating would mean a bot that walks a channel's entire history on
  * every start.
  *
- * A READ THAT CAME BACK FULL IS A READ THAT STOPPED HERE, AND THAT USED TO BE
- * SILENT — which made this constant the ugliest bug in the feature. Discord
- * answers newest-first, so the messages that fell off the end were the OLDEST:
- * the first sections of the manual looked as though somebody had deleted them
- * by hand, were posted again at the bottom of the channel, and the channel grew
- * by one duplicate per section on every single restart, unbounded, while the
- * sections at the top were deleted as "no longer in the file". So the read now
- * says whether it saw the whole channel (`ChannelRead`) and a truncated one
- * stops the run, and a manual with more sections than one read can cover is
- * refused before anything is written rather than posted into that state.
+ * A READ THAT STOPPED HERE USED TO BE A DISASTER AND NOW IS NOT, which is worth
+ * writing down because the guard that existed for it has been deleted. Under the
+ * old model the messages that fell off the end were sections that looked deleted
+ * by hand: they were posted again at the bottom and the ones the read did carry
+ * were deleted as no longer in the file, one duplicate per section per restart,
+ * unbounded. Under this one every message past the first is a leftover to be
+ * removed whatever the read saw, so a short read removes the ones it saw and the
+ * next start removes the rest. It converges on one message either way.
  */
 const DOCS_FETCH_LIMIT = 100
-
-/**
- * How much of the channel one run may delete before the run is treated as a
- * fault rather than as an edit somebody made.
- *
- * THE THRESHOLD IS A JUDGEMENT AND HERE IS THE JUDGEMENT. Deleting sections is
- * the only irreversible thing this feature does, and every way it has gone
- * wrong — an unclosed fence truncating the parse, an empty file, a read that
- * stopped at its limit — arrives here looking exactly like "the author removed
- * most of the manual". The two are not equally likely: a person removing one or
- * two sections is an ordinary edit and happens; a person removing most of the
- * document in one commit and restarting the bot is not, and when it does happen
- * the cost of making them restart the bot a second time after emptying the
- * channel by hand is a minute. The cost of guessing the other way is a
- * documentation channel deleted by a parser bug.
- *
- * SO: UP TO `DOCS_DELETE_FLOOR` DELETIONS ALWAYS GO THROUGH, whatever share of
- * the channel they are — that is what keeps a two-section manual losing a
- * section from needing anybody's attention — and above that floor a run may
- * remove at most `DOCS_DELETE_SHARE` of what it found. Half is chosen because
- * it is the point where "most of it" starts being true; the exact number
- * matters far less than that there is one, since the fault cases are all at or
- * near a hundred per cent.
- */
-const DOCS_DELETE_FLOOR = 2
-const DOCS_DELETE_SHARE = 0.5
 
 /**
  * Where the manual lives.
@@ -3546,8 +3703,8 @@ export function botManualPath(): string {
  * A MISSING FILE IS ONE WARN AND NOTHING ELSE. It is a real state — a checkout
  * of an older commit, a botched deploy — and the correct response is to leave
  * the channel exactly as it is. Treating it as "the manual is now empty" would
- * make a missing file delete every section in the channel, which is the worst
- * possible reading of a file that is not there.
+ * make a missing file empty the channel, which is the worst possible reading of
+ * a file that is not there.
  */
 export async function readManual(path: string = botManualPath()): Promise<string | null> {
   try {
@@ -3568,44 +3725,44 @@ export async function readManual(path: string = botManualPath()): Promise<string
 }
 
 /**
- * A top-level heading: one `#`, whitespace, then something. `##` is body.
+ * The document's one title: a single `#`, whitespace, then something.
  *
  * WHAT A HEADING MAY CONTAIN, DECIDED: one line of plain text. It is not a
  * paragraph of markdown, because it does not become one — it becomes an embed
- * TITLE, and Discord renders nothing in a title. `**Never do this**` in the
- * file is the four asterisks, shown, in the channel. It is also the key the
- * whole reconciliation turns on, so it is the one string in the document whose
- * exact bytes matter; see `HEADING_MARKUP` for what is said about markdown that
- * gets in anyway, and docs/bot-manual.md, which states the rule for the people
- * who write the file.
+ * TITLE, and Discord renders nothing in a title. `**Never do this**` in the file
+ * is the four asterisks, shown, in the channel. See `HEADING_MARKUP`, and
+ * docs/bot-manual.md, which states the rule for the people who write the file.
  *
  * A TRAILING RUN OF `#` IS A CLOSING SEQUENCE AND IS DROPPED. `# Heading #` is
- * one heading called "Heading" to every markdown renderer there is, and it used
- * to be one called "Heading #" here — which is a different key, so the section
- * matched no message, was posted as a new one, and the message it should have
- * matched was deleted as no longer being in the file. The closing run has to be
- * separated by whitespace, exactly as the rest of markdown has it, so a heading
- * that ends in a real `#` — `C#` — keeps it.
+ * one heading called "Heading" to every markdown renderer there is. The closing
+ * run has to be separated by whitespace, exactly as the rest of markdown has it,
+ * so a heading that ends in a real `#` — `C#` — keeps it.
  *
- * THE `#` IS IN THE FIRST COLUMN OR IT IS NOT A HEADING. CommonMark allows up
- * to three spaces in front of one and this deliberately does not: an indented
- * `#` in a document like this one is far more often a line of an example than a
- * section of the manual, and the cost of the two mistakes is not the same —
- * missing a heading leaves a paragraph in the section above it, inventing one
- * cuts a section in half and posts the half as a message of its own.
- * docs/bot-manual.md states the rule for the people writing the file.
+ * THE `#` IS IN THE FIRST COLUMN OR IT IS NOT A HEADING. CommonMark allows up to
+ * three spaces in front of one and this deliberately does not: an indented `#`
+ * in a document like this one is far more often a line of an example than a
+ * heading, and the cost of the two mistakes is not the same — missing a heading
+ * leaves a paragraph where it was, inventing one cuts the document in half.
  */
 const TOP_LEVEL_HEADING = /^#\s+(\S.*?)(?:\s+#+)?\s*$/u
 
 /**
+ * A section: exactly two hashes. `###` and deeper are body.
+ *
+ * THE SPLIT MOVED DOWN A LEVEL WITH THE MODEL. It used to be that `# ` split the
+ * document into messages and `## ` was body; now `# ` is the title and `## ` is
+ * a field. `### ` stays body for the reason `## ` used to be body — a parser
+ * that split on every heading would make a field out of every paragraph.
+ */
+const SECTION_HEADING = /^##\s+(\S.*?)(?:\s+#+)?\s*$/u
+
+/**
  * Inline markdown that got into a heading.
  *
- * SAID, NOT STRIPPED AND NOT REFUSED. Stripping would silently change the key
- * this file matches on — the one thing a heading may not do — and refusing the
- * section would take a whole page of documentation out of the channel over a
- * pair of asterisks. So the section is published exactly as written, the
- * asterisks show up in the title, and there is one line in the journal saying
- * why it looks like that.
+ * SAID, NOT STRIPPED AND NOT REFUSED. Stripping would silently change what the
+ * channel shows against what the file says, and refusing would take the whole
+ * manual out of the channel over a pair of asterisks. So it is published exactly
+ * as written and there is one line in the journal saying why it looks like that.
  *
  * PAIRS ONLY, AND `_` IS DELIBERATELY NOT HERE. Discord does not italicise an
  * underscore inside a word, and this repo's headings are full of variable names
@@ -3617,137 +3774,209 @@ const HEADING_MARKUP = /\*[^*\n]+\*|`[^`\n]+`|~~[^~\n]+~~|\|\|[^|\n]+\|\||\[[^\]
 /** A fenced code block opening or closing. */
 const CODE_FENCE = /^\s*(?:```|~~~)/u
 
+function warnAboutMarkup(heading: string): void {
+  if (!HEADING_MARKUP.test(heading)) return
+
+  log('warn', 'a manual heading carries markdown, which an embed shows literally', {
+    heading: named(heading),
+  })
+}
+
 /**
- * Split the manual into its top-level sections, in file order, or answer none
- * because the file cannot be split at all.
+ * Split the file into the three parts of an embed, or answer null because it
+ * cannot be split at all.
+ *
+ * NULL IS "LEAVE THE CHANNEL ALONE", AND IT IS THE ONE GUARD THIS HALF KEPT.
+ * Every other way of limiting the damage a misparse can do went with the
+ * many-message model; this one stayed because it is the case where acting on a
+ * bad parse destroys something. An empty file, a file with no `# ` heading in
+ * it, and a file whose code fence never closes are all "there is nothing here
+ * that can be published" — never an instruction to replace the manual with
+ * nothing. The difference between them is in the log line, not in what happens
+ * next.
  *
  * FENCES ARE TRACKED, AND THAT IS NOT FUSSINESS. A shell example in the manual
  * carries `# comment` lines, and a parser that did not know it was inside a
- * fence would cut the section in half there and post a "comment" section — a
- * document that silently loses its shape because somebody documented a command.
+ * fence would read one as the document's title. A fence that never CLOSES
+ * swallows every line after it, so the sections below it stop existing as far as
+ * the parse is concerned — which is why it answers null and names the line the
+ * fence was opened on. The fix is a keystroke once you know where to put it.
  *
- * A FENCE THAT NEVER CLOSES IS A FILE THIS CANNOT READ, AND THAT WAS THE WORST
- * BUG IN THE FEATURE. One unbalanced ``` swallows every line after it into
- * whichever section it opened in: the sections below it stop existing as far as
- * the parse is concerned, and the channel is the state, so "stop existing" came
- * out of the far end as a DELETE of each of their messages, logged as "no
- * longer in the file" about text that was still in the file, one line above the
- * fence. Nothing about that is recoverable from the channel. So the answer is
- * no sections at all, which `syncManual` refuses to act on, and one error line
- * naming the line the fence was opened on — the fix is a keystroke once you
- * know where to put it.
- *
- * NO SECTIONS IS ALSO THE ANSWER FOR A FILE WITH NO HEADINGS IN IT, and the two
- * are the same answer on purpose: both mean "there is nothing here that can be
- * published", and `syncManual` treats that as a reason to leave the channel
- * alone rather than as an instruction to empty it. The difference between them
- * is in the log line, not in what happens next.
- *
- * TEXT BEFORE THE FIRST HEADING BELONGS TO NO SECTION AND IS NOT POSTED. It
+ * TEXT ABOVE THE TITLE BELONGS TO NO PART OF THE EMBED AND IS NOT POSTED. It
  * gets a warn rather than being dropped silently, because the whole promise of
  * this feature is that the channel and the file agree: a preamble that vanished
  * quietly would be exactly the drift this exists to make visible.
+ *
+ * A SECOND `# ` IS BODY, AND IS SAID. There is one embed and it has one title,
+ * so the first `# ` is it; a later one is text in whichever section it lands in.
+ * Refusing the document over it would take the manual out of the channel, and
+ * silently promoting it to a section would move a chunk of the file into a field
+ * nobody wrote a heading for.
  */
-export function parseManual(markdown: string): ManualSection[] {
-  const sections: ManualSection[] = []
+export function parseManual(markdown: string): Manual | null {
+  const sections: { heading: string; body: string[] }[] = []
+  const lead: string[] = []
 
-  let heading: string | null = null
-  let body: string[] = []
+  let title: string | null = null
+  let current: { heading: string; body: string[] } | null = null
   let orphaned = 0
+  let extraTitles = 0
 
   // The line an unclosed fence was opened on, or 0 while none is open. A line
   // number rather than a boolean because it is the only thing the operator
   // needs in order to fix the file.
   let fenced = 0
 
-  const finish = (): void => {
-    // `trim` so that the blank line every writer leaves under a heading, and the
-    // one before the next, are not part of the text being compared. Without it,
-    // reformatting the file's whitespace would rewrite the whole channel.
-    if (heading !== null) sections.push({ heading, body: body.join('\n').trim() })
-  }
-
   for (const [index, raw] of markdown.split(/\r?\n/u).entries()) {
     if (CODE_FENCE.test(raw)) fenced = fenced === 0 ? index + 1 : 0
 
-    const found = fenced !== 0 ? null : TOP_LEVEL_HEADING.exec(raw)
+    if (fenced === 0) {
+      // The captures cannot be absent — each pattern has one group and it
+      // matched — but `noUncheckedIndexedAccess` does not know that, and an
+      // assertion here would be the one place in this file that outranks the
+      // compiler.
+      const top = TOP_LEVEL_HEADING.exec(raw)
 
-    if (found !== null) {
-      finish()
-      // The capture cannot be absent — the pattern has one group and it matched
-      // — but `noUncheckedIndexedAccess` does not know that, and an assertion
-      // here would be the one place in this file that outranks the compiler.
-      heading = found[1] ?? ''
-      body = []
-
-      if (HEADING_MARKUP.test(heading)) {
-        log('warn', 'a manual heading carries markdown, which an embed title shows literally', {
-          heading: named(heading),
-        })
+      if (top !== null && title === null) {
+        title = top[1] ?? ''
+        warnAboutMarkup(title)
+        continue
       }
 
-      continue
+      if (top !== null) extraTitles += 1
+
+      const section = top === null ? SECTION_HEADING.exec(raw) : null
+
+      if (section !== null && title !== null) {
+        current = { heading: section[1] ?? '', body: [] }
+        sections.push(current)
+        warnAboutMarkup(current.heading)
+        continue
+      }
     }
 
-    if (heading === null) {
+    if (title === null) {
       if (raw.trim() !== '') orphaned += 1
       continue
     }
 
-    body.push(raw)
+    if (current === null) lead.push(raw)
+    else current.body.push(raw)
   }
 
   if (fenced !== 0) {
     log(
       'error',
-      'the manual has a code fence that is never closed, so it cannot be split into sections',
+      'the manual has a code fence that is never closed, so it cannot be published and the docs channel was left alone',
       { line: fenced },
     )
 
-    return []
+    return null
   }
 
-  finish()
+  if (title === null) {
+    log(
+      'error',
+      'the manual has no top-level heading, so there is nothing to publish and the docs channel was left alone',
+    )
+
+    return null
+  }
 
   if (orphaned > 0) {
-    log('warn', 'the manual has text above its first heading, which is in no section and was not posted', {
+    log('warn', 'the manual has text above its first heading, which is in no part of the embed and was not posted', {
       lines: orphaned,
     })
   }
 
-  return sections
+  if (extraTitles > 0) {
+    log('warn', 'the manual has more than one top-level heading, and only the first is the embed title', {
+      extra: extraTitles,
+    })
+  }
+
+  // `trim` so that the blank line every writer leaves under a heading, and the
+  // one before the next, are not part of the text being compared. Without it,
+  // reformatting the file's whitespace would rewrite the whole message.
+  return {
+    title,
+    lead: lead.join('\n').trim(),
+    sections: sections.map(({ heading, body }) => ({ heading, body: body.join('\n').trim() })),
+  }
+}
+
+/**
+ * The manual as one embed, stamped now.
+ *
+ * THE FOOTER IS BUILT HERE AND ONLY REACHES DISCORD ON A WRITE. That is what
+ * makes it a last-CHANGED stamp rather than a last-checked one: an unchanged
+ * manual returns before this embed is ever handed to `post` or `edit`, so the
+ * message keeps the date of the edit that really happened. It is also why the
+ * footer is not part of the comparison — comparing it would make every start
+ * differ from the last one and rewrite the channel forever.
+ */
+export function manualEmbed(manual: Manual): ManualEmbed {
+  return {
+    title: manual.title,
+    description: manual.lead,
+    colour: MANUAL_COLOUR,
+    fields: manual.sections.map((section) => ({
+      name: section.heading,
+      value: section.body,
+      inline: section.body.length <= INLINE_BODY_CAP,
+    })),
+    footer: `updated ${new Date().toISOString()}`,
+  }
+}
+
+/**
+ * Is the message in the channel already this manual?
+ *
+ * A PLAIN EQUALITY, FIELD BY FIELD, ON PURPOSE. Both sides are stored strings:
+ * what Discord handed back against what the file says. Anything cleverer here is
+ * a source of edits nobody asked for, in a channel whose whole value is that it
+ * changes only when the documentation does.
+ *
+ * THE COLOUR AND THE INLINE FLAGS ARE COMPARED TOO, because they are as much a
+ * part of what was published as the text. Leaving them out would let the code
+ * and the channel disagree about how the manual looks, silently and forever,
+ * which is the drift this feature exists to prevent.
+ */
+function unchanged(posted: PostedManual, embed: ManualEmbed): boolean {
+  return (
+    posted.title === embed.title &&
+    posted.description === embed.description &&
+    posted.colour === embed.colour &&
+    posted.fields.length === embed.fields.length &&
+    posted.fields.every((field, index) => {
+      const built = embed.fields[index]
+
+      return (
+        built !== undefined &&
+        field.name === built.name &&
+        field.value === built.value &&
+        field.inline === built.inline
+      )
+    })
+  )
 }
 
 /**
  * What one write to the channel is. A `Record` per outcome below, so a fourth
  * kind of change is a compile error rather than an `undefined` in a log line.
  */
-type Change = 'post' | 'edit' | 'delete' | 'mark'
+type Change = 'post' | 'edit' | 'delete'
 
 const CHANGED: Record<Change, string> = {
-  post: 'posted a manual section',
-  edit: 'updated a manual section',
-  delete: 'deleted a manual section that is no longer in the file',
-  mark: 'marked a manual section in the channel as one that could not be published',
+  post: 'posted the manual',
+  edit: 'updated the manual',
+  delete: 'deleted a leftover message from the docs channel',
 }
 
 const CHANGE_FAILED: Record<Change, string> = {
-  post: 'could not post a manual section',
-  edit: 'could not update a manual section',
-  delete: 'could not delete a manual section that is no longer in the file',
-  mark: 'could not mark a manual section in the channel as one that could not be published',
-}
-
-/**
- * The error from a write Discord refused because of what was IN it.
- *
- * ANSWERED RATHER THAN LOGGED, which is the whole point of the type. `apply`
- * knows a write failed and nothing else; only the caller knows whether the
- * channel is already carrying a mark that says this, and therefore whether
- * saying it again is a report or a flood. See `unpublishable`.
- */
-interface Refused {
-  readonly error: unknown
+  post: 'could not post the manual',
+  edit: 'could not update the manual',
+  delete: 'could not delete a leftover message from the docs channel',
 }
 
 /**
@@ -3755,16 +3984,13 @@ interface Refused {
  *
  * 50035 IS "INVALID FORM BODY" AND IT IS A STATEMENT ABOUT THE PAYLOAD, not
  * about the channel or about the moment. Retrying it with the same bytes fails
- * the same way, so it belongs with the too-long section rather than with the
- * rate limits and the 500s — and it used to be treated as transient, which
- * meant one warn per refused section on every restart of a process that
- * restarts on every crash. That is a slow flood into the one channel that has
- * to stay readable, and it is the reason `permanentlyUnusable` is not the only
- * question `apply` asks.
+ * the same way, so it is an error rather than the info a rate limit gets — and
+ * it should be unreachable, because `unpublishable` checks every cap Discord
+ * checks before anything is sent. Reaching it means this file's arithmetic and
+ * Discord's disagree, which is exactly the thing somebody has to be told about.
  *
  * IT DOES NOT LATCH THE CHANNEL OFF, and that is the difference from
- * `permanentlyUnusable`. The channel is fine; one section is not. Every other
- * section still goes out.
+ * `permanentlyUnusable`. The channel is fine; this payload is not.
  */
 function contentRefused(error: unknown): boolean {
   if (!(error instanceof DiscordAPIError)) return false
@@ -3775,70 +4001,47 @@ function contentRefused(error: unknown): boolean {
 /**
  * Bring the channel into agreement with the file.
  *
- * THE ONLY WRITES ARE THE DIFFERENCES. A section whose stored description
- * already equals the file's body is not touched and not mentioned; see the
- * header above for why a quiet restart is the point of the whole feature.
+ * THE ONLY WRITES ARE THE DIFFERENCES. A message that already says what the file
+ * says is not touched and not mentioned; see the header above for why a quiet
+ * restart is the point of the whole feature.
  *
- * POSTS GO OUT IN FILE ORDER, AND A MESSAGE CANNOT BE MOVED. Discord orders a
- * channel by when things were said, so a section appended to the file appears
- * at the bottom of the channel where it belongs, and a section inserted into
- * the MIDDLE of the file appears at the bottom too. The alternative is deleting
- * and reposting everything below the insertion — ten messages rewritten to move
- * one, in a channel whose value is that it changes only when the docs change.
- * One post, in the wrong place, is the cheaper wrong.
+ * THE FIRST OF OUR MESSAGES IS THE MANUAL AND THE REST ARE LEFTOVERS. Oldest
+ * first, so the manual keeps the place in the channel it has always had and a
+ * reader's link to it keeps working. Everything after it is a message this bot
+ * put there under a model that no longer applies, or a duplicate left by a run
+ * that failed after posting — the same treatment, because from the channel's
+ * side they are the same thing.
  *
- * DELETIONS COME LAST, so a run that fails part way leaves a stale extra
- * message rather than a hole. The next start removes the extra; a hole would
- * have to be reposted, and it would come back at the bottom of the channel.
- *
- * A SECTION DELETED FROM THE FILE HAS ITS MESSAGE DELETED, rather than being
- * edited to say it was removed. A tombstone is text nobody asked for, it stays
- * forever because nothing ever clears it, and after a year the channel is
- * mostly tombstones. What the docs used to say is in the file's history, which
- * is where a record of a change belongs.
- *
- * AND EVERY ONE OF THOSE DELETIONS IS REFUSED WHEN THERE ARE TOO MANY OF THEM.
- * See `DOCS_DELETE_FLOOR` for the threshold and the argument; see the header of
- * this half for why the three bugs that reached it were all parse faults
- * wearing a deletion's clothes. The refusal is of the destructive half only:
- * the posts and the edits above it have already happened and are recoverable
- * from the file on the next start, and a deleted message is not.
- *
- * NOTHING IS EVEN READ FOR A MANUAL THAT PARSED TO NOTHING. An empty file, a
- * file with no top-level headings and a file whose code fence never closes all
- * arrive here as no sections at all, and "no sections" is the one input for
- * which the correct behaviour is not "make the channel look like that" but
- * "leave the channel alone and say so". `readManual` has always guarded the
- * MISSING file for exactly this reason; the empty one reached the delete loop
- * and took the whole channel with it.
+ * THE WRITE COMES BEFORE THE DELETIONS, so a run that fails part way leaves an
+ * extra message rather than none at all. The next start removes the extra; an
+ * empty channel would have to be posted to again.
  */
 export async function syncManual(
-  sections: readonly ManualSection[],
+  manual: Manual | null,
   channel: DocsChannel,
   pause: () => Promise<void> = () => sleep(DOCS_WRITE_GAP_MS),
 ): Promise<void> {
-  if (sections.length === 0) {
-    log('error', 'the manual has no sections at all, so the docs channel was left alone')
+  // NOTHING IS EVEN READ FOR A MANUAL THAT DID NOT PARSE. `parseManual` has
+  // already said which of the three reasons it was and that the channel was left
+  // alone; saying it twice would put two lines in the status channel for one
+  // fault. The point is that nothing below this line runs.
+  if (manual === null) return
+
+  const embed = manualEmbed(manual)
+  const refusal = unpublishable(embed)
+
+  if (refusal !== null) {
+    // The channel keeps whatever it is showing: the last version Discord
+    // accepted, which is honest, rather than a shortened copy of one it will
+    // not take. This reaches the status channel and therefore the owner.
+    log('error', refusal.why, refusal.fields)
     return
   }
 
-  // More sections than one read of the channel can carry means the channel can
-  // never be read back correctly again — see DOCS_FETCH_LIMIT for what that did
-  // — so this is refused before the first of them is posted rather than after
-  // the hundredth.
-  if (sections.length >= DOCS_FETCH_LIMIT) {
-    log('error', 'the manual has more sections than one read of the channel can carry, so it was left alone', {
-      sections: sections.length,
-      limit: DOCS_FETCH_LIMIT,
-    })
-
-    return
-  }
-
-  let state: ChannelRead
+  let posted: readonly PostedManual[]
 
   try {
-    state = await channel.read()
+    posted = await channel.read()
   } catch (error) {
     // ONE LINE, THEN NOTHING, like `statusReporter` latching off. A wrong id, a
     // channel that was deleted, a missing permission: none of them gets better
@@ -3847,17 +4050,7 @@ export async function syncManual(
     return
   }
 
-  if (!state.complete) {
-    log('error', 'the docs channel holds more messages than one read can carry, so it was left alone', {
-      limit: DOCS_FETCH_LIMIT,
-    })
-
-    return
-  }
-
-  const posted = state.sections
-  const unclaimed = groupByTitle(posted)
-  warnAboutSharedHeadings(sections)
+  const [current, ...leftovers] = posted
 
   let stopped = false
   let writes = 0
@@ -3865,69 +4058,59 @@ export async function syncManual(
   /**
    * One write, paced, and never allowed to throw past this function.
    *
-   * ANSWERS `Refused` FOR A WRITE DISCORD WOULD NEVER ACCEPT and null for
-   * everything else, including the failures it has already written down. See
-   * `contentRefused`: whether that one is worth a line depends on what the
-   * channel is already saying, and this function cannot know that.
+   * A FAILURE THAT MIGHT WORK NEXT TIME IS INFO, not a warning, and the reason
+   * is that nobody has to do anything about it: the channel is the state, so the
+   * next start reads it back and finishes whatever this run did not. The failure
+   * that WOULD need a person is a channel this bot cannot write in at all, which
+   * latches and is an error.
    */
   async function apply(
     change: Change,
-    heading: string,
     run: () => Promise<void>,
-  ): Promise<Refused | null> {
-    if (stopped) return null
+    fields: Record<string, unknown> = {},
+  ): Promise<void> {
+    if (stopped) return
 
-    // Between writes and never before the first, so a run that changes one
-    // section costs no wait at all.
+    // Between writes and never before the first, so a run that changes the
+    // manual and nothing else costs no wait at all.
     if (writes > 0) await paced()
     writes += 1
 
     try {
       await run()
-      log('info', CHANGED[change], { heading })
+      log('info', CHANGED[change], fields)
     } catch (error) {
       if (permanentlyUnusable(error)) {
         stopped = true
-        log('error', 'docs channel unusable, the rest of the manual was not synchronised', {
-          heading,
-          error,
-        })
-
-        return null
+        log('error', 'docs channel unusable, nothing further was written', { ...fields, error })
+        return
       }
 
-      if (contentRefused(error)) return { error }
+      if (contentRefused(error)) {
+        log('error', CHANGE_FAILED[change], { ...fields, error })
+        return
+      }
 
       // Transient: rate limited, a 500, a message somebody deleted underneath
-      // us. The next start reads the channel back and reconciles whatever this
-      // run did not manage, so there is nothing to retry here.
-      //
-      // AND THEREFORE INFO. The sentence above is the definition of
-      // self-healing: nobody has to do anything, and the one section that did
-      // not land is published by the next restart. It is documentation, not
-      // moderation — the failure that WOULD need a person is a channel this bot
-      // cannot write in at all, which is the error line a few lines up.
-      log('info', CHANGE_FAILED[change], { heading, error })
+      // us. The next start reconciles it, so there is nothing to retry here.
+      log('info', CHANGE_FAILED[change], { ...fields, error })
     }
-
-    return null
   }
 
   /**
    * Wait between two writes, and say so if the process goes while we are
    * waiting.
    *
-   * THE WAIT IS UNREFFED, WHICH IS RIGHT AND WHICH MADE THE ABANDONMENT
-   * SILENT. `sleep` deliberately does not hold the process open for a
-   * documentation edit, so a `systemctl stop` in the middle of a ten-section
-   * first run takes the remaining nine writes with it — and used to take them
-   * without a single line anywhere, leaving a half-published channel and no
-   * record of why. The next start does finish the job, and somebody reading the
+   * THE WAIT IS UNREFFED, WHICH IS RIGHT AND WHICH MADE THE ABANDONMENT SILENT.
+   * `sleep` deliberately does not hold the process open for a documentation
+   * edit, so a `systemctl stop` in the middle of the changeover takes the
+   * remaining deletions with it — and used to take them without a single line
+   * anywhere. The next start does finish the job, and somebody reading the
    * journal after a restart still has to be able to see that this one did not.
    *
    * `exit` AND NOT `beforeExit`, because index.ts calls `process.exit` from its
-   * signal handler once the gateway is closed, and `beforeExit` does not fire
-   * on that path at all — which is the only path a `systemctl restart` takes.
+   * signal handler once the gateway is closed, and `beforeExit` does not fire on
+   * that path at all — which is the only path a `systemctl restart` takes.
    * `log()` is synchronous and writes to the journal first, so the line lands
    * even though nothing async can run any more; the copy in the status channel
    * is lost with the process, which is the same trade the whole sink makes.
@@ -3936,11 +4119,10 @@ export async function syncManual(
     const abandoned = (): void => {
       // INFO, AND THE COMMENT ABOVE IS THE ARGUMENT FOR IT: this is what
       // `systemctl restart` looks like from inside a documentation sync, the
-      // next start finishes the job, and the line exists for somebody reading
-      // the journal after a restart and wondering why the channel is half
-      // written. Nobody has to do anything. It could not have reached the
-      // status channel in any case — the process is on its way out.
-      log('info', 'the process is going down between two manual writes, the rest of the manual was not synchronised', {
+      // next start finishes the job, and nobody has to do anything. It could not
+      // have reached the status channel in any case — the process is on its way
+      // out.
+      log('info', 'the process is going down between two docs channel writes, the rest were not made', {
         written: writes,
       })
     }
@@ -3954,286 +4136,17 @@ export async function syncManual(
     }
   }
 
-  /**
-   * Say once that a section is not being published, and leave the channel
-   * saying it too.
-   *
-   * THE MARK IS THE REPORT'S MEMORY, so the two happen together or not at all:
-   * a start that finds the mark already up says nothing and writes nothing, and
-   * a start that puts it up says exactly one line. Reporting without marking is
-   * the flood this replaces — the same error every restart, forever, about a
-   * document that can only be fixed in the repository.
-   *
-   * A HEADING DISCORD WILL NOT TAKE HAS NOWHERE TO PUT THE MARK. No message can
-   * exist under a title over the limit, so there is nothing to stamp and
-   * nothing to read back, and the line is written on every start instead. That
-   * is the honest answer rather than a worse one: the alternative is silence
-   * about a section that is not in the channel at all.
-   */
-  async function unpublishable(
-    section: ManualSection,
-    existing: PostedSection | undefined,
-    refusal: Unpublishable,
-  ): Promise<void> {
-    if (!refusal.markable) {
-      log('error', refusal.why, refusal.fields)
-      return
-    }
-
-    if (existing?.footer === STALE_FOOTER) return
-
-    log('error', refusal.why, refusal.fields)
-
-    // The existing message keeps its own text: it is the last version that
-    // Discord accepted, and replacing it with a shortened copy of the one that
-    // did not is the truncation this feature refuses to do. A section that has
-    // never been posted gets a message with its heading and nothing under it,
-    // so the channel still has one message per heading and a reader can see
-    // which section is missing rather than being left to notice the absence.
-    const mark: ManualEmbed =
-      existing === undefined
-        ? { title: section.heading, description: '', footer: STALE_FOOTER }
-        : { title: existing.title, description: existing.description, footer: STALE_FOOTER }
-
-    const refused = await apply('mark', section.heading, () =>
-      existing === undefined ? channel.post(mark) : channel.edit(existing.id, mark),
-    )
-
-    // Refused in turn — the heading is fine by our arithmetic and Discord
-    // disagrees about something else in it. One line, and no third attempt.
-    if (refused !== null) {
-      log('warn', CHANGE_FAILED.mark, { heading: named(section.heading), error: refused.error })
-    }
+  // A channel with none of our messages in it is a first run, or a manual
+  // somebody deleted by hand. Both are "post it", and that is the whole repair:
+  // there is no local record to have gone stale.
+  if (current === undefined) {
+    await apply('post', () => channel.post(embed))
+  } else if (!unchanged(current, embed)) {
+    await apply('edit', () => channel.edit(current.id, embed), { message: current.id })
   }
 
-  for (const section of sections) {
-    /**
-     * THE MATCH. `shift` off the front of the group filed under this heading,
-     * so a heading that appears once — every heading, in a well-formed manual —
-     * finds its own message wherever in the channel it happens to sit. Two
-     * sections sharing a heading take the first and second message under that
-     * title in channel order, which is the only thing left to go on once the
-     * key is ambiguous; `warnAboutSharedHeadings` says so out loud.
-     */
-    const existing = unclaimed.get(section.heading)?.shift()
-    const fit = fitEmbed(section)
-
-    // Over one of Discord's limits, and deliberately NOT written: any existing
-    // message stays as it was rather than being replaced by a truncated copy
-    // that reads like the whole section. It is marked instead, so the channel
-    // says which of its messages is not the file.
-    if (!fit.ok) {
-      await unpublishable(section, existing, fit)
-      continue
-    }
-
-    if (existing === undefined) {
-      const refused = await apply('post', section.heading, () => channel.post(fit.embed))
-      if (refused !== null) await unpublishable(section, undefined, discordRefused(refused))
-      continue
-    }
-
-    // THE COMPARISON, and it is a plain string equality on purpose. Both sides
-    // are the stored description: what Discord handed back, against what the
-    // file says. Anything cleverer here is a source of edits nobody asked for.
-    //
-    // THE FOOTER IS NOT COMPARED AND IS STILL READ HERE, for one case: a
-    // section that was marked unpublishable and has since been brought back
-    // under the limits by an edit that restored its previous text. The
-    // descriptions match, and the message is still stamped as out of date, so
-    // the write that clears the stamp has to happen anyway.
-    if (existing.description === section.body && existing.footer !== STALE_FOOTER) continue
-
-    const refused = await apply('edit', section.heading, () => channel.edit(existing.id, fit.embed))
-    if (refused !== null) await unpublishable(section, existing, discordRefused(refused))
-  }
-
-  // Whatever is left matched no section in the file. That covers a heading
-  // removed from the manual and a second copy of a section left behind by a run
-  // that failed after posting — the same treatment, because from the channel's
-  // side they are the same thing.
-  const doomed = [...unclaimed.values()].flat()
-
-  if (doomed.length > DOCS_DELETE_FLOOR && doomed.length > posted.length * DOCS_DELETE_SHARE) {
-    log(
-      'error',
-      'refusing to delete most of the docs channel, which is far more likely a misread manual than an edit; nothing was deleted',
-      { deleting: doomed.length, found: posted.length, floor: DOCS_DELETE_FLOOR },
-    )
-
-    return
-  }
-
-  for (const message of doomed) {
-    await apply('delete', message.title, () => channel.remove(message.id))
-  }
-}
-
-/**
- * The channel's messages filed under their embed title, each group in channel
- * order.
- *
- * A LIST PER TITLE RATHER THAN ONE MESSAGE PER TITLE. Two messages can carry
- * the same title — a manual with a repeated heading, or a duplicate left by a
- * failed run — and a `Map<string, PostedSection>` would silently keep one of
- * them and leave the other in the channel forever with nothing to say so.
- */
-function groupByTitle(posted: readonly PostedSection[]): Map<string, PostedSection[]> {
-  const groups = new Map<string, PostedSection[]>()
-
-  for (const message of posted) {
-    const group = groups.get(message.title)
-    if (group === undefined) groups.set(message.title, [message])
-    else group.push(message)
-  }
-
-  return groups
-}
-
-/**
- * Say when the key is not unique.
- *
- * TWO SECTIONS UNDER ONE HEADING ARE HANDLED, NOT REFUSED — they are matched to
- * the first and second message under that title — but the guarantee is weaker
- * there than everywhere else: inserting a third copy shifts the two below it,
- * which is the positional matching this whole design avoids, confined to the
- * ambiguous group. That is worth a line, because the fix is to rename a heading
- * and nobody would think to.
- */
-function warnAboutSharedHeadings(sections: readonly ManualSection[]): void {
-  const seen = new Set<string>()
-  const said = new Set<string>()
-
-  for (const section of sections) {
-    if (!seen.has(section.heading)) {
-      seen.add(section.heading)
-      continue
-    }
-
-    if (said.has(section.heading)) continue
-    said.add(section.heading)
-
-    log('warn', 'the manual has more than one section under this heading, which are matched by position within it rather than by it', {
-      heading: section.heading,
-    })
-  }
-}
-
-/**
- * Why a section is not going into the channel as it stands, in the words of the
- * line that will say so — and whether the channel can be made to say it.
- *
- * THE REASON TRAVELS INSTEAD OF BEING LOGGED WHERE IT IS FOUND, and that is the
- * fix for the repeat. This used to write its own error line, so a section that
- * was too long produced one on every start of a process that restarts on every
- * crash, forever, about a file only a commit can change. The caller is the half
- * that knows whether the channel is already carrying a mark that says this; see
- * `unpublishable`.
- */
-interface Unpublishable {
-  readonly ok: false
-
-  /**
-   * Whether a message saying so can exist. False only when the HEADING is over
-   * the title limit: no message can be posted under a title Discord will not
-   * take, so there is nowhere to put a mark and nothing to read back from it.
-   */
-  readonly markable: boolean
-
-  readonly why: string
-  readonly fields: Record<string, unknown>
-}
-
-/** One section as an embed, or the reason it cannot be one. */
-type Fit = { readonly ok: true; readonly embed: ManualEmbed } | Unpublishable
-
-/**
- * One section as an embed, or why not.
- *
- * A SECTION THAT IS TOO LONG IS NOT POSTED, NOT TRUNCATED, AND IS SAID AT
- * ERROR. Truncating would put a section in the channel that reads like the
- * whole of it and is not, in the one document whose entire purpose is that the
- * channel and the file agree — the drift would be invisible and the bot would
- * have caused it. Refusing leaves the channel honest about the section it last
- * managed to carry, and the error reaches the status channel, where the owner
- * sees it. The fix is to split the section under a second heading.
- *
- * MEASURED IN UTF-16 CODE UNITS, WHICH IS WHAT DISCORD COUNTS. This used to
- * count code points, on the reasoning that a `length` overstates anything
- * outside the basic plane and would refuse a section Discord would take — and
- * it has the failure backwards. Discord's limits are on the JSON string as it
- * arrives, which is UTF-16, so a code-point count UNDERSTATES every astral
- * character by half: 4096 musical symbols passed a 4096 guard at 8192 units and
- * the post came back 50035, which is the one outcome this check exists to
- * prevent. `length` is the number Discord is checking against.
- *
- * THE HEADING IS NAMED IN THE ERROR ABOUT THE HEADING, which sounds too obvious
- * to write down and was missing: the line said only how long it was, in a
- * document that can have any number of headings, so the one thing the owner
- * needed in order to find it was the one thing it did not say. It is capped by
- * `named` because the whole point of this branch is that the string is enormous.
- *
- * THE FOOTER IS BUILT HERE AND ONLY REACHES DISCORD ON A WRITE. That is what
- * makes it a last-CHANGED stamp rather than a last-checked one: an unchanged
- * section returns before this embed is ever handed to `post` or `edit`, so its
- * footer keeps the date of the edit that really happened. It is also why the
- * footer is not part of the comparison — comparing it would make every start
- * differ from the last one and rewrite the channel forever.
- */
-function fitEmbed(section: ManualSection): Fit {
-  const footer = `updated ${new Date().toISOString()}`
-
-  const title = section.heading.length
-  const description = section.body.length
-  const total = title + description + footer.length
-
-  if (title > EMBED_TITLE_CAP) {
-    return {
-      ok: false,
-      markable: false,
-      why: 'a manual heading is too long for an embed title and was not posted',
-      fields: { heading: named(section.heading), length: title, cap: EMBED_TITLE_CAP },
-    }
-  }
-
-  if (description > EMBED_DESCRIPTION_CAP) {
-    return {
-      ok: false,
-      markable: true,
-      why: 'a manual section is too long for one embed and was not posted',
-      fields: { heading: section.heading, length: description, cap: EMBED_DESCRIPTION_CAP },
-    }
-  }
-
-  // The per-embed limits are what a section realistically hits; this is the
-  // other limit Discord enforces, on a message's embeds together. One embed per
-  // message means it cannot bite before the two above do — checked anyway, so
-  // that the arithmetic saying so is code rather than a comment.
-  if (total > EMBED_TOTAL_CAP) {
-    return {
-      ok: false,
-      markable: true,
-      why: 'a manual section is too long for one message and was not posted',
-      fields: { heading: section.heading, length: total, cap: EMBED_TOTAL_CAP },
-    }
-  }
-
-  return { ok: true, embed: { title: section.heading, description: section.body, footer } }
-}
-
-/**
- * A write Discord refused, as a refusal of the section that was in it.
- *
- * MARKABLE, ALWAYS. Whatever Discord objected to, an embed carrying the title
- * it already accepted and the text it already stored is a payload it has taken
- * before — so the mark can go up, and once it is up this stops being said.
- */
-function discordRefused(refused: Refused): Unpublishable {
-  return {
-    ok: false,
-    markable: true,
-    why: 'Discord refused a manual section outright, so it was not published',
-    fields: { error: refused.error },
+  for (const extra of leftovers) {
+    await apply('delete', () => channel.remove(extra.id), { message: extra.id })
   }
 }
 
@@ -4241,9 +4154,9 @@ function discordRefused(refused: Refused): Unpublishable {
  * How much of a heading a log line carries.
  *
  * A CAP BECAUSE THE LINE THAT MOST NEEDS THE HEADING IS THE ONE ABOUT A HEADING
- * THAT IS TOO LONG, and the whole of a 4000-character title in a journal line
- * is a wall that pushes everything else off the status channel post beside it.
- * The first eighty characters are enough to find the section in an editor.
+ * THAT IS TOO LONG, and the whole of a 4000-character title in a journal line is
+ * a wall that pushes everything else off the status channel post beside it. The
+ * first eighty characters are enough to find the section in an editor.
  */
 const HEADING_LOG_CAP = 80
 
@@ -4285,8 +4198,14 @@ interface DocsMessage {
     readonly title: string | null
     readonly description: string | null
 
-    /** Read for one reason: the stale mark lives here. See `STALE_FOOTER`. */
-    readonly footer: { readonly text: string } | null
+    /** discord.js's spelling, at the one boundary that has to use it. */
+    readonly color: number | null
+
+    readonly fields: readonly {
+      readonly name: string
+      readonly value: string
+      readonly inline?: boolean | undefined
+    }[]
   }[]
 
   readonly createdTimestamp: number
@@ -4298,12 +4217,6 @@ interface DocsMessage {
  * `channels.fetch` PER OPERATION, exactly like `announcer`: it reads
  * discord.js's cache first and only spends a request on a miss, and unlike a
  * channel captured at startup it survives the channel being recreated.
- *
- * ONLY THE BOT'S OWN MESSAGES ARE READ BACK, AND ONLY THE ONES SHAPED LIKE A
- * SECTION. The docs channel is bot-only post, but a permission overwrite is one
- * right-click away from not being, and anything else in there — an admin's
- * note, an older message of ours carrying no embed — is not this bot's to key
- * on and certainly not its to delete.
  */
 export function docsChannel(client: Client, channelId: string): DocsChannel {
   async function open(): Promise<SendableChannels> {
@@ -4324,24 +4237,16 @@ export function docsChannel(client: Client, channelId: string): DocsChannel {
        * NO SELF ID, NO READ. `client.user` is set well before `clientReady`
        * fires, so this cannot happen in practice — and if it ever did, the
        * filter below would match nothing, the channel would look empty, and the
-       * bot would post a second copy of every section. Throwing turns the worst
-       * outcome this feature has into one line and an untouched channel.
+       * bot would post a second copy of the manual beside the first. Throwing
+       * turns the worst outcome this feature has into one line and an untouched
+       * channel.
        */
       const selfId = client.user?.id
       if (selfId === undefined) throw new Error('the bot does not know its own user id yet')
 
       const messages = await channel.messages.fetch({ limit: DOCS_FETCH_LIMIT })
 
-      return {
-        sections: ours([...messages.values()], selfId),
-
-        // A read that came back full is a read that stopped at its own limit,
-        // and there is no way to tell that from a channel holding exactly this
-        // many messages. The conservative reading costs a manual of exactly
-        // ninety-nine sections and buys the certainty that a truncated read is
-        // never mistaken for the state of the channel; see DOCS_FETCH_LIMIT.
-        complete: messages.size < DOCS_FETCH_LIMIT,
-      }
+      return ours([...messages.values()], selfId)
     },
 
     post: async (embed) => {
@@ -4369,24 +4274,28 @@ export function docsChannel(client: Client, channelId: string): DocsChannel {
 /**
  * The bot's own single-embed messages, oldest first.
  *
- * OLDEST FIRST BECAUSE `messages.fetch` ANSWERS NEWEST FIRST, and the order is
- * load-bearing for two sections that share a heading: they are paired with the
- * first and second message in the order the channel reads.
+ * OLDEST FIRST BECAUSE `messages.fetch` ANSWERS NEWEST FIRST, and the order
+ * decides which message is the manual and which are leftovers to be deleted.
+ *
+ * ONLY THE BOT'S OWN MESSAGES, AND ONLY THE ONES SHAPED LIKE A MANUAL. The docs
+ * channel is bot-only post, but a permission overwrite is one right-click away
+ * from not being, and anything else in there — an admin's note, an older message
+ * of ours carrying no embed — is not this bot's to edit and certainly not its to
+ * delete.
  *
  * EXPORTED SO THE FILTER CAN BE PROVEN, and it is worth proving: everything it
- * lets through is a message this bot may edit or DELETE, so a mistake here is
- * the bot removing somebody else's post from a channel it was given for its own
- * documentation.
+ * lets through is a message this bot may edit or DELETE, and this is the run
+ * that deletes ten of them.
  */
-export function ours(messages: readonly DocsMessage[], selfId: string): PostedSection[] {
-  const mine: (PostedSection & { at: number })[] = []
+export function ours(messages: readonly DocsMessage[], selfId: string): PostedManual[] {
+  const mine: (PostedManual & { at: number })[] = []
 
   for (const message of messages) {
     if (message.author.id !== selfId) continue
 
     // Exactly one, because that is what this bot posts. A message of ours
-    // carrying two embeds is not a section of the manual, and keying on the
-    // first of them would let an unrelated post be edited over.
+    // carrying two embeds is not the manual, and keying on the first of them
+    // would let an unrelated post be edited over.
     if (message.embeds.length !== 1) continue
 
     const embed = message.embeds[0]
@@ -4395,35 +4304,58 @@ export function ours(messages: readonly DocsMessage[], selfId: string): PostedSe
     mine.push({
       id: message.id,
       title: embed.title,
+
       // Null is what Discord returns for an embed with no description and '' is
-      // what an empty section parses to, so the two have to become one value
-      // before the comparison can be a plain equality.
+      // what an empty lead parses to, so the two have to become one value before
+      // the comparison can be a plain equality.
       description: embed.description ?? '',
 
-      // Same story, and it is compared against one exact string — the stale
-      // mark — so an absent footer has to be a value rather than a null the
-      // comparison would have to know about.
-      footer: embed.footer?.text ?? '',
+      colour: embed.color,
+
+      fields: embed.fields.map((field) => ({
+        name: field.name,
+        value: field.value,
+
+        // Discord omits `inline` rather than sending false, and the built embed
+        // always carries a boolean — same story as the description above.
+        inline: field.inline === true,
+      })),
+
       at: message.createdTimestamp,
     })
   }
 
   return mine
     .sort((a, b) => a.at - b.at)
-    .map(({ id, title, description, footer }) => ({ id, title, description, footer }))
+    .map(({ id, title, description, colour, fields }) => ({
+      id,
+      title,
+      description,
+      colour,
+      fields,
+    }))
 }
 
 /**
  * One `ManualEmbed` as discord.js takes it.
  *
  * AN EMPTY DESCRIPTION IS OMITTED RATHER THAN SENT AS `''`, which Discord
- * rejects. A heading with nothing under it is a section somebody has started
- * writing, and a title-only embed is the honest rendering of that.
+ * rejects. A `# ` heading with no lead under it is a manual somebody has started
+ * writing, and a description-less embed is the honest rendering of that.
+ *
+ * NO THUMBNAIL, NO AUTHOR, NO IMAGE — see `ManualEmbed`. This is the only place
+ * one could be added, so it is the place to say it was asked about and declined.
  */
 function apiEmbed(embed: ManualEmbed): APIEmbed {
   return {
     title: embed.title,
     description: embed.description === '' ? undefined : embed.description,
+    color: embed.colour,
+    fields: embed.fields.map((field) => ({
+      name: field.name,
+      value: field.value,
+      inline: field.inline,
+    })),
     footer: { text: embed.footer },
   }
 }
@@ -4455,6 +4387,1099 @@ export function syncDocsChannel(
       await syncManual(parseManual(markdown), open(client, channelId))
     })().catch((error: unknown) => {
       log('warn', 'the bot manual could not be synchronised', { error })
+    })
+  })
+}
+
+/* ------------------------------------------------------------------ *
+ * THE MODERATION MIRROR — blitz-bot#16.
+ *
+ * Discord's own ban, unban and kick, carried into the game.
+ * ------------------------------------------------------------------ */
+
+/**
+ * ═══ THE POLICY, WHICH IS THE OWNER'S AND IS DELIBERATELY ASYMMETRIC ═══
+ *
+ * A DISCORD BAN MEANS BANNED IN THE GAME, PERMANENTLY. Somebody the owner will
+ * not have in the Discord server is not somebody he wants on the game server,
+ * and there is no expiry: `expiresAt` is null on every row this writes.
+ *
+ * A GAME BAN NEVER MEANS A DISCORD BAN. It assigns `config.gameBanRoleId`
+ * instead, so the person keeps limited access to the guild and can argue their
+ * case with a human. Lifting or expiring the game ban takes the role off again.
+ *
+ * THE ASYMMETRY IS THE WHOLE DESIGN AND NOT AN INCONSISTENCY. The two directions
+ * are not one decision seen from two sides: one is "I do not want this person
+ * here", a judgement about the community that carries the game with it; the
+ * other is "you cheated in a match", a judgement about play that must leave open
+ * the one channel where it can be disputed. A mirror that ran both ways would
+ * mean a cheating ban silences the appeal.
+ *
+ * ═══ THERE ARE NO SLASH COMMANDS HERE, AND THAT IS THE POINT ═══
+ *
+ * `/brban` and `/brkick` were designed and then cut, in the owner's words: "we
+ * do not need /brkick or /brban if the default discord /kick and /ban do the
+ * same thing, since we have event listeners". He is right, and the reason is
+ * worth keeping: a command would have been a SECOND TRIGGER for this one
+ * listener. An admin typing `/brban` would ban on Discord, which fires the audit
+ * event, which arrives here — so either the command duplicated the mirror's work
+ * and the two could disagree, or it did nothing except what the listener was
+ * about to do anyway. One trigger, one path, one place to be wrong.
+ *
+ * It also means there is nothing for an admin to look at while this runs. A
+ * slash command has a reply to edit; a ban typed into Discord's own dialog has
+ * nowhere to put an outcome, which is why the outcomes below are reported
+ * through `log()` — and why the ones that need a person are `warn`, since that
+ * is what reaches the status channel (src/log.ts).
+ *
+ * ═══ WHY THE AUDIT EVENT AND NOT `guildMemberRemove` ═══
+ *
+ * Verified against the installed discord.js, because the obvious listener is the
+ * wrong one twice over:
+ *
+ *   THERE IS NO KICK EVENT. A voluntary leave, a kick and a ban are the same
+ *   `GUILD_MEMBER_REMOVE` on the wire, byte for byte. Nothing in the payload
+ *   says which of the three happened, so a kick mirror built on it would either
+ *   act on everybody who left or go and read the audit log anyway — after the
+ *   fact, hoping the entry has landed, correlating by target and timestamp.
+ *
+ *   IT IS SILENTLY SWALLOWED FOR AN UNCACHED MEMBER. discord.js drops
+ *   `guildMemberRemove` for a member it does not hold unless
+ *   `Partials.GuildMember` is enabled, so a ban mirror built on it would drop
+ *   bans depending on how warm the cache happened to be — a bug that reproduces
+ *   on a busy evening and not on a quiet one.
+ *
+ * THE AUDIT ENTRY CARRIES `targetId`, `executorId` AND `reason` TOGETHER, so
+ * nothing needs correlating: who was acted on, who did it, and what they typed,
+ * in one event with an id of its own. YAGPDB and Red-DiscordBot both work purely
+ * from this event for exactly this reason.
+ *
+ * ═══ THE THREE THINGS THAT WOULD OTHERWISE BITE ═══
+ *
+ * 1. THE LOOP. This bot removes a role in response to an audit entry, and
+ *    removing a role writes an audit entry. `mirrorEntry` ignores any entry
+ *    whose `executorId` is the bot's own user id, which is one line and is what
+ *    both YAGPDB and Red do. `moderationEntry` is the second line of defence: a
+ *    role edit is `MemberRoleUpdate`, which is not in `MIRRORED` and never
+ *    becomes a `ModerationEntry` at all. Idempotence is the backstop, not the
+ *    mechanism.
+ *
+ * 2. IDEMPOTENCY IS THE AUDIT ENTRY ID, stored on the ban row as
+ *    `discordEntryId` and checked before the write — Zeppelin's
+ *    `findByAuditLogId` pattern. It survives a restart, a gateway redelivery and
+ *    the boot replay below, and it records WHICH event produced a ban, which is
+ *    a better question than "is this person banned" because it is still
+ *    answerable after somebody lifts the ban.
+ *
+ * 3. THE BAN WRITE IS CONDITIONAL AND MUST STAY SO. `bans.issue` in src/ddb.ts
+ *    reads before it writes; the console's own write is an unconditional
+ *    overwrite that clears the lifted marker, so a replay through that path
+ *    would silently un-lift a ban an admin had deliberately lifted. That file's
+ *    comment is the long version.
+ */
+
+/** The three things this bot mirrors. Every other audit action is ignored. */
+export type MirrorAction = 'ban' | 'unban' | 'kick'
+
+/**
+ * One audit entry, reduced to the seven things the mirror reads.
+ *
+ * A PLAIN RECORD RATHER THAN discord.js's `GuildAuditLogsEntry`, for the reason
+ * `ScannedMessage` is one: that class is a live object hanging off a guild, a
+ * client and a REST handle, and taking one as a parameter would mean every test
+ * either constructs one or mocks a class with twenty members. Everything below
+ * this line is a function of plain data and can be driven from three lines above
+ * an assertion.
+ *
+ * `at` IS WHEN THE MODERATOR ACTED, not when we heard about it, and it is what
+ * the staleness rule is measured from. A kick replayed out of the audit log at
+ * boot therefore carries the age it really has.
+ */
+export interface ModerationEntry {
+  /** The audit entry's own snowflake. The idempotency key. */
+  readonly id: string
+  readonly action: MirrorAction
+  readonly at: number
+  readonly targetId: string | null
+  readonly targetName: string | null
+  readonly executorId: string | null
+  readonly executorName: string | null
+  /** What the moderator typed in Discord's dialog, or null. */
+  readonly reason: string | null
+}
+
+/**
+ * The audit actions this bot acts on, and the only ones it can see.
+ *
+ * A `Record` RATHER THAN A `switch`, so the listener's filter and the mirror's
+ * dispatch read one list. `MemberRoleUpdate` is deliberately absent — see the
+ * loop note above — and so is everything else Discord writes to that log, which
+ * is most of what happens in a guild.
+ */
+const MIRRORED: Partial<Record<AuditLogEvent, MirrorAction>> = {
+  [AuditLogEvent.MemberBanAdd]: 'ban',
+  [AuditLogEvent.MemberBanRemove]: 'unban',
+  [AuditLogEvent.MemberKick]: 'kick',
+}
+
+/** A username off whatever discord.js put on the entry, or null. */
+function nameOf(who: unknown): string | null {
+  if (typeof who !== 'object' || who === null) return null
+  const username: unknown = (who as { username?: unknown }).username
+  return typeof username === 'string' && username.length > 0 ? username : null
+}
+
+/**
+ * Turn a live audit entry into a `ModerationEntry`, or null for one we ignore.
+ *
+ * THE NAMES ARE TAKEN OFF THE ENTRY AND NEVER FETCHED. `executor` and `target`
+ * arrive populated when discord.js has the user and null when it does not, and a
+ * REST lookup to turn a null into a name would put a network call in front of a
+ * ban write. Where a name is missing the id is used instead — the console's own
+ * fallback in lib/service.ts, chosen there for the property a fallback in a
+ * permanent record needs: ugly in a table, and unambiguous.
+ */
+export function moderationEntry(entry: GuildAuditLogsEntry): ModerationEntry | null {
+  const action = MIRRORED[entry.action]
+  if (action === undefined) return null
+
+  return {
+    id: entry.id,
+    action,
+    at: entry.createdTimestamp,
+    targetId: entry.targetId,
+    // `target` is typed as a union across every audit action; for these three it
+    // is a user, and anything without a `username` is treated as no name at all.
+    targetName: nameOf(entry.target),
+    executorId: entry.executorId,
+    executorName: nameOf(entry.executor),
+    reason: entry.reason,
+  }
+}
+
+/**
+ * ============================================================================
+ * THE BAN REASON WHEN DISCORD'S DIALOG WAS LEFT BLANK. PLACEHOLDER — THE OWNER
+ * SUPPLIES THIS WORDING.
+ * ============================================================================
+ *
+ * THIS STRING IS SHOWN TO A PLAYER AT CONNECT. `Ban.reason` is written for the
+ * banned person and not for the log — src/ddb.ts says so — and it is required,
+ * so a Discord ban typed with no reason has to carry something. That something
+ * is not this file's to invent, and it is deliberately unmistakable so it cannot
+ * ship by accident: no apology, no house style, nothing that reads like a
+ * sentence the owner would have written.
+ *
+ * EVERYTHING AROUND IT IS DECIDED AND TESTED. When it is used, where it is
+ * stored, and that it never replaces a reason the moderator did type. Only the
+ * words are open.
+ *
+ * IT IS NOT USED FOR THE KICK. The console's kick route already has its own
+ * default for a reasonless kick, written by whoever wrote the console, so
+ * src/ringmaster.ts omits the field rather than inventing a second wording for
+ * the same silence.
+ */
+export const BAN_REASON_PLACEHOLDER = 'PLACEHOLDER: banned from the Discord server.'
+
+/**
+ * The reason the bot stamps on its own role edit, in Discord's audit log.
+ *
+ * MACHINE-SHAPED ON PURPOSE, AND THAT IS WHY IT IS NOT A PLACEHOLDER. It is read
+ * by an admin scrolling the guild's audit log, and its whole job is to say which
+ * process did this and why, in the same vocabulary as the journal line. It is
+ * not prose addressed to anybody — but it is one string in one place if the
+ * owner ever wants to word it.
+ */
+export const ROLE_AUDIT_REASON = 'blitz-bot: the game ban this role marked was lifted'
+
+/**
+ * Take the game-ban role off somebody.
+ *
+ * A SEAM RATHER THAN A DIRECT CALL, so `mirrorEntry` runs offline. Null where
+ * the mirror is wired without one.
+ */
+export type RoleTaker = (userId: string) => Promise<void>
+
+/**
+ * The real one.
+ *
+ * `members.removeRole` RATHER THAN `member.roles.remove`, and the difference is
+ * a REST call. The second needs a `GuildMember` object, which means fetching the
+ * member first; this takes a user id and issues the one PATCH. It matters
+ * because the member usually is not there to fetch — see the note in
+ * `mirrorEntry` on why this call is normally a no-op.
+ *
+ * IT NEEDS NO PRIVILEGED INTENT. `GuildMembers` is deliberately absent from
+ * `createClient`'s intents and stays absent: this is a REST write against an id
+ * we already have, not a gateway read of the member list.
+ */
+export function roleTaker(client: Client, guildId: string, roleId: string): RoleTaker {
+  return async (userId) => {
+    const guild = await client.guilds.fetch(guildId)
+    await guild.members.removeRole({ user: userId, role: roleId, reason: ROLE_AUDIT_REASON })
+  }
+}
+
+/**
+ * Everything the mirror needs from the world, named rather than imported.
+ *
+ * ONE SEAM, AND IT IS WHY EVERY BRANCH BELOW IS TESTABLE WITH NO DISCORD, NO AWS
+ * AND NO CONSOLE. `Pick<Ddb, …>` rather than `Ddb` is the access policy written
+ * where a compiler reads it: the mirror can read the identifier index and read,
+ * issue and lift a ban, and it cannot touch the audit table, the player registry
+ * or the maintenance row however it is edited later.
+ */
+export interface MirrorDeps {
+  /**
+   * The bot's own user id, for the loop guard. Null before the gateway is ready,
+   * which is safe here rather than a hole: an entry with a null `executorId` is
+   * already refused a line later, so the guard is only ever comparing two real
+   * ids or not running at all.
+   */
+  readonly selfId: string | null
+
+  readonly ddb: Pick<Ddb, 'bans' | 'playerIds'>
+
+  /** The live kick, or null when `COMMAND_SECRET` is unset. */
+  readonly kick: Ringmaster | null
+
+  /** Take the game-ban role off, or null when no role is wired. */
+  readonly untag: RoleTaker | null
+
+  readonly now?: () => number
+}
+
+/**
+ * What one entry did, for the tests and for nothing else.
+ *
+ * THE JOURNAL IS THE REAL OUTPUT AND THIS IS THE ASSERTABLE ONE. Every branch
+ * below writes its own line, because that is what an operator reads; returning a
+ * value as well means a test can pin WHICH branch ran without matching on log
+ * text that a rewording would break.
+ */
+export type MirrorResult =
+  | { did: 'ignored'; why: 'self' | 'no-target' | 'no-executor' }
+  | {
+      did: 'ban'
+      /** The row's partition key: a license, or a `discord:` id. */
+      key: string
+      outcome: BanIssueOutcome
+      /** False for a `discord:`-keyed row. See `enforcedNote`. */
+      enforced: boolean
+      kick: KickResult | null
+    }
+  | { did: 'unban'; lifted: string[]; kept: string[]; roleRemoved: boolean }
+  | { did: 'kick'; kick: KickResult | null }
+  | { did: 'failed'; step: 'licence' | 'issue' | 'read' | 'lift'; failure: DdbFailure }
+
+/**
+ * A ban keyed on a `discord:` identifier is a RECORD AND NOT A DOOR, and
+ * anything that reports one has to say so.
+ *
+ * THE GAME'S CONNECT GATE IS ONE LOOKUP ON THE CONNECTING LICENSE. Somebody the
+ * game has never seen has no license to look up, so the row this bot writes for
+ * them sits in the table, shows on the console's ban list, and stops nobody from
+ * joining. That changes when fivem-ringmaster#38 lands and the gate learns to
+ * check a qualified Discord identifier too; until then, `enforced=false` on the
+ * journal line is the difference between a ban and a note.
+ *
+ * TWO REASONS NOT TO "FIX" IT FROM THIS SIDE, BOTH FROM src/ddb.ts: FiveM only
+ * reports a `discord:` identifier when the player has Discord's activity
+ * integration switched on, which is opt-in and therefore evadable by switching
+ * it off; and the console's profile link on such a row points at a player page
+ * that resolves to nothing.
+ */
+function enforcedNote(key: string): boolean {
+  return !key.startsWith('discord:')
+}
+
+/**
+ * Is this ban row one that a Discord ban created, and is it OLDER than the unban
+ * being processed?
+ *
+ * THE FIRST HALF IS THE ONE THE BRIEF ASKS FOR AND IT IS THE IMPORTANT ONE.
+ * Lifting unconditionally would walk somebody game-banned for cheating straight
+ * back in: an admin unbans them from Discord — a favour about a chat channel —
+ * and the console's cheating ban evaporates with it. `discordEntryId` is present
+ * only on rows this bot wrote, and `bans.issue` refuses to overwrite an ACTIVE
+ * ban, so a person already game-banned by the console and then banned on Discord
+ * keeps a row with no marker on it. That is exactly the row this must not touch.
+ *
+ * THE SECOND HALF CLOSES A REPLAY THE FIRST ONE DOES NOT. Audit entry ids are
+ * snowflakes and snowflakes sort by time, so "the ban on this row was created by
+ * a LATER Discord event than this unban" is a comparison rather than a guess —
+ * and it is the difference between a redelivered or replayed unban being ignored
+ * and it lifting a ban somebody re-issued afterwards. src/ddb.ts names that gap
+ * explicitly where `bans.lift` explains it has no event id of its own; this is
+ * the caller-side answer to it.
+ *
+ * A MARKER THAT IS NOT A SNOWFLAKE MEANS NO, and says so at `warn`. Nothing in
+ * this system writes one, so a row carrying one is a row something unexpected
+ * touched — and the safe direction for "I cannot tell how old this is" on a
+ * moderation record is to leave it alone.
+ */
+export function liftableBy(ban: Ban, entry: ModerationEntry): boolean {
+  const marker = ban.discordEntryId
+  if (!marker) return false
+
+  let issuedBy: bigint
+  let unbanBy: bigint
+  try {
+    issuedBy = BigInt(marker)
+    unbanBy = BigInt(entry.id)
+  } catch {
+    log('warn', 'ban row carries a discordEntryId that is not a snowflake, so it was left alone', {
+      ban: ban.license,
+      marker,
+      entry: entry.id,
+    })
+    return false
+  }
+
+  return issuedBy <= unbanBy
+}
+
+/**
+ * Act on one moderation entry.
+ *
+ * THE ORDER OF THE GUARDS IS THE SAFETY PROPERTY, and it is the shape the
+ * console's `serviceGate` uses: cheapest and most structural first, so nothing
+ * further down can be reached by an entry that should never have got past the
+ * top.
+ *
+ *   ourselves? → a target? → an executor? → then, and only then, act.
+ *
+ * IT NEVER THROWS. This is called from an EventEmitter listener and from the
+ * boot replay, and both handle the promise rather than await it; a throw out of
+ * here would become an unhandled rejection attached to no member and no event.
+ * Every failure is a `MirrorResult` and a line in the journal.
+ */
+export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Promise<MirrorResult> {
+  const now = deps.now ?? Date.now
+
+  /**
+   * THE LOOP PREVENTION, AND IT IS ONE LINE. The bot removes a role, Discord
+   * writes an audit entry for it, the entry comes back to this listener. Both
+   * YAGPDB and Red-DiscordBot do exactly this and nothing more elaborate,
+   * because anything more elaborate is state that can be wrong.
+   */
+  if (entry.executorId !== null && entry.executorId === deps.selfId) {
+    return { did: 'ignored', why: 'self' }
+  }
+
+  if (entry.targetId === null) {
+    // Discord's audit schema allows it and these three actions never do it in
+    // practice. Worth a line rather than a silent return: an entry we cannot
+    // place is the shape of the API having changed under us.
+    log('warn', 'moderation entry names no target, so nothing was mirrored', {
+      entry: entry.id,
+      action: entry.action,
+    })
+    return { did: 'ignored', why: 'no-target' }
+  }
+
+  /**
+   * NO EXECUTOR, NO ACTION — THE CONSOLE'S OWN STANCE IN ITS OWN WORDS: "an
+   * unattributable ban is the one thing the audit table exists to prevent."
+   * `Ban.by` may be null and `byName` may not, so mirroring an executor-less
+   * entry would mean inventing a name for whoever did it, and a name in a
+   * permanent moderation record is the one field that must never be a guess.
+   * The console would refuse the relayed kick for the same reason.
+   */
+  if (entry.executorId === null) {
+    log('warn', 'moderation entry names no executor, so nothing was mirrored', {
+      entry: entry.id,
+      action: entry.action,
+      target: entry.targetId,
+    })
+    return { did: 'ignored', why: 'no-executor' }
+  }
+
+  // Narrowed once, here, so the four uses below do not each re-prove it.
+  const executorId = entry.executorId
+  const targetId = entry.targetId
+
+  /** The license a Discord account plays on, or null. Never a guess. */
+  async function licenceFor(discordId: string): Promise<DdbResult<string | null>> {
+    const found = await deps.ddb.playerIds.licensesFor(qualifyId('discord', discordId))
+    /**
+     * `at(-1)` — MOST RECENT LAST, which is how the index stores them, and the
+     * same narrowing `readsFrom` in src/commands/profile.ts does. A failure is
+     * passed through as itself: null means "this account has never connected",
+     * and reporting a table we could not read as that is the confident wrong
+     * answer `qualifyId` exists to prevent.
+     */
+    return found.ok ? { ok: true, value: found.value.at(-1) ?? null } : found
+  }
+
+  /**
+   * The admin's own license, for `Ban.by`.
+   *
+   * READ FROM `ringmaster-player-ids` AND NOT FROM THE GRANTS TABLE, WHICH IS
+   * NOT WHERE THE CONSOLE READS IT. The console fills `actorLicense` from
+   * `grantsForDiscordId` — the row linking an admin's Discord account to their
+   * license — and this bot has no reader for that table at all: adding one is a
+   * new table in `Ddb` and a new statement in an IAM policy, which is a
+   * deploy-level change rather than a code one. What is read instead is the
+   * license that Discord account has PLAYED on, which for an admin who plays is
+   * the same license by a different road and for one who does not is null.
+   *
+   * A FAILURE HERE IS NOT A REFUSAL, unlike the console's. Over there the read
+   * happens BEFORE the ban and refusing costs a retry; here the Discord ban has
+   * already happened and refusing would cost the mirror of it. `by: null` with a
+   * line in the journal is the cheaper wrong answer, and `byName` — which is
+   * what the ban list actually renders — is unaffected.
+   */
+  async function issuerLicence(): Promise<string | null> {
+    const found = await licenceFor(executorId)
+    if (found.ok) return found.value
+
+    log('warn', 'could not read the issuing admin license, so the ban row will not carry one', {
+      entry: entry.id,
+      executor: executorId,
+      failure: found.failure.kind,
+      detail: found.failure.message,
+    })
+    return null
+  }
+
+  /**
+   * The name written into the permanent record.
+   *
+   * THE ID IS THE FALLBACK, WHICH IS THE CONSOLE'S CHOICE AND ITS REASONING:
+   * ugly in a table, and unambiguous, which is the property a fallback in an
+   * audit log needs. It is never blank and never the word "unknown".
+   */
+  const issuerName = entry.executorName ?? executorId
+
+  /**
+   * Ask the console for a live kick, and report what came back.
+   *
+   * THREE THINGS CAN STOP IT BEFORE A REQUEST IS MADE, and each is a different
+   * sentence:
+   *
+   *   NO LICENSE — the game has never seen this Discord account. Nothing to kick
+   *     and nothing wrong; `info`.
+   *
+   *   NO RELAY — `COMMAND_SECRET` is unset, so this deployment cannot ask for a
+   *     kick at all. A `warn`, on every ban, on purpose: it is a half-wired
+   *     integration, bans are silently not taking effect on a live server, and
+   *     fixing it is one variable.
+   *
+   *   TOO OLD — the entry predates the staleness window, which in practice means
+   *     the boot replay is walking last week's audit log. `info`, and
+   *     deliberately NOT left to the relay's own check: that one reports a drop,
+   *     and a drop is a `warn`, so a restart would post a burst of alarms about
+   *     kicks nobody expected to happen.
+   *
+   * `KICK_TTL_MS` IS IMPORTED RATHER THAN RESTATED so the two checks cannot
+   * drift into disagreeing about what stale means. The relay keeps its own, for
+   * the case this one cannot see: a kick that goes stale WHILE it is retrying.
+   */
+  async function relayKick(licence: string | null): Promise<KickResult | null> {
+    if (licence === null) {
+      log('info', 'the game has never seen this account, so there was nothing to kick', {
+        entry: entry.id,
+        action: entry.action,
+        target: targetId,
+      })
+      return null
+    }
+
+    if (deps.kick === null) {
+      log('warn', 'COMMAND_SECRET is not set, so no live kick was attempted', {
+        entry: entry.id,
+        action: entry.action,
+        licence,
+      })
+      return null
+    }
+
+    const age = now() - entry.at
+    if (age >= KICK_TTL_MS) {
+      log('info', 'moderation entry is too old for a live kick, so none was sent', {
+        entry: entry.id,
+        action: entry.action,
+        licence,
+        seconds: Math.round(age / 1000),
+      })
+      return null
+    }
+
+    const result = await deps.kick.kick({
+      license: licence,
+      at: entry.at,
+      // The human who acted, so the console's audit row names them and not this
+      // bot. See `SERVICE_ACTOR_HEADER` in src/ringmaster.ts.
+      actorDiscordId: executorId,
+      playerName: entry.targetName,
+      reason: entry.reason,
+    })
+
+    const fields = {
+      entry: entry.id,
+      action: entry.action,
+      licence,
+      target: targetId,
+      attempts: result.attempts,
+    }
+
+    if (result.outcome === 'dispatched') {
+      /**
+       * INFO, AND `confirmed=false` IS ON THE LINE. The console is explicit that
+       * `dispatched` means the command reached the FXServer console and nothing
+       * more — nothing in this system reports whether a player was really
+       * removed. So this line must not say "kicked", and it does not need a
+       * human, which is what `info` means in this bot (src/log.ts).
+       */
+      log('info', 'live kick dispatched to the game server', {
+        ...fields,
+        confirmed: result.confirmed,
+        commandId: result.commandId,
+      })
+      return result
+    }
+
+    /**
+     * WARN, BECAUSE THE PERSON IS STILL IN THE MATCH. The ban row is already
+     * durable and the game will refuse them at their next connect, but right now
+     * a banned player is still playing and nobody would know. This is what
+     * "report the real outcome" means when there is no command reply to edit: it
+     * reaches the status channel because `warn` does.
+     */
+    log(
+      'warn',
+      result.outcome === 'failed'
+        ? 'live kick failed, so the player may still be in the match'
+        : 'live kick was dropped, so the player may still be in the match',
+      {
+        ...fields,
+        ...(result.outcome === 'failed'
+          ? { failure: result.failure, status: result.status }
+          : { dropped: result.why }),
+        detail: result.detail,
+      },
+    )
+    return result
+  }
+
+  if (entry.action === 'kick') {
+    /**
+     * A KICK IS NOT A BAN, SO NOTHING IS WRITTEN TO DYNAMODB. It is a nudge —
+     * the console's own kick route says as much and does not even require a
+     * reason for one — and the person may reconnect a second later. Recording it
+     * as a ban row would put somebody on the ban list for being AFK in the bus.
+     *
+     * The Discord kick has already happened by the time we hear about it; the
+     * only thing left to mirror is the removal from the running match.
+     */
+    const licence = await licenceFor(targetId)
+    if (!licence.ok) {
+      log('error', 'could not read the licence for a kicked member, so no kick was relayed', {
+        entry: entry.id,
+        target: targetId,
+        failure: licence.failure.kind,
+        detail: licence.failure.message,
+      })
+      return { did: 'failed', step: 'licence', failure: licence.failure }
+    }
+
+    return { did: 'kick', kick: await relayKick(licence.value) }
+  }
+
+  if (entry.action === 'ban') {
+    const licence = await licenceFor(targetId)
+    if (!licence.ok) {
+      /**
+       * THE READ FAILED, SO NOTHING IS WRITTEN — a decision rather than a
+       * shortcut. The key depends on the answer: a license if the game has seen
+       * them, a `discord:` id if not. Guessing the second because the first
+       * could not be read would write a row on a key that is not theirs, which
+       * is worse than no row: a ban that never fires, and a lift that will never
+       * find it.
+       *
+       * ERROR, BECAUSE THE BOT HAS NOT DONE THE THING IT IS FOR. An admin banned
+       * somebody and the game does not know.
+       */
+      log('error', 'could not read the licence for a banned member, so no ban was written', {
+        entry: entry.id,
+        target: targetId,
+        failure: licence.failure.kind,
+        detail: licence.failure.message,
+      })
+      return { did: 'failed', step: 'licence', failure: licence.failure }
+    }
+
+    const key = licence.value ?? qualifyId('discord', targetId)
+    const enforced = enforcedNote(key)
+
+    const issued = await deps.ddb.bans.issue({
+      id: key,
+      by: await issuerLicence(),
+      byName: issuerName,
+      // The moderator's own words, or the marked placeholder. Never a rewrite of
+      // what they typed.
+      reason: entry.reason ?? BAN_REASON_PLACEHOLDER,
+      /**
+       * PERMANENT, AND IT IS THE POLICY RATHER THAN A DEFAULT. "A Discord ban
+       * means banned in the game, permanently." Discord's ban dialog has no
+       * duration field to read one from even if the policy wanted it.
+       */
+      expiresAt: null,
+      playerName: entry.targetName,
+      entryId: entry.id,
+    })
+
+    if (!issued.ok) {
+      log('error', 'the game ban could not be written', {
+        entry: entry.id,
+        target: targetId,
+        key,
+        failure: issued.failure.kind,
+        detail: issued.failure.message,
+      })
+      return { did: 'failed', step: 'issue', failure: issued.failure }
+    }
+
+    log('info', 'discord ban mirrored to the game', {
+      entry: entry.id,
+      target: targetId,
+      key,
+      outcome: issued.value.outcome,
+      /**
+       * ON EVERY LINE, BECAUSE THE ALTERNATIVE MISLEADS. `enforced=false` says
+       * the row exists and the game's connect gate cannot see it — see
+       * `enforcedNote`. A line saying only "mirrored" would be true and would
+       * leave a reader believing the person is kept out.
+       */
+      enforced,
+      by: issuerName,
+    })
+
+    /**
+     * THE KICK IS ATTEMPTED FOR EVERY OUTCOME, `duplicate-event` INCLUDED. The
+     * marker is written by the ban write, which happens BEFORE the kick, so
+     * `duplicate-event` proves the row was written and does not prove the kick
+     * landed — and a kick against somebody who is not connected is a no-op on
+     * the game side. What stops a replay removing the wrong session is the
+     * staleness rule in `relayKick`, not this branch.
+     */
+    return {
+      did: 'ban',
+      key,
+      outcome: issued.value.outcome,
+      enforced,
+      kick: await relayKick(licence.value),
+    }
+  }
+
+  /**
+   * THE UNBAN, WHICH IS THE MOST CAREFUL PATH HERE.
+   *
+   * TWO KEYS ARE CONSIDERED AND THEY ARE THE ONLY TWO THIS BOT EVER WRITES: the
+   * license the account plays on today, and its `discord:` identifier. Checking
+   * both is not belt and braces, it closes a real hole — somebody with no player
+   * record is banned under a `discord:` key, that key is not enforced by the game
+   * (see `enforcedNote`), so they go on playing and acquire a license; a lift
+   * that looked only at the license would find no row and the `discord:` one
+   * would stay banned for good.
+   *
+   * IT IS BOUNDED AT TWO. The reverse index can hold several licenses and only
+   * the most recent is ever written to, so a third read would be looking for a
+   * row nothing in this bot could have put there.
+   */
+  const licence = await licenceFor(targetId)
+  if (!licence.ok) {
+    log('error', 'could not read the licence for an unbanned member, so nothing was lifted', {
+      entry: entry.id,
+      target: targetId,
+      failure: licence.failure.kind,
+      detail: licence.failure.message,
+    })
+    return { did: 'failed', step: 'licence', failure: licence.failure }
+  }
+
+  const keys = [...new Set([licence.value, qualifyId('discord', targetId)])].filter(
+    (key): key is string => key !== null,
+  )
+
+  const lifted: string[] = []
+  const kept: string[] = []
+
+  for (const key of keys) {
+    const read = await deps.ddb.bans.get(key)
+    if (!read.ok) {
+      /**
+       * A FAILED READ IS NOT "NO BAN". Carrying on would mean deciding the role
+       * question — and possibly removing the role — on the strength of a table
+       * we could not reach, which is the same confident wrong answer this file
+       * refuses everywhere else.
+       */
+      log('error', 'could not read a ban row, so the lift was abandoned', {
+        entry: entry.id,
+        key,
+        failure: read.failure.kind,
+        detail: read.failure.message,
+      })
+      return { did: 'failed', step: 'read', failure: read.failure }
+    }
+
+    const ban = read.value
+    if (ban === null) continue
+
+    if (!liftableBy(ban, entry)) {
+      /**
+       * THE REFUSAL THE BRIEF IS BUILT AROUND. This ban was issued by the
+       * console — a cheating ban, an incident verdict — or by a LATER Discord
+       * ban than the unban being replayed. Either way the Discord unban is not
+       * about it, and lifting it would walk somebody straight back in.
+       *
+       * WARN, BECAUSE THE ADMIN WILL BELIEVE OTHERWISE. They unbanned somebody
+       * on Discord and the game ban stands; that is the correct outcome and it
+       * is not the one they will assume, so it goes where a person reads it.
+       *
+       * ONLY WHEN IT IS STILL IN FORCE. An expired or already-lifted row that
+       * we did not write is not a refusal to report — nobody is being kept out
+       * by it, and a line about it would be an alarm with nothing behind it.
+       */
+      if (isBanActive(ban, now())) {
+        kept.push(key)
+        log('warn', 'the game ban was not created by a discord ban, so it still stands', {
+          entry: entry.id,
+          key,
+          target: targetId,
+          issuedBy: ban.byName,
+          marker: ban.discordEntryId ?? null,
+        })
+      }
+      continue
+    }
+
+    const result = await deps.ddb.bans.lift({
+      id: key,
+      by: await issuerLicence(),
+      byName: issuerName,
+      reason: entry.reason,
+    })
+
+    if (!result.ok) {
+      log('error', 'the game ban could not be lifted', {
+        entry: entry.id,
+        key,
+        failure: result.failure.kind,
+        detail: result.failure.message,
+      })
+      return { did: 'failed', step: 'lift', failure: result.failure }
+    }
+
+    if (result.value.outcome === 'lifted') lifted.push(key)
+
+    log('info', 'discord unban mirrored to the game', {
+      entry: entry.id,
+      target: targetId,
+      key,
+      outcome: result.value.outcome,
+      by: issuerName,
+    })
+  }
+
+  /**
+   * THE ROLE COMES OFF ONLY WHEN NO ACTIVE GAME BAN IS LEFT, which is the
+   * invariant the role exists to express: it is on somebody exactly while a game
+   * ban stands. A cheating ban that survived the loop above is precisely the case
+   * where the role must stay — taking it off would hand back the limited access
+   * that the standing ban is the reason for.
+   *
+   * IT IS USUALLY A NO-OP, AND THAT IS EXPECTED RATHER THAN A BUG. A Discord
+   * unban does not put anybody back in the guild, it only makes rejoining
+   * possible, so at the moment this runs the target is almost always not a member
+   * and Discord answers `Unknown Member`. That is the ordinary case and is logged
+   * at `info`. The removal earns its place for the member who IS in the guild:
+   * somebody the console game-banned, who kept their limited access, and whose
+   * ban this event has just lifted.
+   */
+  let roleRemoved = false
+
+  if (deps.untag === null) {
+    log('info', 'no game-ban role is configured, so none was removed', { entry: entry.id })
+  } else if (kept.length > 0) {
+    log('info', 'a game ban still stands, so the game-ban role was kept', {
+      entry: entry.id,
+      target: targetId,
+      kept,
+    })
+  } else {
+    try {
+      await deps.untag(targetId)
+      roleRemoved = true
+      log('info', 'game-ban role removed', { entry: entry.id, target: targetId })
+    } catch (error) {
+      const expected =
+        error instanceof DiscordAPIError &&
+        (error.code === RESTJSONErrorCodes.UnknownMember ||
+          error.code === RESTJSONErrorCodes.UnknownRole)
+
+      log(
+        expected ? 'info' : 'warn',
+        expected
+          ? 'nobody to take the game-ban role off, which is normal after an unban'
+          : 'could not remove the game-ban role',
+        { entry: entry.id, target: targetId, error },
+      )
+    }
+  }
+
+  return { did: 'unban', lifted, kept, roleRemoved }
+}
+
+/**
+ * Where the boot replay's cursor is kept.
+ *
+ * IN `ringmaster-bot-state` RATHER THAN ON DISK, and the difference is what
+ * happens on a fresh box. A file under `StateDirectory=` is lost when the
+ * instance is replaced, and losing this one means replaying a window of audit
+ * log that has already been mirrored — harmless, because every write below is
+ * idempotent, but a burst of DynamoDB reads on a boot that had no reason for
+ * one. The table already exists and this is its first caller.
+ */
+export const AUDIT_CURSOR_KEY = 'discord-audit-cursor'
+
+/**
+ * How much history one boot may replay, per action.
+ *
+ * TWENTY-FIVE, WHICH IS A BOUND AND NOT A CAPACITY. The cursor means a normal
+ * restart reads nothing at all — three REST calls that come back empty — so this
+ * number only ever matters after a real outage, and there it is the answer to
+ * "how much are we willing to spend catching up". Each entry costs up to three
+ * DynamoDB round trips, so seventy-five entries is the worst boot this can have,
+ * and a longer outage than that is one where somebody should be looking anyway.
+ *
+ * THE THREE ACTIONS ARE FETCHED SEPARATELY FOR THIS REASON. One untyped fetch
+ * would spend its whole window on whatever else the guild's audit log recorded —
+ * a channel rename, a role edit — and quietly come back with no moderation in it
+ * at all.
+ */
+export const RECONCILE_LIMIT = 25
+
+/**
+ * Read one page of the guild's audit log. A seam, so the replay runs offline.
+ *
+ * `after` IS AN ENTRY ID AND MEANS "NEWER THAN THIS". Null is the first-ever
+ * boot; see `reconcileModeration`.
+ */
+export type AuditReader = (action: MirrorAction, after: string | null) => Promise<ModerationEntry[]>
+
+/** The real one, over one guild. */
+export function auditReader(guild: Guild, limit = RECONCILE_LIMIT): AuditReader {
+  const types: Record<MirrorAction, AuditLogEvent> = {
+    ban: AuditLogEvent.MemberBanAdd,
+    unban: AuditLogEvent.MemberBanRemove,
+    kick: AuditLogEvent.MemberKick,
+  }
+
+  return async (action, after) => {
+    const page = await guild.fetchAuditLogs({
+      type: types[action],
+      limit,
+      ...(after === null ? {} : { after }),
+    })
+
+    return [...page.entries.values()]
+      .map((entry) => moderationEntry(entry))
+      .filter((entry): entry is ModerationEntry => entry !== null)
+  }
+}
+
+/**
+ * Catch up on what was missed while the bot was down.
+ *
+ * WHY THIS EXISTS. Gateway events are not queued for a client that is not
+ * connected: a ban issued during a deploy, a crash or a network partition is an
+ * event nobody will ever redeliver. Without a replay the mirror is only as
+ * reliable as this process's uptime, and this process restarts on every deploy.
+ *
+ * IT REPLAYS THE AUDIT LOG AND NOT THE BAN LIST, WHICH IS A DEPARTURE WORTH
+ * STATING. "Reconcile Discord's ban list against DynamoDB" was the brief, and
+ * `guild.bans.fetch()` is the literal reading of it. It was rejected because
+ * that list carries a user and a reason and NOTHING ELSE — no executor, so every
+ * mirrored ban would be attributed to nobody, and no entry id, so the idempotency
+ * key would have to be invented. Those are the two things this whole design
+ * rests on. The audit log carries both, and replaying it is the same
+ * reconciliation reached through the door that has the keys in it.
+ *
+ * WHAT THAT COSTS, SAID PLAINLY: a Discord ban that predates this feature, or
+ * that has aged out of the audit log's forty-five day retention, is never
+ * backfilled. That is a one-off migration with a decision attached — who is it
+ * attributed to? — and not something a boot path should do quietly.
+ *
+ * OLDEST FIRST, ACROSS ALL THREE ACTIONS TOGETHER. Snowflakes sort by time, so
+ * sorting the merged list by id replays a ban-then-unban in the order it
+ * happened. Replaying it backwards would leave somebody banned who is not.
+ *
+ * SEQUENTIALLY, NOT IN PARALLEL. Two entries about the same person are exactly
+ * the case where order matters, and a `Promise.all` over `mirrorEntry` would
+ * race them against each other over one DynamoDB row.
+ *
+ * KICKS REPLAY AND DELIVER NOTHING. Every entry here is old by construction, so
+ * `relayKick`'s staleness check drops them without a request — the owner's rule
+ * about a kick queued at 21:00 arriving at 21:40, applied to one queued last
+ * Tuesday.
+ *
+ * THE CURSOR ONLY MOVES ON A CLEAN PASS. A replay that failed halfway has to be
+ * repeated, and repeating it is free because every write it makes is idempotent.
+ * Moving the cursor over an entry we could not act on would turn a transient
+ * DynamoDB failure into a ban that is never mirrored at all.
+ */
+export async function reconcileModeration(
+  read: AuditReader,
+  state: Pick<Ddb['botState'], 'get' | 'put'>,
+  deps: MirrorDeps,
+): Promise<void> {
+  const cursor = await state.get(AUDIT_CURSOR_KEY)
+
+  if (!cursor.ok) {
+    log('warn', 'could not read the audit cursor, so nothing was replayed', {
+      failure: cursor.failure.kind,
+      detail: cursor.failure.message,
+    })
+    return
+  }
+
+  /**
+   * NULL ON THE FIRST EVER BOOT, AND THAT REPLAYS THE MOST RECENT WINDOW RATHER
+   * THAN NOTHING. Same argument as the replay itself: the guild's recent bans
+   * are decisions the game has not been told about, and the policy says a
+   * Discord ban is a game ban. Bounded by `RECONCILE_LIMIT` like every other
+   * pass, and idempotent, so the cost of being wrong about it is a few DynamoDB
+   * reads once.
+   */
+  const after = cursor.value?.value ?? null
+
+  const pages = await Promise.all(
+    (['ban', 'unban', 'kick'] as const).map(async (action) => {
+      try {
+        return await read(action, after)
+      } catch (error) {
+        // One action failing must not lose the other two silently. A missing
+        // View Audit Log permission fails all three and says so three times,
+        // which is the right number of times for a permission the whole feature
+        // depends on.
+        log('warn', 'could not read the audit log', { action, error })
+        return null
+      }
+    }),
+  )
+
+  if (pages.some((page) => page === null)) {
+    log('warn', 'the audit log could not be read in full, so nothing was replayed', { after })
+    return
+  }
+
+  const entries = pages
+    .flatMap((page) => page ?? [])
+    // Oldest first. Snowflakes are time-ordered, and comparing them as BigInt
+    // rather than as numbers is what keeps that true past 2^53.
+    .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0))
+
+  if (entries.length === 0) {
+    log('info', 'nothing to replay from the audit log', { after })
+    return
+  }
+
+  log('info', 'replaying moderation missed while the bot was down', {
+    entries: entries.length,
+    after,
+  })
+
+  for (const entry of entries) {
+    const result = await mirrorEntry(entry, deps)
+    if (result.did === 'failed') {
+      log('warn', 'the audit replay stopped on a failure and the cursor was not moved', {
+        entry: entry.id,
+        step: result.step,
+      })
+      return
+    }
+  }
+
+  // `entries` is non-empty and sorted, so the last element is the newest.
+  const newest = entries[entries.length - 1]?.id
+  if (newest === undefined) return
+
+  const stored = await state.put(AUDIT_CURSOR_KEY, newest)
+  if (!stored.ok) {
+    // The replay itself succeeded; only the bookmark did not. The next boot
+    // replays the same window again, which is idempotent and cheap.
+    log('warn', 'the audit replay finished but its cursor could not be saved', {
+      newest,
+      failure: stored.failure.kind,
+      detail: stored.failure.message,
+    })
+  }
+}
+
+/**
+ * Wire the mirror onto the gateway.
+ *
+ * TWO LISTENERS: the live event, and the boot replay. Both go through
+ * `mirrorEntry`, which is what makes a replayed ban and a live one the same code
+ * path rather than two implementations that can disagree.
+ *
+ * THE GUILD IS CHECKED ON EVERY EVENT. This bot is only ever in one guild, but
+ * "only ever" is a fact about today's invite list and not a property of the
+ * process — and an audit entry from somewhere else would be somebody else's
+ * moderation written into this community's ban table.
+ *
+ * THE LISTENER IS SYNCHRONOUS AND HANDLES ITS OWN PROMISE, for the reason
+ * `onMessage` above does: an async function handed to an EventEmitter has
+ * nowhere to reject to, and becomes an unhandled rejection several ticks later
+ * attached to no event.
+ */
+export function installBanMirror(
+  client: Client,
+  config: Config,
+  ddb: Ddb,
+  /**
+   * THE RELAY IS BUILT HERE AND IS NULL WITHOUT A SECRET, which is the one switch
+   * that turns the live kick off. Everything else about the mirror keeps working:
+   * the ban row is written, the lift is written, the role comes off. The bot must
+   * never depend on the console being up, and this is where that rule is spelled
+   * as a value.
+   */
+  relay: Ringmaster | null = config.commandSecret === null
+    ? null
+    : createRingmaster({ baseUrl: config.ringmasterUrl, secret: config.commandSecret }),
+): void {
+  const deps = (): MirrorDeps => ({
+    selfId: client.user?.id ?? null,
+    ddb,
+    kick: relay,
+    untag: roleTaker(client, config.guildId, config.gameBanRoleId),
+  })
+
+  client.on(Events.GuildAuditLogEntryCreate, (entry, guild) => {
+    if (guild.id !== config.guildId) return
+
+    const moderation = moderationEntry(entry)
+    if (moderation === null) return
+
+    void mirrorEntry(moderation, deps()).catch((error: unknown) => {
+      // `mirrorEntry` is written not to throw; this is the guarantee that it
+      // did, rather than a path anything is expected to take.
+      log('error', 'the moderation mirror threw', { entry: entry.id, error })
+    })
+  })
+
+  client.once(Events.ClientReady, (ready) => {
+    const guild = ready.guilds.cache.get(config.guildId)
+    // The guild check in `createClient` has already halted moderation and said
+    // why; there is nothing to add and no audit log worth reading.
+    if (guild === undefined) return
+
+    void reconcileModeration(auditReader(guild), ddb.botState, deps()).catch((error: unknown) => {
+      // A replay that came apart is a warn and not a stop. The live listener is
+      // already armed and the bot is moderating; what is lost is the catch-up.
+      log('warn', 'the moderation replay failed', { error })
     })
   })
 }

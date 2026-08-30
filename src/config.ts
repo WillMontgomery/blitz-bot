@@ -177,6 +177,74 @@ export interface Config {
 
   exemptAdmins: boolean
   dryRun: boolean
+
+  /**
+   * The credential the Ringmaster console's command routes want, or null for
+   * "the bot cannot reach the console".
+   *
+   * UNPREFIXED, AND THAT IS DELIBERATE RATHER THAN AN OVERSIGHT. Every other
+   * setting here is `BLITZ_`-prefixed because it belongs to this bot alone; this
+   * one is the SAME VALUE that sits in `/opt/ringmaster/.env.local` under the
+   * same name, so prefixing our copy would make one secret look like two. The
+   * console's own `.env.example` says the same thing from the other side.
+   *
+   * NULL DOES NOT DISABLE MODERATION, ONLY THE LIVE KICK. The DynamoDB ban row
+   * is durable the moment it is written and needs no console at all; the kick is
+   * the one thing that has to go through a box that can talk to the game host.
+   * So an unset secret costs a live removal and nothing else — see
+   * `mirrorEntry` in src/client.ts, which reports it and carries on.
+   *
+   * IT IS NEVER LOGGED AND NEVER RENDERED. `loadConfig` names variables in its
+   * failure message and never their values, and src/ringmaster.ts puts this in a
+   * header and nowhere else.
+   */
+  commandSecret: string | null
+
+  /**
+   * Where the Ringmaster console answers, for the kick relay.
+   *
+   * IT DEFAULTS TO THE LOOPBACK, AND UNLIKE ALMOST EVERYTHING ELSE HERE THE
+   * DEFAULT IS NOT "OFF". The bot is the second service on the console's own box
+   * (docs/deploy.md), and the console listens on 127.0.0.1:3000 there — so the
+   * address is a fact about this deployment that an operator should not have to
+   * restate, in the same way `serverIps` is. What turns the relay off is
+   * `commandSecret` being unset, which is one switch rather than two.
+   *
+   * LOOPBACK RATHER THAN THE PUBLIC HOSTNAME ON PURPOSE. Going out through
+   * Cloudflare and back would put the shared secret on the public internet and
+   * the console's availability behind a CDN, to reach a process on the same
+   * machine. Port 3000 is closed to the internet (docs/deploy.md) precisely so
+   * that this address is the private one.
+   *
+   * ORIGIN ONLY — scheme, host, port. A path, a query or a fragment is refused
+   * at boot rather than silently concatenated into `…/api/kick`, because a
+   * base URL with a stray trailing path is a 404 that looks exactly like a
+   * console that is down.
+   */
+  ringmasterUrl: string
+
+  /**
+   * The role that marks somebody as banned in the GAME but not from Discord.
+   *
+   * THE POLICY IT IMPLEMENTS IS THE OWNER'S AND IS ASYMMETRIC ON PURPOSE. A
+   * Discord ban means banned in the game, permanently. A game ban never means a
+   * Discord ban: it assigns this role, so the person keeps limited access to the
+   * server and can argue their case. Lifting or expiring the game ban takes the
+   * role off again.
+   *
+   * THE ID IS IN THE SOURCE AS A DEFAULT, FOR `DEFAULT_SERVER_IPS`'S REASON. A
+   * value that lived only in `.env.example` is a value systemd's
+   * `EnvironmentFile=` never reads, and the failure would be silent: the ban is
+   * mirrored, the role is not touched, and the policy is half-implemented in a
+   * way nothing in the guild shows. Overridable so a second guild is a variable
+   * rather than a code change.
+   *
+   * IT IS THE ONE ID HERE THAT CANNOT BE TURNED OFF BY BLANKING IT, again like
+   * `serverIps`: a blank line is what an unedited template looks like, and the
+   * only thing "no role" could mean is a policy the owner settled being quietly
+   * skipped.
+   */
+  gameBanRoleId: string
 }
 
 /**
@@ -200,6 +268,26 @@ const required = z
  * whitespace-only collapse to the same null for the reason above.
  */
 const optionalId = z
+  .string()
+  .trim()
+  .optional()
+  .transform((value) => (value === undefined || value === '' ? null : value))
+
+/**
+ * An optional shared secret.
+ *
+ * THE SAME TRANSFORM AS `optionalId` AND A DIFFERENT NAME, which is the whole
+ * of the reason it exists. `optionalId: optionalId` reads as "this is a
+ * snowflake" to the next person editing the schema, and the one thing that must
+ * never happen to this value is somebody deciding it can be shape-checked and
+ * putting a fragment of it in an error message.
+ *
+ * NO `.min()`, NO PATTERN, NOTHING THAT COULD ECHO IT. `loadConfig`'s failure
+ * message is written to stderr and to `systemctl status`; a zod issue that
+ * quoted the value the way `ipList` quotes a bad address would put the console's
+ * command credential in the journal.
+ */
+const optionalSecret = z
   .string()
   .trim()
   .optional()
@@ -314,6 +402,119 @@ function flag(fallback: boolean) {
 }
 
 /**
+ * Where the console answers when nobody says otherwise. See `Config.ringmasterUrl`.
+ *
+ * IN THE SOURCE RATHER THAN IN `.env.example` ONLY, for `DEFAULT_SERVER_IPS`'s
+ * reason: a systemd `EnvironmentFile=` never reads that file, so a default that
+ * lives there alone is a default production does not have.
+ */
+const DEFAULT_RINGMASTER_URL = 'http://127.0.0.1:3000'
+
+/**
+ * The role the owner settled on for a game ban. See `Config.gameBanRoleId`.
+ *
+ * A LITERAL, BECAUSE THE POLICY IS SETTLED AND THE GUILD IS ONE GUILD. The same
+ * argument as `DEFAULT_SERVER_IPS`: an operator who has to discover this from a
+ * template is an operator whose next deploy quietly stops enforcing half of a
+ * rule the owner wrote down.
+ */
+const DEFAULT_GAME_BAN_ROLE_ID = '1542596612306505808'
+
+/**
+ * A Discord snowflake.
+ *
+ * COPIED FROM THE CONSOLE'S `SNOWFLAKE` IN lib/service.ts, DIGIT RULE AND ALL —
+ * `[0-9]{1,32}` rather than the seventeen-to-nineteen ids are today. That file
+ * explains why at length and the reasoning carries over unchanged: the format is
+ * documented to grow, and a second, stricter opinion about the same value in the
+ * same system is a bug waiting for the year the digit count changes.
+ *
+ * NOT APPLIED TO THE OTHER IDS HERE, and that asymmetry is deliberate rather
+ * than an omission. A wrong channel id makes the bot post nowhere and say so; a
+ * wrong role id makes it try to take a role off somebody and fail loudly. This
+ * one is checked because it has a default that the operator may not know is
+ * there, so "I set it and nothing happened" has to be a boot failure naming the
+ * variable rather than a silent fallback.
+ */
+const SNOWFLAKE = /^[0-9]{1,32}$/
+
+/**
+ * The console's origin: scheme, host, port, and nothing after them.
+ *
+ * PARSED WITH `URL` RATHER THAN MATCHED WITH A REGEX, because the thing that
+ * has to agree is not this file's idea of a URL but the one `fetch` will build
+ * the request from — src/ringmaster.ts concatenates `/api/kick` onto whatever
+ * comes out of here, so the check and the use must be the same parser.
+ *
+ * A PATH, QUERY OR FRAGMENT IS REFUSED RATHER THAN TRIMMED. `…:3000/console`
+ * concatenated with `/api/kick` is a 404, and a 404 out of the console is
+ * indistinguishable from a console that is down — an evening spent on the wrong
+ * service. The trailing slash `URL` always produces is the one exception and is
+ * removed, because that spelling IS just the origin.
+ *
+ * http AND https ONLY. `file:` and `data:` parse perfectly well and would send
+ * the command credential somewhere no console is listening.
+ */
+const originUrl = z
+  .string()
+  .optional()
+  .transform((raw, ctx) => {
+    const value = raw?.trim()
+    if (value === undefined || value === '') return DEFAULT_RINGMASTER_URL
+
+    let parsed: URL
+    try {
+      parsed = new URL(value)
+    } catch {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `must be a URL, got "${value}"`,
+      })
+      return z.NEVER
+    }
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `must be an http or https URL, got "${value}"`,
+      })
+      return z.NEVER
+    }
+
+    if (parsed.pathname !== '/' || parsed.search !== '' || parsed.hash !== '') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `must be an origin with no path, query or fragment, got "${value}"`,
+      })
+      return z.NEVER
+    }
+
+    // `URL.origin` rather than the input, so `HTTP://Localhost:3000` and
+    // `http://localhost:3000/` become one spelling before anything concatenates
+    // a path onto them.
+    return parsed.origin
+  })
+
+/**
+ * An id that has a default and cannot be blanked away. See `gameBanRoleId`.
+ */
+const idWithDefault = (fallback: string) =>
+  z
+    .string()
+    .optional()
+    .transform((raw, ctx) => {
+      const value = raw?.trim()
+      if (value === undefined || value === '') return fallback
+      if (SNOWFLAKE.test(value)) return value
+
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `must be a Discord id, got "${value}"`,
+      })
+      return z.NEVER
+    })
+
+/**
  * Keys are the environment variable names verbatim, so zod's issue paths are
  * already the thing an operator has to go and edit. That is the only reason
  * the error assembly below can be three lines long.
@@ -330,6 +531,12 @@ const schema = z.object({
   BLITZ_SERVER_IPS: ipList,
   BLITZ_EXEMPT_ADMINS: flag(true),
   BLITZ_DRY_RUN: flag(false),
+
+  // Unprefixed, because the same value with the same name is in the console's
+  // own dotenv file. See `Config.commandSecret`.
+  COMMAND_SECRET: optionalSecret,
+  BLITZ_RINGMASTER_URL: originUrl,
+  BLITZ_GAME_BAN_ROLE_ID: idWithDefault(DEFAULT_GAME_BAN_ROLE_ID),
 })
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -356,5 +563,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     serverIps: parsedEnv.BLITZ_SERVER_IPS,
     exemptAdmins: parsedEnv.BLITZ_EXEMPT_ADMINS,
     dryRun: parsedEnv.BLITZ_DRY_RUN,
+    commandSecret: parsedEnv.COMMAND_SECRET,
+    ringmasterUrl: parsedEnv.BLITZ_RINGMASTER_URL,
+    gameBanRoleId: parsedEnv.BLITZ_GAME_BAN_ROLE_ID,
   }
 }

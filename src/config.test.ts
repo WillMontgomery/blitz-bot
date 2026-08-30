@@ -52,6 +52,9 @@ const schemaVariables = [
   'BLITZ_SERVER_IPS',
   'BLITZ_EXEMPT_ADMINS',
   'BLITZ_DRY_RUN',
+  'COMMAND_SECRET',
+  'BLITZ_RINGMASTER_URL',
+  'BLITZ_GAME_BAN_ROLE_ID',
 ]
 
 /**
@@ -548,6 +551,172 @@ describe('BLITZ_SERVER_IPS', () => {
    */
   it('is in the template operators copy, with the same two addresses', () => {
     expect(repoFile('.env.example')).toContain('BLITZ_SERVER_IPS=3.130.92.28,18.222.244.205')
+  })
+})
+
+/**
+ * THE THREE SETTINGS THE MODERATION MIRROR ADDED — blitz-bot#16.
+ *
+ * `COMMAND_SECRET` opens the console's command routes, `BLITZ_RINGMASTER_URL`
+ * says where they are, and `BLITZ_GAME_BAN_ROLE_ID` is the role a game ban
+ * assigns. What is decided here is which of them may be absent and what absence
+ * means, because the three answers are deliberately not the same one.
+ */
+describe('loadConfig, on the console relay', () => {
+  const base = { DISCORD_BOT_TOKEN: 'token', DISCORD_GUILD_ID: 'guild' }
+
+  /**
+   * UNSET MEANS THE LIVE KICK IS OFF AND NOTHING ELSE IS. The ban row is written
+   * straight to DynamoDB and needs no console at all; the standing rule is that
+   * this bot must never depend on the console being up, and a required secret
+   * here would be that dependency written into the boot path.
+   */
+  it('treats an absent command secret as null rather than refusing to boot', () => {
+    expect(loadConfig(base).commandSecret).toBeNull()
+    expect(loadConfig({ ...base, COMMAND_SECRET: '   ' }).commandSecret).toBeNull()
+  })
+
+  it('carries the secret through untouched when there is one', () => {
+    expect(loadConfig({ ...base, COMMAND_SECRET: 's3cret' }).commandSecret).toBe('s3cret')
+  })
+
+  /**
+   * THE SECRET MUST NEVER REACH THE FAILURE MESSAGE, which is written to stderr
+   * and read out of `systemctl status`. Nothing shape-checks it, so there is
+   * nothing that could quote it — and this is the test that stops somebody
+   * adding a `.min(32)` with a helpful message attached.
+   */
+  it('never echoes the secret in an error, even when everything else is wrong', () => {
+    let message = ''
+    try {
+      loadConfig({ COMMAND_SECRET: 'do-not-print-me', BLITZ_RINGMASTER_URL: 'not a url' })
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+
+    expect(message).toContain('BLITZ_RINGMASTER_URL')
+    expect(message).not.toContain('do-not-print-me')
+  })
+
+  /**
+   * THE BOT IS THE SECOND SERVICE ON THE CONSOLE'S OWN BOX and the console
+   * listens on 127.0.0.1:3000 there, so the address is a fact about this
+   * deployment rather than something an operator should have to restate. Unlike
+   * every optional channel id, unset does not mean "off" — `COMMAND_SECRET` is
+   * the switch, and it is one switch rather than two.
+   */
+  it('defaults to the loopback the console listens on', () => {
+    expect(loadConfig(base).ringmasterUrl).toBe('http://127.0.0.1:3000')
+    expect(loadConfig({ ...base, BLITZ_RINGMASTER_URL: '' }).ringmasterUrl).toBe(
+      'http://127.0.0.1:3000',
+    )
+  })
+
+  it('normalises an origin so nothing downstream has two spellings of it', () => {
+    expect(loadConfig({ ...base, BLITZ_RINGMASTER_URL: 'http://localhost:3000/' }).ringmasterUrl).toBe(
+      'http://localhost:3000',
+    )
+    expect(loadConfig({ ...base, BLITZ_RINGMASTER_URL: ' https://console.example ' }).ringmasterUrl).toBe(
+      'https://console.example',
+    )
+  })
+
+  /**
+   * A BASE URL WITH A PATH ON IT IS A 404, AND A 404 OUT OF THE CONSOLE LOOKS
+   * EXACTLY LIKE A CONSOLE THAT IS DOWN — an evening spent on the wrong service.
+   * Refusing at boot names the variable instead.
+   */
+  it('refuses a url carrying a path, a query or a fragment', () => {
+    for (const bad of [
+      'http://127.0.0.1:3000/console',
+      'http://127.0.0.1:3000/?x=1',
+      'http://127.0.0.1:3000/#top',
+    ]) {
+      let message = ''
+      try {
+        loadConfig({ ...base, BLITZ_RINGMASTER_URL: bad })
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error)
+      }
+
+      expect(message).toContain('BLITZ_RINGMASTER_URL')
+      expect(message).toContain('no path, query or fragment')
+    }
+  })
+
+  /** `file:` and `data:` parse perfectly well and would send the credential
+   * somewhere no console is listening. */
+  it('refuses a scheme that is not http or https', () => {
+    let message = ''
+    try {
+      loadConfig({ ...base, BLITZ_RINGMASTER_URL: 'file:///etc/passwd' })
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+
+    expect(message).toContain('BLITZ_RINGMASTER_URL: must be an http or https URL')
+  })
+
+  it('refuses something that is not a url at all', () => {
+    let message = ''
+    try {
+      loadConfig({ ...base, BLITZ_RINGMASTER_URL: '127.0.0.1:3000' })
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+
+    expect(message).toContain('BLITZ_RINGMASTER_URL: must be')
+  })
+
+  /**
+   * THE ROLE ID HAS A DEFAULT IN THE SOURCE, for `DEFAULT_SERVER_IPS`'s reason:
+   * a value that lived only in `.env.example` is a value systemd's
+   * `EnvironmentFile=` never reads, and the failure would be silent — the ban is
+   * mirrored, the role is never touched, and a policy the owner settled is half
+   * implemented in a way nothing in the guild shows.
+   */
+  it('defaults the game-ban role to the id the owner settled on', () => {
+    expect(loadConfig(base).gameBanRoleId).toBe('1542596612306505808')
+    expect(loadConfig({ ...base, BLITZ_GAME_BAN_ROLE_ID: '  ' }).gameBanRoleId).toBe(
+      '1542596612306505808',
+    )
+  })
+
+  it('takes an override for a second guild', () => {
+    expect(loadConfig({ ...base, BLITZ_GAME_BAN_ROLE_ID: '999' }).gameBanRoleId).toBe('999')
+  })
+
+  /**
+   * A SET-BUT-WRONG ROLE ID STOPS THE PROCESS, and it is the one id here that is
+   * shape-checked. The others fail loudly at use; this one has a default that an
+   * operator may not know is there, so "I set it and nothing happened" has to be
+   * a boot failure naming the variable rather than a silent fallback.
+   */
+  it('refuses a role id that is not a Discord id', () => {
+    let message = ''
+    try {
+      loadConfig({ ...base, BLITZ_GAME_BAN_ROLE_ID: 'the-banned-role' })
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+
+    expect(message).toContain('BLITZ_GAME_BAN_ROLE_ID: must be a Discord id')
+  })
+
+  /**
+   * THE TEMPLATE AND THE SOURCE DEFAULTS HAVE TO SAY THE SAME THING, the same
+   * argument `BLITZ_SERVER_IPS` makes above. `COMMAND_SECRET` is deliberately
+   * blank in the template — it is a secret — but it has to be NAMED there, or an
+   * operator copying the file has no way to learn the bot wants it.
+   */
+  it('is in the template operators copy, defaults and all', () => {
+    const template = repoFile('.env.example')
+
+    expect(template).toContain('COMMAND_SECRET=')
+    expect(template).toContain('BLITZ_RINGMASTER_URL=')
+    expect(template).toContain('BLITZ_GAME_BAN_ROLE_ID=')
+    expect(template).toContain('1542596612306505808')
+    expect(template).toContain('http://127.0.0.1:3000')
   })
 })
 

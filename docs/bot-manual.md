@@ -1,211 +1,91 @@
-# What this bot does
+# Blitz bot
 
-It removes Discord invites to other servers from this one. An invite to this
-server is left alone; every other invite posted here is deleted.
+What the bot does to this server, and what it does on its own. This channel renders `docs/bot-manual.md`; an edit to these messages is undone on the next restart.
 
-That is the whole feature set. It does not warn, mute, kick, ban, filter words,
-or moderate anything else.
+## What it removes
 
-# Where it looks for an invite
+Six rules. Each removal is reported under the rule that fired.
 
-Not only the message text. It reads the message content, embeds (title,
-description, fields, footer, author), buttons and every other component
-including the link a button points at, poll questions and answers, attachment
-filenames and their alt text, and sticker names.
+- **foreign-invite** — an invite to another Discord server.
+- **over-lookup-cap** — more invite codes in one message than it will check.
+- **fivem-connect** — a `fivem://connect/` link to another game server.
+- **server-listing** — a `cfx.re/join` or `servers.fivem.net` listing.
+- **foreign-ip** — an IP address that is not ours.
+- **link-shortener** — bit.ly, dsc.gg, t.co and the like. The destination is hidden, so it is never followed.
 
-It reads forwarded messages the same way, because a forward keeps the original
-text somewhere the message text is not.
+Nothing else is moderated. **No word filter, no warnings, no mutes.**
 
-It reads edits. A message edited to add an invite after it was posted is scanned
-again, including a message posted before the bot last restarted.
+## Why a clip or version number vanished
 
-Ten distinct invite codes per message are looked up. A message carrying more
-than that is removed on those grounds alone, because the codes past the tenth
-cannot be checked and no ordinary message has eleven.
+**Four numbers separated by dots read as an IP address**, wherever they sit — prose, a filename, an attachment.
 
-# What it never touches
+- Kept: **our own server address**, whatever punctuation follows it.
+- Kept: a filename ending in one extension, `... 14.22.35.13.mp4`, and a zero-padded clock, `14.22.05.03`.
+- Removed: `version 1.2.3.4` in a sentence, and any name with two more parts after the numbers, `clip-1.2.3.4.tar.gz`.
 
-Its own messages. Direct messages. Messages in any other server it happens to be
-in. Messages in the channels listed in `BLITZ_EXEMPT_CHANNEL_IDS`. Threads are
-not covered by an exempt channel: a thread has its own id and must be listed
-itself.
+Rename the file and post it again.
 
-An invite code Discord will not answer for — expired, revoked, mistyped — is
-left alone. The bot deletes on a confirmed answer, never on a guess.
+## Where it looks
 
-# The admin exemption
+Message text, embeds, buttons and the links behind them, poll questions and answers, attachment filenames and alt text, and sticker names. A forwarded message is read the same way.
 
-If `DISCORD_ADMIN_ROLE_ID` names a role and `BLITZ_EXEMPT_ADMINS` is true, a
-message from a holder of that role is not scanned at all. Unsetting the role id
-turns the exemption off.
+**Edits are scanned**, including on messages posted before the last restart.
 
-Webhooks are never exempt. A webhook cannot hold a role, so a webhook post is
-always scanned.
+## What it never touches
 
-If the bot cannot read an author's roles, it scans the message anyway. The cost
-of that is one admin post scanned; the cost of the other choice is anyone who
-looks unreadable getting a free pass.
+- Its own messages, direct messages, and any other server it is in.
+- Channels listed in `BLITZ_EXEMPT_CHANNEL_IDS`. **A thread has its own id and must be listed itself.**
+- Posts by holders of `DISCORD_ADMIN_ROLE_ID`, while `BLITZ_EXEMPT_ADMINS` is on. **Webhooks are never exempt.**
+- An invite code Discord will not answer for: it removes on a confirmed answer, never a guess.
 
-# Dry run
+## What the poster is told
 
-With `BLITZ_DRY_RUN` set to true the bot does everything except delete. It
-scans, it decides, it writes the journal line, and it posts to the removals
-channel with "Dry run, nothing removed" as the first words.
+The bot **DMs them**, naming the rule that fired. If their DMs are shut it tags them in the channel instead and takes that note down after about half a minute — **the one message the bot sends that pings anybody**.
 
-Whether it is on right now is not something this file can say: it is an
-environment variable on the box, not part of the repository. The removals
-channel is where you can see which of the two the bot is doing.
+Nothing it posts quotes the removed text.
 
-# The removals channel
+## The removals channel
 
-`BLITZ_LOG_CHANNEL_ID`. One message per removal: who posted it, which channel,
-the reason, and the invite codes. Nothing else, and nothing about what the
-message said.
+`BLITZ_LOG_CHANNEL_ID`. One line per removal: who posted it, which channel, which rule, and the invite codes when the rule found any. Never what the message said.
 
-Two reasons appear there. `foreign-invite` means a code was resolved and points
-at another server. `over-lookup-cap` means the message carried more codes than
-the scan will resolve, so nothing was confirmed about the ones past the tenth —
-that line reports a count and no codes.
+## The status channel
 
-The author is named as a mention and again in plain text, because a mention
-stops rendering once that account leaves.
+`BLITZ_STATUS_CHANNEL_ID`. The bot's own faults and nothing else: a delete that failed, a rate limit, a channel it cannot post in, a dropped connection. The same fault repeating folds into one line.
 
-# The status channel
+It also posts **`Update installed.`** with a link to the commit when it starts on a new one. A normal start says nothing.
 
-`BLITZ_STATUS_CHANNEL_ID`. The bot's own faults, so they do not sit unread in
-the journal on the box: a delete that failed, a rate limit, a channel it cannot
-post in, a gateway disconnect.
+## Dry run
 
-Warnings and errors only, plus the deploy notice below. It never posts a
-removal there, and a start that goes normally says nothing at all.
+With `BLITZ_DRY_RUN` on, the bot scans and reports but **deletes nothing and tells nobody**. Those lines open with `Dry run, nothing removed`.
 
-The same fault repeating folds into one message with a count on it rather than
-filling the channel.
+Whether it is on is set on the box, not here; the removals channel shows which it is doing.
 
-# The deploy notice
+## Discord bans, kicks and unbans
 
-When the bot starts on a commit different from the one it last reported, it
-posts `Update installed.` to the status channel, naming the short sha as a
-link to that commit on GitHub.
+Read from the audit log and carried into the game.
 
-It restarts on every deploy and on every crash. A restart on the same commit
-says nothing, which is why a crash loop does not fill the channel.
+- **Ban** — a permanent game ban, and they are dropped from the match they are in.
+- **Kick** — dropped from the match. Nothing is recorded.
+- **Unban** — lifts the game ban and takes the game-ban role off.
 
-# This manual
+**A game ban never bans anybody on Discord.** It puts the game-ban role on them, so they can argue their case.
 
-`BLITZ_DOCS_CHANNEL_ID`. This channel is a rendering of `docs/bot-manual.md` in
-the bot's repository, one embed per top-level heading.
+Anything done while the bot was down is picked up at the next start.
 
-On every start the bot compares the channel against that file and edits only
-what differs. A section that did not change is not touched and its footer keeps
-the date it last did. A section removed from the file has its message deleted; a
-message deleted by hand is posted again on the next start.
+## The commands
 
-The file is the source of truth. Editing a message here is undone the next time
-the bot restarts.
+Four, re-registered on every start. **Admin** means holding `DISCORD_ADMIN_ROLE_ID`; with that unset, nothing admin-only runs.
 
-A heading is a line beginning `# ` in the first column, and what follows is one
-line of plain text. It becomes the embed's title, where Discord formats nothing,
-so markdown in a heading is shown as the characters that were typed; a trailing
-run of `#` is read as markdown's closing sequence and dropped. An indented `#`
-is not a heading. The heading is also how a section is matched to its message,
-so renaming one posts a new message and deletes the old.
+- `/help [user]` — anyone. Links the player guide. Posted in the channel when aimed at somebody, private otherwise.
+- `/profile` — anyone. Your own progression and match record. Private.
+- `/profile <user>` — **admin**. Bans, career, registry row, last five matches, and a button to the console. Private.
+- `/sticky <text>` — **admin**. Keeps a message at the bottom of this channel. Running it again replaces it.
+- `/unsticky` — **admin**. Takes it down.
 
-A section that will not fit one embed — 256 characters of heading, 4096 of body
-— is not published and never shortened. Its message keeps the last text that did
-fit and its footer says it is out of date; a section that has never been
-published gets a message with its heading and nothing under it. The same happens
-to a section Discord refuses outright. Either way it is reported once rather than
-on every restart, because the mark in the channel is what the next start reads.
+Some replies are still placeholder text and say so.
 
-There are four things that stop the bot touching this channel at all: a file it
-cannot split into sections (a code fence that is never closed), a file with no
-top-level headings in it, a channel holding more messages than one read can
-carry, and any run that would delete more than half of what it found. Each of
-those is far more often a broken file or a broken deploy than somebody's edit,
-and a deleted message cannot be got back. All four say so in the status channel.
+## Maintenance notices
 
-# The slash commands
+`BLITZ_MAINTENANCE_CHANNEL_ID`. Two posts per window, from what the console schedules: the server is going down, and it is back, with how long it was gone.
 
-Four of them, and the whole list is registered into this guild again on every
-start, so what Discord offers cannot drift from what the bot has.
-
-Admin-only means holding the role named by `DISCORD_ADMIN_ROLE_ID`. Discord also
-hides an admin-only command from everybody else in the client, but that is a
-default anybody with Manage Server can grant back, so the bot checks the role
-itself on every use. With the variable unset nobody is an admin and no
-admin-only command runs at all.
-
-Who may run a command and who sees the answer are two separate questions.
-Ephemeral means the reply is delivered to the person who ran the command and to
-nobody else.
-
-`/help` is open to everybody. It replies with a link to the player guide and one
-mention in it: whoever was tagged, or the sender when nobody was. Tagged at
-somebody the reply is posted in the channel, because a guide only the tagger can
-read is no use to the person it is for; tagged at nobody it is ephemeral. The
-mention renders as a name and notifies nobody, as every mention this bot sends
-does.
-
-`/profile` takes an OPTIONAL user, and its reply is always ephemeral.
-
-Naming somebody is admin-only, and that half is the one this rule exists for. It
-carries a member's ban history and every name their account has used, and a copy
-in the channel cannot be taken back. It reports the bans, the game's career
-numbers, the server registry row and the last five matches, and it carries a
-button that opens that player's page in the Ringmaster console.
-
-The bans cover every game identity that account has played under, up to the ten
-most recent, so a ban is not hidden by a clean current one. No identity is named
-in the reply.
-
-Naming nobody is open to anyone and shows you your own progression and match
-record, plus a ban if one is in force right now. It cannot show you any lifted
-ban or anything about other accounts: those are what a moderator uses to join up
-alternate accounts, and the bot never reads them for this half at all. No console
-button either: the console is behind a sign-in players do not have.
-
-Whatever could not be read is named in the reply rather than left out, because
-"no record" and "the table would not answer" are opposite answers to the same
-question.
-
-Both halves read the same way. Bans, server record, recent matches and what could
-not be read are headings in the body; the short numbers — level, Volts, matches,
-kills, damage, time in match — are columns underneath, because Discord renders no
-heading inside a column. Every time in it is a Discord timestamp, so it renders in
-your own timezone rather than as UTC. The balance is in Volts, which is what the
-game calls it. The bar down the side is red while the subject is under a ban in
-force, and the picture in the corner is that account's Discord avatar. Five
-matches are listed with the number played in all beside them, so a short list
-never reads as a whole career. Past names are listed only when the in-game name
-is not already the name Discord shows them by. Whoever it is about is tagged, and
-their Discord id is printed nowhere — the tag already carries it.
-
-`/sticky` takes the text of a message, is admin-only, and its reply is
-ephemeral. It keeps that message at the bottom of the channel it was run in: up
-to 2000 characters, reposted at most once every fifteen seconds, however
-many messages land on top of it. Run in a channel that already has
-one, it replaces that one rather than adding a second. The reply is ephemeral
-because a visible confirmation would be one more message pushing the sticky
-down.
-
-`/unsticky` is admin-only and its reply is ephemeral. It takes down the sticky in
-the channel it was run in, and says so when there was not one. Neither sticky
-command takes a channel: both act on the channel the admin is standing in, so
-there is no channel id to mistype.
-
-Several of the replies are still placeholder text and say so in their first
-word. The wording is the owner's to supply; what this section describes is the
-behaviour under it.
-
-# What it does not have
-
-No kick, no ban, no mute, no warning. The four commands above are the whole
-list, and none of them acts on a member or on a message.
-
-The bot never contacts a member about a removal: no DM, no reply, no "your
-message was removed". A removal is a journal line and a line in the removals
-channel, and that is all.
-
-Nothing else is typed at it. What it does about invites is decided by its
-environment variables alone, and this channel by `docs/bot-manual.md`.
+A window that is scheduled, draining or cancelled is not announced.

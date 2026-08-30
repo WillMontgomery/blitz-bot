@@ -178,6 +178,9 @@ function cfg(over: Partial<Config> = {}): Config {
     serverIps: ['3.130.92.28'],
     exemptAdmins: true,
     dryRun: false,
+    commandSecret: null,
+    ringmasterUrl: 'http://127.0.0.1:3000',
+    gameBanRoleId: '1542596612306505808',
     ...over,
   }
 }
