@@ -45,6 +45,7 @@ const schemaVariables = [
   'DISCORD_GUILD_ID',
   'DISCORD_ADMIN_ROLE_ID',
   'BLITZ_LOG_CHANNEL_ID',
+  'BLITZ_STATUS_CHANNEL_ID',
   'BLITZ_EXEMPT_CHANNEL_IDS',
   'BLITZ_EXEMPT_ADMINS',
   'BLITZ_DRY_RUN',
@@ -223,6 +224,36 @@ describe('.env, as node loads it', () => {
 
     expect(config.discordToken).toBe('token-from-environment')
     expect(config.guildId).toBe('guild-from-environment')
+  })
+})
+
+/**
+ * The channel the bot reports its OWN faults to.
+ *
+ * OPTIONAL, AND THAT IS THE POINT OF THESE TWO CASES. The bot is live on the
+ * server right now with no `BLITZ_STATUS_CHANNEL_ID` anywhere near it, so a
+ * variable that was required — or one that made the schema reject an
+ * environment without it — would mean the next deploy refuses to boot until
+ * somebody logs into the box, which is the interaction this feature exists to
+ * remove.
+ */
+describe('BLITZ_STATUS_CHANNEL_ID', () => {
+  it('is null when it is not set, so the bot still boots on journal only', () => {
+    const config = loadConfig({ DISCORD_BOT_TOKEN: 'token', DISCORD_GUILD_ID: 'guild' })
+
+    expect(config.statusChannelId).toBeNull()
+  })
+
+  it('is carried through, and is not the same field as the removal log channel', () => {
+    const config = loadConfig({
+      DISCORD_BOT_TOKEN: 'token',
+      DISCORD_GUILD_ID: 'guild',
+      BLITZ_LOG_CHANNEL_ID: '111',
+      BLITZ_STATUS_CHANNEL_ID: '222',
+    })
+
+    expect(config.logChannelId).toBe('111')
+    expect(config.statusChannelId).toBe('222')
   })
 })
 

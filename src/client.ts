@@ -1,3 +1,6 @@
+import { readFile, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+
 import {
   Client,
   DiscordAPIError,
@@ -9,7 +12,7 @@ import {
 
 import type { Config } from './config.ts'
 import { scanMessage, type InviteResolver, type ScanResult } from './invites.ts'
-import { log } from './log.ts'
+import { log, type Fault, type Sink } from './log.ts'
 
 /**
  * The bot: the discord.js client, and the decision it makes about a message.
@@ -1398,6 +1401,20 @@ export function createClient(config: Config): Client {
     onMessage(updated)
   })
 
+  /**
+   * WIRED HERE RATHER THAN IN index.ts, because it is one more `clientReady`
+   * listener and every listener this bot has is registered in this function.
+   * Registered last so it runs after the guild check: a bot that came up on a
+   * new commit AND cannot find its guild says the halt line first.
+   *
+   * NOTHING AT ALL WHEN NO STATUS CHANNEL IS SET, the same rule the sink
+   * follows in index.ts. The bot is live today with the id unset and has to
+   * keep running exactly as it does now.
+   */
+  if (config.statusChannelId !== null) {
+    announceDeployedCommit(client, config.statusChannelId)
+  }
+
   return client
 }
 
@@ -1549,4 +1566,778 @@ export function announcer(client: Client, channelId: string): (line: string) => 
 
     await channel.send({ content: line, allowedMentions: { parse: [] } })
   }
+}
+
+/**
+ * The bot's own faults, in a channel the owner is already in.
+ *
+ * WHY THIS EXISTS. Today a failed delete, a rate limit, an unusable log channel
+ * or an unexpected exception reaches `journalctl` on the box and stops there.
+ * The owner does not read journalctl — the standing rule is that there are no
+ * CLI interactions with this bot or its data — so in practice those faults
+ * reach nobody, and a bot that has quietly stopped moderating looks exactly
+ * like a quiet guild. This is the copy that lands where he can see it.
+ *
+ * IT IS NOT THE MODERATION RECORD. `announcer` and BLITZ_LOG_CHANNEL_ID carry
+ * what was removed and why, which is evidence about a member. This carries what
+ * BROKE, which is evidence about the bot. The two point at the same channel
+ * today and are still two different features; keeping them apart is why there
+ * are two functions here rather than one with a flag on it.
+ *
+ * WARNINGS AND ERRORS ONLY — `log()` never offers this an `info`, and the
+ * `Sink` type says so. A channel that also announced every start, every ready
+ * and every deleted message would be a running commentary, and the whole value
+ * of this one is that anything appearing in it needs a person.
+ *
+ * EVERY POST IS SERIALISED THROUGH ONE PROMISE CHAIN, and that is load-bearing
+ * rather than tidy. `log()` is synchronous and fires the sink off unawaited, so
+ * two faults a millisecond apart would otherwise be two concurrent posts, each
+ * reading `seen` before the other had written to it — and the coalescing below
+ * would post the same fault twice and then edit only one of them. The chain
+ * also means the bot makes at most one Discord request at a time for this,
+ * which is the cheapest possible answer to the rate limit.
+ *
+ * THE CHAIN MUST NEVER REJECT. A rejected promise skips every callback chained
+ * onto it, so one unhandled failure would silence the channel permanently —
+ * which is the exact failure this whole feature exists to stop happening
+ * silently. `deliver` handles its own faults and the `.catch` below is the
+ * structural guarantee that it did.
+ */
+export function statusReporter(client: Client, channelId: string): Sink {
+  const seen = new Map<string, Repeat>()
+
+  /**
+   * Faults raised before the gateway was ready, held until it is.
+   *
+   * WITHOUT THIS, THE FAULTS THAT MEAN "THE BOT IS NOT RUNNING" ARE THE ONLY
+   * ONES THAT NEVER POST. Everything below gates on `client.isReady()`, and
+   * that gate used to be a `return` — so `login failed`, a gateway close on a
+   * disallowed intent, a `client error` thrown while connecting, every fault
+   * that happens on the way up, wrote its journal line and posted nothing.
+   * Those are the most important things this bot can say and they were exactly
+   * the ones the channel could not carry. Measured, before the fix: one journal
+   * line, zero posts.
+   *
+   * THE GATE ITSELF STAYS, and it is not the bug. Before the gateway is up
+   * there is no channel to fetch, and a fetch attempted then fails for reasons
+   * that say nothing about the channel — which would latch it unusable for the
+   * life of the process over a race. What changes is what happens to the fault
+   * meanwhile: held, not dropped, and flushed by the same `clientReady` that
+   * makes posting possible.
+   *
+   * ONE CASE REMAINS IRREDUCIBLE AND IS NOT A BUG TO FIX HERE. A login that
+   * NEVER succeeds — a revoked token, an intent that is not ticked on in the
+   * developer portal — has no gateway, so there is no channel and no way to
+   * reach Discord at all; index.ts logs `login failed` and exits, and this
+   * buffer is discarded with the process. Nothing inside a Discord bot can
+   * report that over Discord. It is a systemd restart loop, and finding it is
+   * what `journalctl -u blitz-bot -p warning` and docs/deploy.md are for.
+   *
+   * THE FIRST FAULTS ARE THE ONES KEPT when the buffer is full. A start that is
+   * going wrong tends to produce one cause and then a run of consequences, and
+   * the cause is the line worth having. Dropping the newest is therefore the
+   * opposite choice from `remember` below, which evicts the oldest — there, the
+   * newest occurrence is the evidence that a fault is still happening.
+   */
+  const early: { level: Fault; msg: string; line: string }[] = []
+
+  let usable = true
+  let queued = 0
+  let tail: Promise<void> = Promise.resolve()
+
+  /**
+   * Stop, and say why exactly once.
+   *
+   * A WRONG ID, A DELETED CHANNEL OR A MISSING PERMISSION DOES NOT GET BETTER
+   * BY BEING RETRIED, and retrying it costs a journal line and a failed HTTP
+   * request per fault for as long as the process lives — worst when the bot is
+   * already in trouble and producing faults quickly. One line, then silence,
+   * and the fix is a variable and a restart either way.
+   *
+   * This goes through `log()` like everything else, and the async context in
+   * log.ts is what makes that safe: the line is written to the journal and is
+   * not handed back to the sink that is currently running.
+   */
+  function giveUp(reason: string, fields: Record<string, unknown> = {}): void {
+    usable = false
+    log('error', `status channel unusable, nothing more will be posted to it: ${reason}`, {
+      channel: channelId,
+      ...fields,
+    })
+  }
+
+  /**
+   * Write the current count onto the message that is already reporting a fault.
+   *
+   * NEVER THROWS, like everything else that runs on the chain.
+   *
+   * NOTHING IS SENT WHEN THE COUNT HAS NOT MOVED since the last edit, which is
+   * what makes a trailing flush free when the storm stopped on its own.
+   */
+  async function flush(entry: Repeat): Promise<void> {
+    if (!usable || entry.count === entry.written) return
+
+    // Read once and recorded BEFORE the await. Occurrences that arrive while
+    // this request is in flight must schedule their own flush rather than
+    // believing this one already carried them.
+    const count = entry.count
+    entry.written = count
+    entry.edited = Date.now()
+
+    try {
+      await entry.message.edit(statusBody(entry.line, count, entry.last))
+    } catch (error) {
+      // The message was deleted, or the edit lost a race with something.
+      // Forgetting the entry is what stops that repeating forever: the next
+      // occurrence posts a fresh message instead of editing a dead one. Only if
+      // the map still holds THIS entry — a trailing flush can land after the
+      // window closed and a fresh message took its place.
+      if (seen.get(entry.key) === entry) seen.delete(entry.key)
+      log('warn', 'could not update the status channel message', { error })
+    }
+  }
+
+  /**
+   * Arrange for the count to reach Discord, at most once every
+   * STATUS_EDIT_MS.
+   *
+   * THIS IS THE HALF OF FLOOD CONTROL THAT WAS MISSING. Coalescing collapsed
+   * the CHANNEL — five hundred occurrences of one fault produced one message —
+   * and left the API TRAFFIC exactly where it was: one PATCH per occurrence,
+   * measured at ~500 requests for those 500 faults. The rate limit is spent
+   * either way, and it is spent at the moment the bot is already in trouble and
+   * raising faults as fast as it can. Folding in memory and writing the running
+   * total on a timer collapses that to a handful of requests.
+   *
+   * THE FIRST REPEAT IS STILL PROMPT. `edited` starts at 0, so the edit that
+   * turns one message into "seen 2 times" goes out immediately and the visible
+   * behaviour of an occasional repeat is unchanged. It is only a burst — a
+   * second occurrence and then hundreds inside the same window — that waits.
+   *
+   * THERE IS ALWAYS A TRAILING FLUSH. Throttling on the leading edge alone
+   * would leave the last occurrences unwritten whenever a storm stopped, so the
+   * posted message would understate what happened; the timer is what makes the
+   * final edit carry the true total.
+   *
+   * `unref` SO A PENDING EDIT CANNOT HOLD THE PROCESS OPEN. A timer with
+   * nothing but a count in it is not a reason for `systemctl stop` to wait.
+   */
+  function schedule(entry: Repeat, now: number): Promise<void> | null {
+    const wait = STATUS_EDIT_MS - (now - entry.edited)
+
+    if (wait <= 0) {
+      // Already on the chain — the caller is `deliver`, which runs there — so
+      // this is serialised with every send like the edit it replaces.
+      return flush(entry)
+    }
+
+    if (entry.timer === null) {
+      entry.timer = setTimeout(() => {
+        entry.timer = null
+
+        // Back onto the chain rather than straight into an edit, so a trailing
+        // flush cannot overlap a send. Nothing awaits this: the occurrence that
+        // scheduled it was reported as delivered when its journal line was
+        // written, and `flush` handles its own faults.
+        tail = tail.then(() => flush(entry)).catch(() => {})
+      }, wait)
+
+      entry.timer.unref()
+    }
+
+    return null
+  }
+
+  /**
+   * Post one fault, or fold it into the message that already reported it.
+   *
+   * NEVER THROWS. See the chain above.
+   */
+  async function deliver(key: string, line: string): Promise<void> {
+    // Checked here as well as at the sink's own gate, because a queued fault
+    // can reach this after an earlier one latched the channel unusable — which
+    // is exactly what a flush of the startup buffer looks like against a
+    // misconfigured channel id.
+    if (!usable) return
+
+    const now = Date.now()
+    const previous = seen.get(key)
+
+    if (previous !== undefined && now - previous.posted < STATUS_WINDOW_MS) {
+      previous.count += 1
+      previous.last = now
+
+      // Re-inserted so that a fault which is still repeating is not the one the
+      // bound in `remember` evicts. A `Map` iterates in insertion order, so a
+      // delete and a set are the whole of "least recently seen goes first".
+      seen.delete(key)
+      seen.set(key, previous)
+
+      await schedule(previous, now)
+      return
+    }
+
+    try {
+      const channel = await client.channels.fetch(channelId)
+
+      if (channel === null || !channel.isSendable()) {
+        giveUp('the id names no channel this bot can send in')
+        return
+      }
+
+      const message = await channel.send({
+        content: statusBody(line, 1, now),
+        // The same suppression `announcer` states at its own send, for the same
+        // reason and one more: a rendered line can carry an id a stranger put
+        // in an invite code, and nothing this bot posts may notify anybody.
+        allowedMentions: { parse: [] },
+      })
+
+      remember(key, {
+        key,
+        message,
+        line,
+        posted: now,
+        last: now,
+        count: 1,
+        written: 1,
+        // Zero rather than `now`, so the first repeat is written immediately
+        // and only a burst is made to wait. See `schedule`.
+        edited: 0,
+        timer: null,
+      })
+    } catch (error) {
+      if (permanentlyUnusable(error)) {
+        giveUp('the bot cannot post there', { error })
+        return
+      }
+
+      // Rate limited, a 500, a network that went away. All transient, all worth
+      // one journal line and another attempt on the next fault.
+      log('warn', 'could not post to the status channel', { error })
+    }
+  }
+
+  /**
+   * Remember a posted fault, and forget the oldest when there are too many.
+   *
+   * BOUNDED, BECAUSE THIS PROCESS RUNS FOR MONTHS. The map is keyed on fault
+   * text, which is small and fixed in a healthy bot and neither of those in a
+   * broken one — an id reaching a `msg` string would make every occurrence a
+   * new key. An unbounded map here is a leak that shows up only in production
+   * and only after weeks, and it holds a discord.js `Message` per entry, so it
+   * is not a leak of one string apiece.
+   *
+   * EVICTION COSTS ONLY THE COALESCING. An evicted fault that happens again
+   * posts a new message instead of editing the old one, which is what happens
+   * after the window closes anyway.
+   */
+  function remember(key: string, entry: Repeat): void {
+    // Deleted first, because `set` on a key that is already there keeps its
+    // ORIGINAL position in the iteration order — which would leave a fault that
+    // just re-posted looking like the least recently seen one.
+    seen.delete(key)
+    seen.set(key, entry)
+
+    while (seen.size > STATUS_MEMORY) {
+      const oldest = seen.keys().next().value
+      if (oldest === undefined) break
+      seen.delete(oldest)
+    }
+  }
+
+  /** Put one fault on the chain, or drop it because too much is already there. */
+  function enqueue(level: Fault, msg: string, line: string): Promise<void> {
+    /**
+     * A BOUND ON WHAT IS WAITING, not only on what is remembered. Coalescing
+     * happens at the front of the queue, so a burst of DISTINCT faults still
+     * queues one entry each — and a Discord that is answering slowly is exactly
+     * when a burst arrives. What is dropped here is the channel copy of a fault
+     * whose journal line was already written.
+     */
+    if (queued >= STATUS_BACKLOG) return Promise.resolve()
+
+    queued += 1
+
+    tail = tail
+      .then(() => deliver(`${level} ${msg}`, redact(line)))
+      .catch(() => {
+        // Unreachable while `deliver` keeps its promise not to throw, and kept
+        // anyway: this is what stops one bad post from poisoning the chain and
+        // silencing every fault after it.
+      })
+      .finally(() => {
+        queued -= 1
+      })
+
+    return tail
+  }
+
+  /**
+   * The gateway came up, so everything held on the way up can now be said.
+   *
+   * `once`, AND REGISTERED HERE RATHER THAN IN index.ts, because the buffer is
+   * this closure's and nothing outside it can flush it. index.ts builds the
+   * sink before `client.login()`, so this listener is always in place before
+   * there is any gateway to become ready.
+   *
+   * ORDERING IS NOT LOAD-BEARING FOR THIS ONE. createClient's own
+   * `clientReady` listener runs first and may emit the halt line — that fault
+   * finds `isReady()` already true and posts directly, without ever reaching
+   * the buffer.
+   *
+   * NOTHING AWAITS THE FLUSH. `log()` fires this sink unawaited and there is no
+   * caller here at all; `enqueue` returns a promise that cannot reject, so
+   * discarding it is not an unhandled rejection.
+   */
+  client.once(Events.ClientReady, () => {
+    for (const fault of early.splice(0, early.length)) {
+      void enqueue(fault.level, fault.msg, fault.line)
+    }
+  })
+
+  return (level, msg, line) => {
+    if (!usable) return Promise.resolve()
+
+    /**
+     * NOTHING POSTS DURING STARTUP, AND THIS IS STILL THE WHOLE MECHANISM.
+     * index.ts installs the sink before it logs in, so the gate is the client's
+     * own readiness rather than an ordering between two listeners: before the
+     * gateway is up there is no channel to fetch, and a fetch that failed then
+     * would latch the channel unusable for the rest of the process over
+     * nothing.
+     *
+     * WHAT IS GATED IS THE POST, NOT THE FAULT. A clean start emits no warning
+     * and no error, so a normal restart still says nothing; a start that goes
+     * wrong and then connects has its faults posted the moment there is
+     * somewhere to post them. See `early` above for why that is the whole point
+     * of this feature and for the one case it cannot cover.
+     */
+    if (!client.isReady()) {
+      if (early.length < STATUS_EARLY) early.push({ level, msg, line })
+      return Promise.resolve()
+    }
+
+    return enqueue(level, msg, line)
+  }
+}
+
+/**
+ * One fault that has already been posted, and the message reporting it.
+ *
+ * `line` IS THE FIRST OCCURRENCE'S, kept so that an edit can rebuild the whole
+ * body from it. Later occurrences differ only in their fields and their
+ * timestamp — that is what made them the same fault — and rewriting the body
+ * with the newest one would quietly change which channel or author the entry
+ * names while the count says it happened forty times.
+ */
+interface Repeat {
+  /**
+   * The key this entry is filed under in `seen`, carried on the entry so that a
+   * flush arriving late can tell whether the map still holds IT rather than a
+   * fresh message posted after the window closed.
+   */
+  readonly key: string
+
+  /**
+   * Structural rather than discord.js's `Message`, for the reason every other
+   * boundary in this file is: a test can write this down in one line, and the
+   * only thing needed from a `Message` here is the ability to edit it.
+   */
+  readonly message: { edit: (content: string) => Promise<unknown> }
+  readonly line: string
+  readonly posted: number
+
+  /** When the most recent occurrence arrived — the `last` in the posted body. */
+  last: number
+
+  /** How many times this fault has happened inside the window. */
+  count: number
+
+  /**
+   * The count as of the last edit that was actually SENT, which is what makes
+   * "nothing changed since the last one" a request that does not have to be
+   * made at all.
+   */
+  written: number
+
+  /** When that edit went out, or 0 while none has. See `schedule`. */
+  edited: number
+
+  /** The trailing flush, while one is waiting. See `schedule`. */
+  timer: ReturnType<typeof setTimeout> | null
+}
+
+/**
+ * How long identical faults fold into one message.
+ *
+ * MEASURED FROM THE FIRST POST, NOT THE LAST. A fault that repeats forever
+ * therefore produces a fresh message every five minutes rather than one message
+ * quietly edited for a week — which is the difference between a channel that
+ * resurfaces an ongoing problem and one that looks idle while the bot is on
+ * fire. Inside the window it is one message and a count, which is the half that
+ * keeps sixty failures a minute from burying everything else in the channel.
+ */
+const STATUS_WINDOW_MS = 5 * 60 * 1000
+
+/**
+ * The shortest gap between two edits of the same message.
+ *
+ * THIS IS A REQUEST BUDGET, NOT A DISPLAY DECISION. Discord's own limit on
+ * editing a message is a handful of requests every few seconds, and the folding
+ * above used to spend one PATCH per occurrence — so a fault repeating sixty
+ * times a minute burned the whole allowance to keep a number on one message
+ * up to date. Ten seconds bounds that to at most thirty edits inside a
+ * five-minute window however hard the bot is failing, and a number that is at
+ * most ten seconds stale is not a number anybody is reading that closely.
+ */
+const STATUS_EDIT_MS = 10_000
+
+/** How many distinct faults can be folding at once. See `remember`. */
+const STATUS_MEMORY = 50
+
+/** How many posts may be waiting on the chain. See the sink's own comment. */
+const STATUS_BACKLOG = 20
+
+/**
+ * How many faults raised before the gateway is ready are held for it.
+ *
+ * SMALL ON PURPOSE. This holds what happened during one connect, and a start
+ * that produces more than twenty distinct faults before it reaches `ready` has
+ * said everything it needs to in the first few. See `early`.
+ */
+const STATUS_EARLY = 20
+
+/**
+ * How much of a rendered line survives into the channel.
+ *
+ * DISCORD REFUSES A MESSAGE OVER 2000 CHARACTERS OUTRIGHT, and a rejected send
+ * is a fault that never gets reported at all. The rest of the budget is the
+ * code fence and the repeat count.
+ */
+const STATUS_LINE_CAP = 1800
+
+/**
+ * The posted message: the journal line, and how many times it has happened.
+ *
+ * INSIDE A CODE FENCE, AND THAT IS A NEUTRALISER RATHER THAN STYLING. The line
+ * carries values written by strangers — an invite code, a webhook's name
+ * reflected back out of an error — and inside a fence Discord renders every one
+ * of `*` `_` `~~` `|| ||` `@everyone` `<@id>` literally, links nothing and
+ * pings nobody. It is also exactly what `journalctl` shows, so a line pasted
+ * out of the channel into an issue is the string an operator would have
+ * grepped.
+ *
+ * THE COUNT SITS OUTSIDE THE FENCE and is absent altogether on the first post,
+ * because `seen 1 times` on something that has happened once is noise on every
+ * line in the channel to make the fortieth one cheaper to write.
+ */
+function statusBody(line: string, count: number, last: number): string {
+  const quoted = ['```', line, '```'].join('\n')
+  if (count === 1) return quoted
+
+  return `${quoted}\nseen ${count} times, last ${new Date(last).toISOString()}`
+}
+
+/**
+ * What is allowed to leave the process.
+ *
+ * THE TOKEN MUST NEVER REACH THE CHANNEL. #bot-status is admin-only in this
+ * guild, which is one permission overwrite away from not being, and a bot token
+ * in a message is a full takeover of an application whose credentials are
+ * shared with the Ringmaster console. Nothing in src/ logs the token today —
+ * that was checked call site by call site — but this sink is a general hook on
+ * every warning and error the bot will ever emit, including the ones nobody has
+ * written yet, so the guarantee is made here where it holds for all of them.
+ *
+ * URLS GO FIRST AND GO WHOLE. An error object is the realistic carrier: undici
+ * and discord.js put a request URL in the message of some failures, and a
+ * Discord WEBHOOK url carries its own token as the last path segment — posting
+ * one hands anybody reading the channel the ability to speak as that webhook.
+ * No URL this bot could log is worth more than the ids already in the fields
+ * beside it.
+ *
+ * THEN ANYTHING SHAPED LIKE A TOKEN. A Discord token is three base64url runs
+ * separated by dots and is recognisable without knowing the value, which
+ * matters: the value is not available here, and passing it in would mean
+ * handing the token to the one function whose job is making sure it never
+ * leaves.
+ *
+ * MESSAGE CONTENT IS NOT SCRUBBED HERE BECAUSE IT NEVER ARRIVES. A removal
+ * names the author, the channel and the invite codes and never what was said —
+ * see `removedLine` — and no `log()` call in the bot passes message text. That
+ * is a property of the call sites rather than of this function, and it is the
+ * one item on this list that a reviewer of a new log line has to check by hand.
+ *
+ * BACKTICKS ARE REMOVED, because three of them close the fence in `statusBody`.
+ * Values are JSON-quoted by `render`, so a backtick inside one is literal text
+ * and cannot arrive from an escape sequence; it can still arrive from a
+ * webhook's name.
+ */
+function redact(line: string): string {
+  const scrubbed = line
+    .replace(/https?:\/\/\S+/giu, '[url]')
+    .replace(/[\w-]{20,}\.[\w-]{6,}\.[\w-]{25,}/gu, '[redacted]')
+    .replace(/`/gu, '')
+
+  // Cut by code point: a UTF-16 slice can land inside a surrogate pair and
+  // leave half a character in the post.
+  const points = [...scrubbed]
+  return points.length > STATUS_LINE_CAP
+    ? `${points.slice(0, STATUS_LINE_CAP).join('')}…`
+    : scrubbed
+}
+
+/**
+ * Whether a failed post means the channel will never work again.
+ *
+ * THE DISTINCTION IS "FIX THE CONFIG" AGAINST "TRY AGAIN LATER". A rate limit,
+ * a 500 or a dropped connection is the second, and latching on one of those
+ * would turn a bad ten seconds into a bot that reports nothing until the next
+ * restart. These three are the first: the id is wrong, the channel is gone, or
+ * the bot was never given permission to speak there.
+ */
+function permanentlyUnusable(error: unknown): boolean {
+  if (!(error instanceof DiscordAPIError)) return false
+
+  return (
+    error.code === RESTJSONErrorCodes.UnknownChannel ||
+    error.code === RESTJSONErrorCodes.MissingAccess ||
+    error.code === RESTJSONErrorCodes.MissingPermissions
+  )
+}
+
+/**
+ * WHICH COMMIT THIS PROCESS IS RUNNING, SAID ONCE, WHEN IT CHANGES.
+ *
+ * THE OWNER ASKED FOR THIS ABOUT UPDATES — "when an update is installed I
+ * expect a message in the log channel telling us which commit it's running
+ * now". An update restarts the bot, so the bot reporting its own commit at
+ * startup IS that message, and it is the better half of the pair: an updater
+ * can only say what it INSTALLED, and a tree that was installed and a process
+ * that came up on it are different facts. What this posts is the second one.
+ *
+ * THE STATUS CHANNEL, NOT THE LOG CHANNEL, and the wording of the request is
+ * not the reason to put it in BLITZ_LOG_CHANNEL_ID. That channel carries the
+ * moderation record — what was removed and why, which is evidence about a
+ * member. A deploy notice is evidence about the BOT, which is what
+ * BLITZ_STATUS_CHANNEL_ID and `statusReporter` are for. The owner said "log
+ * channel" because it is the only channel he has configured today; the two are
+ * separate features and keeping them apart is the same argument `announcer` and
+ * `statusReporter` already make.
+ *
+ * IT POSTS ONLY WHEN THE COMMIT CHANGED, AND THAT IS THE WHOLE DIFFICULTY.
+ * `Restart=always` means this process starts again five seconds after every
+ * crash. A channel that says "running abc1234" on each of those is unsolicited
+ * noise — the owner has a standing rule against exactly that — and it is noise
+ * that arrives in a burst on top of the faults explaining the crash, which is
+ * the one moment the channel has to be readable. So the sha on disk is compared
+ * against the last one this bot REPORTED, and a restart on the same commit says
+ * nothing at all.
+ *
+ * A MISSING FILE IS NOT A FAULT AND POSTS NOTHING. A hand-cloned box, a first
+ * start before any update has ever run, someone running the bot from a checkout
+ * on a laptop: in all three there is no deployed-commit file, and the correct
+ * behaviour is silence rather than a warning about a feature nobody set up.
+ */
+
+/** A short git sha, as `git rev-parse --short` writes one. */
+const SHORT_SHA = /^[0-9a-f]{7,40}$/u
+
+/**
+ * Where the updater records what it installed.
+ *
+ * DERIVED FROM THIS FILE'S OWN LOCATION, NOT TYPED OUT. This module is
+ * <repo>/src/client.ts wherever the repo happens to be, so the parent of its
+ * directory is the repo root — /opt/blitz-bot on the box, and somebody's
+ * checkout when the bot is run by hand. A literal /opt/blitz-bot would make a
+ * hand-run bot read the deployed box's file and report a commit it is not
+ * running.
+ */
+export function deployedCommitPath(): string {
+  return join(import.meta.dirname, '..', '.deployed-commit')
+}
+
+/**
+ * Where the bot remembers the last commit it announced.
+ *
+ * DELIBERATELY NOT IN THE REPO, AND THAT IS THE LOAD-BEARING PART. The updater
+ * owns /opt/blitz-bot: it runs `git reset --hard origin/main` in it and writes
+ * the deployed-commit file into it. Anything this bot remembers under that
+ * directory is a file the updater can overwrite or discard, and then the notice
+ * either repeats on every restart or never fires again — the two failures this
+ * whole comparison exists to avoid.
+ *
+ * /var/lib/blitz-bot IS THE UNIT'S `StateDirectory=`. systemd creates it, owns
+ * it to the service user and keeps it writable while `ProtectSystem=strict`
+ * puts the rest of the filesystem back to read-only — which is what it is now
+ * that updating no longer happens inside the bot's own start. It is the only
+ * path this process can write, and it survives a restart and a reboot.
+ *
+ * systemd's OWN ANSWER FIRST. `StateDirectory=` exports `STATE_DIRECTORY`
+ * (colon-separated when a unit names more than one), so the unit file and this
+ * function cannot drift apart about where the directory is. The literal is the
+ * fallback for a bot started by hand, where the write will usually fail — which
+ * is a fault, handled as one, and never a reason not to start.
+ */
+export function reportedCommitPath(): string {
+  const [first] = (process.env.STATE_DIRECTORY ?? '').split(':')
+  const state = first === undefined || first === '' ? '/var/lib/blitz-bot' : first
+
+  return join(state, 'reported-commit')
+}
+
+/**
+ * The two files, behind three functions.
+ *
+ * STRUCTURAL FOR THE REASON EVERY OTHER BOUNDARY IN THIS FILE IS: the rules
+ * about what posts and what stays quiet are the difficult part, and they are
+ * worth exercising against a missing file, an unreadable one and a malformed
+ * one without a test having to arrange any of those on a real disk.
+ */
+export interface CommitFiles {
+  /** The commit the updater last installed. Rejects when there is no file. */
+  readonly deployed: () => Promise<string>
+
+  /** The commit this bot last reported. Rejects when it has never reported one. */
+  readonly reported: () => Promise<string>
+
+  /** Record a commit as reported, so the next start knows not to repeat it. */
+  readonly remember: (sha: string) => Promise<void>
+}
+
+export function commitFiles(
+  deployedPath: string = deployedCommitPath(),
+  reportedPath: string = reportedCommitPath(),
+): CommitFiles {
+  return {
+    deployed: () => readFile(deployedPath, 'utf8'),
+    reported: () => readFile(reportedPath, 'utf8'),
+
+    // A trailing newline, so the file is one an operator can `cat` without it
+    // running into the next prompt, and so it is the same shape as the file the
+    // updater writes.
+    remember: (sha) => writeFile(reportedPath, `${sha}\n`, 'utf8'),
+  }
+}
+
+/**
+ * Post the commit, if there is one to post and it is not the one already said.
+ *
+ * THE POST HAPPENS BEFORE THE REMEMBERING, and the order is a decision. The
+ * file means "this commit was reported", so writing it first and then failing
+ * to post would make it a lie and lose the notice permanently — the next start
+ * would compare equal and stay quiet. This way a failed post is retried by the
+ * next start, which is the only start that could have noticed.
+ */
+export async function reportDeployedCommit(
+  files: CommitFiles,
+  post: (content: string) => Promise<void>,
+): Promise<void> {
+  const deployed = await readSha(files.deployed, 'the commit the updater recorded')
+  if (deployed === null) return
+
+  const reported = await readSha(files.reported, 'the commit last reported')
+  if (reported === deployed) return
+
+  await post(`running commit ${deployed}`)
+
+  try {
+    await files.remember(deployed)
+  } catch (error) {
+    // Worth a fault line: it is not visible from Discord, and its consequence
+    // is that this notice comes back on every single restart — the exact noise
+    // the comparison exists to prevent.
+    log('warn', 'could not record the reported commit, the notice will repeat on every start', {
+      error,
+    })
+  }
+}
+
+/**
+ * One sha out of one file, or null and a reason.
+ *
+ * THE THREE ANSWERS ARE DELIBERATELY DIFFERENT. A file that is not there is the
+ * ordinary state of a box nobody has deployed to and gets no line at all. A
+ * file that cannot be READ, or that holds something which is not a commit id,
+ * means the updater is broken — the bot cannot fix that and must not post a
+ * deploy notice about it, but the journal says so, and through the sink so does
+ * the status channel.
+ *
+ * THE CONTENT IS NEVER LOGGED, ONLY ITS LENGTH. Whatever sits in a file this
+ * process did not write is not a thing to copy into a channel.
+ */
+async function readSha(read: () => Promise<string>, what: string): Promise<string | null> {
+  let raw: string
+
+  try {
+    raw = await read()
+  } catch (error) {
+    if (error instanceof Error && (error as NodeJS.ErrnoException).code === 'ENOENT') return null
+
+    log('warn', `could not read ${what}`, { error })
+    return null
+  }
+
+  const sha = raw.trim()
+  if (SHORT_SHA.test(sha)) return sha
+
+  log('warn', `${what} is not a commit id`, { length: sha.length })
+  return null
+}
+
+/**
+ * Sending one line to the status channel.
+ *
+ * A THROW RATHER THAN A LOGGED RETURN when the channel cannot be posted to, so
+ * that `reportDeployedCommit` does not record a notice as delivered when
+ * nothing was sent. `statusReporter` makes the opposite choice for the same
+ * condition because it has somewhere to latch and a whole process's worth of
+ * later faults to protect; this runs exactly once.
+ *
+ * THE SAME MENTION SUPPRESSION `announcer` STATES AT ITS OWN SEND. The content
+ * here is a hex sha and cannot carry a mention, and the guarantee is still made
+ * at the call rather than left to the client-wide default, because that default
+ * is silently replaced by any send that passes an `allowedMentions` of its own
+ * and a reader of this function cannot see it.
+ */
+export function statusPoster(
+  client: Client,
+  channelId: string,
+): (content: string) => Promise<void> {
+  return async (content) => {
+    const channel = await client.channels.fetch(channelId)
+
+    if (channel === null || !channel.isSendable()) {
+      throw new Error('the status channel id names no channel this bot can send in')
+    }
+
+    await channel.send({ content, allowedMentions: { parse: [] } })
+  }
+}
+
+/**
+ * Wire the notice to the gateway coming up.
+ *
+ * `clientReady` IS THE EARLIEST POINT THERE IS A CHANNEL TO POST TO, and it is
+ * also the one event that says this process really did start on that commit
+ * rather than merely being handed it.
+ *
+ * `once`, BECAUSE A RECONNECT IS NOT A DEPLOY. discord.js does not re-emit it
+ * on a resumed session, and if a later version did, the sha comparison would
+ * keep it quiet anyway — this is belt and braces on a rule that already holds.
+ */
+export function announceDeployedCommit(
+  client: Client,
+  channelId: string,
+  files: CommitFiles = commitFiles(),
+): void {
+  client.once(Events.ClientReady, () => {
+    void reportDeployedCommit(files, statusPoster(client, channelId)).catch((error: unknown) => {
+      // Including a channel that cannot be posted to. One line, and the bot
+      // carries on moderating: a deploy notice that did not land is not a
+      // reason to be down.
+      log('warn', 'could not report the commit this bot is running', { error })
+    })
+  })
 }

@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { DiscordAPIError, DiscordjsError, RESTJSONErrorCodes } from 'discord.js'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { log, type Level } from './log.ts'
+import { log, setSink, type Level, type Sink } from './log.ts'
 
 /**
  * The log line, as journald and as a person read it.
@@ -43,6 +43,11 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+
+  // The sink is module state in log.ts, so a case that installs one and does
+  // not take it away leaves every later case in this file — and in whichever
+  // file vitest reuses this worker for — logging into it.
+  setSink(null)
 })
 
 /**
@@ -632,6 +637,256 @@ function journalRecord(level: Level, message: string, fields?: Record<string, un
   const line = emit(level, message, fields)
   return line.slice(line.indexOf('level=')).trimEnd()
 }
+
+/**
+ * The sink: a second copy of every fault, for somebody who is not on the box.
+ *
+ * THE PROPERTY THESE PROTECT IS THAT THE JOURNAL DOES NOT DEPEND ON DISCORD.
+ * `log()` is synchronous, is called from error handlers and `finally` blocks,
+ * and now also hands warnings and errors to something that makes a network
+ * request. Every case below is one of the ways that arrangement takes a live
+ * bot down: a sink that logs, a sink that rejects, a sink that throws where the
+ * caller cannot catch it. The line in the journal has to survive all three.
+ *
+ * NOTHING HERE POSTS ANYTHING. The sink is a function; what the real one does
+ * with Discord is `statusReporter`, in client.test.ts.
+ */
+
+/** What a sink was handed, in order. */
+interface Handed {
+  level: string
+  msg: string
+  line: string
+}
+
+function recorder(): { sink: Sink; calls: Handed[] } {
+  const calls: Handed[] = []
+
+  return {
+    calls,
+    sink: (level, msg, line) => {
+      calls.push({ level, msg, line })
+      return Promise.resolve()
+    },
+  }
+}
+
+/**
+ * The one call a case expects, or a loud failure.
+ *
+ * `noUncheckedIndexedAccess` again: `calls[0]` is possibly undefined, and
+ * "the sink was never called" is a better failure than a property read on
+ * undefined three lines further down.
+ */
+function only(calls: Handed[]): Handed {
+  if (calls.length !== 1) throw new Error(`expected one sink call, got ${calls.length}`)
+  const first = calls[0]
+  if (first === undefined) throw new Error('expected one sink call, got a hole')
+  return first
+}
+
+/**
+ * Let everything that was going to happen, happen.
+ *
+ * A MACROTASK RATHER THAN `await Promise.resolve()`. Node reports an unhandled
+ * rejection after the microtask queue drains, so a case that asserts one did
+ * NOT happen has to get past that point before the assertion means anything.
+ */
+const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
+
+describe('the sink — which lines are copied, and what the copy is', () => {
+  it('hands a warning over', () => {
+    const { sink, calls } = recorder()
+    setSink(sink)
+
+    log('warn', 'gateway disconnected', { shard: 0, code: 4014 })
+
+    expect(only(calls).level).toBe('warn')
+    expect(only(calls).msg).toBe('gateway disconnected')
+  })
+
+  it('hands an error over', () => {
+    const { sink, calls } = recorder()
+    setSink(sink)
+
+    log('error', 'delete failed, message left standing')
+
+    expect(only(calls).level).toBe('error')
+    expect(only(calls).msg).toBe('delete failed, message left standing')
+  })
+
+  /**
+   * THE ONE THAT DECIDES WHETHER THE CHANNEL IS WORTH READING. `ready`, and a
+   * line per deleted message, are info — and a status channel carrying those is
+   * a running commentary that an admin learns to scroll past, which is the same
+   * as not having it.
+   */
+  it('never hands over an info', () => {
+    const { sink, calls } = recorder()
+    setSink(sink)
+
+    log('info', 'ready', { guild: 'Blitz Royale' })
+
+    expect(calls).toEqual([])
+    expect(stdout).toHaveLength(1)
+  })
+
+  /**
+   * THE COPY IS THE JOURNAL LINE, WITHOUT THE PRIORITY PREFIX. journald eats
+   * `<4>`; anywhere else it is four characters of noise at the front of every
+   * line. The rest is identical on purpose, so a line pasted out of Discord is
+   * the string an operator would have grepped for.
+   */
+  it('gives the sink the journal line, minus the prefix journald eats', () => {
+    const { sink, calls } = recorder()
+    setSink(sink)
+
+    log('warn', 'invite lookup failed', { code: 'abc123' })
+
+    const journal = written(stderr)
+    expect(only(calls).line).toBe(journal.slice('<4>'.length, -1))
+    expect(only(calls).line).not.toContain('\n')
+    expect(only(calls).line).toContain('msg="invite lookup failed"')
+  })
+
+  it('writes the journal line first, and writes it whether or not a sink is there', () => {
+    setSink(() => {
+      // The line is already on stderr by the time the sink can look. The
+      // journal is the floor: nothing here is allowed to decide whether it was
+      // written.
+      expect(stderr).toHaveLength(1)
+      return Promise.resolve()
+    })
+
+    log('error', 'client error')
+
+    expect(written(stderr)).toContain('msg="client error"')
+  })
+
+  it('stops handing anything over once the sink is removed', () => {
+    const { sink, calls } = recorder()
+    setSink(sink)
+    log('error', 'first')
+
+    setSink(null)
+    log('error', 'second')
+
+    expect(calls.map((call) => call.msg)).toEqual(['first'])
+    expect(stderr).toHaveLength(2)
+  })
+})
+
+/**
+ * The fault loop, which is the one that takes the bot down.
+ *
+ * THE SHAPE OF IT: the sink posts to Discord, the post fails, the failed post is
+ * itself a fault, the fault is logged, the log calls the sink. Nothing about
+ * that is exotic — it is what happens the first time the channel's permissions
+ * are wrong — and it recurses until the process dies, at the exact moment the
+ * bot was trying to say something was wrong.
+ *
+ * BOTH TIMINGS ARE TESTED SEPARATELY AND ON PURPOSE. A boolean flag raised
+ * around the call and dropped after it passes the first of these two and fails
+ * the second, because the sink is async and its own failure is handled several
+ * ticks later. The second case is the one that says the guard follows the
+ * awaits.
+ */
+describe('the sink — a failure inside the reporting cannot become a loop', () => {
+  it('does not re-enter the sink when the sink logs while it is running', async () => {
+    const seen: string[] = []
+
+    setSink((_level, msg) => {
+      seen.push(msg)
+      log('error', 'could not post to the status channel')
+      return Promise.reject(new Error('send failed'))
+    })
+
+    log('error', 'delete failed, message left standing')
+    await settle()
+
+    expect(seen).toEqual(['delete failed, message left standing'])
+  })
+
+  it('does not re-enter the sink when the sink logs several ticks later', async () => {
+    const seen: string[] = []
+
+    setSink(async (_level, msg) => {
+      seen.push(msg)
+      await Promise.resolve()
+      await Promise.resolve()
+      log('error', 'could not post to the status channel')
+      throw new Error('send failed')
+    })
+
+    log('error', 'delete failed, message left standing')
+    await settle()
+
+    expect(seen).toEqual(['delete failed, message left standing'])
+  })
+
+  /**
+   * THE SUPPRESSION IS OF THE COPY, NOT OF THE FAULT. `statusReporter` reports
+   * its own failures through `log()` and depends on this: the reason the
+   * channel went quiet has to be somewhere, and the journal is where.
+   */
+  it('still writes the journal line for a log call made from inside the sink', async () => {
+    setSink(() => {
+      log('error', 'status channel unusable, nothing more will be posted to it')
+      return Promise.resolve()
+    })
+
+    log('warn', 'gateway disconnected')
+    await settle()
+
+    expect(stderr).toHaveLength(2)
+    expect(stderr.join('')).toContain('msg="gateway disconnected"')
+    expect(stderr.join('')).toContain('msg="status channel unusable')
+  })
+
+  /**
+   * `log()` IS SYNCHRONOUS AND HAS NO CALLER THAT COULD AWAIT IT, so a sink
+   * that rejects is an unhandled rejection — which index.ts logs, which is a
+   * fault, which reaches the sink, which is the loop again by a longer route.
+   * Since Node 15 the default for one nobody handles is to kill the process.
+   */
+  it('does not let a rejecting sink become an unhandled rejection', async () => {
+    const rejections: unknown[] = []
+    const listener = (reason: unknown): void => {
+      rejections.push(reason)
+    }
+
+    process.on('unhandledRejection', listener)
+
+    try {
+      setSink(() => Promise.reject(new Error('discord is down')))
+      log('error', 'delete failed, message left standing')
+      await settle()
+    } finally {
+      process.off('unhandledRejection', listener)
+    }
+
+    expect(rejections).toEqual([])
+    expect(written(stderr)).toContain('msg="delete failed, message left standing"')
+  })
+
+  /**
+   * A sink is allowed to be written badly. It is not allowed to make `log()`
+   * throw: half the call sites in the bot are inside a `catch`, and an
+   * exception raised from one of those is thrown away from the thing that had
+   * already gone wrong.
+   */
+  it('does not let a sink that throws synchronously reach the caller', () => {
+    setSink(() => {
+      throw new Error('sink is broken')
+    })
+
+    expect(() => {
+      log('error', 'login failed')
+    }).not.toThrow()
+
+    expect(written(stderr)).toContain('msg="login failed"')
+  })
+})
 
 describe('.github/workflows/ci.yml — the first push must not fail on a mode bit', () => {
   const workflow = repoFile('.github/workflows/ci.yml')
@@ -1231,44 +1486,152 @@ describe('docs/deploy.md — the steps that cannot be left out', () => {
   })
 
   /**
-   * THE BLOCKER, AND IT WAS INVISIBLE BECAUSE IT WOULD NOT HAVE FAILED. §1
-   * installs git, curl, ca-certificates and xz-utils and never names npm; §2
-   * keeps `/opt/node24/bin` off `PATH` on purpose. So a bare `npm ci` in §3 or
-   * §16 does not error — it resolves to the CONSOLE'S npm, running on
-   * `/usr/bin/node` v22.23.2, which is the one runtime the first page of this
-   * document promises the bot never touches. It would have installed something,
-   * and the operator would have had no reason to look.
+   * THE BLOCKER, AND IT WAS INVISIBLE BECAUSE IT DID NOT FAIL. §1 installs git,
+   * curl, ca-certificates and xz-utils and never names npm; §2 keeps
+   * `/opt/node24/bin` off `PATH` on purpose. So a bare `npm ci` in §3 or §16
+   * does not error — it resolves to the CONSOLE'S npm, on `/usr/bin/node`
+   * v22.23.2, the one runtime the first page of this document promises the bot
+   * never touches. It installs something, and nobody has a reason to look.
    *
-   * COMMENT LINES ARE SKIPPED, and one of them is load-bearing: the unit heredoc
-   * in §6 explains why `ExecStart` is node and not `npm start`. That is prose
-   * which happens to live inside a fenced block, not a command anyone runs.
+   * AND AN ABSOLUTE PATH TO `npm` DOES NOT FIX THAT, WHICH IS THE CLAIM THIS
+   * TEST REPLACES. The version of this file that came before it asserted
+   * `/opt/node24/bin/npm ci` was present and called the absolute path the
+   * load-bearing part. The owner disproved it on the box:
+   *
+   *     head -1 $(readlink -f /opt/node24/bin/npm)  ->  #!/usr/bin/env node
+   *     /opt/node24/bin/npm exec -- node -v         ->  v22.23.2
+   *
+   * `bin/npm` is a symlink to `npm-cli.js`, a SCRIPT, and a script is run by
+   * whatever its shebang resolves to. `#!/usr/bin/env node` searches `PATH`,
+   * and `PATH` has no `/opt/node24/bin` on it. Where the script sits changes
+   * nothing at all. Every install this runbook has ever produced ran on Node 22.
+   *
+   * SO THE RULE IS ABOUT THE BINARY, AND THE TEST IS TOO: every npm in the
+   * document must be npm's CLI script handed to `/opt/node24/bin/node`, which
+   * is an ELF executable nothing resolves through `PATH`. A bare `npm`, a
+   * `/opt/node24/bin/npm`, a `node_modules/.bin/npm` — anything added later
+   * that a shell would run through a shebang — fails on the first assertion,
+   * because the only token this accepts is the one absolute `npm-cli.js` path.
+   *
+   * COMMENT LINES ARE SKIPPED, and that is not a loophole: the retraction has
+   * to be able to name the wrong form in order to withdraw it, and it does so
+   * in the script's comments and in the prose the last assertions here pin.
    */
-  it('never invokes the console npm for the bot', () => {
-    const bash = captureAll(deployDoc, /^```bash\n([\s\S]*?)^```/gm, 'a bash block in deploy.md')
+  it('runs every npm through the node binary, never through a shebang', () => {
+    // The runtime, taken from the unit that has to be right about it rather
+    // than typed out a second time here.
+    const node = capture(
+      deployDoc,
+      /^ExecStart=(\S+) --disable-warning/m,
+      "the bot unit's node binary",
+    )
+    const prefix = capture(node, /^(.*)\/bin\/node$/, "the node install's prefix")
 
-    for (const line of bash.flatMap((block) => block.split('\n'))) {
-      if (/^\s*#/.test(line)) continue
-      expect(line, line).not.toMatch(/(^|[^\w/])npm\b/)
-    }
-
-    // Both places that install dependencies: the first deploy, and every one
-    // after it.
-    const code = section(deployDoc, /^## \d+\. The code/m)
-
-    expect(code).toContain('/opt/node24/bin/npm ci')
-    expect(section(deployDoc, /^## \d+\. Deploying an update/m)).toContain('/opt/node24/bin/npm ci')
+    // The layout of the official linux-x64 tarball §2 unpacks with
+    // --strip-components=1: bin/npm is a relative symlink to this path, which
+    // is also what `readlink -f` printed on the box.
+    const cli = `${prefix}/lib/node_modules/npm/bin/npm-cli.js`
 
     /**
-     * And why it is an absolute path rather than a `PATH` entry, which is the
-     * fix somebody will reach for first: a `PATH` entry would change which
-     * `node` the OPERATOR'S shell finds, and the console is maintained from
-     * that shell. Written down, or the next edit undoes this one for tidiness.
+     * Anything a shell would run as npm: a bare `npm`, any path ending in
+     * `/npm`, and npm's own CLI script. Bounded on both sides so that
+     * `npm_config_cache=` — an environment variable the update script exports —
+     * is not mistaken for a command.
      */
-    const flat = code.replace(/\s+/g, ' ')
+    const NPM = /(?:^|[\s;&|`"'(])((?:[^\s;&|`"'()]*\/)?npm(?:-cli\.js)?)(?=[\s;&|`"')]|$)/g
 
-    expect(flat).toMatch(/is deliberately off everyone/)
-    expect(flat).toMatch(/Adding `\/opt\/node24\/bin` to `PATH` would fix this line/)
-    expect(flat).toMatch(/shell finds, and the console/)
+    const lines = captureAll(deployDoc, /^```bash\n([\s\S]*?)^```/gm, 'a bash block in deploy.md')
+      .flatMap((block) => block.split('\n'))
+      .filter((line) => !/^\s*#/.test(line))
+
+    let invocations = 0
+
+    for (const line of lines) {
+      for (const match of line.matchAll(NPM)) {
+        const token = match[1] ?? ''
+        invocations += 1
+
+        // Nothing but the CLI script, by absolute path.
+        expect(token, line).toBe(cli)
+
+        // And the word in front of it is the binary. `timeout 300` and
+        // `cd … &&` are allowed to be further left; nothing is allowed
+        // between the runtime and the script it runs.
+        const at = line.indexOf(token, match.index)
+        expect(line.slice(0, at).trimEnd().split(/\s+/).at(-1), line).toBe(node)
+      }
+    }
+
+    // The guard against this check quietly checking nothing: every place the
+    // document installs still installs.
+    expect(invocations).toBeGreaterThanOrEqual(4)
+
+    for (const [what, heading] of [
+      ['the first install', /^## \d+\. The code/m],
+      ['the update script', /^## \d+\. The units/m],
+      ['deploying by hand', /^## \d+\. Deploying an update/m],
+    ] as const) {
+      expect(section(deployDoc, heading), what).toContain(cli)
+    }
+  })
+
+  /**
+   * THE WITHDRAWAL, WHICH IS NOT THE SAME AS THE EDIT. The absolute-npm claim
+   * was argued for in §2, in §3 at length and again in §16, and a reader who
+   * remembers being told it needs to find it retracted rather than to find it
+   * silently absent and wonder which of the two documents was right.
+   */
+  it('retracts the absolute-path-to-npm claim rather than quietly dropping it', () => {
+    const code = section(deployDoc, /^## \d+\. The code/m).replace(/\s+/g, ' ')
+    const update = section(deployDoc, /^## \d+\. Deploying an update/m).replace(/\s+/g, ' ')
+
+    // The sentences the old design was carried in. Gone, both of them.
+    expect(deployDoc).not.toMatch(/The absolute path to `npm` is the load-bearing part/)
+    expect(deployDoc).not.toMatch(/`npm` is spelled out in full/)
+
+    /**
+     * §2 IS WHERE THE RULE IS STATED FIRST, AND IT STATED THE WRONG ONE. It is
+     * the section that keeps `/opt/node24/bin` off `PATH`, so it is also the
+     * section that has to say what naming a path does and does not buy.
+     */
+    const path = section(deployDoc, /^## \d+\. Node/m).replace(/\s+/g, ' ')
+
+    expect(path).toMatch(/names \*\*the `node` binary itself\*\* by absolute path/)
+    expect(path).toMatch(/Naming `npm` by absolute path does not do that/)
+
+    // Said, in the section that argued hardest for it, with the mechanism and
+    // not just a change of mind.
+    expect(code).toMatch(/this document used to say that it was/i)
+    expect(code).toMatch(/That claim is withdrawn/i)
+    expect(code).toContain('#!/usr/bin/env node')
+    expect(code).toMatch(/env` searches `PATH`/)
+
+    // And where the operator deploys by hand, which is the other place it was
+    // asserted and the place he is standing when it matters.
+    expect(update).toMatch(/used to say that path was enough, and it was wrong/i)
+
+    /**
+     * NO PARAGRAPH MAY NAME THE WRONG FORM WITHOUT SAYING WHY IT IS WRONG.
+     * `/opt/node24/bin/npm` is still all over §3, because the proof and the
+     * retraction are about it — but a future paragraph that mentions it as the
+     * thing to run has nothing in it that reads as a withdrawal.
+     */
+    for (const paragraph of paragraphs(deployDoc)) {
+      if (!paragraph.includes('/opt/node24/bin/npm')) continue
+      expect(paragraph, paragraph).toMatch(
+        /shebang|env node|used to|Earlier versions|withdraw|was wrong|not enough/i,
+      )
+    }
+
+    /**
+     * And the PATH argument survives the retraction, because it is a separate
+     * point and still true: a `PATH` entry is the fix somebody reaches for
+     * first, and it would change which `node` the OPERATOR'S shell finds — the
+     * shell the console is maintained from.
+     */
+    expect(code).toMatch(/is deliberately off everyone/)
+    expect(code).toMatch(/A `PATH` entry is the other fix, and it is the wrong one/)
+    expect(code).toMatch(/shell finds, and the console/)
   })
 
   /**
@@ -1278,6 +1641,13 @@ describe('docs/deploy.md — the steps that cannot be left out', () => {
    * runtime the unit will use and read back what that runtime says it is.
    * `vitest --version` prints the Node version and the architecture on one
    * line, which answers §2's question and §3's at the same time.
+   *
+   * THIS STEP WAS ALREADY WRITTEN THE RIGHT WAY, AND IT IS THE PATTERN THE
+   * INSTALL ABOVE IT HAS NOW BEEN FIXED INTO. `node_modules/.bin/vitest` is a
+   * `#!/usr/bin/env node` script exactly as npm's CLI is, so run on its own it
+   * would answer for whatever `node` is on `PATH` — and the whole value of its
+   * output is that `node-v24…` is evidence. It is only evidence because
+   * `/opt/node24/bin/node` comes first and the script is its argument.
    */
   it('proves after the install that the bot runtime can run what was installed', () => {
     const code = section(deployDoc, /^## \d+\. The code/m)
@@ -1289,9 +1659,12 @@ describe('docs/deploy.md — the steps that cannot be left out', () => {
     // worth reading: a bare version number would look identical on Node 22.
     expect(code).toContain(`node-v${major}.`)
 
-    expect(code.indexOf('/opt/node24/bin/npm ci')).toBeLessThan(
+    expect(code.indexOf('npm-cli.js ci')).toBeLessThan(
       code.indexOf('/opt/node24/bin/node /opt/blitz-bot/node_modules/.bin/'),
     )
+
+    // And why that shape is the shape, said where the next person copies it.
+    expect(code.replace(/\s+/g, ' ')).toMatch(/is a shebang script too/i)
   })
 
   /**
@@ -1543,6 +1916,849 @@ describe('docs/deploy.md — the steps that cannot be left out', () => {
     expect(silent).toMatch(/journalctl[^\n]*grep/)
   })
 })
+
+/**
+ * The bot no longer updates itself, a timer does, and every part of that is a
+ * fact about five files on a box nobody looks at.
+ *
+ * NONE OF THOSE FIVE IS SOMETHING A PUSH CAN DEPLOY. Two units, a timer, a
+ * shell script and a sudoers drop-in, all outside the repo — so the runbook
+ * heredocs are the only copy of them under version control, and an edit that
+ * drops a line from one of them changes what the next box does while reviewing
+ * as a documentation tweak.
+ *
+ * THE LAST ROUND'S DESIGN WAS REJECTED, AND THESE TESTS ARE MOSTLY HERE TO
+ * KEEP IT REJECTED. An `ExecStartPre` on the bot's own unit meant three things
+ * that are not fixable inside it: `npm ci` deletes node_modules before it
+ * installs, so a failed install left no dependencies on a box restarting into
+ * them every five seconds; `reset --hard` in a crash loop destroyed the
+ * last-known-good tree with nothing referencing it; and `Restart=always` made
+ * every crash a deploy. Each of those is one line away from coming back —
+ * an `ExecStartPre=` re-added "so a restart picks up the fix", a
+ * `ReadWritePaths=` re-added "because the update needs it", a restart moved
+ * above the install "so the bot comes back sooner". So the assertions below are
+ * about absence at least as much as presence.
+ *
+ * FIVE VALUES ARE LOAD-BEARING IN A WAY THAT LOOKS COSMETIC:
+ *
+ *   - the absence of ExecStartPre on blitz-bot.service. Add one line and every
+ *     crash is a deploy again, and nothing about the unit looks different.
+ *   - ProtectSystem=strict with no ReadWritePaths on that same unit. The bot
+ *     writes nothing; the moment it can write /opt/blitz-bot it can rewrite its
+ *     own source and its own token file.
+ *   - Persistent=true, which has an effect only on an OnCalendar= timer.
+ *     Rewrite the schedule as OnUnitActiveSec= and the line is accepted and
+ *     silently does nothing, so a box that was off never catches up.
+ *   - the order of the install and the restart. Swap them and a failed install
+ *     is a restart into a tree with no dependencies — the exact outage this
+ *     design exists to remove.
+ *   - the commit comparison in front of the restart. Delete it and the bot
+ *     drops its gateway connection four times an hour to arrive at the commit
+ *     it was already on.
+ *
+ * SO THE TESTS READ THE HEREDOCS AND ASSERT ON DIRECTIVES, and where a value
+ * appears in two places — the script's path, the off switch, the sudo grant,
+ * the commit file, the line number in .gitignore — one side is derived from the
+ * other rather than typed out twice, for the reason the rest of this file
+ * gives.
+ */
+describe('docs/deploy.md — the timer that updates, and the unit that no longer does', () => {
+  const UNITS = /^## \d+\. The units/m
+  const UPDATE = /^## \d+\. Deploying an update/m
+  const RESTART_LOOP = /^## \d+\. When it will not start/m
+
+  const flat = (text: string): string => text.replace(/\s+/g, ' ')
+
+  /** One heredoc the runbook writes, exactly as the thing that reads it will. */
+  const heredoc = (path: string): string =>
+    capture(
+      deployDoc,
+      new RegExp(`sudo tee ${path.replace(/[/.]/g, '\\$&')} > /dev/null <<'EOF'\\n([\\s\\S]*?)\\nEOF`),
+      `the ${path} heredoc in deploy.md`,
+    )
+
+  const botUnit = heredoc('/etc/systemd/system/blitz-bot.service')
+  const updateUnit = heredoc('/etc/systemd/system/blitz-bot-update.service')
+  const timerUnit = heredoc('/etc/systemd/system/blitz-bot-update.timer')
+  const updateScript = heredoc('/usr/local/bin/blitz-bot-update')
+  const sudoers = heredoc('/tmp/blitz-bot-update.sudoers')
+
+  /** A unit's settings, with its prose and its section headers dropped. */
+  const directivesOf = (unit: string): string[] =>
+    unit
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line !== '' && !line.startsWith('#') && !line.startsWith('['))
+
+  /** A unit's comments, which is where the reasons have to be. */
+  const commentsOf = (unit: string): string =>
+    unit
+      .split('\n')
+      .filter((line) => line.trim().startsWith('#'))
+      .join('\n')
+
+  const botDirectives = directivesOf(botUnit)
+  const updateDirectives = directivesOf(updateUnit)
+  const timerDirectives = directivesOf(timerUnit)
+
+  const setting = (unit: string, name: string, what: string): string =>
+    capture(unit, new RegExp(`^${name}=(.*)$`, 'm'), what)
+
+  const positionOf = (haystack: string, needle: RegExp | string, what: string): number => {
+    const index = typeof needle === 'string' ? haystack.indexOf(needle) : haystack.search(needle)
+    if (index === -1) throw new Error(`${what} is not in the update script`)
+    return index
+  }
+
+  /** Where the restart lives in the script, derived from the sudo grant it needs. */
+  const grantedCommand = capture(
+    sudoers,
+    /^ubuntu ALL=\(root\) NOPASSWD: (.+)$/m,
+    'the command the sudoers drop-in grants',
+  )
+
+  /**
+   * THE FEATURE THAT WAS REJECTED, PINNED AS AN ABSENCE. `ExecStartPre=` is one
+   * line, it reads as an improvement — "so a restart picks up the fix" — and it
+   * reintroduces every failure the review rejected: a crash becomes a deploy, a
+   * failed `npm ci` leaves no dependencies on a box restarting into them, and a
+   * `reset --hard` runs inside a crash loop.
+   *
+   * THE ABSENCE IS ASSERTED ON THE PARSED DIRECTIVES, not on the text, because
+   * the unit's own comments name `ExecStartPre` in order to say it was removed.
+   * A test that searched the whole heredoc would fail on the explanation.
+   */
+  it('never runs the update as part of starting the bot', () => {
+    for (const directive of botDirectives) {
+      expect(directive, directive).not.toMatch(/^ExecStartPre=/)
+      expect(directive, directive).not.toMatch(/^ExecStartPost=/)
+      expect(directive, directive).not.toContain('blitz-bot-update')
+    }
+
+    // ExecStart is the bot and nothing but the bot: no `sh -c` smuggling the
+    // update back in ahead of node.
+    expect(setting(botUnit, 'ExecStart', "the bot's ExecStart")).toBe(
+      '/opt/node24/bin/node --disable-warning=ExperimentalWarning /opt/blitz-bot/src/index.ts',
+    )
+
+    // And the removal is explained where somebody about to undo it will read
+    // it: in the unit, from /etc/systemd/system, with no commit message.
+    expect(commentsOf(botUnit)).toContain('ExecStartPre')
+    expect(flat(commentsOf(botUnit))).toMatch(/reviewed and rejected/i)
+  })
+
+  /**
+   * THE SANDBOX, PUT BACK, WITH ONE DIRECTORY OPEN IN IT AND THE SOURCE TREE
+   * SHUT. The version that updated itself had to open /opt/blitz-bot for
+   * writing and hand npm a HOME and a cache — so the running bot could rewrite
+   * its own source and its own token file. All of that is gone and the cheap
+   * way to bring it back is one line added for a reason that sounds good.
+   *
+   * `ReadWritePaths=` IS THE ONE THAT MATTERS HERE and it is asserted absent
+   * separately from `StateDirectory=`, which is now present: they are opposite
+   * answers to "what may this process write", and the whole point of the
+   * distinction is that a directory systemd created for this unit is not the
+   * directory the bot's own code and token live in.
+   */
+  it('restores the bot to a sandbox with nothing but its own state directory writable', () => {
+    for (const kept of [
+      'NoNewPrivileges=true',
+      'PrivateTmp=true',
+      'ProtectSystem=strict',
+      'ProtectHome=true',
+    ]) {
+      expect(botDirectives, kept).toContain(kept)
+    }
+
+    for (const directive of botDirectives) {
+      // The bot's own source and its own .env. This is the line that must
+      // never come back, and it is why StateDirectory= is safe and this is not.
+      expect(directive, directive).not.toMatch(/^ReadWritePaths=/)
+
+      // The npm cache and the HOME the rejected install needed.
+      expect(directive, directive).not.toMatch(/^CacheDirectory=/)
+      expect(directive, directive).not.toMatch(/^Environment=/)
+
+      // The bump that only existed to cover a cold `npm ci` inside the start.
+      expect(directive, directive).not.toMatch(/^TimeoutStartSec=/)
+    }
+
+    // The one thing the bot still does with /opt/blitz-bot is read it, and
+    // read-only is not invisible — which is the whole reason .deployed-commit
+    // is there and not in the state directory.
+    expect(flat(commentsOf(botUnit))).toMatch(/Read-only is not invisible/i)
+  })
+
+  /**
+   * THE DEPLOY NOTICE'S MEMORY, AND THE INTEGRATION BUG IT WAS LEFT IN.
+   *
+   * src/client.ts writes the last commit it announced into
+   * `$STATE_DIRECTORY/reported-commit`, falling back to /var/lib/blitz-bot, and
+   * compares it at the next start so that a restart on the same commit posts
+   * nothing. The unit lost its `StateDirectory=` when the rejected ExecStartPre
+   * went, and kept `ProtectSystem=strict` — so that path was read-only to the
+   * bot, the write failed, and `Restart=always` re-announced the same commit
+   * after every crash. Five seconds apart, in the channel that has to stay
+   * readable while the bot is crashing, which is precisely the noise the
+   * comparison exists to stop.
+   *
+   * NOTHING ELSE WOULD HAVE CAUGHT IT. The bot starts, the notice posts, the
+   * unit is green; the only signal is one `warn` line nobody is grepping for.
+   * Two files, edited in the same round by two people, agreeing about a path
+   * and disagreeing about whether it could be written.
+   *
+   * SO THE UNIT AND THE CODE ARE COMPARED, NOT DESCRIBED. The literal in
+   * client.ts is the fallback for a bot started by hand; on the box the value
+   * comes from `StateDirectory=` through the `STATE_DIRECTORY` systemd exports.
+   * Both have to name the same directory, and neither side is typed out here.
+   */
+  it('gives the bot the state directory its deploy notice remembers in', () => {
+    const state = setting(botUnit, 'StateDirectory', "the bot's state directory")
+
+    // One line, and the name systemd turns into /var/lib/<name>.
+    expect(botDirectives.filter((line) => line.startsWith('StateDirectory='))).toHaveLength(1)
+    expect(state).toMatch(/^[\w.-]+$/)
+
+    // The path src/client.ts falls back to when STATE_DIRECTORY is unset is the
+    // path this directive produces. Change either and this fails.
+    const fallback = capture(
+      clientSource,
+      /const state = first === undefined \|\| first === '' \? '([^']+)'/,
+      "the state directory src/client.ts falls back to",
+    )
+
+    expect(fallback).toBe(`/var/lib/${state}`)
+
+    // And systemd's own answer is preferred over that literal, which is what
+    // keeps the unit and the code from drifting apart in the first place.
+    expect(clientSource).toContain('process.env.STATE_DIRECTORY')
+
+    // Both units name the same directory, which is a decision and not a
+    // coincidence — one directory, one owner, two writers of different files.
+    expect(setting(updateUnit, 'StateDirectory', "the update's state directory")).toBe(state)
+
+    /**
+     * AND IT IS COMMENTED FOR THE REASON IT IS THERE NOW. It was there before
+     * for an npm cache, in a design that was rejected and stripped out — so the
+     * next person tidying this sandbox reads it as a leftover and removes it,
+     * unless the unit itself says otherwise where they are standing.
+     */
+    const why = flat(commentsOf(botUnit))
+
+    expect(why).toMatch(/reported-commit/)
+    expect(why).toMatch(/not why it was here before/i)
+    expect(why).toMatch(/repeats on every crash restart/i)
+
+    // Including the line that must NOT come back with it, said in the same
+    // breath, because "the sandbox already has a hole in it" is the argument
+    // that reopens the source tree.
+    expect(why).toMatch(/ReadWritePaths=\/opt\/blitz-bot would open/i)
+  })
+
+  /**
+   * TWO UNITS, ONE DIRECTORY, AND EXACTLY ONE WRITER OF THE FILE THAT MATTERS.
+   *
+   * Both units now declare `StateDirectory=blitz-bot`, so both see
+   * /var/lib/blitz-bot and both run as ubuntu. That is deliberate and it is
+   * cheap — but it puts the update one line away from a file it must never
+   * touch. Writing the NEW sha into reported-commit would leave the bot
+   * believing it had already announced a deploy it never announced, and the
+   * notice would never fire again; writing the OLD one would make it fire on
+   * every restart. Neither is an error anywhere: one is a silent channel, the
+   * other is the noise this file exists to stop.
+   *
+   * THE NAME IS TAKEN FROM src/client.ts, so renaming the file there and
+   * forgetting this is a failure here rather than on the box.
+   */
+  it('never lets the update write the file the bot remembers its notice in', () => {
+    const reported = capture(clientSource, /return join\(state, '([^']+)'\)/, "the bot's notice file")
+
+    // Not written, not copied, not removed, not mentioned as a path in any
+    // command: the update script has no business naming it at all.
+    for (const line of updateScript.split('\n')) {
+      if (/^\s*#/.test(line)) continue
+      expect(line, line).not.toContain(reported)
+    }
+
+    // And the prohibition is written down in both places somebody would be
+    // standing when they broke it.
+    expect(flat(commentsOf(updateScript))).toMatch(
+      new RegExp(`must never write \\$STATE/${reported}`, 'i'),
+    )
+    expect(flat(commentsOf(updateUnit))).toMatch(
+      new RegExp(`never write ${reported}`, 'i'),
+    )
+
+    // The one file the update does own in there, so that "shared directory"
+    // stays a statement about a directory rather than about a file.
+    expect(capture(updateScript, /^INSTALLED=\$STATE\/(\S+)/m, "the update's own state file")).not.toBe(
+      reported,
+    )
+  })
+
+  /**
+   * A CRASH MUST NOT DEPLOY, WHICH IS THE SENTENCE THE OWNER ASKED FOR.
+   * `Restart=always` stays — it is what carries the bot through a Discord
+   * outage — and it is only safe because the start it produces fetches nothing.
+   * Both halves have to be said, and said in §14, which is the section somebody
+   * opens while the bot is looping.
+   */
+  it('keeps Restart=always and says plainly that it no longer deploys', () => {
+    expect(botDirectives).toContain('Restart=always')
+    expect(botDirectives).toContain('RestartSec=5')
+
+    expect(flat(commentsOf(botUnit))).toMatch(/no longer a deployment mechanism/i)
+    expect(flat(section(deployDoc, RESTART_LOOP))).toMatch(/crash loop deploys nothing/i)
+  })
+
+  /**
+   * THE UPDATE IS A ONESHOT THAT RUNS THE SCRIPT AND NOTHING ELSE, and its
+   * failure is allowed to be a failure — the exact inverse of the `-` on the
+   * ExecStartPre this replaces, because nothing is waiting on it to start a
+   * bot any more.
+   *
+   * NO Restart= ON IT. A oneshot that restarts itself on failure is the fetch
+   * loop this design exists to remove; retrying is the timer's job, once, in
+   * fifteen minutes.
+   */
+  it('runs the update as a oneshot whose failures are allowed to be failures', () => {
+    expect(updateDirectives).toContain('Type=oneshot')
+    expect(updateDirectives).toContain('ExecStart=/usr/local/bin/blitz-bot-update')
+
+    for (const directive of updateDirectives) {
+      // A leading `-` here would restore the swallow-everything policy.
+      expect(directive, directive).not.toMatch(/^ExecStart=-/)
+      expect(directive, directive).not.toMatch(/^Restart=/)
+    }
+
+    // Installed under the path the unit runs, executable, and written before
+    // the unit that names it — the other order leaves a window in which a run
+    // finds nothing there.
+    const script = setting(updateUnit, 'ExecStart', "the update unit's ExecStart")
+    const units = section(deployDoc, UNITS)
+
+    expect(units).toContain(`sudo chmod 755 ${script}`)
+    expect(deployDoc.indexOf(`sudo tee ${script}`)).toBeLessThan(
+      deployDoc.indexOf('sudo tee /etc/systemd/system/blitz-bot-update.service'),
+    )
+
+    // It runs as the user that owns the tree. As root, git refuses an
+    // ubuntu-owned repository outright and the install leaves a tree the
+    // operator can no longer touch by hand.
+    expect(updateDirectives).toContain('User=ubuntu')
+
+    // The two network steps bound themselves; the unit's limit is above their
+    // sum, so what gives up is the step that hung, with a line naming it.
+    const startTimeout = Number(
+      capture(updateUnit, /^TimeoutStartSec=(\d+)$/m, "the update unit's start timeout"),
+    )
+    const fetch = Number(capture(updateScript, /timeout (\d+) git fetch/, "the script's fetch timeout"))
+    const install = Number(
+      capture(updateScript, /timeout (\d+) \S+\/bin\/node \S+\/npm-cli\.js ci/, "the script's install timeout"),
+    )
+
+    expect(startTimeout).toBeGreaterThan(fetch + install)
+  })
+
+  /**
+   * NEITHER UNIT MAY DEPEND ON THE OTHER, for the reason §"the rule that
+   * matters" gives about the console and one more that is specific to these
+   * two: the update restarts the bot, and an ordering dependency between a unit
+   * and a unit it restarts is how a boot wedges. A `Wants=` looks harmless and
+   * is exactly how it starts.
+   */
+  it('keeps the two units independent of each other', () => {
+    for (const directive of updateDirectives) {
+      expect(directive, directive).not.toMatch(/^(Requires|Requisite|BindsTo|PartOf|After|Before|Wants)=.*blitz-bot\.service/)
+    }
+
+    for (const directive of botDirectives) {
+      expect(directive, directive).not.toMatch(/blitz-bot-update/)
+    }
+
+    expect(flat(commentsOf(updateUnit))).toMatch(/NOTHING HERE NAMES blitz-bot\.service/)
+  })
+
+  /**
+   * THE SCHEDULE, AND THE TWO LINES AROUND IT THAT ARE EASY TO GET WRONG.
+   *
+   * Persistent= HAS AN EFFECT ONLY ON OnCalendar= TIMERS. Written as
+   * `OnUnitActiveSec=15min` the schedule reads identically and is arguably
+   * tidier, and `Persistent=true` beneath it is then accepted and does
+   * nothing — so a box that was switched off comes back and sits on old code
+   * until the next window instead of catching up. That is a silent regression
+   * with no error anywhere, which is why the pairing is asserted rather than
+   * the interval alone.
+   *
+   * AND THE INTERVAL IS PINNED TO THE PROSE THAT JUSTIFIES IT. A number in a
+   * unit file with no argument attached is a number the next person changes on
+   * a hunch.
+   */
+  it('fires on a calendar it can catch up on, with the interval it claims', () => {
+    const schedule = capture(timerUnit, /^OnCalendar=(.+)$/m, "the timer's schedule")
+    const minutes = Number(capture(schedule, /^\*:0\/(\d+)$/, "the timer's interval in minutes"))
+
+    // Short enough that nobody opens an SSH session; long enough that an
+    // evening's commits are a handful of restarts rather than one per push.
+    expect(minutes).toBeGreaterThanOrEqual(5)
+    expect(minutes).toBeLessThanOrEqual(60)
+
+    expect(timerDirectives).toContain('Persistent=true')
+    expect(timerDirectives).toContain('WantedBy=timers.target')
+
+    // The pairing, both ways: no monotonic schedule, and the reason written
+    // where the person rewriting it will be standing.
+    for (const directive of timerDirectives) {
+      expect(directive, directive).not.toMatch(/^OnUnitActiveSec=/)
+      expect(directive, directive).not.toMatch(/^OnBootSec=/)
+    }
+
+    expect(flat(commentsOf(timerUnit))).toMatch(/only on OnCalendar= timers/)
+
+    // Spread, or every box on this schedule hits github.com on the same second
+    // for ever. Less than the interval, or the windows overlap.
+    const jitter = Number(capture(timerUnit, /^RandomizedDelaySec=(\d+)$/m, "the timer's spread"))
+
+    expect(jitter).toBeGreaterThan(0)
+    expect(jitter).toBeLessThan(minutes * 60)
+
+    // The number is argued for, in the timer and in the section the owner
+    // reads, in the units he thinks in.
+    expect(flat(commentsOf(timerUnit))).toMatch(/fifteen minutes/i)
+    expect(flat(section(deployDoc, UPDATE))).toMatch(/about fifteen minutes/i)
+    expect(minutes).toBe(15)
+  })
+
+  /**
+   * NO CHANGE MEANS NO RESTART, WHICH IS THE OWNER'S OWN SENTENCE. The bot
+   * holds a websocket; restarting it four times an hour to arrive back at the
+   * commit it was already on is a reconnect for nothing, and it buries the one
+   * line that means something was deployed.
+   *
+   * THE COMPARISON IS AGAINST WHAT THE BOT IS RUNNING, not against what this
+   * run changed, and that is not pedantry: a run that fetched a new commit and
+   * then failed its install did not restart, so the bot is still on the old
+   * code while the disk is on the new. "Did the commit move this run" answers
+   * no at the next tick and leaves it there until somebody pushes again.
+   */
+  it('restarts only when the bot is not already on the commit on disk', () => {
+    const restart = positionOf(updateScript, grantedCommand, 'the restart')
+
+    // The comparison, the early exit, and both of them ahead of the restart.
+    const compare = positionOf(updateScript, '[ "$current" = "$deployed" ]', 'the commit comparison')
+
+    expect(compare).toBeLessThan(restart)
+    expect(positionOf(updateScript, "say \"no restart:", 'the no-restart line')).toBeLessThan(restart)
+    expect(updateScript.slice(compare, restart)).toMatch(/exit 0/)
+
+    // `$deployed` is the commit file, not the reset's own before-and-after, and
+    // an unreadable one reads as unknown rather than as "already deployed".
+    expect(updateScript).toMatch(/deployed=\$\(cat "\$COMMIT" 2>\/dev\/null \|\| true\)/)
+
+    // try-restart and not restart: a bot somebody stopped on purpose stays
+    // stopped rather than being started by a deploy nobody was watching.
+    expect(grantedCommand).toContain('try-restart')
+
+    // Exactly one restart in the script. A second one is a path that skips
+    // everything above it.
+    expect(updateScript.split(grantedCommand).length - 1).toBe(1)
+  })
+
+  /**
+   * `npm ci` DELETES node_modules BEFORE IT INSTALLS, which is the failure the
+   * last review found. On a timer it is survivable — nothing is starting the
+   * bot into that window, and the running process holds its dependencies in
+   * memory — but only while the restart stays behind the install and a failed
+   * install ends the run.
+   *
+   * A RESTART AFTER A FAILED INSTALL IS THE OUTAGE, in one line, and it is the
+   * obvious "fix" for somebody who reads the script as "why didn't it come
+   * back on the new code".
+   */
+  it('installs before it restarts, and does not restart at all after a failed install', () => {
+    const install = positionOf(updateScript, 'npm-cli.js ci', 'the install')
+    const record = positionOf(updateScript, 'cp package-lock.json "$INSTALLED"', 'the lockfile record')
+    const failure = positionOf(updateScript, 'die "install failed', 'the failed-install line')
+    const restart = positionOf(updateScript, grantedCommand, 'the restart')
+
+    // The order that is the whole argument.
+    expect(install).toBeLessThan(restart)
+    expect(failure).toBeLessThan(restart)
+
+    // The failure branch leaves through `die`, and `die` exits non-zero without
+    // reaching anything below it. Both halves: a `warn` there would fall
+    // through to the restart with no dependencies on disk.
+    expect(updateScript).toMatch(/^die\(\) \{ warn "\$1"; exit 1; \}$/m)
+
+    // node_modules missing is its own reason to install: the lockfile can be
+    // unchanged and the tree still unrunnable.
+    expect(updateScript).toMatch(/\[ -d node_modules \] && cmp -s package-lock\.json "\$INSTALLED"/)
+
+    // Recorded after the install and only on its success branch, so a failed
+    // install is retried at the next tick rather than remembered as done —
+    // which is also what makes a transient failure heal without a human.
+    expect(record).toBeGreaterThan(install)
+    expect(updateScript.split('cp package-lock.json').length - 1).toBe(1)
+    expect(failure).toBeGreaterThan(record)
+
+    // And the operator is told what that state looks like from outside, in the
+    // section he opens when something is wrong.
+    expect(flat(section(deployDoc, RESTART_LOOP))).toMatch(/tree is ahead of the running process/i)
+  })
+
+  /**
+   * THE WAY BACK, AND IT HAS TO EXIST BEFORE THE THING IT UNDOES. The review
+   * that rejected updating at start said it plainly: `reset --hard` destroys the
+   * last-known-good tree with nothing holding a reference to it. A tag is a
+   * reference, it is on this disk, and using it needs no network — which
+   * matters, because "github.com is unreachable" is one of the two reasons to
+   * be rolling back at all.
+   *
+   * LIGHTWEIGHT, NOT ANNOTATED. An annotated tag is an object with an author,
+   * an author needs an identity, and `ProtectHome=true` leaves no home
+   * directory to read a `.gitconfig` from — so the annotated form fails exactly
+   * when it is needed.
+   */
+  it('tags the commit it is leaving before it overwrites it', () => {
+    const tag = capture(updateScript, /^PREVIOUS=(\S+)/m, "the update script's rollback tag")
+
+    // The commands, not the comments — the comment above the tag quotes the
+    // rollback, so a search for a bare `git reset --hard` finds prose first.
+    const tagged = positionOf(updateScript, 'git tag -f "$PREVIOUS"', 'the tag')
+    const reset = positionOf(updateScript, 'git reset --hard --quiet origin/main', 'the reset')
+
+    // Before the reset, or it names the commit it was supposed to preserve you
+    // from.
+    expect(tagged).toBeLessThan(reset)
+
+    // Lightweight: `-a`, `-m` or `-s` would need an identity this service has
+    // no home directory to read.
+    expect(updateScript).not.toMatch(/git tag[^\n]*\s-[ams]\b/)
+
+    // And it is a tag on the commit the box was on, not on HEAD after the fact.
+    expect(updateScript).toContain('git tag -f "$PREVIOUS" "$before"')
+
+    // The runbook rolls back with the same name the script writes, and switches
+    // updating off first — without that the next tick undoes the rollback.
+    const update = section(deployDoc, UPDATE)
+    const off = capture(updateScript, /^OFF_SWITCH=(\S+)/m, "the update script's off switch")
+
+    expect(update).toContain(`git reset --hard ${tag}`)
+    expect(update.indexOf(`sudo touch ${off}`)).toBeLessThan(update.indexOf(`git reset --hard ${tag}`))
+  })
+
+  /**
+   * THE OFF SWITCH, WHICH NOW STOPS A TIMER RATHER THAN A START. It is read
+   * before anything else in the script so that it still works when the rest of
+   * the script is what is broken, and both halves are in the runbook — turning
+   * it on, and the one that gets forgotten, turning it back off.
+   */
+  it('keeps a way to stop the box updating itself', () => {
+    const off = capture(updateScript, /^OFF_SWITCH=(\S+)/m, "the update script's off switch")
+    const check = positionOf(updateScript, /if \[ -e "\$OFF_SWITCH" \]/, 'the off-switch check')
+
+    expect(check).toBeLessThan(positionOf(updateScript, 'git fetch --quiet origin', 'the fetch'))
+    expect(check).toBeLessThan(
+      positionOf(updateScript, 'git reset --hard --quiet origin/main', 'the reset'),
+    )
+
+    const update = section(deployDoc, UPDATE)
+
+    expect(update).toContain(`sudo touch ${off}`)
+    expect(update).toContain(`sudo rm ${off}`)
+
+    // A box left switched off reports success on every tick for ever, which is
+    // the failure that looks exactly like a working deploy pipeline.
+    expect(flat(update)).toMatch(/looks completely healthy and deploys nothing/i)
+  })
+
+  /**
+   * THE CONTRACT src/ IS CODED AGAINST, PINNED FROM THE SCRIPT THAT WRITES IT.
+   * The bot reads one file at startup and reports what is in it, so the path
+   * and the shape are an interface between two things that are edited by
+   * different people on different days. Every value below is derived from the
+   * script rather than typed out again, so a path changed in one place fails
+   * here instead of in Discord.
+   */
+  it('writes the commit file the bot reads, in the one place the bot can read it', () => {
+    const repo = capture(updateScript, /^REPO=(\S+)/m, "the update script's repo path")
+    const commit = capture(updateScript, /^COMMIT=(\S+)/m, "the update script's commit file")
+    const absolute = commit.replace('$REPO', repo)
+
+    // Inside the bot's WorkingDirectory, which under ProtectSystem=strict with
+    // no ReadWritePaths is readable — and not in the state directory, which
+    // belongs to the update's unit.
+    expect(absolute.startsWith(`${repo}/`)).toBe(true)
+    expect(setting(botUnit, 'WorkingDirectory', "the bot's working directory")).toBe(repo)
+    expect(absolute).not.toContain('/var/lib')
+
+    /**
+     * The runbook states the absolute path and the exact contents, because
+     * src/ is written against this section and not against the script.
+     *
+     * POSITIONALLY, IN THE BLOCK THAT STATES IT. A `toContain` over §6 stays
+     * green with the wrong path under "Path, exactly", because the right one
+     * survives in the script, in the file table and in three comments — the
+     * same "present somewhere in the file" mistake the quoted log lines above
+     * are pinned against, and a mutation pass proved it here too.
+     */
+    const units = section(deployDoc, UNITS)
+
+    expect(capture(units, /\*\*Path, exactly:\*\*\n\n```\n([^\n]+)\n```/, 'the path §6.2 states')).toBe(
+      absolute,
+    )
+
+    expect(flat(units)).toMatch(/one line — the short commit sha, then a newline/i)
+
+    // And the worked example is a bare sha, not a decorated one. `commit=6bbff70`
+    // in an example is what somebody codes against when the prose is long.
+    expect(
+      capture(units, /as it is on the box today:\n\n```\n([^\n]*)\n```/, "§6.2's example file"),
+    ).toMatch(/^[0-9a-f]{7,40}$/)
+
+    // One writer, writing one line with no decoration, and writing it before
+    // the restart — the other order hands the new process the old commit.
+    expect(updateScript).toContain(`printf '%s\\n' "$current" > "$COMMIT"`)
+    expect(updateScript.split('> "$COMMIT"').length - 1).toBe(1)
+    expect(positionOf(updateScript, '> "$COMMIT"', 'the commit file write')).toBeLessThan(
+      positionOf(updateScript, grantedCommand, 'the restart'),
+    )
+
+    // What the value is, said once, in the file that produces it and in the
+    // file that describes it.
+    expect(updateScript).toContain('git rev-parse --short HEAD')
+    expect(units).toContain('git rev-parse --short HEAD')
+
+    // Missing means unknown, and unknown must not be papered over by the bot
+    // running git — after a failed install that answers with a commit the
+    // process is not on.
+    expect(flat(units)).toMatch(/must not fall back to running git/i)
+  })
+
+  /**
+   * THE ONE PRIVILEGED THING, AND THE TWO SPELLINGS THAT HAVE TO MATCH.
+   * sudoers matches a command and its arguments literally: `blitz-bot` in the
+   * script against `blitz-bot.service` in the drop-in is a denial, at the last
+   * line of a deploy, with the tree already moved. Deriving one from the other
+   * is the only way that stays true.
+   */
+  it('grants exactly the command the script runs, and nothing else', () => {
+    expect(updateScript).toContain(`sudo -n ${grantedCommand}`)
+    expect(grantedCommand).toMatch(/^\/usr\/bin\/systemctl try-restart blitz-bot\.service$/)
+
+    // One rule in the file, or the narrow grant is not narrow.
+    expect(sudoers.split('NOPASSWD:').length - 1).toBe(1)
+
+    const units = section(deployDoc, UNITS)
+
+    // Checked before it is in place. A file in /etc/sudoers.d that does not
+    // parse stops sudo working at all, on a box whose only privileged path is
+    // sudo over SSH.
+    // The check comes before the install, in the same `&&` chain, so a paste
+    // that went wrong never reaches /etc/sudoers.d at all. Compared against the
+    // install command rather than the path, which §6's file table names first.
+    expect(units).toContain('visudo -c -f /tmp/blitz-bot-update.sudoers')
+    expect(units.indexOf('visudo -c -f')).toBeLessThan(
+      units.indexOf('install -o root -g root -m 440 /tmp/blitz-bot-update.sudoers'),
+    )
+
+    // And sudo is why the update unit cannot have NoNewPrivileges. The bot's
+    // unit keeps it; this one says out loud that it cannot.
+    for (const directive of updateDirectives) {
+      expect(directive, directive).not.toMatch(/^NoNewPrivileges=/)
+    }
+
+    expect(botDirectives).toContain('NoNewPrivileges=true')
+    expect(flat(commentsOf(updateUnit))).toMatch(/NO NoNewPrivileges=true HERE/)
+  })
+
+  /**
+   * `git pull` IS THE WRONG VERB FOR A DEPLOY BOX, in three ways this box will
+   * hit: it refuses outright if a tracked file was edited in place, it can
+   * leave a merge commit so the box sits at a commit that exists nowhere else,
+   * and a merge commit wants an identity that `ProtectHome=true` leaves no home
+   * directory to read.
+   */
+  it('lands on exactly origin/main and never runs git pull or git clean on the box', () => {
+    expect(updateScript).toContain('git fetch --quiet origin')
+    expect(updateScript).toContain('git reset --hard --quiet origin/main')
+
+    for (const block of captureAll(deployDoc, /^```bash\n([\s\S]*?)^```/gm, 'a bash block in deploy.md')) {
+      for (const line of block.split('\n')) {
+        if (/^\s*#/.test(line)) continue
+        expect(line, line).not.toMatch(/git pull/)
+
+        // `git clean -x` is the tidy-up that would delete .env, .commit and
+        // node_modules in one go, and it is the obvious thing to add next to a
+        // hard reset.
+        expect(line, line).not.toMatch(/git clean/)
+      }
+    }
+
+    /**
+     * AND THE OPERATOR IS TOLD WHAT IT COSTS HIM, IN THE SECTION HE READS
+     * BEFORE HE EDITS SOMETHING IN PLACE. He is not a programmer; "resets onto
+     * origin/main" does not read as "your edit is gone" to anyone who has not
+     * used git in anger — and the window is now a timer he is not watching
+     * rather than a restart he typed.
+     */
+    const update = flat(section(deployDoc, UPDATE))
+
+    expect(update).toMatch(/is destroyed at the next run of the update/)
+    expect(update).toMatch(/fifteen minutes/)
+  })
+
+  /**
+   * `.env` HOLDS THE BOT TOKEN AND IS NOT IN THE REPO, so a hard reset must
+   * leave it alone — and "must" is a claim about `git reset --hard`, not a
+   * wish. It is true only while the file is untracked AND ignored, so this
+   * reads .gitignore rather than trusting the sentence in the runbook, and the
+   * runbook has to cite the same line of the same file.
+   */
+  it('keeps .env out of the reset, and cites how that was checked', () => {
+    const ignore = repoFile('.gitignore')
+    const lines = ignore.split('\n').map((line) => line.trim())
+
+    expect(lines).toContain('.env')
+
+    const update = section(deployDoc, UPDATE)
+
+    // The line number is derived, so reordering .gitignore fails here rather
+    // than leaving the runbook citing evidence that has moved.
+    expect(update).toContain(`.gitignore:${lines.indexOf('.env') + 1}:.env`)
+
+    // Named as repeatable checks rather than as an assurance.
+    expect(update).toContain('git check-ignore -v .env')
+    expect(update).toContain('git ls-files')
+    expect(flat(update)).toMatch(/checked\s+rather than assumed/i)
+  })
+
+  /**
+   * THE SAME ANTI-FABRICATION RULE AS EVERY OTHER QUOTED LINE IN THIS FILE, for
+   * the same reason: four log lines this document quoted had never been written
+   * by anything, and each one cost somebody an evening grepping for a string
+   * that does not exist. The update's lines are the ones §14 sends an operator
+   * to look for, they were all reworded this round, and nothing else was going
+   * to notice.
+   *
+   * BOTH PLACES THEY APPEAR. The fenced examples are what gets compared against
+   * the screen; the backticked rows in §14 are what names the fault. A pin on
+   * one is not a pin on the other.
+   */
+  it('quotes only update lines the script can actually print', () => {
+    // All three ways the script says something, each cut at the first
+    // expansion: `say "deployed $current"` can be held to its literal half and
+    // no further.
+    const printable = [
+      ...updateScript.matchAll(/\b(?:say|warn|die) "([^"]*)"/g),
+      ...updateScript.matchAll(/\b(?:say|warn|die) '([^']*)'/g),
+    ]
+      .map((match) => (match[1] ?? '').split('$')[0] ?? '')
+      .filter((prefix) => prefix !== '')
+
+    expect(printable.length).toBeGreaterThan(0)
+
+    const fromBlocks = codeBlocks(deployDoc)
+      .flatMap((block) => block.split('\n'))
+      .map((line) => /^\d{4}-\d{2}-\d{2}T[\d:.]+Z blitz-bot-update: (.+)$/.exec(line)?.[1])
+      .filter((message): message is string => message !== undefined)
+
+    const fromProse = [...deployDoc.matchAll(/`blitz-bot-update: ([^`]+)`/g)].map(
+      (match) => match[1] ?? '',
+    )
+
+    expect(fromBlocks.length).toBeGreaterThan(0)
+    expect(fromProse.length).toBeGreaterThan(0)
+
+    for (const message of [...fromBlocks, ...fromProse]) {
+      expect(
+        printable.some((prefix) => message.startsWith(prefix)),
+        `${message} — no say/warn/die in the update script produces this`,
+      ).toBe(true)
+    }
+  })
+
+  /**
+   * EVERY `journalctl` HAS TO NAME THE UNIT THE LINE IS ACTUALLY IN. The update
+   * moved out of blitz-bot.service into its own unit this round, and a command
+   * that greps the bot's journal for an update line now returns nothing at all
+   * — which reads as "the update never ran" rather than as "wrong unit", and
+   * sends an operator to look for a fault that is not there.
+   */
+  it('reads update lines out of the update unit and not the bot', () => {
+    const commands = captureAll(deployDoc, /^```bash\n([\s\S]*?)^```/gm, 'a bash block in deploy.md')
+      .flatMap((block) => block.split('\n'))
+      .filter((line) => !/^\s*#/.test(line) && line.includes('journalctl'))
+
+    expect(commands.length).toBeGreaterThan(0)
+
+    for (const command of commands) {
+      if (!command.includes('blitz-bot-update:')) continue
+      expect(command, command).toMatch(/-u blitz-bot-update\b/)
+    }
+  })
+
+  /**
+   * THREE ANSWERS CHANGED AGAIN, AND ONE OF THEM IS THE POINT OF THE ROUND.
+   * "I pushed" now means the box picks it up by itself; "it crashed" now means
+   * nothing was deployed; "I edited a file on the box" now means it disappears
+   * on a timer rather than at a restart somebody typed. A runbook that documents
+   * the mechanism without a table of those answers is one the owner has to
+   * derive them from, and he is not a programmer.
+   */
+  it('answers "I changed X, what happens" for everything that changed', () => {
+    const table = section(deployDoc, UPDATE)
+      .split('\n')
+      .filter((line) => line.startsWith('|'))
+      .join('\n')
+
+    for (const [what, row] of [
+      ['new code on main', /New code on `main`/],
+      ['a crash', /The bot crashed/],
+      ['the environment file', /`\/opt\/blitz-bot\/\.env`/],
+      ['a unit file or the timer', /A unit file, or the timer/],
+      ['the update script', /`\/usr\/local\/bin\/blitz-bot-update`/],
+      ['the sudoers grant', /`\/etc\/sudoers\.d\/blitz-bot-update`/],
+      ['a tracked file edited on the box', /edited on the box/],
+    ] as const) {
+      expect(table, what).toMatch(row)
+    }
+
+    // The row that is the headline: a crash restarts and deploys nothing.
+    expect(table).toMatch(/a crash does not deploy/i)
+
+    // The rows whose answer is still not "it happens by itself".
+    expect(table).toMatch(/daemon-reload/)
+  })
+
+  /**
+   * THIS SECTION HAS NOW ARGUED BOTH WAYS AND MUST NOT BE LEFT DOING SO.
+   * Two rounds ago it argued against a restart ever fetching; last round it
+   * documented an ExecStartPre that did exactly that; this round that was
+   * rejected and removed. Naming an old claim in order to withdraw it is
+   * allowed — leaving it standing as current advice is not, which is the rule
+   * §4.1's retraction is held to.
+   *
+   * AND THE THREE REASONS IT WAS REJECTED ARE THE THREE THINGS A FUTURE READER
+   * WILL BE TEMPTED TO UNDO, so the withdrawal has to carry them rather than
+   * just saying it changed its mind.
+   */
+  it('retracts the update-on-start design and says what was wrong with it', () => {
+    const update = section(deployDoc, UPDATE)
+
+    expect(flat(update)).toMatch(/reviewed and rejected/i)
+    expect(flat(update)).toMatch(/deletes `node_modules` before it installs/i)
+    expect(flat(update)).toMatch(/nothing holding a reference to it/i)
+    expect(flat(update)).toMatch(/any crash deployed/i)
+
+    // No paragraph may still describe updating at start as what happens.
+    for (const paragraph of paragraphs(deployDoc)) {
+      if (!/ExecStartPre/.test(paragraph)) continue
+      expect(paragraph, paragraph).toMatch(/used to|no longer|removed|rejected|does not|inverse/i)
+    }
+  })
+})
+
 
 describe('README.md — true on the day it is first pushed', () => {
   const readme = repoFile('README.md')

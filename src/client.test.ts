@@ -1,4 +1,7 @@
-import { readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import {
   DiscordAPIError,
@@ -13,15 +16,23 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 
 import {
+  announceDeployedCommit,
   announcer,
+  commitFiles,
   createClient,
   decide,
+  deployedCommitPath,
   handleLive,
   handleMessage,
   inviteResolver,
   remover,
+  reportDeployedCommit,
+  reportedCommitPath,
   scanText,
+  statusPoster,
+  statusReporter,
   type Actions,
+  type CommitFiles,
   type AttachmentText,
   type ComponentText,
   type EmbedText,
@@ -38,6 +49,7 @@ import {
 } from './client.ts'
 import type { Config } from './config.ts'
 import { findInviteCodes, type InviteResolver } from './invites.ts'
+import { log, setSink } from './log.ts'
 
 /**
  * The decision, and what gets done about it.
@@ -84,6 +96,7 @@ function cfg(over: Partial<Config> = {}): Config {
     guildId: OURS,
     adminRoleId: null,
     logChannelId: null,
+    statusChannelId: null,
     exemptChannelIds: [],
     exemptAdmins: true,
     dryRun: false,
@@ -154,6 +167,10 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+
+  // The sink is module state in log.ts, so a case that installs one and leaves
+  // it there would send every later case's log lines to a fake Discord.
+  setSink(null)
 })
 
 describe('decide — messages that are never scanned at all', () => {
@@ -2201,5 +2218,1109 @@ describe('the file header', () => {
     expect(header).toMatch(/login/i)
     expect(header).toMatch(/restart loop/i)
     expect(header).not.toContain('is indistinguishable from a bot whose regex is')
+  })
+})
+
+/**
+ * The status channel: the bot's own faults, where somebody will see them.
+ *
+ * THE RULE THIS SERVES IS THE OWNER'S, VERBATIM — "there should be no cli
+ * interactions with the bot or its data". A failed delete, a rate limit, an
+ * unusable log channel and an unexpected exception all reached journalctl and
+ * stopped there, which for this owner means they reached nobody.
+ *
+ * NOTHING HERE TOUCHES DISCORD, for the same reason nothing else in this file
+ * does. `statusReporter` reads three things off a client — `isReady`,
+ * `channels.fetch` and the channel's `send` — and every one of those is
+ * answered by the fake below, including the answers a real Discord only gives
+ * when something is already broken.
+ *
+ * THE CASES ARE THE FIVE WAYS THIS FEATURE BREAKS A LIVE BOT: a fault loop, a
+ * flood, a secret in a public-ish channel, noise on every restart, and an async
+ * failure raised where nothing can catch it. The first and the last are tested
+ * in log.test.ts, where the hook is; the middle three are here, where the
+ * posting is.
+ */
+const STATUS_CHANNEL = '999999999999999999'
+
+/**
+ * A client with one status channel behind it, and a record of what reached it.
+ *
+ * `hold` KEEPS EVERY SEND PENDING until `open()` is called, which is the only
+ * way to observe a backlog: the reporter serialises its posts, so a queue only
+ * exists while Discord is slow.
+ *
+ * `ready()` IS THE GATEWAY COMING UP, and it is a second thing entirely from
+ * `open()`. `statusReporter` reads `isReady()` and registers a `clientReady`
+ * listener of its own, because faults raised on the way up are held rather than
+ * dropped; this is what lets a case start disconnected, raise a fault, connect,
+ * and watch what the channel gets. Starting `ready: false` and never calling
+ * this is a start that never reaches Discord at all.
+ */
+function statusHarness(
+  options: {
+    ready?: boolean
+    sendable?: boolean
+    missing?: boolean
+    hold?: boolean
+    fetchRejects?: unknown
+    sendRejects?: unknown
+    editRejects?: unknown
+  } = {},
+): {
+  client: Client
+  send: Mock<(payload: { content: string; allowedMentions: unknown }) => Promise<unknown>>
+  sent: string[]
+  edited: string[]
+  fetched: string[]
+  open: () => void
+  ready: () => void
+} {
+  const sent: string[] = []
+  const edited: string[] = []
+  const fetched: string[] = []
+
+  let open = (): void => {}
+  const gate =
+    options.hold === true
+      ? new Promise<void>((resolve) => {
+          open = resolve
+        })
+      : Promise.resolve()
+
+  const send = vi.fn(async (payload: { content: string; allowedMentions: unknown }) => {
+    await gate
+    if (options.sendRejects !== undefined) throw options.sendRejects
+    sent.push(payload.content)
+
+    return {
+      edit: (content: string): Promise<unknown> => {
+        if (options.editRejects !== undefined) return Promise.reject(options.editRejects)
+        edited.push(content)
+        return Promise.resolve({})
+      },
+    }
+  })
+
+  let connected = options.ready ?? true
+  const waiting: (() => void)[] = []
+
+  const client = {
+    isReady: () => connected,
+    once: (event: unknown, handler: () => void) => {
+      if (event === Events.ClientReady) waiting.push(handler)
+    },
+    channels: {
+      // The id is recorded rather than ignored: which channel this bot posts
+      // its health to is a decision — BLITZ_STATUS_CHANNEL_ID and not
+      // BLITZ_LOG_CHANNEL_ID — and a fake that answers whatever it is asked
+      // cannot tell the two apart.
+      fetch: (id: string) => {
+        fetched.push(id)
+        if (options.fetchRejects !== undefined) return Promise.reject(options.fetchRejects)
+        if (options.missing === true) return Promise.resolve(null)
+        return Promise.resolve({ isSendable: () => options.sendable ?? true, send })
+      },
+    },
+  } as unknown as Client
+
+  // `isReady()` is already true by the time discord.js emits `clientReady`,
+  // which is the fact the reporter's gate depends on, so the fake sets it
+  // before it calls anybody.
+  const ready = (): void => {
+    connected = true
+    for (const handler of waiting.splice(0, waiting.length)) handler()
+  }
+
+  return { client, send, sent, edited, fetched, open, ready }
+}
+
+/** A rendered line, of the shape `log()` hands a sink. */
+const line = (msg: string, fields = ''): string =>
+  `2026-08-30T00:00:00.000Z level=error msg="${msg}"${fields === '' ? '' : ` ${fields}`}`
+
+/** Let the fire-and-forget half of `log()` finish. */
+const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
+
+/** One captured post, or a loud failure rather than an undefined comparison. */
+function at(posts: string[], index: number): string {
+  const value = posts[index]
+  if (value === undefined) throw new Error(`nothing was posted at index ${index}`)
+  return value
+}
+
+describe('statusReporter — which faults reach the channel at all', () => {
+  it('posts a warning and an error', async () => {
+    const { client, sent } = statusHarness()
+    const report = statusReporter(client, STATUS_CHANNEL)
+
+    await report('warn', 'gateway disconnected', line('gateway disconnected'))
+    await report('error', 'delete failed, message left standing', line('delete failed'))
+
+    expect(sent).toHaveLength(2)
+    expect(at(sent, 0)).toContain('gateway disconnected')
+    expect(at(sent, 1)).toContain('delete failed')
+  })
+
+  /**
+   * THE FILTER IS IN log.ts AND THIS IS THE PROOF IT IS WIRED. A status channel
+   * that also carries `ready` and a line per removal is a running commentary,
+   * and the only reason the channel is worth reading is that everything in it
+   * needs a person.
+   */
+  it('posts nothing for an info, all the way through log()', async () => {
+    const { client, sent } = statusHarness()
+    setSink(statusReporter(client, STATUS_CHANNEL))
+
+    log('info', 'ready', { guild: 'Blitz Royale' })
+    await settle()
+
+    expect(sent).toEqual([])
+  })
+
+  /**
+   * NOTHING POSTS ON A CLEAN START. index.ts installs the sink before it logs
+   * in — deliberately, so that the halt line emitted during `clientReady` still
+   * lands — so the thing that keeps a restart quiet is this gate and not the
+   * order two listeners were registered in. The bot restarts on every deploy
+   * and every crash; a channel that says something each time is one nobody
+   * reads.
+   */
+  it('posts nothing before the client is ready', async () => {
+    const { client, sent, send } = statusHarness({ ready: false })
+    setSink(statusReporter(client, STATUS_CHANNEL))
+
+    log('error', 'login failed', { error: new Error('An invalid token was provided.') })
+    await settle()
+
+    expect(send).not.toHaveBeenCalled()
+    expect(sent).toEqual([])
+    // The journal is the floor and is unaffected by any of this.
+    expect(stderr.join('')).toContain('msg="login failed"')
+  })
+
+  /**
+   * The same suppression `announcer` states at its own send. A rendered line
+   * can carry an id a stranger chose — an invite code, a webhook's name — and
+   * nothing this bot posts is allowed to notify anybody.
+   */
+  it('suppresses every mention on the send', async () => {
+    const { client, send } = statusHarness()
+
+    await statusReporter(client, STATUS_CHANNEL)('error', 'client error', line('client error'))
+
+    expect(send).toHaveBeenCalledWith({
+      content: expect.stringContaining('client error') as unknown as string,
+      allowedMentions: { parse: [] },
+    })
+  })
+})
+
+/**
+ * REGRESSION, AND THE WORST KIND: the faults that mean "the bot is not running"
+ * were the only ones the channel could never carry.
+ *
+ * An adversarial pass proved it end to end. The sink gated on
+ * `client.isReady()` and RETURNED, so every fault raised on the way up — a
+ * gateway close on an intent that is not ticked on in the developer portal, a
+ * `client error` thrown while connecting, anything at all before `clientReady`
+ * — wrote its journal line and posted nothing. Journal 1, channel 0, for the
+ * most important thing this bot can say.
+ *
+ * THE GATE IS STILL THERE AND IS STILL RIGHT: there is no channel to fetch
+ * before the gateway is up. What changed is that the fault is HELD and flushed
+ * by the same event that makes posting possible.
+ */
+describe('statusReporter — faults raised before the gateway was up', () => {
+  it('holds a fault raised before ready and posts it once the gateway comes up', async () => {
+    const { client, sent, send, ready } = statusHarness({ ready: false })
+    setSink(statusReporter(client, STATUS_CHANNEL))
+
+    log('warn', 'gateway disconnected', { shard: 0, code: 4014 })
+    await settle()
+
+    expect(send).not.toHaveBeenCalled()
+
+    ready()
+    await settle()
+
+    expect(sent).toHaveLength(1)
+    expect(at(sent, 0)).toContain('gateway disconnected')
+    expect(at(sent, 0)).toContain('code=4014')
+  })
+
+  it('flushes them in the order they happened', async () => {
+    const { client, sent, ready } = statusHarness({ ready: false })
+    const report = statusReporter(client, STATUS_CHANNEL)
+
+    await report('error', 'client error', line('client error'))
+    await report('warn', 'gateway reconnecting', line('gateway reconnecting'))
+
+    ready()
+    await settle()
+
+    expect(sent).toHaveLength(2)
+    expect(at(sent, 0)).toContain('client error')
+    expect(at(sent, 1)).toContain('gateway reconnecting')
+  })
+
+  /**
+   * BOUNDED, because a start that is going wrong can raise faults as fast as
+   * the event loop turns and there is nothing draining this until the gateway
+   * is up — which, in the case that matters, it never is.
+   *
+   * THE FIRST ONES ARE THE ONES KEPT, which is the opposite of the eviction
+   * rule for `seen`. A bad start produces one cause and then a run of
+   * consequences; the cause is the line worth having, and there is no "still
+   * happening" to preserve because none of this has been posted yet.
+   */
+  it('bounds what it holds, and keeps the earliest faults', async () => {
+    const { client, sent, ready } = statusHarness({ ready: false })
+    const report = statusReporter(client, STATUS_CHANNEL)
+
+    for (let i = 0; i < 200; i += 1) {
+      await report('error', `fault ${i}`, line(`fault ${i}`))
+    }
+
+    ready()
+    await settle()
+
+    expect(sent).toHaveLength(20)
+    expect(at(sent, 0)).toContain('fault 0')
+    expect(at(sent, 19)).toContain('fault 19')
+  })
+
+  /**
+   * THE IRREDUCIBLE CASE, WRITTEN DOWN AS A TEST SO IT IS NOT MISTAKEN FOR A
+   * BUG LATER. A login that never succeeds — a revoked token, an intent the
+   * portal does not grant — has no gateway, so there is no channel and nothing
+   * inside a Discord bot can report it over Discord. index.ts writes the line
+   * and exits; systemd restarts; the evidence is `journalctl -u blitz-bot -p
+   * warning` and nowhere else.
+   *
+   * WHAT IS ASSERTED IS THAT IT COSTS NOTHING: no request, and no floating
+   * promise to reject into a process that is on its way out. The sink answers
+   * an already-resolved promise, so a held fault is dropped with the process
+   * rather than turning into an unhandled rejection during shutdown.
+   */
+  it('drops what it is holding when ready never comes, without a pending promise', async () => {
+    const { client, send } = statusHarness({ ready: false })
+    const report = statusReporter(client, STATUS_CHANNEL)
+
+    const rejections: unknown[] = []
+    const record = (reason: unknown): void => {
+      rejections.push(reason)
+    }
+    process.on('unhandledRejection', record)
+
+    try {
+      const held = report('error', 'login failed', line('login failed'))
+      await expect(held).resolves.toBeUndefined()
+
+      // Two turns of the loop: an unhandled rejection is reported at the end of
+      // one, so a promise left hanging here would have surfaced by now.
+      await settle()
+      await settle()
+    } finally {
+      process.off('unhandledRejection', record)
+    }
+
+    expect(send).not.toHaveBeenCalled()
+    expect(rejections).toEqual([])
+  })
+})
+
+/**
+ * The flood, which is the failure that hurts most at the worst moment.
+ *
+ * AN ERROR REPEATING SIXTY TIMES A MINUTE buries the channel exactly when it
+ * matters, and spends the bot's rate limit doing it. The first occurrence
+ * posts; identical ones inside the window edit that message and add a count.
+ */
+describe('statusReporter — a repeat edits rather than posts', () => {
+  it('folds an identical fault into an edit that carries a count', async () => {
+    vi.useFakeTimers()
+
+    try {
+      vi.setSystemTime(new Date('2026-08-30T00:00:00.000Z'))
+
+      const { client, sent, edited } = statusHarness()
+      const report = statusReporter(client, STATUS_CHANNEL)
+
+      await report('error', 'delete failed', line('delete failed'))
+      await report('error', 'delete failed', line('delete failed'))
+      await report('error', 'delete failed', line('delete failed'))
+
+      // One message, and the first repeat written straight away: an occasional
+      // repeat behaves exactly as it did before the edits were throttled.
+      expect(sent).toHaveLength(1)
+      expect(edited).toHaveLength(1)
+      expect(at(edited, 0)).toContain('seen 2 times')
+
+      // The third happened inside the throttle window, so it is folded in
+      // memory and written by the trailing flush rather than by a request of
+      // its own.
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      expect(edited).toHaveLength(2)
+      expect(at(edited, 1)).toContain('seen 3 times')
+      // A last-seen time, so a fault that stopped an hour ago is
+      // distinguishable from one still happening.
+      expect(at(edited, 1)).toMatch(/last \d{4}-\d{2}-\d{2}T[\d:.]+Z/)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  /**
+   * COALESCING COLLAPSED THE CHANNEL AND LEFT THE API TRAFFIC WHERE IT WAS, and
+   * that was half of flood control missing rather than a detail of it. Five
+   * hundred occurrences of one fault produced one message and ~500 PATCH edits
+   * — one Discord request per occurrence, the whole rate limit spent keeping a
+   * number up to date, at the moment the bot is already failing as fast as it
+   * can.
+   *
+   * THE VISIBLE BEHAVIOUR IS THE SAME. One message, a count on it, a last-seen
+   * time, and the final number is the true one. What changed is the number of
+   * requests it cost.
+   */
+  it('spends a handful of requests on a fault storm, not one per occurrence', async () => {
+    vi.useFakeTimers()
+
+    try {
+      vi.setSystemTime(new Date('2026-08-30T00:00:00.000Z'))
+
+      const { client, sent, edited, send } = statusHarness()
+      const report = statusReporter(client, STATUS_CHANNEL)
+
+      for (let i = 0; i < 500; i += 1) {
+        await report('error', 'delete failed', line('delete failed'))
+      }
+
+      expect(send).toHaveBeenCalledTimes(1)
+      expect(edited).toHaveLength(1)
+
+      // A second of it buys nothing. Every one of those 500 occurrences used to
+      // be its own request.
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(edited).toHaveLength(1)
+
+      // The trailing flush is what makes the count true rather than whatever it
+      // happened to be when the throttle last let an edit through.
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(edited).toHaveLength(2)
+      expect(at(edited, 1)).toContain('seen 500 times')
+
+      // THE NUMBER, STATED. Three Discord requests for five hundred faults.
+      expect(sent.length + edited.length).toBe(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  /**
+   * THROTTLING THE EDITS MUST NOT DELAY A NEW FAULT. The whole point of the
+   * channel is that something appearing in it needs a person, and a fault
+   * nobody has seen before is the thing most worth seeing promptly. Only
+   * repeats of something already posted wait.
+   */
+  it('posts a distinct fault immediately, mid-storm', async () => {
+    vi.useFakeTimers()
+
+    try {
+      vi.setSystemTime(new Date('2026-08-30T00:00:00.000Z'))
+
+      const { client, sent } = statusHarness()
+      const report = statusReporter(client, STATUS_CHANNEL)
+
+      for (let i = 0; i < 500; i += 1) {
+        await report('error', 'delete failed', line('delete failed'))
+      }
+
+      await report('error', 'client error', line('client error'))
+
+      // No timer advanced, and it is already in the channel.
+      expect(sent).toHaveLength(2)
+      expect(at(sent, 1)).toContain('client error')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  /**
+   * IDENTITY IS THE MESSAGE AND THE LEVEL, NOT THE RENDERED LINE. Two failed
+   * deletes differ in their message id, their channel and their timestamp and
+   * are the same fault; keying on the whole line would post one message per
+   * occurrence and coalesce nothing at all, which is the bug this exists to
+   * avoid rather than a detail of it.
+   */
+  it('treats the same failure about two different messages as one fault', async () => {
+    const { client, sent, edited } = statusHarness()
+    const report = statusReporter(client, STATUS_CHANNEL)
+
+    await report('error', 'delete failed', line('delete failed', 'channel="111" author="222"'))
+    await report('error', 'delete failed', line('delete failed', 'channel="333" author="444"'))
+
+    expect(sent).toHaveLength(1)
+    expect(edited).toHaveLength(1)
+    // The body stays the first occurrence's. Rewriting it would change which
+    // channel the entry names while the count claims it happened twice.
+    expect(at(edited, 0)).toContain('channel="111"')
+  })
+
+  it('keeps different faults apart', async () => {
+    const { client, sent, edited } = statusHarness()
+    const report = statusReporter(client, STATUS_CHANNEL)
+
+    await report('error', 'delete failed', line('delete failed'))
+    await report('error', 'client error', line('client error'))
+    await report('warn', 'delete failed', line('delete failed'))
+
+    expect(sent).toHaveLength(3)
+    expect(edited).toEqual([])
+  })
+
+  /**
+   * THE WINDOW IS MEASURED FROM THE FIRST POST, so a fault that never stops
+   * produces a fresh message every five minutes instead of one message quietly
+   * edited for a week. A channel that looks idle while the bot is on fire is
+   * the thing being avoided.
+   */
+  it('posts fresh once the window has closed', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+
+    try {
+      const start = new Date('2026-08-30T00:00:00.000Z')
+      vi.setSystemTime(start)
+
+      const { client, sent, edited } = statusHarness()
+      const report = statusReporter(client, STATUS_CHANNEL)
+
+      await report('error', 'delete failed', line('delete failed'))
+      await report('error', 'delete failed', line('delete failed'))
+
+      vi.setSystemTime(new Date(start.getTime() + 6 * 60 * 1000))
+      await report('error', 'delete failed', line('delete failed'))
+
+      expect(sent).toHaveLength(2)
+      expect(edited).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  /**
+   * BOUNDED, BECAUSE THIS PROCESS RUNS FOR MONTHS. One entry per distinct fault
+   * text, each holding a discord.js `Message`, is a memory leak the day a log
+   * line starts carrying an id in its `msg`. Eviction costs only the
+   * coalescing.
+   */
+  it('remembers a bounded number of faults and evicts the oldest', async () => {
+    const { client, sent, edited } = statusHarness()
+    const report = statusReporter(client, STATUS_CHANNEL)
+
+    // One more than it can hold. `fault 0` is the oldest and is the one pushed
+    // out; `fault 50` was the most recent and must still be there.
+    for (let i = 0; i <= 50; i += 1) {
+      await report('error', `fault ${i}`, line(`fault ${i}`))
+    }
+
+    expect(sent).toHaveLength(51)
+    expect(edited).toEqual([])
+
+    await report('error', 'fault 50', line('fault 50'))
+    expect(edited).toHaveLength(1)
+
+    await report('error', 'fault 0', line('fault 0'))
+    expect(sent).toHaveLength(52)
+    expect(edited).toHaveLength(1)
+  })
+
+  /**
+   * THE BACKLOG IS BOUNDED TOO. Coalescing happens at the front of the queue,
+   * so a burst of DISTINCT faults still queues one post each — and a Discord
+   * that is answering slowly is exactly when a burst arrives. What is dropped
+   * is the channel copy of a fault whose journal line was already written.
+   */
+  it('drops what it cannot keep up with rather than queueing without limit', async () => {
+    const { client, sent, open } = statusHarness({ hold: true })
+    const report = statusReporter(client, STATUS_CHANNEL)
+
+    const pending: Promise<void>[] = []
+    for (let i = 0; i < 40; i += 1) {
+      pending.push(report('error', `fault ${i}`, line(`fault ${i}`)))
+    }
+
+    open()
+    await Promise.all(pending)
+
+    expect(sent).toHaveLength(20)
+  })
+})
+
+describe('statusReporter — a channel that cannot be posted to', () => {
+  /**
+   * SAY IT ONCE, THEN STOP. A wrong id, a deleted channel or a missing
+   * permission does not get better by being retried, and retrying costs a
+   * journal line and a failed request per fault for as long as the process
+   * lives — worst when the bot is already producing faults quickly.
+   */
+  it('says the channel is unusable exactly once and then stops trying', async () => {
+    const { client, send } = statusHarness({ sendable: false })
+    const report = statusReporter(client, STATUS_CHANNEL)
+
+    await report('error', 'delete failed', line('delete failed'))
+    await report('error', 'client error', line('client error'))
+    await report('warn', 'gateway disconnected', line('gateway disconnected'))
+
+    expect(send).not.toHaveBeenCalled()
+
+    const said = stderr.join('').split('status channel unusable').length - 1
+    expect(said).toBe(1)
+    expect(stderr.join('')).toContain(`channel="${STATUS_CHANNEL}"`)
+  })
+
+  it('gives up the same way when the id names no channel', async () => {
+    const { client } = statusHarness({ missing: true })
+
+    await statusReporter(client, STATUS_CHANNEL)('error', 'client error', line('client error'))
+
+    expect(stderr.join('')).toContain('status channel unusable')
+  })
+
+  it('gives up when the bot has no permission to post there', async () => {
+    const refused = new DiscordAPIError(
+      { code: RESTJSONErrorCodes.MissingPermissions, message: 'Missing Permissions' },
+      RESTJSONErrorCodes.MissingPermissions,
+      403,
+      'POST',
+      'https://discord.com/api/v10/channels/0/messages',
+      {},
+    )
+
+    const { client, send } = statusHarness({ sendRejects: refused })
+    const report = statusReporter(client, STATUS_CHANNEL)
+
+    await report('error', 'client error', line('client error'))
+    await report('error', 'delete failed', line('delete failed'))
+
+    expect(stderr.join('')).toContain('status channel unusable')
+    expect(send).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * A RATE LIMIT IS NOT A REASON TO GIVE UP FOREVER. Latching on a transient
+   * failure would turn a bad ten seconds into a bot that reports nothing until
+   * the next restart, which is the failure this whole feature exists to stop.
+   */
+  it('keeps trying after a transient failure', async () => {
+    const { client, send } = statusHarness({ sendRejects: new Error('rate limited') })
+    const report = statusReporter(client, STATUS_CHANNEL)
+
+    await report('error', 'client error', line('client error'))
+    await report('error', 'delete failed', line('delete failed'))
+
+    expect(send).toHaveBeenCalledTimes(2)
+    expect(stderr.join('')).toContain('could not post to the status channel')
+    expect(stderr.join('')).not.toContain('status channel unusable')
+  })
+
+  /**
+   * An edit that fails means the message is gone — deleted by an admin tidying
+   * up, most likely. Forgetting the entry is what stops the reporter editing a
+   * dead message for the rest of the window.
+   */
+  it('forgets a message it could not edit, so the next occurrence posts fresh', async () => {
+    const { client, sent } = statusHarness({ editRejects: new Error('Unknown Message') })
+    const report = statusReporter(client, STATUS_CHANNEL)
+
+    await report('error', 'delete failed', line('delete failed'))
+    await report('error', 'delete failed', line('delete failed'))
+    await report('error', 'delete failed', line('delete failed'))
+
+    expect(sent).toHaveLength(2)
+    expect(stderr.join('')).toContain('could not update the status channel message')
+  })
+})
+
+/**
+ * What is allowed to leave the process.
+ *
+ * THE TOKEN IS THE ONE THAT MATTERS. #bot-status is admin-only in this guild,
+ * which is one permission overwrite away from not being, and this application's
+ * credentials are shared with the Ringmaster console — so a token in a message
+ * is not a leak of one bot. The sink is a general hook on every warning and
+ * error the bot will ever emit, including the ones nobody has written yet.
+ */
+describe('statusReporter — what never reaches the channel', () => {
+  // Assembled from parts on purpose. A literal Discord-token-shaped string in a
+  // source file trips GitHub push protection and blocks the push, even for a
+  // fixture that was never a real credential. The redactor under test sees the
+  // same bytes either way, so nothing here is weakened to get past a scanner.
+  const TOKEN = ["MTIzNDU2Nzg5MDEyMzQ1Njc4", "GaBcDe", "abcdefghijklmnopqrstuvwxyz0123"].join('.')
+
+  it('posts neither a request url nor anything shaped like a token', async () => {
+    const { client, sent } = statusHarness()
+    setSink(statusReporter(client, STATUS_CHANNEL))
+
+    log('error', 'client error', {
+      error: new Error(
+        `request to https://discord.com/api/webhooks/123/secret failed, authorization ${TOKEN}`,
+      ),
+    })
+    await settle()
+
+    expect(at(sent, 0)).not.toContain(TOKEN)
+    expect(at(sent, 0)).not.toContain('discord.com')
+    expect(at(sent, 0)).toContain('[url]')
+    expect(at(sent, 0)).toContain('[redacted]')
+    // The fault itself still arrives; it is the payload that was cut.
+    expect(at(sent, 0)).toContain('msg="client error"')
+  })
+
+  /**
+   * THE REAL PATH, NOT A CONSTRUCTED LINE. A failed delete names the channel
+   * and the author and never what was said — that is a property of the call
+   * site in `handleMessage`, and it is the one thing on the secrets list a
+   * reviewer of a new log line has to check by hand, so it gets a test that
+   * goes through the call site.
+   */
+  it('names the channel and the author of a failed delete, and not the message', async () => {
+    const { client, sent } = statusHarness()
+    setSink(statusReporter(client, STATUS_CHANNEL))
+
+    const acts = actions({ remove: () => Promise.reject(new Error('Missing Permissions')) })
+    await handleMessage(msg({ text: 'join us at discord.gg/abc123 you losers' }), cfg(), acts)
+    await settle()
+
+    expect(at(sent, 0)).toContain(`channel="${CHANNEL}"`)
+    expect(at(sent, 0)).toContain(`author="${AUTHOR}"`)
+    expect(at(sent, 0)).not.toContain('you losers')
+    expect(at(sent, 0)).not.toContain('join us at')
+  })
+
+  /**
+   * A post over 2000 characters is refused outright by Discord, which would
+   * turn a long fault into a fault that never gets reported.
+   */
+  it('caps the line so the post cannot be refused for its length', async () => {
+    const { client, sent } = statusHarness()
+
+    await statusReporter(client, STATUS_CHANNEL)(
+      'error',
+      'invite scan capped',
+      line('invite scan capped', `codes="${'x'.repeat(4000)}"`),
+    )
+
+    expect(at(sent, 0).length).toBeLessThan(2000)
+    expect(at(sent, 0)).toContain('…')
+  })
+
+  /**
+   * The body is fenced, and that is a neutraliser rather than styling: inside a
+   * fence Discord renders `*`, `_`, `@everyone` and `<@id>` literally, links
+   * nothing and pings nobody. A backtick in the line would close the fence, so
+   * backticks do not survive.
+   */
+  it('fences the line, and nothing in the line can close the fence', async () => {
+    const { client, sent } = statusHarness()
+
+    await statusReporter(client, STATUS_CHANNEL)(
+      'warn',
+      'author roles could not be fetched',
+      line('author roles could not be fetched', 'author="```@everyone"'),
+    )
+
+    expect(at(sent, 0).startsWith('```\n')).toBe(true)
+    expect(at(sent, 0).endsWith('\n```')).toBe(true)
+    expect(at(sent, 0).split('```')).toHaveLength(3)
+  })
+})
+
+/**
+ * The deploy notice: which commit this process is running.
+ *
+ * WHAT THE OWNER ASKED FOR — "when an update is installed I expect a message in
+ * the log channel telling us which commit it's running now" — and the whole
+ * difficulty is the half he did not have to say. `Restart=always` starts this
+ * process again five seconds after every crash, so a notice on every start is a
+ * channel full of "running abc1234" arriving on top of the faults explaining
+ * the crash, and the owner has a standing rule against unsolicited text. So the
+ * cases below are mostly cases where it must say NOTHING.
+ *
+ * THE MEMORY IS THE OTHER HALF. It has to survive a restart, and it must not be
+ * a file the updater can overwrite — /opt/blitz-bot is the directory the
+ * updater resets, and the bot's own state lives in the unit's
+ * `StateDirectory=` instead. That is asserted here as a property of the paths
+ * rather than left to docs/deploy.md.
+ */
+const DEPLOYED = 'a1b2c3d'
+const PREVIOUS = 'deadbee'
+
+/** An `ENOENT`, exactly as `readFile` rejects with one. */
+const noSuchFile = (): Error =>
+  Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' })
+
+/**
+ * The two files, in memory.
+ *
+ * `deployed` IS WHAT THE UPDATER WROTE and never changes during a case;
+ * `reported` is what this bot remembers and is the thing a restart carries
+ * forward. Absent means the file is not there; an `Error` means the read
+ * itself fails, which is a different answer again — see `readSha`.
+ */
+function commitStore(
+  options: {
+    deployed?: string | Error
+    reported?: string | Error
+    unwritable?: boolean
+  } = {},
+): { files: CommitFiles; file: () => string | Error | null } {
+  let reported: string | Error | null = options.reported ?? null
+
+  const read = (value: string | Error | null): Promise<string> => {
+    if (value === null) return Promise.reject(noSuchFile())
+    if (value instanceof Error) return Promise.reject(value)
+    return Promise.resolve(value)
+  }
+
+  return {
+    files: {
+      deployed: () => read(options.deployed ?? null),
+      reported: () => read(reported),
+      remember: (sha) => {
+        if (options.unwritable === true) {
+          return Promise.reject(new Error('EROFS: read-only file system'))
+        }
+
+        reported = `${sha}\n`
+        return Promise.resolve()
+      },
+    },
+    file: () => reported,
+  }
+}
+
+/** A post that always works, and remembers what it was handed. */
+const poster = (): Mock<(content: string) => Promise<void>> => vi.fn(() => Promise.resolve())
+
+describe('the deploy notice — what it says, and when it says nothing', () => {
+  it('names the commit when it is not the one already reported', async () => {
+    const post = poster()
+    const store = commitStore({ deployed: DEPLOYED, reported: `${PREVIOUS}\n` })
+
+    await reportDeployedCommit(store.files, post)
+
+    expect(post).toHaveBeenCalledWith(`running commit ${DEPLOYED}`)
+    expect(store.file()).toBe(`${DEPLOYED}\n`)
+  })
+
+  /**
+   * THE CASE THE WHOLE FEATURE IS SHAPED BY. A crash loop restarts this process
+   * every five seconds on the same commit, and every one of those restarts must
+   * be silent — otherwise the fix for the noise the owner rejected is a second
+   * source of the same noise.
+   */
+  it('says nothing when the bot came back up on the commit it already reported', async () => {
+    const post = poster()
+
+    await reportDeployedCommit(commitStore({ deployed: DEPLOYED, reported: DEPLOYED }).files, post)
+
+    expect(post).not.toHaveBeenCalled()
+  })
+
+  /**
+   * A trailing newline is what the updater writes and what this bot writes; a
+   * comparison that did not trim would post on every restart forever, which is
+   * the failure mode this whole test file is about.
+   */
+  it('ignores the whitespace around either sha', async () => {
+    const post = poster()
+
+    await reportDeployedCommit(
+      commitStore({ deployed: `${DEPLOYED}\n`, reported: `  ${DEPLOYED}  \n` }).files,
+      post,
+    )
+
+    expect(post).not.toHaveBeenCalled()
+  })
+
+  /**
+   * NOT AN ERROR, AND NOT WORTH A LINE EITHER. A hand-cloned box, a first start
+   * before any update has run, somebody running the bot out of a checkout: in
+   * all three the file is simply not there, and a warning about a feature
+   * nobody has set up is exactly the unsolicited text the rule is about.
+   */
+  it('says nothing at all when no deploy has ever been recorded', async () => {
+    const post = poster()
+
+    await reportDeployedCommit(commitStore().files, post)
+
+    expect(post).not.toHaveBeenCalled()
+    expect(stderr.join('')).toBe('')
+    expect(stdout.join('')).toBe('')
+  })
+
+  /**
+   * A FILE THAT EXISTS AND CANNOT BE READ IS A DIFFERENT ANSWER. Nothing is
+   * posted — there is no commit to name — but the updater is broken, and that
+   * is a fault, so the journal gets a line and the status channel gets it
+   * through the sink like every other fault.
+   */
+  it('posts nothing and says why when the file cannot be read', async () => {
+    const post = poster()
+    const denied = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+
+    await reportDeployedCommit(commitStore({ deployed: denied }).files, post)
+
+    expect(post).not.toHaveBeenCalled()
+    expect(stderr.join('')).toContain('could not read the commit the updater recorded')
+  })
+
+  it('posts nothing when the file holds something that is not a commit id', async () => {
+    for (const rubbish of ['', 'HEAD', 'not a sha', 'zzzzzzz', 'a1b2c3', '<!DOCTYPE html>']) {
+      const post = poster()
+
+      await reportDeployedCommit(commitStore({ deployed: rubbish }).files, post)
+
+      expect(post, rubbish).not.toHaveBeenCalled()
+    }
+
+    expect(stderr.join('')).toContain('is not a commit id')
+  })
+
+  /**
+   * THE CONTENT OF THAT FILE IS NEVER COPIED ANYWHERE. It was written by
+   * something other than this process, and the fault line goes to a Discord
+   * channel — so what is said about it is its length and nothing else.
+   */
+  it('does not put the malformed content in the line about it', async () => {
+    const post = poster()
+
+    await reportDeployedCommit(commitStore({ deployed: 'ROLLBACK-IN-PROGRESS' }).files, post)
+
+    expect(post).not.toHaveBeenCalled()
+    expect(stderr.join('')).not.toContain('ROLLBACK-IN-PROGRESS')
+    expect(stderr.join('')).toContain('length=20')
+  })
+
+  /**
+   * A CORRUPT MEMORY MUST NOT BE READ AS "NOTHING HAS BEEN REPORTED", which
+   * would post on every start. It is read as "unknown", the notice goes out
+   * once, and the write that follows repairs the file.
+   */
+  it('reports once and repairs the file when its own memory is unreadable', async () => {
+    const post = poster()
+    const store = commitStore({ deployed: DEPLOYED, reported: 'not a sha either' })
+
+    await reportDeployedCommit(store.files, post)
+
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(store.file()).toBe(`${DEPLOYED}\n`)
+
+    const next = poster()
+    await reportDeployedCommit(store.files, next)
+    expect(next).not.toHaveBeenCalled()
+  })
+
+  /**
+   * THE RESTART, WHICH IS THE POINT OF WRITING ANYTHING DOWN. Nothing survives
+   * a crash except the file, so the second run below shares only that — and it
+   * has to be enough to keep the channel quiet.
+   */
+  it('remembers across a restart, and says nothing the second time', async () => {
+    const store = commitStore({ deployed: DEPLOYED })
+
+    const first = poster()
+    await reportDeployedCommit(store.files, first)
+    expect(first).toHaveBeenCalledWith(`running commit ${DEPLOYED}`)
+
+    // The process died here. A new one comes up on the same commit, with the
+    // same two files and no memory of anything else.
+    const second = poster()
+    await reportDeployedCommit(store.files, second)
+    expect(second).not.toHaveBeenCalled()
+
+    // And an update lands: a different sha, so it is said once more.
+    const store2 = commitStore({ deployed: PREVIOUS, reported: store.file() as string })
+    const third = poster()
+    await reportDeployedCommit(store2.files, third)
+    expect(third).toHaveBeenCalledWith(`running commit ${PREVIOUS}`)
+  })
+
+  /**
+   * THE ORDER IS A DECISION. The file means "this commit was reported", so
+   * writing it before the post lands would make it a lie — and the notice would
+   * be lost for good, because the next start would compare equal and stay
+   * quiet. A failed post leaves the file alone and the next start tries again.
+   */
+  it('does not record a notice it could not post', async () => {
+    const store = commitStore({ deployed: DEPLOYED })
+
+    await expect(
+      reportDeployedCommit(store.files, () => Promise.reject(new Error('rate limited'))),
+    ).rejects.toThrow('rate limited')
+
+    expect(store.file()).toBeNull()
+  })
+
+  /**
+   * A write that fails is not visible from Discord, and its consequence is that
+   * this notice comes back on every single restart — the exact noise the
+   * comparison exists to prevent. So it is a fault, and it is said.
+   */
+  it('says so when it cannot remember what it just reported', async () => {
+    const post = poster()
+
+    await reportDeployedCommit(commitStore({ deployed: DEPLOYED, unwritable: true }).files, post)
+
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(stderr.join('')).toContain('could not record the reported commit')
+  })
+})
+
+describe('the deploy notice — where it goes, and when', () => {
+  /**
+   * THE STATUS CHANNEL, NOT THE MODERATION LOG. BLITZ_LOG_CHANNEL_ID carries
+   * what was removed and why — evidence about a member. Which commit the bot is
+   * running is evidence about the BOT, which is what BLITZ_STATUS_CHANNEL_ID is
+   * for. The owner said "log channel" because it is the only one he has set up.
+   */
+  it('waits for the gateway and posts to the status channel', async () => {
+    const { client, sent, fetched, ready } = statusHarness({ ready: false })
+
+    announceDeployedCommit(client, STATUS_CHANNEL, commitStore({ deployed: DEPLOYED }).files)
+    await settle()
+
+    // Nothing before there is a gateway: there is no channel to fetch yet.
+    expect(sent).toEqual([])
+    expect(fetched).toEqual([])
+
+    ready()
+    await settle()
+
+    expect(sent).toEqual([`running commit ${DEPLOYED}`])
+    expect(fetched).toEqual([STATUS_CHANNEL])
+  })
+
+  it('is wired to the status channel id and not to the log channel id', async () => {
+    // A source assertion because the two ids are both strings and both optional:
+    // a fake client cannot tell which of `config`'s two fields was handed to
+    // `announceDeployedCommit`, and getting it wrong puts deploy notices in the
+    // channel that holds the moderation record.
+    const source = await readFile(new URL('./client.ts', import.meta.url), 'utf8')
+
+    expect(source).toContain('announceDeployedCommit(client, config.statusChannelId)')
+    expect(source).not.toMatch(/announceDeployedCommit\([^)]*logChannelId/)
+  })
+
+  it('registers nothing at all when no status channel is configured', async () => {
+    const quiet = createClient(cfg())
+    expect(quiet.listenerCount(Events.ClientReady)).toBe(1)
+    await quiet.destroy()
+
+    const wired = createClient(cfg({ statusChannelId: STATUS_CHANNEL }))
+    expect(wired.listenerCount(Events.ClientReady)).toBe(2)
+    await wired.destroy()
+  })
+
+  /**
+   * A NOTICE THAT DID NOT LAND IS NOT A REASON TO BE DOWN. One line in the
+   * journal, and the bot carries on moderating.
+   */
+  it('logs and carries on when the channel cannot be posted to', async () => {
+    const { client, sent, ready } = statusHarness({ ready: false, sendable: false })
+
+    announceDeployedCommit(client, STATUS_CHANNEL, commitStore({ deployed: DEPLOYED }).files)
+    ready()
+    await settle()
+
+    expect(sent).toEqual([])
+    expect(stderr.join('')).toContain('could not report the commit this bot is running')
+  })
+
+  /**
+   * The same suppression every other send in this file states at the call. The
+   * content is a hex sha and could not carry a mention today; the guarantee is
+   * made where a reader of the function can see it, because the client-wide
+   * default is silently replaced by any send that passes its own.
+   */
+  it('suppresses every mention on the notice', async () => {
+    const { client, send } = statusHarness()
+
+    await statusPoster(client, STATUS_CHANNEL)(`running commit ${DEPLOYED}`)
+
+    expect(send).toHaveBeenCalledWith({
+      content: `running commit ${DEPLOYED}`,
+      allowedMentions: { parse: [] },
+    })
+  })
+})
+
+describe('the deploy notice — the two files it reads', () => {
+  /**
+   * THE ONE PROPERTY THAT KEEPS THIS WORKING. The updater owns /opt/blitz-bot:
+   * it runs `git reset --hard origin/main` in it and writes the deployed-commit
+   * file into it. A memory of what has been reported that lived under that
+   * directory would be overwritten or discarded by the next update, and then
+   * the notice either repeats on every restart or never fires again.
+   *
+   * /var/lib/blitz-bot is the unit's `StateDirectory=`: systemd creates it,
+   * keeps it writable while `ProtectSystem=strict` puts the rest of the
+   * filesystem back to read-only, and it survives a reboot.
+   */
+  it('remembers outside the repo the updater resets', () => {
+    const repo = fileURLToPath(new URL('..', import.meta.url))
+
+    expect(deployedCommitPath().startsWith(repo)).toBe(true)
+    expect(reportedCommitPath().startsWith(repo)).toBe(false)
+  })
+
+  it('reads the deployed sha from the root of whichever checkout is running', () => {
+    // Derived from this module's own location rather than hard-coded to
+    // /opt/blitz-bot, so a bot run out of a checkout does not read the deployed
+    // box's file and report a commit it is not running.
+    expect(deployedCommitPath()).toBe(
+      join(fileURLToPath(new URL('..', import.meta.url)), '.deployed-commit'),
+    )
+  })
+
+  it('takes the state directory from systemd when the unit supplies one', () => {
+    try {
+      // Colon-separated, because `StateDirectory=` may name more than one.
+      vi.stubEnv('STATE_DIRECTORY', '/var/lib/blitz-bot:/var/lib/other')
+      expect(reportedCommitPath()).toBe(join('/var/lib/blitz-bot', 'reported-commit'))
+
+      // An empty value is not a directory; the fallback has to hold.
+      vi.stubEnv('STATE_DIRECTORY', '')
+      expect(reportedCommitPath()).toBe(join('/var/lib/blitz-bot', 'reported-commit'))
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  /**
+   * THE SEAM BETWEEN THE RULES ABOVE AND A REAL DISK, which is the one part of
+   * this the fakes cannot speak for: a missing file has to reject with the
+   * `ENOENT` that `readSha` reads as silence, and what is written has to come
+   * back the way it went in.
+   */
+  it('rejects with ENOENT for a file that is not there, and round-trips one that is', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'blitz-bot-'))
+
+    try {
+      const files = commitFiles(join(dir, '.deployed-commit'), join(dir, 'reported-commit'))
+
+      await expect(files.deployed()).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(files.reported()).rejects.toMatchObject({ code: 'ENOENT' })
+
+      await files.remember(DEPLOYED)
+
+      // The trailing newline is deliberate: `cat` of this file should not run
+      // into the next prompt, and it is the shape the updater's file has too.
+      await expect(files.reported()).resolves.toBe(`${DEPLOYED}\n`)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

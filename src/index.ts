@@ -1,6 +1,6 @@
-import { createClient } from './client.ts'
+import { createClient, statusReporter } from './client.ts'
 import { loadConfig, type Config } from './config.ts'
-import { log } from './log.ts'
+import { log, setSink } from './log.ts'
 
 /**
  * The entrypoint, and the only file that owns the process.
@@ -53,6 +53,28 @@ try {
 }
 
 const client = createClient(config)
+
+/**
+ * WARNINGS AND ERRORS GET A SECOND COPY IN DISCORD, if a channel was configured
+ * for them. This is the one wiring decision that belongs in this file: `log()`
+ * is where every fault in the bot already passes, and installing the sink is
+ * how those reach somebody who does not read journalctl.
+ *
+ * INSTALLED BEFORE THE LOGIN, AND IT STILL POSTS NOTHING AT STARTUP. Waiting
+ * for `clientReady` here would be listener ordering — this one would run after
+ * the one createClient registers, which is the listener that emits the halt
+ * line when DISCORD_GUILD_ID names the wrong guild, so the single most
+ * important thing the bot can say would be the one thing that never posted.
+ * `statusReporter` gates on `client.isReady()` instead, which is already true
+ * by the time that event is emitted and is false for everything before it.
+ *
+ * NO SINK AT ALL WHEN THE VARIABLE IS UNSET, rather than one that quietly
+ * discards: the bot is live today with nothing configured, and it has to keep
+ * running exactly as it does now until somebody sets the id.
+ */
+if (config.statusChannelId !== null) {
+  setSink(statusReporter(client, config.statusChannelId))
+}
 
 /**
  * A REJECTED PROMISE IS LOGGED AND THE PROCESS KEEPS RUNNING, which REPLACES

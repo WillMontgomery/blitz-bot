@@ -72,6 +72,26 @@ export interface Config {
   guildId: string
   adminRoleId: string | null
   logChannelId: string | null
+
+  /**
+   * Where the bot reports its OWN faults, which is a different channel's job
+   * from `logChannelId` even when both ids happen to be the same one.
+   * `logChannelId` carries the moderation record — what was removed and why.
+   * This carries the warnings and errors that would otherwise reach journalctl
+   * and nobody, because the owner operates this bot from Discord.
+   *
+   * IT ALSO CARRIES THE DEPLOY NOTICE, for the same reason: which commit the
+   * bot came up on is a fact about the bot and not about a member, and it is
+   * only said when that commit CHANGED — see `announceDeployedCommit` in
+   * src/client.ts. That is the whole of the informational traffic in this
+   * channel; everything else in it is a warning or an error.
+   *
+   * UNSET IS JOURNAL-ONLY, AND THAT HAS TO KEEP WORKING. The bot is already
+   * live; a required variable here would mean the next deploy refuses to boot
+   * until somebody sets it.
+   */
+  statusChannelId: string | null
+
   exemptChannelIds: string[]
   exemptAdmins: boolean
   dryRun: boolean
@@ -156,6 +176,7 @@ const schema = z.object({
   DISCORD_GUILD_ID: required,
   DISCORD_ADMIN_ROLE_ID: optionalId,
   BLITZ_LOG_CHANNEL_ID: optionalId,
+  BLITZ_STATUS_CHANNEL_ID: optionalId,
   BLITZ_EXEMPT_CHANNEL_IDS: idList,
   BLITZ_EXEMPT_ADMINS: flag(true),
   BLITZ_DRY_RUN: flag(false),
@@ -178,6 +199,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     guildId: parsedEnv.DISCORD_GUILD_ID,
     adminRoleId: parsedEnv.DISCORD_ADMIN_ROLE_ID,
     logChannelId: parsedEnv.BLITZ_LOG_CHANNEL_ID,
+    statusChannelId: parsedEnv.BLITZ_STATUS_CHANNEL_ID,
     exemptChannelIds: parsedEnv.BLITZ_EXEMPT_CHANNEL_IDS,
     exemptAdmins: parsedEnv.BLITZ_EXEMPT_ADMINS,
     dryRun: parsedEnv.BLITZ_DRY_RUN,

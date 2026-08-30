@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
+
 /**
  * The log.
  *
@@ -6,6 +8,14 @@
  * nowhere else — no shipper, no index, no dashboard. So the format is chosen
  * for `journalctl -u blitz-bot | grep`: a timestamp, a level, a message, then
  * flat `key=value` pairs that survive being grepped for one at a time.
+ *
+ * THE JOURNAL IS THE FLOOR AND NOTHING IS ALLOWED UNDER IT. `log()` is
+ * synchronous, writes its line before anything else is attempted, and depends
+ * on no network and no configuration. The optional sink at the foot of this
+ * file copies faults to a Discord channel so that the owner — who operates this
+ * bot from Discord and not from an SSH session — sees them at all; it can be
+ * absent, slow, rate-limited or outright broken, and none of that changes a
+ * byte of what systemd recorded.
  *
  * NOT JSON, though that was the real alternative. JSON is right when something
  * machine-parses the stream, and nothing does; what it costs here is that
@@ -92,13 +102,113 @@ export function log(level: Level, msg: string, fields?: Record<string, unknown>)
     }
   }
 
+  const body = parts.join(' ')
+
   // The prefix is prepended here and nowhere else, so it cannot end up after
   // the timestamp on one path and before it on another. journald only reads it
   // as a priority when it is the first thing on the line.
-  const line = `${PRIORITY[level]}${parts.join(' ')}\n`
+  const line = `${PRIORITY[level]}${body}\n`
 
   if (level === 'info') process.stdout.write(line)
   else process.stderr.write(line)
+
+  // Second, and only ever second. `body` and not `line`: the prefix is a thing
+  // journald eats, and a `<4>` at the front of a Discord post is noise nobody
+  // can act on.
+  if (level !== 'info') report(level, msg, body)
+}
+
+/**
+ * A level that means something went wrong.
+ *
+ * INFO IS NOT A FAULT AND THE TYPE IS WHERE THAT IS SAID. The sink exists to
+ * put the things that need a human in front of one, and a channel that also
+ * carries `ready` and a line per deleted message is a channel nobody reads —
+ * so `info` never reaches it. Excluding it here rather than in a comment means
+ * no sink can be written that expects to be handed one.
+ */
+export type Fault = Exclude<Level, 'info'>
+
+/**
+ * Somewhere else a fault is copied to. index.ts installs one; `statusReporter`
+ * in client.ts is the only implementation.
+ *
+ * IT IS HANDED THE RENDERED LINE, NOT THE FIELDS. Everything the caller passed
+ * has already been through `render` by the time it arrives — quoted, escaped,
+ * newline-free — so a sink cannot interpolate a raw invite code or an error's
+ * own text into whatever it builds, and the copy in the channel is the same
+ * string as the copy in the journal, which is most of the reason for having a
+ * second one.
+ *
+ * `level` AND `msg` COME SEPARATELY ANYWAY, because those two are the identity
+ * of a fault and the rendered line is not: the same failure about two different
+ * messages differs only in its fields and its timestamp. A sink that wants to
+ * recognise a repeat has to compare the parts that do not move.
+ */
+export type Sink = (level: Fault, msg: string, line: string) => Promise<void>
+
+/**
+ * MODULE STATE, AND THE ONLY PIECE IN THIS FILE. There is exactly one journal
+ * and one process, and the alternative — threading a logger object through
+ * every call site in the bot — buys a second sink nobody will ever want and
+ * costs an argument on every function between here and `decide`.
+ *
+ * `null` REMOVES IT, which is what tests use between cases and what an unset
+ * BLITZ_STATUS_CHANNEL_ID leaves it as.
+ */
+let sink: Sink | null = null
+
+export function setSink(next: Sink | null): void {
+  sink = next
+}
+
+/**
+ * Whether the code running right now IS the sink.
+ *
+ * THIS IS WHAT STOPS A FAULT LOOP, and it has to be structural because the loop
+ * is not hypothetical: the sink posts to Discord, the post fails, the failed
+ * post is itself a fault, the fault is logged, the log calls the sink. That is
+ * not a rare edge — it is what happens the first time the channel's permissions
+ * are wrong — and it is an unbounded recursion that takes the bot down at
+ * exactly the moment it is trying to say something.
+ *
+ * AN ASYNC CONTEXT RATHER THAN A BOOLEAN FLAG, and the difference is the whole
+ * design. A flag raised around the call and dropped after it covers nothing,
+ * because the sink is async and its own failure is handled several ticks later.
+ * A flag held until the sink's promise settles does cover that, but it also
+ * silences every UNRELATED fault that happens while a post is in flight — which
+ * is precisely the minute the channel is worth having. `AsyncLocalStorage`
+ * follows the awaits: everything the sink does, however deep and however late,
+ * is inside the store, and nothing else in the process is.
+ *
+ * A `log()` CALL FROM INSIDE THE SINK STILL WRITES ITS LINE. Only the copy is
+ * dropped. `statusReporter` reports its own faults through `log()` on purpose
+ * and depends on this being true.
+ */
+const reporting = new AsyncLocalStorage<true>()
+
+function report(level: Fault, msg: string, line: string): void {
+  const current = sink
+  if (current === null || reporting.getStore() !== undefined) return
+
+  /**
+   * FIRE AND FORGET, WITH THE REJECTION CAUGHT HERE AND NOWHERE ELSE. `log()`
+   * is synchronous and is called from error handlers and `finally` blocks;
+   * there is no caller in the bot that could await this. An unawaited promise
+   * that rejects is an unhandled rejection, and index.ts's handler for those
+   * logs an error — which is a fault, which reaches the sink, which is the loop
+   * again by a longer route.
+   *
+   * WHAT IS CAUGHT IS DROPPED. The journal already has the line; saying
+   * anything more about it here is the one thing that cannot be done safely.
+   */
+  void reporting.run(true, async () => {
+    try {
+      await current(level, msg, line)
+    } catch {
+      // Dropped on purpose. See above.
+    }
+  })
 }
 
 /**
