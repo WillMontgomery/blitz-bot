@@ -14,14 +14,22 @@ import type {
 } from '@aws-sdk/lib-dynamodb'
 
 /**
- * DynamoDB: the tables the bot reads, and the two it writes.
+ * DynamoDB: the tables the bot reads, and the three it writes.
  *
  * THIS IS THE FIRST AWS CALL THIS PROCESS HAS EVER MADE, so everything here is
  * a first decision rather than a convention already in force. The console —
  * fivem-ringmaster, on the same box — has been talking to these tables for
  * months, and where a decision is already made over there this file makes the
- * same one and says so. Where it deliberately differs, it says that too. The
- * one that matters is the audit log, and it is at the foot of this file.
+ * same one and says so. Where it deliberately differs, it says that too.
+ *
+ * IT DELIBERATELY DIFFERS TWICE, and both differences are the same shape: the
+ * console writes as a WEB APP, where a human clicked once and a request either
+ * happened or did not, and the bot writes as an EVENT CONSUMER, where the same
+ * event can arrive twice and no user is watching the second one. So the two
+ * writes the console does unconditionally — the audit row at the foot of this
+ * file, and the ban row in `bans.issue` — are both CONDITIONAL here, and each
+ * one carries the paragraph explaining what the unconditional version would
+ * have destroyed.
  *
  * NO CREDENTIALS ANYWHERE, AND NONE ARE CONFIGURABLE. The SDK's default
  * provider chain finds the EC2 instance role from instance metadata on its
@@ -291,13 +299,13 @@ function classify(error: unknown, op: DdbOp, table: string): DdbFailure {
  * this repo; there is no second one to fall out of step.
  */
 export interface TableNames {
-  /** Read only. One row per license, lifted bans kept. */
+  /** Read AND written. One row per identifier, lifted bans kept. See `bans.issue`. */
   bans: string
   /** Read only. The console's player registry, keyed on license. */
   players: string
   /** Read only. Reverse index: qualified identifier -> licenses. */
   playerIds: string
-  /** Read AND written. The one table the bot appends to. See `begin`. */
+  /** Read AND written. The only one the bot APPENDS to. See `begin`. */
   audit: string
   /** Read only. One row, fixed key, the scheduled window. */
   maintenance: string
@@ -365,9 +373,26 @@ export function qualifyId(kind: IdKind, value: string): string {
   return `${kind}:${value}`
 }
 
-/** From lib/bans.ts, whole. A ban is a record and lifting one does not remove it. */
+/**
+ * From lib/bans.ts, whole — the bot writes these rows now, so nothing is
+ * dropped and the field meanings below are that file's, not this one's.
+ *
+ * A BAN IS A RECORD, NOT A DELETION, which is lib/bans.ts's own rule and the
+ * reason there is no `bans.remove` here and never will be. Lifting stamps
+ * `liftedAt`/`liftedBy` onto the row and leaves it exactly where it was,
+ * because the question an admin asks six months later is "has this person been
+ * banned before, and who let them back in" — which a table that deletes on
+ * lift cannot answer at all.
+ */
 export interface Ban {
-  /** Partition key. The qualified license, e.g. `license:abc123…`. */
+  /**
+   * Partition key. A QUALIFIED IDENTIFIER — `license:abc123…` for a player the
+   * game has seen, and see `bans.issue` for the `discord:…` case.
+   *
+   * The attribute is called `license` because that is its name on a table the
+   * console and the game box already read, and an attribute the bot renamed
+   * would simply be a row neither of them can find.
+   */
   license: string
   at: number
   /** The issuing admin, by license. Null only for system-issued bans. */
@@ -383,6 +408,24 @@ export interface Ban {
   liftedBy?: string | null
   liftedByName?: string | null
   liftReason?: string | null
+
+  /**
+   * THE ONE ATTRIBUTE ON THIS ROW THE CONSOLE DOES NOT WRITE: the id of the
+   * Discord audit log entry this ban came from. Absent on every row the
+   * console issued, and on every row written before this existed.
+   *
+   * It is safe to add BECAUSE the console reads these rows with a cast rather
+   * than a projection — `res.Item as Ban` in lib/bans.ts — so an attribute it
+   * has no name for is an attribute it never looks at. It costs the console
+   * nothing and the game box nothing.
+   *
+   * WHAT IT IS FOR is the whole of `bans.issue`: it is the bot's answer to
+   * "have I already acted on this event", which is a better question than
+   * "is this person banned" because it survives a restart, a replay and a
+   * lift. Optional in the type because a row that has been overwritten since,
+   * or that the console wrote, genuinely does not have one.
+   */
+  discordEntryId?: string | null
 }
 
 /**
@@ -405,6 +448,76 @@ export function isBanActive(ban: Ban, now = Date.now()): boolean {
   if (ban.expiresAt !== null && ban.expiresAt <= now) return false
   return true
 }
+
+/**
+ * What `bans.issue` needs. The console's `issue` input plus `entryId`.
+ *
+ * NAMED `id` RATHER THAN `license`, unlike the console's, because the bot
+ * writes rows keyed on a `discord:…` identifier as well and a parameter called
+ * `license` holding `discord:280…` is a lie the next reader has to discover.
+ * The row's ATTRIBUTE is still `license` — see `Ban`.
+ */
+export interface BanIssueInput {
+  /** The partition key: a qualified identifier, from `qualifyId`. */
+  id: string
+  /** The issuing admin, by license, or null when we cannot resolve one. */
+  by: string | null
+  byName: string
+  /** Shown to the player at connect. Written for them, not for the log. */
+  reason: string
+  /** Absolute, or null for permanent. Never a duration — see `Ban`. */
+  expiresAt: number | null
+  playerName?: string | null
+
+  /**
+   * The Discord audit log entry id that produced this ban. The idempotency
+   * key; see `bans.issue` for what it costs and what it does not cover.
+   */
+  entryId: string
+}
+
+/**
+ * What happened, in the three ways it can happen — and a caller has to tell
+ * them apart, because they are three different sentences to an admin.
+ *
+ * `issued` — the row was written.
+ * `already-banned` — an ACTIVE ban was already there, from some other event or
+ *   from the console, and nothing was written. Not an error: it is the correct
+ *   outcome of asking twice, and the ban that stands is the one attached.
+ * `duplicate-event` — this exact Discord event has already been acted on. The
+ *   attached row is the one it produced, whatever state it is in NOW; it may
+ *   have been lifted since, and this outcome is precisely what stops the bot
+ *   re-banning over that lift.
+ *
+ * THERE IS ALWAYS A BAN TO REPORT, in all three cases, so no caller has to
+ * handle a success with nothing in it.
+ */
+export type BanIssueOutcome = 'issued' | 'already-banned' | 'duplicate-event'
+
+export interface BanIssueResult {
+  outcome: BanIssueOutcome
+  ban: Ban
+}
+
+/** What `bans.lift` needs. The console's `lift` input, by qualified id. */
+export interface BanLiftInput {
+  id: string
+  /** The lifting admin, by license, or null. Kept on the row forever. */
+  by: string | null
+  byName: string
+  reason?: string | null
+}
+
+/**
+ * `no-ban` carries no row BY CONSTRUCTION, so a caller cannot report a lift of
+ * something that was never there. The other two carry the row as it now
+ * stands: `lifted` the one this call stamped, `already-lifted` the one that
+ * was already stamped — with the ORIGINAL lifter's name on it, which is the
+ * point of not writing over it.
+ */
+export type BanLiftResult =
+  | { outcome: 'lifted' | 'already-lifted'; ban: Ban }
+  | { outcome: 'no-ban'; ban: null }
 
 /** From lib/players.ts. */
 export interface IdentifierSighting {
@@ -716,13 +829,32 @@ const AUDIT_PK = 'AUDIT'
  * Everything the bot may ask of DynamoDB. Nothing else is reachable.
  *
  * THE SHAPE OF THIS INTERFACE IS THE ACCESS POLICY, written a second time in a
- * place a compiler reads. Five tables offer a read and nothing else; two offer
- * a write. There is no `bans.issue`, no `players.write`, no `maintenance.
- * schedule` — the console owns those actions and owns the consequences of
- * getting them wrong, and a Discord bot that could ban somebody from a slash
- * command would be a second, less careful implementation of the console's most
- * dangerous path. When the bot genuinely needs one, it goes here with the
- * reason attached.
+ * place a compiler reads. Four tables offer a read and nothing else; three
+ * offer a write. There is still no `players.write` and no
+ * `maintenance.schedule` — the console owns those actions and owns the
+ * consequences of getting them wrong.
+ *
+ * `bans.issue` AND `bans.lift` ARE NEW, AND THIS COMMENT USED TO SAY THEY
+ * WOULD NEVER BE HERE. The reason it gave was that a Discord bot able to ban
+ * somebody would be a second, less careful implementation of the console's
+ * most dangerous path, and it added: "when the bot genuinely needs one, it
+ * goes here with the reason attached." blitz-bot#16 is that need — moderation
+ * from Discord is the point of the bot — so here is the reason, attached.
+ *
+ * IT IS NOT A COPY OF THE CONSOLE'S WRITE and must not become one. The
+ * console's is an unconditional overwrite that would un-lift a lifted ban on a
+ * repeated event; this one reads first, refuses when an active ban already
+ * stands, and remembers which Discord event produced which row. All of that is
+ * in `bans.issue` below, which is the most careful function in this file
+ * because it is the most dangerous one.
+ *
+ * WHAT STILL LIVES ONLY IN THE CONSOLE, so this is a narrower path rather than
+ * a second copy of the same one: the duration-to-expiry conversion, the
+ * refusal to ban on an already-resolved incident, the immediate kick of
+ * somebody mid-match, the incident verdict and the permanent-ban sweep of
+ * their other open cases (see the console's `src/app/api/bans/route.ts`). This
+ * module writes the ROW. Everything a ban does BESIDES the row is still the
+ * console's, and a caller that needs those needs the console.
  */
 export interface Ddb {
   /** The settled settings, so a caller can log what it is actually pointed at. */
@@ -731,8 +863,18 @@ export interface Ddb {
   readonly timeoutMs: number
 
   bans: {
-    /** The ban row for a license — lifted and expired ones included, like the console's. */
-    get(license: string): Promise<DdbResult<Ban | null>>
+    /**
+     * The ban row for a qualified identifier — lifted and expired ones
+     * included, like the console's `banFor`. Ask `isBanActive` whether it is
+     * in force; this answers whether it exists.
+     */
+    get(id: string): Promise<DdbResult<Ban | null>>
+
+    /** Write a ban, unless one already stands or this event already wrote one. */
+    issue(input: BanIssueInput): Promise<DdbResult<BanIssueResult>>
+
+    /** Stamp the lifted fields onto a ban. Never deletes; nothing here can. */
+    lift(input: BanLiftInput): Promise<DdbResult<BanLiftResult>>
   }
 
   players: {
@@ -871,17 +1013,296 @@ export function createDdb(options: DdbOptions = {}): Ddb {
     return lastTs
   }
 
+  /**
+   * The ban row for a qualified identifier, or null.
+   *
+   * A NAMED FUNCTION RATHER THAN A METHOD, because `bans.issue` and
+   * `bans.lift` both begin by reading the row they are about to change and
+   * must read it the same way `bans.get` does — a second spelling of this
+   * `Key` is a second chance to key it wrong, and a `GetItem` with the wrong
+   * key shape answers "no row" rather than failing.
+   */
+  function readBan(id: string): Promise<DdbResult<Ban | null>> {
+    return call('get', tables.bans, async (o) => {
+      const res = await doc.get({ TableName: tables.bans, Key: { license: id } }, o)
+      return (res.Item as Ban | undefined) ?? null
+    })
+  }
+
   return {
     region,
     tables,
     timeoutMs,
 
     bans: {
-      get(license) {
-        return call('get', tables.bans, async (o) => {
-          const res = await doc.get({ TableName: tables.bans, Key: { license } }, o)
-          return (res.Item as Ban | undefined) ?? null
+      get: readBan,
+
+      /**
+       * Issue a ban.
+       *
+       * NOT A COPY OF THE CONSOLE'S, AND THAT IS THE WHOLE FUNCTION.
+       * `bans.issue` in fivem-ringmaster/src/lib/bans.ts is an unconditional
+       * `PutItem` of a complete row, including `liftedAt: null`. For the
+       * console that is correct and its comment says why: a human clicked once,
+       * and re-banning somebody previously banned and lifted SHOULD replace the
+       * record — the write that clears `liftedAt` is the same write that puts
+       * them back under a ban.
+       *
+       * THE BOT DOES NOT GET TO ASSUME "ONCE". It writes from Discord events,
+       * and a gateway reconnect can redeliver one. The same unconditional put,
+       * on the second delivery, would replace a row an admin had DELIBERATELY
+       * LIFTED in between — putting somebody back under a ban nobody re-issued,
+       * erasing who let them back in, and reporting exactly the same success as
+       * a write that created a row, because a `PutItem` that overwrites is
+       * indistinguishable from one that does not. A bot must never un-lift a
+       * ban. Everything below is that sentence.
+       *
+       * IT READS FIRST, AND THE READ IS NOT AN EXTRA ROUND TRIP BOUGHT FOR THE
+       * GUARD. The answer is needed anyway: "there is already an active ban"
+       * has to name the ban that stands, and the idempotency key lives on the
+       * row. One `GetItem` serves all three purposes.
+       *
+       * IT IS STILL TWO ROUND TRIPS, AND `timeoutMs` IS PER CALL, so a ban
+       * write can spend twice the deadline before it gives up — more than the
+       * three seconds Discord allows an un-deferred interaction. A caller must
+       * have deferred before it gets here. That is not new: a ban is
+       * `audit.begin`, then this, then `audit.resolve`, and no per-call ceiling
+       * has ever added up to a command budget.
+       *
+       * THEN THE EVENT ID, BEFORE ANYTHING ELSE. If the row already carries
+       * this Discord audit log entry id, this event has been acted on and
+       * nothing is written — WHATEVER STATE THE ROW IS IN NOW. That ordering is
+       * load-bearing: a replay arriving after an admin lifted the ban finds a
+       * lifted row, and a check that asked "are they banned" would answer no
+       * and re-ban them. Asking "have I done this" answers yes, and the lift
+       * stands.
+       *
+       * WHY THE EVENT ID IS THE BETTER KEY, and why both checks are kept. "Is
+       * this person banned" is a fact about the world that an admin may
+       * legitimately change; "have I already acted on event 1234" is a fact
+       * about this bot that nothing can change, and it survives a restart and a
+       * redelivery alike. It also records WHICH event produced the row, so
+       * "why is this person banned" has an answer that is not a guess. It does
+       * not replace the active check — that one catches a DIFFERENT event about
+       * somebody already banned, which the event id cannot see.
+       *
+       * WHERE THE LOOKUP LIVES: ON THE ROW, FOUND BY THE KEY WE ARE WRITING.
+       * The table is keyed on the identifier and not on the entry id, so there
+       * is no way to ask "which row came from event 1234" — but there is no
+       * need to, because we already know which row we are about to write and
+       * the question is only ever about that one. The effective key is
+       * (identifier, entry id), which is also the right grain: one event that
+       * bans a Discord account AND a license writes two rows, and those are two
+       * independent decisions that can succeed and fail separately.
+       *
+       * WHAT THAT COSTS, PLAINLY. The memory lives on the row, so it lasts
+       * exactly as long as the row does. A full-row overwrite — the console
+       * re-banning, or this function issuing a later ban — replaces the
+       * attribute, and a replay arriving after that looks like a new event.
+       * Replays arrive seconds after the original and overwrites are human
+       * paced, so in practice the key is there when it matters; but it is a
+       * bounded memory and not a ledger, and it should not be described as one.
+       *
+       * THE TWO WAYS TO MAKE IT A LEDGER, NOT TAKEN, so the next person does
+       * not have to rediscover the choice. A GSI on `discordEntryId` would let
+       * the bot ask the question directly — but it is an index on a table
+       * another repo owns, that the bot's role cannot create, for a lookup we
+       * do not actually need. A claim row per entry id in `ringmaster-bot-state`
+       * (the bot's own table, already keyed on a string) would genuinely
+       * outlive the ban row — but it is a second write that fails on its own,
+       * leaving either a claim with no ban or a ban with no claim, and it needs
+       * an expiry story of its own. Both are more machinery than the failure
+       * they close.
+       *
+       * THE WRITE IS GUARDED ON THE ROW WE READ. `at = :seenAt` says "only if
+       * this is still the row I looked at" — an optimistic check on a value we
+       * actually saw, rather than a condition expression trying to re-derive
+       * `isBanActive` in DynamoDB's expression language, which is where the
+       * console's rule and the bot's would quietly stop agreeing. Anything that
+       * lands in the gap — a console re-ban, a second bot process, a lift —
+       * changes or creates the row, the condition fails, and the caller gets a
+       * `conflict` with NOTHING WRITTEN. That is the right end: somebody else
+       * got there first, and the honest answer is to look again rather than to
+       * overwrite whatever they did.
+       *
+       * `attribute_not_exists(license)` IS THE SAME GUARD FOR THE OTHER CASE.
+       * We read no row, so the row we are guarding against is the one that
+       * appeared since; "create, do not replace" says exactly that.
+       *
+       * A `discord:…` KEY IS A REAL ROW AND A PARTIAL ENFORCEMENT, and this is
+       * the one caveat a caller must not be allowed to miss. The table is
+       * keyed on a qualified identifier, so banning a Discord account with no
+       * player record is `qualifyId('discord', id)` and the row is written,
+       * listed by the console's moderation page and kept forever like any
+       * other. But THE CONNECT GATE ASKS ONE QUESTION AND IT IS ABOUT THE
+       * LICENSE: `br_ddb` does a single `GetItem` on the connecting player's
+       * license (fivem-ringmaster/docs/aws-setup.md §"the reads it needs"), so
+       * a `discord:`-keyed row does not stop anybody joining. It is a RECORD of
+       * a decision, not a door. Two further points against ever "fixing" that
+       * by widening the gate: FiveM only reports a `discord:` identifier when
+       * the player has Discord's activity integration switched on, which is
+       * opt-in and therefore evadable by switching it off (aws-setup.md says so
+       * about the grants table); and the console's profile link on that row
+       * points at `/players/discord:280…`, which resolves to nothing. Pass a
+       * `playerName` so the ban list reads as something rather than as a
+       * snowflake.
+       */
+      async issue(input) {
+        const seen = await readBan(input.id)
+        if (!seen.ok) return seen
+
+        const existing = seen.value
+
+        if (existing && existing.discordEntryId === input.entryId) {
+          return { ok: true, value: { outcome: 'duplicate-event', ban: existing } }
+        }
+
+        // `isBanActive`, the rule copied from the console, rather than an
+        // `if` written out here — see the comment on that function.
+        if (existing && isBanActive(existing, now())) {
+          return { ok: true, value: { outcome: 'already-banned', ban: existing } }
+        }
+
+        // Every field the console writes, including its explicit nulls — and
+        // the reason for those is not what it looks like. A `PutItem` replaces
+        // the WHOLE item, so a re-ban over a lifted row drops the lift fields
+        // whether or not they are named here; the row would be in force again
+        // either way. What the nulls buy is a row indistinguishable from one
+        // the console wrote, which is what lets a condition expression be
+        // written once and hold for both writers — see the two spellings of
+        // "not lifted" that `lift` below has to allow for, precisely because
+        // rows exist that predate this.
+        const ban: Ban = {
+          license: input.id,
+          at: now(),
+          by: input.by,
+          byName: input.byName,
+          reason: input.reason,
+          expiresAt: input.expiresAt,
+          playerName: input.playerName ?? null,
+          liftedAt: null,
+          liftedBy: null,
+          liftedByName: null,
+          liftReason: null,
+          discordEntryId: input.entryId,
+        }
+
+        const guard: Pick<PutCommandInput, 'ConditionExpression' | 'ExpressionAttributeValues'> =
+          existing
+            ? {
+                ConditionExpression: 'at = :seenAt',
+                ExpressionAttributeValues: { ':seenAt': existing.at },
+              }
+            : { ConditionExpression: 'attribute_not_exists(license)' }
+
+        const written = await call('put', tables.bans, async (o) => {
+          await doc.put({ TableName: tables.bans, Item: ban, ...guard }, o)
         })
+
+        if (!written.ok) return written
+        return { ok: true, value: { outcome: 'issued', ban } }
+      },
+
+      /**
+       * Lift a ban, keeping the row.
+       *
+       * AN UPDATE AND NEVER A DELETE, and this module could not delete one if
+       * it wanted to: `DocumentClient` above has no `delete`, deliberately. The
+       * rule is lib/bans.ts's own — a ban is a record — and the fields this
+       * stamps are the answer to "who let them back in", which is the half of
+       * the record a deletion throws away.
+       *
+       * IT READS FIRST, LIKE `issue`, AND FOR THE SAME KIND OF REASON: an
+       * unban event can be redelivered too. A row that is ALREADY lifted is
+       * left completely alone — writing the lift again would replace the
+       * original lifter's name and time with this one's, which is the same
+       * class of erasure as un-lifting a ban, just quieter. `already-lifted`
+       * returns the row with the FIRST lifter still on it.
+       *
+       * `attribute_exists(license)` IS THE CONSOLE'S CONDITION AND IS KEPT
+       * VERBATIM, because `UpdateItem` against a missing key CREATES it: a lift
+       * of a ban nobody issued would otherwise write a row carrying lift fields
+       * and no ban, which reads forever after as though somebody had been
+       * banned. The read above already answers `no-ban` for that case; the
+       * condition is what covers the row being removed between the two.
+       *
+       * THE SECOND HALF OF THE CONDITION IS THE ONE THE CONSOLE DOES NOT HAVE.
+       * `attribute_not_exists(liftedAt) OR liftedAt = :unlifted` is "still not
+       * lifted", and it needs both spellings because there are two: the console
+       * writes `liftedAt: null` explicitly on every ban it issues, so the
+       * attribute EXISTS as a null on those rows, while an older or
+       * hand-written row may not have it at all. A condition that tested only
+       * `attribute_not_exists` would refuse to lift any ban the console ever
+       * issued. It closes the gap between our read and our write: a lift that
+       * lands in it wins, and ours comes back a `conflict` with nothing
+       * written.
+       *
+       * WHAT THIS DOES NOT COVER, SAID PLAINLY BECAUSE IT IS STILL TRUE. There
+       * is no event id on the lift, so the one replay it cannot catch is an
+       * unban redelivered AFTER somebody re-banned the same person: the row is
+       * active again, `already-lifted` does not fire, and the replay lifts a
+       * ban it was never about. It needs a re-ban inside the seconds-wide
+       * redelivery window to happen at all. Closing it means a second entry-id
+       * attribute for the lift — with the same bounded memory `issue` describes,
+       * since a re-ban overwrites the whole row anyway — and that is the change
+       * to make if it is ever observed rather than reasoned about.
+       */
+      async lift(input) {
+        const seen = await readBan(input.id)
+        if (!seen.ok) return seen
+
+        const existing = seen.value
+        if (!existing) return { ok: true, value: { outcome: 'no-ban', ban: null } }
+
+        if (existing.liftedAt) {
+          return { ok: true, value: { outcome: 'already-lifted', ban: existing } }
+        }
+
+        const liftedAt = now()
+        const liftReason = input.reason ?? null
+
+        const written = await call('update', tables.bans, async (o) => {
+          await doc.update(
+            {
+              TableName: tables.bans,
+              Key: { license: input.id },
+              ConditionExpression:
+                'attribute_exists(license) AND (attribute_not_exists(liftedAt) OR liftedAt = :unlifted)',
+              // The console's four fields, in the console's order. A lift that
+              // set fewer of them would leave the previous lift's reason
+              // attached to this one.
+              UpdateExpression:
+                'SET liftedAt = :t, liftedBy = :b, liftedByName = :n, liftReason = :r',
+              ExpressionAttributeValues: {
+                ':unlifted': null,
+                ':t': liftedAt,
+                ':b': input.by,
+                ':n': input.byName,
+                ':r': liftReason,
+              },
+            },
+            o,
+          )
+        })
+
+        if (!written.ok) return written
+
+        // The row as it now stands, assembled rather than read back: a second
+        // GetItem would cost another round trip out of the same deadline to
+        // learn four values we just wrote.
+        return {
+          ok: true,
+          value: {
+            outcome: 'lifted',
+            ban: {
+              ...existing,
+              liftedAt,
+              liftedBy: input.by,
+              liftedByName: input.byName,
+              liftReason,
+            },
+          },
+        }
       },
     },
 

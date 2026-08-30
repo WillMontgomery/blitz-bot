@@ -1364,11 +1364,11 @@ export function selfEmbed(data: SelfData): ProfileEmbed {
 /**
  * Is THIS invocation of `/profile` the admin-only one?
  *
- * THE GATE, AS A FUNCTION OF THE INVOCATION, WHICH IS WHAT THIS COMMAND NOW
- * NEEDS AND WHAT `BotCommand.adminOnly` CANNOT YET EXPRESS. Asking about
- * somebody else is a moderation lookup and requires the role; asking about
- * yourself is not, and requires nothing. There is exactly one bit of the
- * invocation that decides it, and it is the one Discord already fills in.
+ * THE GATE, AS A FUNCTION OF THE INVOCATION, WHICH IS THE ONLY SHAPE THAT CAN
+ * STATE THIS COMMAND'S RULE. Asking about somebody else is a moderation lookup
+ * and requires the role; asking about yourself is not, and requires nothing.
+ * There is exactly one bit of the invocation that decides it, and it is the one
+ * Discord already fills in.
  *
  * A PREDICATE HERE RATHER THAN AN `if` IN `run`, EVEN THOUGH `run` IS WHERE IT
  * WOULD BE EASIEST. `refusalFor` in command.ts is the gate — the one that fails
@@ -1379,13 +1379,12 @@ export function selfEmbed(data: SelfData): ProfileEmbed {
  * agrees with the framework's on the day it is written and not after. So this
  * file states the CONDITION and command.ts keeps the enforcement.
  *
- * WHAT IT IS WIRED TO TODAY, AND WHAT IT IS NOT. `BotCommand.adminOnly` is a
- * `boolean` property of the COMMAND, so `refusalFor` cannot ask a question
- * about the invocation and this predicate has nothing to attach to yet. Until
- * command.ts can take it, the command below ships `adminOnly: true` — the
- * CLOSED direction: a member who has no role is refused whichever way they run
- * it, which discloses nothing and disappoints somebody. The exact edit that
- * lands the open half is written on the command below.
+ * WHAT IT IS WIRED TO. `BotCommand.adminOnly` is an `AdminGate`, so this
+ * function IS the command's gate — `profileCommand` below passes it by name and
+ * `refusalFor` resolves it against the invocation before it refuses anything.
+ * There is no second copy of this rule anywhere: `run` reads `targetId` to
+ * decide which VIEW to build, and this reads it to decide who may ask for one,
+ * and the two agree because they are the same question asked of the same field.
  */
 export function profileAdminOnly(invocation: Invocation): boolean {
   return invocation.targetId !== null
@@ -1409,41 +1408,21 @@ export function profileAdminOnly(invocation: Invocation): boolean {
  * A public copy cannot be taken back — deleting the message does not unsee it.
  * There is no invocation that should make this false.
  *
- * `adminOnly: true` IS NOT THE RULE THIS COMMAND WANTS, AND IT IS HERE ON
- * PURPOSE UNTIL THE FRAMEWORK CAN CARRY THE RULE IT DOES WANT. The rule is
- * `profileAdminOnly` above: gated when a target is given, open when it is not.
- * `BotCommand.adminOnly` is a `boolean`, and `refusalFor` reads it without ever
- * seeing the invocation, so there is nowhere to put a predicate. Shipping
- * `false` to get the open half would open the TARGETED half too — a member
- * could look up anybody — so the value here is the closed one. What it costs is
- * the self view being unreachable by non-admins; what it buys is that no
- * arrangement of this file can leak a licence list to one. THE EDIT THAT
- * FINISHES IT, in three files this change does not own:
+ * `adminOnly` IS `profileAdminOnly` AND NOT A CONSTANT, WHICH IS THE WHOLE
+ * SHAPE OF THIS COMMAND. Gated when a target is given, open when it is not —
+ * see that function above for why the condition is stated here and enforced in
+ * command.ts. Neither constant was ever the rule: `true` refuses the self view
+ * to the members it exists for, and `false` would let any member look anybody
+ * else up, which is the one thing that must not happen.
  *
- *   command.ts   `readonly adminOnly: boolean | ((i: Invocation) => boolean)`,
- *                and in `refusalFor`, above the `if (!command.adminOnly)`:
- *                  `const gated = typeof command.adminOnly === 'function'`
- *                  `  ? command.adminOnly(invocation) : command.adminOnly`
- *                then test `gated`. Every refusal reason below it is untouched,
- *                which is the whole reason to make the edit there.
- *
- *   index.ts     in `commandData`, `command.adminOnly === true ? 0n : null`.
- *                It MUST be the identity check and not the truthiness one: a
- *                function is truthy, so `command.adminOnly ? 0n : null` would
- *                hide `/profile` from everybody in the client and the open half
- *                would be unreachable in the picker even once the gate allows
- *                it. `0n` is a DEFAULT and never a guard, so un-hiding it costs
- *                nothing — `refusalFor` is still what refuses.
- *
- *   commands.test.ts  'hides exactly the admin-only commands from the client'
- *                expects `['profile', 'sticky', 'unsticky']`; after the two
- *                edits above, `/profile` is no longer hidden and the list is
- *                `['sticky', 'unsticky']`. That assertion failing IS the edit
- *                landing, and it is worth a case of its own saying that a
- *                command with a per-invocation gate is registered visible.
- *
- * Then this line becomes `adminOnly: profileAdminOnly` and nothing else in this
- * file changes: both handlers below are already written for it.
+ * IT IS REGISTERED VISIBLE IN THE CLIENT, AND THAT IS NOT A HOLE. `commandData`
+ * in ./index.ts derives `defaultMemberPermissions` from this field and gives a
+ * conditionally gated command `null` — everybody sees `/profile` in the picker,
+ * because a member who cannot see it cannot run the half of it that is theirs.
+ * What stops them running the other half is `refusalFor` and only ever was:
+ * `0n` is a DEFAULT that anybody holding Manage Server can re-grant, so the
+ * targeted call has always had to be refused by the handler check against a
+ * caller whose interaction looks exactly like an admin's.
  */
 export function profileCommand(reads: ProfileReads, now: () => number = Date.now): BotCommand {
   return {
@@ -1468,7 +1447,7 @@ export function profileCommand(reads: ProfileReads, now: () => number = Date.now
       ],
     },
 
-    adminOnly: true,
+    adminOnly: profileAdminOnly,
     onlyInvoker: () => true,
 
     run: async (invocation) => {

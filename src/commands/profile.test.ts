@@ -15,11 +15,13 @@ import {
 import { setSink } from '../log.ts'
 import {
   refusalFor,
+  runCommand,
   TARGET_OPTION,
   type BotCommand,
   type CommandReply,
   type Invocation,
   type Refusal,
+  type Responder,
 } from './command.ts'
 import {
   embedUnits,
@@ -498,6 +500,14 @@ describe('readsFrom', () => {
           seen.push(['bans', licence])
           return Promise.resolve(ok(null))
         },
+
+        // A lookup reads and never writes, so these two reject like every other
+        // member of `Ddb` that a profile has no business reaching. They are
+        // named rather than left off because this fake IS a `Ddb`: a member
+        // added to that interface has to appear here, which is what stops this
+        // file's idea of the module drifting from the module.
+        issue: unused,
+        lift: unused,
       },
       players: {
         get: (licence) => {
@@ -1105,17 +1115,15 @@ describe('profileCommand', () => {
   })
 
   /**
-   * THE GATE THIS COMMAND SHIPS WITH IS THE CLOSED ONE, AND THAT IS ON PURPOSE.
-   * `BotCommand.adminOnly` is a `boolean` property of the COMMAND, so
-   * `refusalFor` cannot ask a question about the invocation; the rule this
-   * command wants is in `profileAdminOnly` and is exercised below. Until
-   * command.ts can carry a predicate, shipping `false` here would open the
-   * TARGETED half to everybody, which is the one thing that must not happen.
-   * This assertion is the reminder that the self view is gated shut meanwhile —
-   * change it in the same commit that changes command.ts, and not before.
+   * THE GATE IS THE PREDICATE ITSELF, NOT A COPY OF WHAT IT SAYS. `adminOnly`
+   * is `profileAdminOnly` by reference, so the rule the tests below exercise is
+   * the rule `refusalFor` resolves — there is no second expression anywhere
+   * that could answer differently. Neither constant was ever right: `true`
+   * refuses the self view to the members it exists for, and `false` lets any
+   * member look anybody else up.
    */
-  it('ships admin-only until the framework can gate per invocation', () => {
-    expect(profileCommand(reads()).adminOnly).toBe(true)
+  it('gates per invocation rather than shipping either constant', () => {
+    expect(profileCommand(reads()).adminOnly).toBe(profileAdminOnly)
   })
 
   it('is ephemeral for every invocation there is', () => {
@@ -1589,27 +1597,42 @@ describe('selfEmbed', () => {
  *
  * `/profile @someone` NEEDS THE ROLE AND `/profile` DOES NOT, which is a
  * question about the INVOCATION rather than about the command.
- * `BotCommand.adminOnly` is a `boolean` property of the command, so
- * `refusalFor` never sees an invocation and cannot answer it; `profileAdminOnly`
- * states the CONDITION and command.ts is still what enforces it.
+ * `BotCommand.adminOnly` is an `AdminGate`, so `profileAdminOnly` states the
+ * CONDITION and command.ts is what enforces it — see `refusalFor`, which
+ * resolves the predicate above every reason it refuses for.
  *
  * ASSERTED THROUGH `refusalFor` AND NOT AGAINST A RE-IMPLEMENTATION. The four
  * refusal reasons — no guild, unset admin role, no member on the payload, no
  * role — are the framework's, and the point of stating only the condition here
- * is that this command does not get its own copy of them to drift from.
+ * is that this command does not get its own copy of them to drift from. The
+ * helper below passes the command through UNCHANGED for exactly that reason:
+ * anything it rewrote would be a claim about a command that is not the one
+ * registered.
  * ------------------------------------------------------------------ */
 
-/**
- * The gate as it will be composed once command.ts can take a predicate: resolve
- * `adminOnly` against the invocation, then hand it to `refusalFor` unchanged.
- *
- * TWO LINES, AND THEY ARE THE TWO LINES `refusalFor` GAINS — see the comment on
- * `profileCommand`. That is what makes this a claim about the real gate rather
- * than a mock of one: every refusal reason below the resolution is the
- * framework's own, untouched.
- */
 function gate(command: BotCommand, one: Invocation, config: Config = cfg()): Refusal | null {
-  return refusalFor({ ...command, adminOnly: profileAdminOnly(one) }, one, config)
+  return refusalFor(command, one, config)
+}
+
+/**
+ * The three things `runCommand` may do to an interaction, remembered.
+ *
+ * WHAT THE DISPATCHER ADDS TO A `refusalFor` ASSERTION. The gate answering
+ * `not-admin` and the member actually being stopped are two different claims,
+ * and only the second one is the feature: a refusal is answered WITHOUT
+ * deferring and without the handler running at all, so a case that drives
+ * `runCommand` can say that the reads were never even reached.
+ */
+function answering(): Responder & {
+  defer: ReturnType<typeof vi.fn<Responder['defer']>>
+  edit: ReturnType<typeof vi.fn<Responder['edit']>>
+  reply: ReturnType<typeof vi.fn<Responder['reply']>>
+} {
+  return {
+    defer: vi.fn<Responder['defer']>(() => Promise.resolve()),
+    edit: vi.fn<Responder['edit']>(() => Promise.resolve()),
+    reply: vi.fn<Responder['reply']>(() => Promise.resolve()),
+  }
 }
 
 describe('/profile is admin-only only when a target is given', () => {
@@ -1673,6 +1696,54 @@ describe('/profile is admin-only only when a target is given', () => {
    * licence list this way — the decision, not an oversight. They tag themselves
    * if they want it.
    */
+  /**
+   * THE WHOLE POINT OF THE CONDITIONAL GATE, IN ONE CASE, THROUGH THE REAL
+   * DISPATCHER. One member, holding no admin role, running the one registered
+   * `/profile`: naming somebody else is refused before a single read happens,
+   * and naming nobody is served their own profile. Neither constant can pass
+   * this — `adminOnly: true` fails the second half and `false` fails the first
+   * — which is what makes it the test for the feature rather than for the gate.
+   *
+   * `subject` RECORDS EVERY READ, so "refused" is asserted as nothing having
+   * been looked up rather than as an embed that happened to come back empty.
+   */
+  it('refuses a non-admin who named somebody, and serves one who named nobody', async () => {
+    const seen: string[] = []
+    const one = profileCommand(subject(seen), () => NOW)
+    const config = cfg()
+
+    const refused = answering()
+    await runCommand(invocation({ ...member, targetId: DISCORD }), config, refused, [one])
+
+    // Answered at once and never deferred: the refusal path does not run the
+    // handler, so nothing about the subject was read.
+    expect(refused.reply).toHaveBeenCalledTimes(1)
+    expect(refused.defer).not.toHaveBeenCalled()
+    expect(refused.edit).not.toHaveBeenCalled()
+    expect(seen).toEqual([])
+
+    const served = answering()
+    await runCommand(invocation({ ...member, targetId: null }), config, served, [one])
+
+    expect(served.reply).not.toHaveBeenCalled()
+    expect(served.defer).toHaveBeenCalledWith(true)
+    expect(served.edit).toHaveBeenCalledTimes(1)
+
+    // And what they were served is the SELF view of themselves: keyed on the
+    // caller, with no licence in it and no licence list ever asked for.
+    const answer = served.edit.mock.calls[0]?.[0]
+    if (answer === undefined) throw new Error('the reply was filled in with nothing')
+
+    const text = rendered(answer)
+
+    expect(text).toContain(CALLER)
+    expect(text).not.toContain(DISCORD)
+    expect(text).not.toContain(NEWEST)
+
+    expect(seen).toContain(`currentLicenceFor:${CALLER}`)
+    expect(seen.filter((entry) => entry.startsWith('licencesFor:'))).toEqual([])
+  })
+
   it('gives an admin who named nobody the self view and not the admin view', async () => {
     const seen: string[] = []
     const one = profileCommand(subject(seen), () => NOW)

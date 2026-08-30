@@ -209,6 +209,66 @@ describe('the gate is a role check in the handler, not a permission on the comma
   })
 
   /**
+   * A GATE THAT IS A QUESTION ABOUT THE INVOCATION. `/profile` is the command
+   * this exists for — see profile.test.ts, which asserts it through the real
+   * one — and the cases here are about the FRAMEWORK: a predicate is resolved
+   * before anything else happens, and `true` out of one is the same thing as
+   * the constant.
+   */
+  it('resolves a gate that is a predicate against the invocation it was given', () => {
+    const config = cfg({ adminRoleId: ADMIN_ROLE })
+    const conditional = guarded({ adminOnly: (one) => one.targetId !== null })
+
+    // The role is not held, so the answer is entirely the predicate's.
+    expect(refusalFor(conditional, invocation({ targetId: TARGET }), config)).toBe('not-admin')
+    expect(refusalFor(conditional, invocation({ targetId: null }), config)).toBeNull()
+  })
+
+  /**
+   * THE HALF THAT MUST NOT BE WEAKENED. Making one refusal conditional must not
+   * make any of the others conditional too: once the predicate says yes, every
+   * closed direction the framework has is exactly where it was, in the same
+   * order. `not-in-guild` sits ABOVE the predicate and refuses whatever it
+   * would have answered — which is why a payload with no guild is refused here
+   * even though this predicate would have let it through.
+   */
+  it('keeps every closed direction once a predicate says the gate applies', () => {
+    const conditional = guarded({ adminOnly: (one) => one.targetId !== null })
+    const targeted = invocation({ targetId: TARGET, roleIds: [ADMIN_ROLE] })
+
+    expect(refusalFor(conditional, targeted, cfg())).toBe('admin-role-unset')
+    expect(
+      refusalFor(conditional, invocation({ targetId: TARGET, roleIds: null }), cfg({ adminRoleId: ADMIN_ROLE })),
+    ).toBe('roles-unreadable')
+
+    const open = invocation({ targetId: null, guildId: null, roleIds: [ADMIN_ROLE] })
+    expect(refusalFor(conditional, open, cfg({ adminRoleId: ADMIN_ROLE }))).toBe('not-in-guild')
+  })
+
+  /**
+   * A PREDICATE IS NEVER CONSULTED FOR ANYTHING BUT THE GATE, and it is asked
+   * once. It is written in a command file, so treating it as a general hook —
+   * calling it twice, or calling it for a command Discord did not send — would
+   * make a command file's function a thing the dispatcher depends on for more
+   * than it says.
+   */
+  it('asks the predicate exactly once, and only about the gate', () => {
+    const asked: Invocation[] = []
+    const config = cfg({ adminRoleId: ADMIN_ROLE })
+
+    const conditional = guarded({
+      adminOnly: (one) => {
+        asked.push(one)
+        return false
+      },
+    })
+
+    const who = invocation({ targetId: TARGET })
+    expect(refusalFor(conditional, who, config)).toBeNull()
+    expect(asked).toEqual([who])
+  })
+
+  /**
    * THE PATH THAT MAKES ALL OF THE ABOVE NECESSARY. `defaultMemberPermissions:
    * 0n` is what Discord shows by default, and anybody with Manage Server can
    * re-grant the command to @everyone under Server Settings -> Integrations.
@@ -703,15 +763,45 @@ describe('registerCommands', () => {
   })
 
   /**
-   * THE THREE ADMIN COMMANDS ARE HIDDEN AS WELL AS GATED, and `commandData`
-   * derives the hiding from the gate so the two cannot disagree. /help is open
-   * to everybody and must stay that way — it is the one command a member runs.
+   * THE TWO UNCONDITIONALLY ADMIN COMMANDS ARE HIDDEN AS WELL AS GATED, and
+   * `commandData` derives the hiding from the gate so the two cannot disagree.
+   * /help is open to everybody and must stay that way — it is the one command a
+   * member runs.
+   *
+   * /profile IS NOT IN THIS LIST AND MUST NOT BE. Its gate is a predicate, so
+   * it is registered visible: hiding it would leave a member unable to reach
+   * the self view the gate exists to permit. See the case below.
    */
-  it('hides exactly the admin-only commands from the client', () => {
+  it('hides exactly the unconditionally admin-only commands from the client', () => {
     const hidden = COMMANDS.filter((one) => commandData(one).defaultMemberPermissions === 0n)
 
-    expect(hidden.map((one) => one.data.name)).toEqual(['profile', 'sticky', 'unsticky'])
-    expect(hidden.every((one) => one.adminOnly)).toBe(true)
+    expect(hidden.map((one) => one.data.name)).toEqual(['sticky', 'unsticky'])
+    expect(hidden.every((one) => one.adminOnly === true)).toBe(true)
+  })
+
+  /**
+   * A CONDITIONALLY GATED COMMAND IS REGISTERED VISIBLE, AND IS STILL REFUSED.
+   * A function is truthy, so a `commandData` written with a truthiness test
+   * would hide this command from everybody and the open half of it would be
+   * unreachable in the picker however the gate answers. `0n` is a DEFAULT and
+   * never a guard — anybody with Manage Server can re-grant it — so un-hiding
+   * costs nothing that was ever protection, and the assertion below is the one
+   * that says so: visible, and refused all the same.
+   */
+  it('registers a per-invocation gate visible and still refuses the gated half', () => {
+    const conditional = guarded({ adminOnly: (one) => one.targetId !== null })
+
+    expect(commandData(conditional).defaultMemberPermissions).toBeNull()
+
+    const config = cfg({ adminRoleId: ADMIN_ROLE })
+    expect(refusalFor(conditional, invocation({ targetId: TARGET }), config)).toBe('not-admin')
+
+    // And /profile, the command all of this exists for, is one of them.
+    const profile = COMMANDS.find((one) => one.data.name === 'profile')
+    if (profile === undefined) throw new Error('/profile is not in the command list')
+
+    expect(commandData(profile).defaultMemberPermissions).toBeNull()
+    expect(typeof profile.adminOnly).toBe('function')
   })
 
   /**

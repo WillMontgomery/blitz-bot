@@ -3323,6 +3323,35 @@ describe('statusReporter — what never reaches the channel', () => {
     expect(at(sent, 0).endsWith('\n```')).toBe(true)
     expect(at(sent, 0).split('```')).toHaveLength(3)
   })
+
+  /**
+   * THE OTHER HALF OF THE DEPLOY NOTICE'S DISTINCTION, ASSERTED HERE SO THAT
+   * OPENING ONE PATH CANNOT QUIETLY OPEN THIS ONE. The notice renders a masked
+   * link on purpose — see the deploy-notice cases — and this is the same
+   * markup, arriving in the same channel, from a value somebody else chose. It
+   * is fenced, so the markdown is inert, and the url is `[url]` before the
+   * fence is even reached. What decides that is where the text came from, never
+   * which channel it is going to.
+   */
+  it('still fences a fault, and its markdown is inert whatever it carries', async () => {
+    const { client, sent } = statusHarness()
+
+    await statusReporter(client, STATUS_CHANNEL)(
+      'warn',
+      'author roles could not be fetched',
+      line('author roles could not be fetched', 'author="[click](https://evil.example/x)"'),
+    )
+
+    const posted = at(sent, 0)
+
+    // Fenced, so `[click](…)` is text rather than a link a reader can follow.
+    expect(posted.startsWith('```\n')).toBe(true)
+    expect(posted.endsWith('\n```')).toBe(true)
+
+    // And the url never got as far as the fence.
+    expect(posted).toContain('[url]')
+    expect(posted).not.toContain('evil.example')
+  })
 })
 
 /**
@@ -3344,6 +3373,18 @@ describe('statusReporter — what never reaches the channel', () => {
  */
 const DEPLOYED = 'a1b2c3d'
 const PREVIOUS = 'deadbee'
+
+/**
+ * The notice, in the owner's words, WRITTEN OUT HERE.
+ *
+ * NOT IMPORTED FROM client.ts, WHICH IS THE POINT OF SPELLING IT OUT. A case
+ * that built its expectation with the same function under test would pass
+ * against any wording at all — including one that lost the link, which is the
+ * regression this exists to catch. The owner asked for this sentence and this
+ * link, so this file is where they are pinned.
+ */
+const notice = (sha: string): string =>
+  `Update installed. Now running [${sha}](https://github.com/WillMontgomery/blitz-bot/commit/${sha})`
 
 /** An `ENOENT`, exactly as `readFile` rejects with one. */
 const noSuchFile = (): Error =>
@@ -3399,7 +3440,7 @@ describe('the deploy notice — what it says, and when it says nothing', () => {
 
     await reportDeployedCommit(store.files, post)
 
-    expect(post).toHaveBeenCalledWith(`running commit ${DEPLOYED}`)
+    expect(post).toHaveBeenCalledWith(notice(DEPLOYED))
     expect(store.file()).toBe(`${DEPLOYED}\n`)
   })
 
@@ -3521,7 +3562,7 @@ describe('the deploy notice — what it says, and when it says nothing', () => {
 
     const first = poster()
     await reportDeployedCommit(store.files, first)
-    expect(first).toHaveBeenCalledWith(`running commit ${DEPLOYED}`)
+    expect(first).toHaveBeenCalledWith(notice(DEPLOYED))
 
     // The process died here. A new one comes up on the same commit, with the
     // same two files and no memory of anything else.
@@ -3533,7 +3574,7 @@ describe('the deploy notice — what it says, and when it says nothing', () => {
     const store2 = commitStore({ deployed: PREVIOUS, reported: store.file() as string })
     const third = poster()
     await reportDeployedCommit(store2.files, third)
-    expect(third).toHaveBeenCalledWith(`running commit ${PREVIOUS}`)
+    expect(third).toHaveBeenCalledWith(notice(PREVIOUS))
   })
 
   /**
@@ -3587,7 +3628,7 @@ describe('the deploy notice — where it goes, and when', () => {
     ready()
     await settle()
 
-    expect(sent).toEqual([`running commit ${DEPLOYED}`])
+    expect(sent).toEqual([notice(DEPLOYED)])
     expect(fetched).toEqual([STATUS_CHANNEL])
   })
 
@@ -3629,19 +3670,54 @@ describe('the deploy notice — where it goes, and when', () => {
 
   /**
    * The same suppression every other send in this file states at the call. The
-   * content is a hex sha and could not carry a mention today; the guarantee is
-   * made where a reader of the function can see it, because the client-wide
-   * default is silently replaced by any send that passes its own.
+   * content is a sentence, a hex sha and a github.com url and could not carry a
+   * mention today; the guarantee is made where a reader of the function can see
+   * it, because the client-wide default is silently replaced by any send that
+   * passes its own.
    */
   it('suppresses every mention on the notice', async () => {
     const { client, send } = statusHarness()
 
-    await statusPoster(client, STATUS_CHANNEL)(`running commit ${DEPLOYED}`)
+    await statusPoster(client, STATUS_CHANNEL)(notice(DEPLOYED))
 
     expect(send).toHaveBeenCalledWith({
-      content: `running commit ${DEPLOYED}`,
+      content: notice(DEPLOYED),
       allowedMentions: { parse: [] },
     })
+  })
+
+  /**
+   * THE SHA IS A LINK, AND THE LINK ONLY WORKS UNFENCED — which is the whole
+   * reason the deploy notice does not take the fault path into this same
+   * channel. Inside `statusBody`'s code fence the markdown is inert and this
+   * arrives as literal brackets and a bare URL; `redact` would have replaced
+   * the URL with `[url]` before that even happened.
+   *
+   * A MASKED LINK IS ALLOWED BECAUSE A BOT SENT IT. Discord renders
+   * `[text](url)` in content posted by an application and refuses it in content
+   * a human types, so this needs no embed.
+   *
+   * ASSERTED ON WHAT REACHES THE CHANNEL rather than on the builder, because
+   * the fence and the redaction are both things that would happen BETWEEN a
+   * correct builder and the send.
+   */
+  it('posts a real markdown link to the commit, and no code fence around it', async () => {
+    const { client, sent, ready } = statusHarness({ ready: false })
+
+    announceDeployedCommit(client, STATUS_CHANNEL, commitStore({ deployed: DEPLOYED }).files)
+    ready()
+    await settle()
+
+    const posted = at(sent, 0)
+
+    expect(posted).toBe(notice(DEPLOYED))
+    expect(posted).toContain(`[${DEPLOYED}](https://github.com/`)
+    expect(posted).toContain(`/commit/${DEPLOYED})`)
+
+    // Nothing fenced it, and nothing redacted the url out of it: those are the
+    // fault path's, and this is not a fault.
+    expect(posted).not.toContain('```')
+    expect(posted).not.toContain('[url]')
   })
 })
 
@@ -5411,7 +5487,12 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
       'blitz_log_channel_id',
       'blitz_status_channel_id',
       'blitz_docs_channel_id',
-      'running commit',
+      // The FEATURE, not the sentence the bot posts. This used to be `running
+      // commit`, which pinned one wording of one message in a document that
+      // only has to say the notice exists — so changing the wording broke a
+      // test about the manual, and leaving the wording in the manual made the
+      // manual a second place the message is written down.
+      'deploy notice',
     ]) {
       expect(markdown, subject).toContain(subject)
     }

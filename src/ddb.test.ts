@@ -26,6 +26,7 @@ import {
   type AuditOutcome,
   type AuditRow,
   type Ban,
+  type BanIssueInput,
   type Ddb,
   type DdbOp,
   type DdbResult,
@@ -70,6 +71,19 @@ const ACTOR: Actor = {
   license: 'license:admin1',
   name: 'Admin One',
   discordId: '280000000000000000',
+}
+
+/** A Discord audit log entry id: the idempotency key for a ban write. */
+const ENTRY = '1300000000000000000'
+
+/** The smallest legal ban write. Spread and overridden where a test needs more. */
+const ISSUE: BanIssueInput = {
+  id: LICENSE,
+  by: ACTOR.license,
+  byName: ACTOR.name,
+  reason: 'cheating',
+  expiresAt: null,
+  entryId: ENTRY,
 }
 
 /** Any AWS response is legal with only this on it; every field we read is optional. */
@@ -159,6 +173,11 @@ function awsError(name: string, message = 'from the fake'): Error {
  */
 const EXERCISES: Array<{ name: string; run: (ddb: Ddb) => Promise<DdbResult<unknown>> }> = [
   { name: 'bans.get', run: (d) => d.bans.get(LICENSE) },
+  { name: 'bans.issue', run: (d) => d.bans.issue(ISSUE) },
+  {
+    name: 'bans.lift',
+    run: (d) => d.bans.lift({ id: LICENSE, by: ACTOR.license, byName: ACTOR.name }),
+  },
   { name: 'players.get', run: (d) => d.players.get(LICENSE) },
   { name: 'playerIds.licensesFor', run: (d) => d.playerIds.licensesFor(qualifyId('discord', '280')) },
   { name: 'gamePlayers.profile', run: (d) => d.gamePlayers.profile(LICENSE) },
@@ -712,6 +731,476 @@ describe('the bot state table', () => {
 })
 
 /* ------------------------------------------------------------------ *
+ * The ban write path.
+ *
+ * THE ONE FAILURE THIS SECTION IS FOR: the console's `bans.issue` is an
+ * unconditional PutItem of a whole row, so a repeated Discord event run
+ * through a copy of it would replace a row an admin had deliberately LIFTED
+ * and put somebody back under a ban nobody re-issued. Silently. Most of what
+ * follows is that one sentence, asserted from several directions.
+ * ------------------------------------------------------------------ */
+
+/** A ban row exactly as the console writes one: explicit nulls, no entry id. */
+const CONSOLE_BAN: Ban = {
+  license: LICENSE,
+  at: 1_000,
+  by: 'license:admin1',
+  byName: 'Admin One',
+  reason: 'cheating',
+  expiresAt: null,
+  playerName: 'Someone',
+  liftedAt: null,
+  liftedBy: null,
+  liftedByName: null,
+  liftReason: null,
+}
+
+/** The same, lifted by somebody else. The row a replay must not write over. */
+const LIFTED_BAN: Ban = {
+  ...CONSOLE_BAN,
+  liftedAt: 1_500,
+  liftedBy: 'license:admin2',
+  liftedByName: 'Admin Two',
+  liftReason: 'appealed',
+}
+
+/** A table holding this row for the read that every write starts with. */
+function holding(ban: Ban | null): Handlers {
+  return { get: async () => ({ ...META, ...(ban ? { Item: ban } : {}) }) }
+}
+
+/** Was anything written at all? Half of these tests are about not writing. */
+function wrote(calls: Recorded[]): boolean {
+  return calls.some((call) => call.op === 'put' || call.op === 'update')
+}
+
+/**
+ * `Ban` AS fivem-ringmaster/src/lib/bans.ts DECLARES IT, transcribed by hand
+ * and deliberately not imported — same treatment as `ConsoleAuditRow` below,
+ * and now for the same reason: the bot WRITES these rows, so a field it
+ * renamed or dropped is a row the console renders wrong and the connect gate
+ * reads wrong.
+ *
+ * `discordEntryId` IS NOT ON THIS INTERFACE AND MUST NOT BE. It is the one
+ * attribute the console does not know about, and `toConsoleBan` still compiles
+ * because an extra property on a typed value is not an excess-property error —
+ * which is precisely the guarantee being claimed: the bot's own attribute
+ * costs the console nothing.
+ */
+interface ConsoleBan {
+  license: string
+  at: number
+  by: string | null
+  byName: string
+  reason: string
+  expiresAt: number | null
+  playerName?: string | null
+  liftedAt?: number | null
+  liftedBy?: string | null
+  liftedByName?: string | null
+  liftReason?: string | null
+}
+
+const toConsoleBan: (ban: Ban) => ConsoleBan = (ban) => ban
+const toModuleBan: (ban: ConsoleBan) => Ban = (ban) => ban
+
+describe('the ban row', () => {
+  /** The assertion is the typecheck, as with the audit row. See above. */
+  it("is the console's row, both ways round", () => {
+    expect(toModuleBan(toConsoleBan(CONSOLE_BAN))).toEqual(CONSOLE_BAN)
+  })
+})
+
+describe('issuing a ban', () => {
+  it("writes the console's fields, including the nulls it writes explicitly", async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc, now: () => 1_700_000_000_000 })
+
+    const result = await ddb.bans.issue({
+      ...ISSUE,
+      playerName: 'Someone',
+      expiresAt: 1_800_000_000_000,
+    })
+
+    expect(result.ok && result.value.outcome).toBe('issued')
+    expect(writtenRow(fake.calls)).toEqual({
+      license: LICENSE,
+      at: 1_700_000_000_000,
+      by: 'license:admin1',
+      byName: 'Admin One',
+      reason: 'cheating',
+      expiresAt: 1_800_000_000_000,
+      playerName: 'Someone',
+      // The console's explicit nulls, kept so a bot row and a console row are
+      // the same shape — NOT because the put needs them to clear a lift, which
+      // it does not: a `PutItem` replaces the whole item on its own.
+      liftedAt: null,
+      liftedBy: null,
+      liftedByName: null,
+      liftReason: null,
+      discordEntryId: ENTRY,
+    })
+  })
+
+  it('reports the row it wrote, so a caller need not rebuild it', async () => {
+    const ddb = createDdb({ document: fakeDocument().doc, now: () => 1_700_000_000_000 })
+
+    const result = await ddb.bans.issue(ISSUE)
+
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        outcome: 'issued',
+        ban: {
+          license: LICENSE,
+          at: 1_700_000_000_000,
+          by: 'license:admin1',
+          byName: 'Admin One',
+          reason: 'cheating',
+          expiresAt: null,
+          playerName: null,
+          liftedAt: null,
+          liftedBy: null,
+          liftedByName: null,
+          liftReason: null,
+          discordEntryId: ENTRY,
+        },
+      },
+    })
+  })
+
+  /**
+   * A BAN ON SOMEBODY THE GAME HAS NEVER SEEN. The table is keyed on a
+   * qualified identifier, so this is `qualifyId('discord', …)` in the same
+   * place a license goes — and the ATTRIBUTE is still called `license`,
+   * because renaming it would be a row the console and the game cannot find.
+   *
+   * IT IS A RECORD RATHER THAN A DOOR, and the test says so because the code
+   * cannot: `br_ddb`'s connect gate does one GetItem on the connecting
+   * player's LICENSE, so this row does not stop anybody joining.
+   */
+  it('keys a row on whatever qualified identifier it is given', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+    const id = qualifyId('discord', '280000000000000000')
+
+    await ddb.bans.issue({ ...ISSUE, id, playerName: 'someone' })
+
+    expect(fake.calls[0]?.input).toMatchObject({
+      TableName: 'ringmaster-bans',
+      Key: { license: id },
+    })
+    expect(writtenRow(fake.calls)).toMatchObject({ license: id, playerName: 'someone' })
+  })
+
+  it('writes nothing when an active ban already stands, and reports the one that does', async () => {
+    const fake = fakeDocument(holding(CONSOLE_BAN))
+    const ddb = createDdb({ document: fake.doc, now: () => 2_000 })
+
+    const result = await ddb.bans.issue({ ...ISSUE, entryId: 'a-second-event' })
+
+    expect(result).toEqual({ ok: true, value: { outcome: 'already-banned', ban: CONSOLE_BAN } })
+    expect(wrote(fake.calls)).toBe(false)
+  })
+
+  /**
+   * `isBanActive` DECIDES, not an `if` written out in the write path — the
+   * same rule the console and the connect gate use. An expiry in the past is
+   * a ban served, and re-banning is then a normal thing to do.
+   */
+  it('bans over a ban that has expired', async () => {
+    const fake = fakeDocument(holding({ ...CONSOLE_BAN, expiresAt: 2_000 }))
+    const ddb = createDdb({ document: fake.doc, now: () => 3_000 })
+
+    const result = await ddb.bans.issue({ ...ISSUE, entryId: 'a-second-event' })
+
+    expect(result.ok && result.value.outcome).toBe('issued')
+    expect(wrote(fake.calls)).toBe(true)
+  })
+
+  it('bans over a lifted ban, clearing the lift, when the event is a new one', async () => {
+    const fake = fakeDocument(holding(LIFTED_BAN))
+    const ddb = createDdb({ document: fake.doc, now: () => 3_000 })
+
+    const result = await ddb.bans.issue({ ...ISSUE, entryId: 'a-second-event' })
+
+    expect(result.ok && result.value.outcome).toBe('issued')
+    expect(writtenRow(fake.calls)).toMatchObject({
+      at: 3_000,
+      liftedAt: null,
+      liftedBy: null,
+      liftedByName: null,
+      liftReason: null,
+      discordEntryId: 'a-second-event',
+    })
+  })
+
+  /**
+   * THE TEST THIS WHOLE PATH EXISTS FOR.
+   *
+   * The bot bans somebody; an admin looks at it and lifts it; Discord's
+   * gateway redelivers the SAME audit log entry after a reconnect. A write
+   * that asked "is this person banned" would answer no — they were just
+   * unbanned — and ban them again over the admin's decision, with the
+   * console's unconditional PutItem clearing `liftedAt` and taking the record
+   * of who let them back in with it.
+   *
+   * Asking "have I already acted on this event" answers yes, and the lift
+   * stands. Which is why the entry id is checked BEFORE the ban's state and
+   * not after.
+   */
+  it('never re-bans on a replay of the event that produced the ban, lifted or not', async () => {
+    const replayed: Ban = { ...LIFTED_BAN, discordEntryId: ENTRY }
+    const fake = fakeDocument(holding(replayed))
+    const ddb = createDdb({ document: fake.doc, now: () => 3_000 })
+
+    const result = await ddb.bans.issue(ISSUE)
+
+    expect(result).toEqual({ ok: true, value: { outcome: 'duplicate-event', ban: replayed } })
+    expect(wrote(fake.calls)).toBe(false)
+  })
+
+  /**
+   * The same replay while the ban is still in force. It is reported as the
+   * duplicate it is rather than as `already-banned`, because those are two
+   * different sentences: one is "you already did this", the other is
+   * "somebody else did".
+   */
+  it('reports a replay as a duplicate event and not as an already-banned player', async () => {
+    const fake = fakeDocument(holding({ ...CONSOLE_BAN, discordEntryId: ENTRY }))
+    const ddb = createDdb({ document: fake.doc, now: () => 2_000 })
+
+    const result = await ddb.bans.issue(ISSUE)
+
+    expect(result.ok && result.value.outcome).toBe('duplicate-event')
+    expect(wrote(fake.calls)).toBe(false)
+  })
+
+  it('treats a different entry id on the row as a different event', async () => {
+    const fake = fakeDocument(holding({ ...LIFTED_BAN, discordEntryId: 'an-older-event' }))
+    const ddb = createDdb({ document: fake.doc, now: () => 3_000 })
+
+    const result = await ddb.bans.issue(ISSUE)
+
+    expect(result.ok && result.value.outcome).toBe('issued')
+  })
+
+  /**
+   * THE GUARD IS ON THE ROW WE READ, not on a re-derivation of `isBanActive`
+   * in DynamoDB's expression language — which is where the console's rule and
+   * the bot's would quietly stop agreeing. `at` is the value we saw; anything
+   * that changes the row in the gap between the read and the write fails the
+   * condition instead of being overwritten.
+   */
+  it('guards the write on the exact row it read', async () => {
+    const fake = fakeDocument(holding(LIFTED_BAN))
+    const ddb = createDdb({ document: fake.doc, now: () => 3_000 })
+
+    await ddb.bans.issue({ ...ISSUE, entryId: 'a-second-event' })
+
+    const put = fake.calls.find((call) => call.op === 'put')?.input as PutCommandInput
+    expect(put.ConditionExpression).toBe('at = :seenAt')
+    expect(put.ExpressionAttributeValues).toEqual({ ':seenAt': 1_000 })
+  })
+
+  /** No row read means the row to guard against is the one that appeared since. */
+  it('guards a first ban with create-do-not-replace', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    await ddb.bans.issue(ISSUE)
+
+    const put = fake.calls.find((call) => call.op === 'put')?.input as PutCommandInput
+    expect(put.ConditionExpression).toBe('attribute_not_exists(license)')
+    expect(put.ExpressionAttributeValues).toBeUndefined()
+  })
+
+  it('reports a row that changed underneath it as a conflict, having written nothing', async () => {
+    const fake = fakeDocument({
+      ...holding(LIFTED_BAN),
+      put: async () => {
+        throw awsError('ConditionalCheckFailedException')
+      },
+    })
+    const ddb = createDdb({ document: fake.doc, now: () => 3_000 })
+
+    const result = await ddb.bans.issue({ ...ISSUE, entryId: 'a-second-event' })
+
+    expect(result.ok).toBe(false)
+    expect(!result.ok && result.failure.kind).toBe('conflict')
+    expect(!result.ok && result.failure.table).toBe('ringmaster-bans')
+  })
+
+  /**
+   * A READ THAT FAILED IS NOT A ROW THAT IS ABSENT. Writing anyway would ban
+   * over whatever is actually there, which is the un-lift failure again by
+   * another route.
+   */
+  it('never writes blind when the read it decides from failed', async () => {
+    const fake = fakeDocument({
+      get: async () => {
+        throw awsError('AccessDeniedException')
+      },
+    })
+    const ddb = createDdb({ document: fake.doc })
+
+    const result = await ddb.bans.issue(ISSUE)
+
+    expect(result.ok).toBe(false)
+    expect(!result.ok && result.failure.kind).toBe('denied')
+    expect(wrote(fake.calls)).toBe(false)
+  })
+})
+
+describe('lifting a ban', () => {
+  const LIFT = { id: LICENSE, by: 'license:admin2', byName: 'Admin Two', reason: 'appealed' }
+
+  /**
+   * A BAN IS A RECORD, NOT A DELETION — lib/bans.ts's own rule. The row stays
+   * where it is and gains four fields, and the module could not delete it if
+   * something asked: `DocumentClient` has no `delete` on it at all.
+   */
+  it('stamps the lifted fields with an update, and removes nothing', async () => {
+    const fake = fakeDocument(holding(CONSOLE_BAN))
+    const ddb = createDdb({ document: fake.doc, now: () => 4_000 })
+
+    await ddb.bans.lift(LIFT)
+
+    expect(fake.calls.map((call) => call.op)).toEqual(['get', 'update'])
+
+    const update = fake.calls[1]?.input as UpdateCommandInput
+    expect(update.TableName).toBe('ringmaster-bans')
+    expect(update.Key).toEqual({ license: LICENSE })
+    expect(update.UpdateExpression).toBe(
+      'SET liftedAt = :t, liftedBy = :b, liftedByName = :n, liftReason = :r',
+    )
+    expect(update.ExpressionAttributeValues).toMatchObject({
+      ':t': 4_000,
+      ':b': 'license:admin2',
+      ':n': 'Admin Two',
+      ':r': 'appealed',
+    })
+  })
+
+  it('returns the row as it now stands, without reading it back', async () => {
+    const fake = fakeDocument(holding(CONSOLE_BAN))
+    const ddb = createDdb({ document: fake.doc, now: () => 4_000 })
+
+    const result = await ddb.bans.lift(LIFT)
+
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        outcome: 'lifted',
+        ban: {
+          ...CONSOLE_BAN,
+          liftedAt: 4_000,
+          liftedBy: 'license:admin2',
+          liftedByName: 'Admin Two',
+          liftReason: 'appealed',
+        },
+      },
+    })
+    expect(fake.calls.filter((call) => call.op === 'get')).toHaveLength(1)
+  })
+
+  it('writes a missing reason as null rather than leaving the field off', async () => {
+    const fake = fakeDocument(holding(CONSOLE_BAN))
+    const ddb = createDdb({ document: fake.doc, now: () => 4_000 })
+
+    await ddb.bans.lift({ id: LICENSE, by: null, byName: 'Blitz' })
+
+    const update = fake.calls[1]?.input as UpdateCommandInput
+    expect(update.ExpressionAttributeValues?.[':r']).toBeNull()
+    expect(update.ExpressionAttributeValues?.[':b']).toBeNull()
+  })
+
+  /**
+   * TWO CONDITIONS IN ONE, AND THE SECOND HAS TO BE SPELLED TWICE.
+   *
+   * `attribute_exists(license)` is the console's, verbatim, and it is there
+   * because `UpdateItem` against a missing key CREATES one — a lift of a ban
+   * nobody issued would otherwise leave a row that reads forever after as
+   * though somebody had been banned.
+   *
+   * The rest is "still not lifted", which needs both spellings because there
+   * are two: the console writes `liftedAt: null` explicitly on every ban it
+   * issues, so on those rows the attribute EXISTS and is null, while an older
+   * or hand-written row may not carry it at all. A condition testing only
+   * `attribute_not_exists` would refuse to lift any ban the console ever
+   * issued.
+   */
+  it('conditions on the ban existing and on nobody having lifted it first', async () => {
+    const fake = fakeDocument(holding(CONSOLE_BAN))
+    const ddb = createDdb({ document: fake.doc, now: () => 4_000 })
+
+    await ddb.bans.lift(LIFT)
+
+    const update = fake.calls[1]?.input as UpdateCommandInput
+    expect(update.ConditionExpression).toBe(
+      'attribute_exists(license) AND (attribute_not_exists(liftedAt) OR liftedAt = :unlifted)',
+    )
+    expect(update.ExpressionAttributeValues?.[':unlifted']).toBeNull()
+  })
+
+  it('reports a ban that was never there, without writing a lift for it', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    const result = await ddb.bans.lift(LIFT)
+
+    expect(result).toEqual({ ok: true, value: { outcome: 'no-ban', ban: null } })
+    expect(wrote(fake.calls)).toBe(false)
+  })
+
+  /**
+   * A REDELIVERED UNBAN MUST NOT REPLACE THE FIRST LIFTER. Writing the lift
+   * again would put this call's admin and reason on the row in place of the
+   * ones already there — the same erasure as un-lifting a ban, just quieter,
+   * on the field that answers "who let them back in".
+   */
+  it('leaves an already-lifted ban completely alone, first lifter and all', async () => {
+    const fake = fakeDocument(holding(LIFTED_BAN))
+    const ddb = createDdb({ document: fake.doc, now: () => 4_000 })
+
+    const result = await ddb.bans.lift(LIFT)
+
+    expect(result).toEqual({ ok: true, value: { outcome: 'already-lifted', ban: LIFTED_BAN } })
+    expect(wrote(fake.calls)).toBe(false)
+  })
+
+  it('reports a lift that lost the race as a conflict', async () => {
+    const fake = fakeDocument({
+      ...holding(CONSOLE_BAN),
+      update: async () => {
+        throw awsError('ConditionalCheckFailedException')
+      },
+    })
+    const ddb = createDdb({ document: fake.doc, now: () => 4_000 })
+
+    const result = await ddb.bans.lift(LIFT)
+
+    expect(result.ok).toBe(false)
+    expect(!result.ok && result.failure.kind).toBe('conflict')
+    expect(!result.ok && result.failure.op).toBe('update')
+  })
+
+  it('never writes blind when the read it decides from failed', async () => {
+    const fake = fakeDocument({
+      get: async () => {
+        throw awsError('ResourceNotFoundException')
+      },
+    })
+    const ddb = createDdb({ document: fake.doc })
+
+    const result = await ddb.bans.lift(LIFT)
+
+    expect(result.ok).toBe(false)
+    expect(wrote(fake.calls)).toBe(false)
+  })
+})
+
+/* ------------------------------------------------------------------ *
  * The audit log. The reason this module is not a copy of the console's.
  * ------------------------------------------------------------------ */
 
@@ -1057,12 +1546,17 @@ describe('stamping an outcome', () => {
 
 describe('what the bot may do to these tables', () => {
   /**
-   * THE ACCESS POLICY, ASSERTED. Five tables are read and two are written, and
-   * the write list is short enough to read: the audit log the bot appends to,
-   * and the bot's own state. A future accessor that writes to `ringmaster-
-   * bans` fails here before it reaches a review.
+   * THE ACCESS POLICY, ASSERTED. Three tables are written and the list is
+   * short enough to read: the audit log the bot appends to, the bot's own
+   * state, and — since blitz-bot#16 — the ban table. A future accessor that
+   * writes to a fourth fails here before it reaches a review.
+   *
+   * `ringmaster-bans` WAS ON THE OTHER SIDE OF THIS ASSERTION UNTIL #16, and
+   * the line moving is the whole of what that change did to the bot's reach
+   * into AWS. It is asserted rather than described so that the next widening
+   * is also a visible edit to a test rather than a quiet extra call.
    */
-  it('writes to the audit log and its own state, and to nothing else', async () => {
+  it('writes to the audit log, its own state and the ban table, and nothing else', async () => {
     const fake = fakeDocument()
     const ddb = createDdb({ document: fake.doc })
 
@@ -1072,7 +1566,11 @@ describe('what the bot may do to these tables', () => {
       fake.calls.filter((call) => call.op === 'put' || call.op === 'update').map((c) => c.table),
     )
 
-    expect([...written].sort()).toEqual(['ringmaster-audit', 'ringmaster-bot-state'])
+    expect([...written].sort()).toEqual([
+      'ringmaster-audit',
+      'ringmaster-bans',
+      'ringmaster-bot-state',
+    ])
   })
 
   it('reads the seven it is pointed at, and no others', async () => {

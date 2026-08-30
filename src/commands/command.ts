@@ -116,6 +116,24 @@ export interface Invocation {
 export const TARGET_OPTION = 'user'
 
 /**
+ * Who a command is for: everybody, admins, or admins depending on how it was
+ * run.
+ *
+ * A UNION RATHER THAN A PREDICATE FOR EVERYTHING. Three of the four commands in
+ * this bot are one answer or the other for every invocation there is, and
+ * `adminOnly: true` says that in one word that cannot be got wrong; making them
+ * all write `() => true` would put a function nobody reads in front of the one
+ * fact about a command that most needs reading. The predicate is for the
+ * command whose audience genuinely depends on the invocation.
+ *
+ * A FUNCTION OF THE `Invocation` AND NOTHING ELSE — no config, no reads, no
+ * clock. What it may look at is therefore exactly what `refusalFor` already
+ * has in its hand, which is what keeps the answer a pure question about the
+ * payload rather than a second gate with its own inputs and its own failures.
+ */
+export type AdminGate = boolean | ((invocation: Invocation) => boolean)
+
+/**
  * Why an invocation was not run. Four reasons, and they are four different
  * things to an operator reading the journal.
  *
@@ -176,8 +194,23 @@ export interface BotCommand {
   /**
    * Whether the gate below applies. THIS FIELD IS THE GATE — see `refusalFor`
    * for why the permission Discord shows in its own UI is not.
+   *
+   * A PREDICATE WHEN THE ANSWER DEPENDS ON THE INVOCATION, AND `/profile` IS
+   * WHY. `/profile @someone` is a moderation lookup and needs the role;
+   * `/profile` with no target answers about the caller and needs nothing. That
+   * is one command with two audiences, and a `boolean` can only state the
+   * stricter of the two — which is what this field used to be, and what made
+   * the self view unreachable by the members it was written for. Shipping the
+   * looser one instead would have opened the targeted half to everybody.
+   *
+   * A COMMAND STATES THE CONDITION; `refusalFor` STILL ENFORCES IT. The
+   * alternative is an `if` in the handler, and a handler that answers its own
+   * refusals has to re-implement four reasons — no guild, unset admin role, no
+   * member on the payload, no role — which agree with the framework on the day
+   * they are written and not after. Nothing below the resolution in
+   * `refusalFor` knows a predicate was involved.
    */
-  readonly adminOnly: boolean
+  readonly adminOnly: AdminGate
 
   /**
    * Whether the reply is seen only by the person who ran the command.
@@ -277,6 +310,15 @@ const COPY = {
  * scanned. Both are the closed direction for what they guard: there, not being
  * able to identify an admin means nobody is skipped; here, it means nobody is
  * let in. An unset variable must never be the thing that opens a door.
+ *
+ * WHETHER THE GATE APPLIES CAN BE A QUESTION ABOUT THE INVOCATION, and asking
+ * it is ONE LINE, in ONE place, above everything that refuses. That position is
+ * the whole design: a command that is gated for this invocation is then refused
+ * by exactly the reasons and in exactly the order a statically admin-only one
+ * is, so the conditional cannot weaken any of them — an unset
+ * DISCORD_ADMIN_ROLE_ID still refuses, a payload with no member on it still
+ * refuses, and a payload with no guild is refused above the question being
+ * asked at all. See `AdminGate` for why a command may not do this itself.
  */
 export function refusalFor(
   command: BotCommand,
@@ -285,10 +327,17 @@ export function refusalFor(
 ): Refusal | null {
   // Checked for every command, admin-only or not. A guild command cannot be
   // invoked outside its guild, so this is a payload that is not what this file
-  // expects rather than a DM — and the roles below would be meaningless.
+  // expects rather than a DM — and the roles below would be meaningless. It
+  // sits ABOVE the resolution below, so no predicate can be written that lets
+  // one through.
   if (invocation.guildId === null) return 'not-in-guild'
 
-  if (!command.adminOnly) return null
+  // The one line a conditional gate costs this function. `true` and a predicate
+  // answering `true` are the same thing from here down.
+  const gated =
+    typeof command.adminOnly === 'function' ? command.adminOnly(invocation) : command.adminOnly
+
+  if (!gated) return null
 
   if (config.adminRoleId === null) return 'admin-role-unset'
   if (invocation.roleIds === null) return 'roles-unreadable'

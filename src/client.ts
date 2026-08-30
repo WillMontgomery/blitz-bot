@@ -2299,6 +2299,12 @@ const STATUS_LINE_CAP = 1800
  * out of the channel into an issue is the string an operator would have
  * grepped.
  *
+ * THIS IS THE FAULT PATH'S BODY AND NOT EVERY POST'S. The deploy notice reaches
+ * the same channel through `statusPoster` and is not fenced, because nothing in
+ * it is borrowed and it is meant to render a link — see there for the whole
+ * distinction. What decides the fence is where the text came from, never which
+ * channel it is going to.
+ *
  * THE COUNT SITS OUTSIDE THE FENCE and is absent altogether on the first post,
  * because `seen 1 times` on something that has happened once is noise on every
  * line in the channel to make the fortieth one cheaper to write.
@@ -2429,6 +2435,56 @@ function permanentlyUnusable(error: unknown): boolean {
 const SHORT_SHA = /^[0-9a-f]{7,40}$/u
 
 /**
+ * Where this bot's source lives, so a sha can be a link to the commit.
+ *
+ * A MODULE CONSTANT HERE, AND DELIBERATELY NOT IN `Config`. Everything in
+ * config.ts is a thing that DIFFERS between deployments and that an operator
+ * has to supply — a token, a guild, three channel ids — and every one of them
+ * is a thing they can get wrong. This is not one of those: it is a fact about
+ * the SOURCE this process was built from, identical on the box, on a laptop and
+ * in CI, and there is no deployment for which a different value would be right.
+ * Making it an environment variable would buy nothing and would introduce a
+ * failure this feature cannot otherwise have — a notice whose sha is a link
+ * into somebody else's repository, which reads as authoritative and points at
+ * code the bot is not running.
+ *
+ * BESIDE `SHORT_SHA` AND `deployedCommitPath` RATHER THAN INSIDE THE BUILDER,
+ * because those three are the whole answer to "where does the commit in that
+ * message come from": what shape it must be, which file it was read out of, and
+ * what it names. A literal buried in `deployNotice` would be a URL nobody reads
+ * until it is wrong, and the next thing that wants the repo — a compare link, an
+ * issue link — would grow a second copy of it.
+ *
+ * NO TRAILING SLASH, and the paths below add their own. `/commit/<sha>` is
+ * GitHub's own route and it resolves an abbreviated sha, which is what the
+ * updater writes.
+ */
+const REPO_URL = 'https://github.com/WillMontgomery/blitz-bot'
+
+/**
+ * The notice itself, in the owner's words.
+ *
+ * THE WORDING IS HIS AND IS REPRODUCED EXACTLY, including the full stop and the
+ * capital on "Now". The sha is a MASKED LINK — `[text](url)` — so the message
+ * says the short sha and one click reaches the commit, instead of an operator
+ * copying seven characters into a search box.
+ *
+ * A MASKED LINK WORKS BECAUSE A BOT SENT IT. Discord refuses `[text](url)` in
+ * message content that a HUMAN types and renders it as literal brackets; it
+ * renders it as a link in content posted by an application, which is what this
+ * is. So the notice needs no embed, and does not get one — an embed would be a
+ * box drawn around one sentence.
+ *
+ * IT MUST NOT BE FENCED, WHICH IS WHY IT DOES NOT TAKE THE FAULT PATH. Inside a
+ * code fence the markdown above is inert and this arrives as literal brackets
+ * and a bare URL. See `statusPoster` for the distinction and for why this line
+ * is allowed to be formatted when a fault line is not.
+ */
+function deployNotice(sha: string): string {
+  return `Update installed. Now running [${sha}](${REPO_URL}/commit/${sha})`
+}
+
+/**
  * Where the updater records what it installed.
  *
  * DERIVED FROM THIS FILE'S OWN LOCATION, NOT TYPED OUT. This module is
@@ -2524,7 +2580,7 @@ export async function reportDeployedCommit(
   const reported = await readSha(files.reported, 'the commit last reported')
   if (reported === deployed) return
 
-  await post(`running commit ${deployed}`)
+  await post(deployNotice(deployed))
 
   try {
     await files.remember(deployed)
@@ -2579,11 +2635,31 @@ async function readSha(read: () => Promise<string>, what: string): Promise<strin
  * condition because it has somewhere to latch and a whole process's worth of
  * later faults to protect; this runs exactly once.
  *
+ * THE CONTENT GOES OUT VERBATIM: NO `redact`, AND NO CODE FENCE. That is the
+ * deliberate half of a distinction rather than a step somebody forgot, and it
+ * is the reason there are two ways into this one channel at all. FAULTS take
+ * `statusReporter`, where every line is scrubbed by `redact` and wrapped in a
+ * fence by `statusBody` — because a fault line carries values a stranger chose
+ * (a webhook's name, an error message with somebody's text reflected back), and
+ * inside a fence Discord renders all of it literally, links nothing and pings
+ * nobody. THIS path carries lines the bot wrote about itself.
+ *
+ * SO THE RULE IS "BORROWED TEXT IS FENCED", NOT "THIS CHANNEL IS FENCED", and
+ * these two functions are what state it. Its only caller is the deploy notice,
+ * which is a literal sentence plus a sha that `readSha` has already matched
+ * against `SHORT_SHA` — seven to forty hex characters, which cannot be markup,
+ * cannot be a mention and cannot close anything that was opened. It is also the
+ * one line in the channel that is MEANT to be formatted: fencing it would
+ * render the owner's link as literal brackets. A caller added here that carries
+ * anybody else's text belongs on `statusReporter` instead, and if one ever has
+ * to be on this path it fences its own borrowed values before it arrives.
+ *
  * THE SAME MENTION SUPPRESSION `announcer` STATES AT ITS OWN SEND. The content
- * here is a hex sha and cannot carry a mention, and the guarantee is still made
- * at the call rather than left to the client-wide default, because that default
- * is silently replaced by any send that passes an `allowedMentions` of its own
- * and a reader of this function cannot see it.
+ * here is a sentence, a hex sha and a github.com URL, none of which can carry a
+ * mention, and the guarantee is still made at the call rather than left to the
+ * client-wide default, because that default is silently replaced by any send
+ * that passes an `allowedMentions` of its own and a reader of this function
+ * cannot see it.
  */
 export function statusPoster(
   client: Client,

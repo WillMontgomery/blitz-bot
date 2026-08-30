@@ -67,9 +67,27 @@ export const COMMANDS: readonly BotCommand[] = [
  * Registration is a bulk PUT, so an absent field means "reset to the default"
  * anyway — writing it says which of the two we meant, and makes a command
  * flipped from admin-only back to open actually get un-hidden.
+ *
+ * `=== true`, AND NEVER `command.adminOnly ? …`, WHICH IS THE WHOLE OF WHAT A
+ * CONDITIONAL GATE COSTS THIS FUNCTION. `BotCommand.adminOnly` may be a
+ * PREDICATE — see `AdminGate` — and a function is truthy, so the shorter test
+ * would hide `/profile` from every member in the client and leave the half of
+ * it that needs no role unreachable in the picker whatever `refusalFor` allows.
+ * The gate would then be decorative: nobody could reach the invocation it was
+ * written to permit.
+ *
+ * SO A COMMAND WHOSE GATE DEPENDS ON THE INVOCATION IS REGISTERED VISIBLE, and
+ * that is a decision rather than a fallthrough. `defaultMemberPermissions` is
+ * one value for the whole command and cannot say "admin-only only when this
+ * option is filled in"; of the two things it CAN say, hidden closes the half
+ * that was meant to be open and visible closes nothing at all. It closes
+ * nothing because `0n` was never the guard: it is a DEFAULT anybody with Manage
+ * Server can re-grant, and `refusalFor` is what refuses the targeted call
+ * either way. Un-hiding therefore costs exactly the protection that path never
+ * had.
  */
 export function commandData(command: BotCommand): ChatInputApplicationCommandData {
-  return { ...command.data, defaultMemberPermissions: command.adminOnly ? 0n : null }
+  return { ...command.data, defaultMemberPermissions: command.adminOnly === true ? 0n : null }
 }
 
 /** The guild, reduced to the one thing registration does to it. */

@@ -35,13 +35,16 @@ including `DeleteItem` and `Scan`. **blitz-bot#4** is scoping the bot to an
 identity of its own, and §15's instruction is to do that *before* the first AWS
 call rather than after.
 
-**That gate is still intact.** `src/ddb.ts` exists but nothing calls
-`createDdb`, so the bot still makes no AWS call at all. Wiring it up is the
-change that spends the gate.
+**That gate has been spent.** `createDdb()` is called from the client and from
+the command wiring, so the bot makes AWS calls today, with the console's role,
+and `RingmasterTableAccess` is the only thing standing between it and every
+`ringmaster-*` table. Nothing about that is new to the ban write — it was true
+of the first `GetItem` — but the ban write is the first thing the bot does that
+a wrong grant could not have made harmless.
 
 ### What the bot's own policy needs, when #4 writes one
 
-Seven tables are read; two of those are also written. There is no `DeleteItem`
+Seven tables are read; three of those are also written. There is no `DeleteItem`
 and no `Scan` anywhere in this list, and the module has no code path that could
 use either — its document-client interface exposes `get`, `put`, `update` and
 `query` and nothing else.
@@ -50,10 +53,24 @@ use either — its document-client interface exposes `get`, `put`, `update` and
 |---|---|
 | `dynamodb:GetItem` | `ringmaster-bans`, `ringmaster-players`, `ringmaster-player-ids`, `ringmaster-maintenance`, `ringmaster-bot-state`, `br-players` |
 | `dynamodb:Query` | `ringmaster-audit` |
-| `dynamodb:PutItem` | `ringmaster-audit`, `ringmaster-bot-state` |
-| `dynamodb:UpdateItem` | `ringmaster-audit` |
+| `dynamodb:PutItem` | `ringmaster-audit`, `ringmaster-bot-state`, **`ringmaster-bans`** |
+| `dynamodb:UpdateItem` | `ringmaster-audit`, **`ringmaster-bans`** |
 
 All in `us-east-2`. See the region section below before writing an ARN.
+
+**The two bold entries are new in blitz-bot#16 and they widen the bot's AWS
+grant.** Not the grant it *runs* with — that has been `ringmaster-*` with every
+action on it since the first call, and this changes nothing about what the bot
+is technically able to do today. What widens is the grant it will need when
+**blitz-bot#4** scopes the bot to an IAM user of its own: that policy now has to
+allow writing to the moderation table, which is the most consequential table in
+the stack, and it will not be possible to give the bot a read-only posture on
+`ringmaster-bans` and keep `/ban` working. Anyone reviewing #4 should treat
+these two rows as the decision, not as a detail of it.
+
+**`dynamodb:DeleteItem` on `ringmaster-bans` is not on this list and must never
+be added.** A ban is a record; lifting one stamps fields onto the row and keeps
+it. See below.
 
 ### `br-players` is denied by the role the bot has today
 
@@ -100,7 +117,7 @@ game's from `DDB_GAME_TABLE_PREFIX` (`br-`).
 
 | Table | Key | Bot | Shape from |
 |---|---|---|---|
-| `ringmaster-bans` | `license` (S) | read | `lib/bans.ts` |
+| `ringmaster-bans` | `license` (S) | read **and write** | `lib/bans.ts` |
 | `ringmaster-players` | `license` (S) | read | `lib/players.ts` |
 | `ringmaster-player-ids` | `id` (S) | read | `lib/players.ts` |
 | `ringmaster-maintenance` | `id` (S), one row, `id = "current"` | read | `lib/maintenance.ts` |
@@ -144,10 +161,82 @@ is the bot's". The cost, stated so it is a decision and not an accident: the
 console's `ringmaster-*` grant covers this table, so the console *can* write the
 bot's state. It has no reason to and no code that does.
 
+## The bot writes bans now
+
+**A ban is a record, not a deletion.** That is `fivem-ringmaster/src/lib/bans.ts`'s
+own rule and it is why this document lists `PutItem` and `UpdateItem` on
+`ringmaster-bans` and no `DeleteItem`. Lifting a ban stamps `liftedAt`,
+`liftedBy`, `liftedByName` and `liftReason` onto the row and leaves it exactly
+where it was, because the question an admin asks six months later is "has this
+person been banned before, and who let them back in", which a table that deletes
+on lift cannot answer at all.
+
+**The bot's write is not the console's, and the difference is the reason it was
+written by hand rather than copied.** The console's `bans.issue` is an
+unconditional `PutItem` of a complete row, including `liftedAt: null` — correct
+for a web app, where a human clicked once and re-banning somebody previously
+lifted *should* replace the record. The bot writes from Discord events, and a
+gateway reconnect can redeliver one. The same unconditional put, on the second
+delivery, would replace a row an admin had **deliberately lifted** in between:
+somebody back under a ban nobody re-issued, the record of who let them back in
+gone, and no way to tell from the write that anything happened, because a
+`PutItem` that overwrites reports exactly what one that creates reports.
+
+**So the bot reads first and its write is conditional.** In order:
+
+1. **The Discord audit log entry id on the row.** If it matches the event being
+   processed, this event has already been acted on and nothing is written —
+   *whatever state the row is in now*. That ordering is the whole protection: a
+   replay arriving after an admin lifted the ban finds a lifted row, and a check
+   asking "is this person banned" would answer no and re-ban them.
+2. **`isBanActive`** — the rule copied verbatim from the console, so the bot,
+   the console and the connect gate cannot disagree about what banned means. An
+   active ban already standing means nothing is written, and the ban that stands
+   is reported instead.
+3. **A condition on the row that was read** (`at = :seenAt`, or
+   `attribute_not_exists(license)` when there was no row). Anything landing in
+   the gap between the read and the write — a console re-ban, a second bot
+   process — fails the condition, and the caller gets a `conflict` with nothing
+   written rather than an overwrite of somebody else's decision.
+
+**What the entry id costs, so it is not described as more than it is.** It lives
+on the ban row, so the memory lasts exactly as long as that row does: a full-row
+overwrite — the console re-banning, or the bot issuing a later ban — replaces the
+attribute, and a replay arriving after that looks like a new event. Replays
+arrive seconds after the original and overwrites are human-paced, so in practice
+it is there when it matters. It is a bounded memory, not a ledger. Making it a
+ledger means either a GSI on the entry id (an index on a table another repo owns,
+that the bot's role cannot create, for a lookup the bot does not need — the row
+it is about to write is the only one it ever asks about) or a claim row per entry
+id in `ringmaster-bot-state` (a real ledger, but a second write that fails on its
+own and leaves a claim with no ban or a ban with no claim, and it needs an expiry
+story). Neither is worth it yet; both are written down so the next person does
+not have to rediscover the choice.
+
+**Lift has no entry id, and the one replay it cannot catch is named in the
+code**: an unban redelivered *after* somebody re-banned the same person. It needs
+a re-ban inside the seconds-wide redelivery window to happen at all. Every
+ordinary replay is caught by the row already being lifted, which the bot leaves
+completely alone — writing the lift again would replace the first lifter's name
+with the second's.
+
+**A `discord:`-keyed ban is a record and not a door.** The table is keyed on a
+qualified identifier, so banning a Discord account with no player record writes a
+row keyed `discord:280…` in the same place a `license:…` goes; it is listed by
+the console's moderation page and kept like any other. But
+`fivem-ringmaster/docs/aws-setup.md` is explicit that `br_ddb`'s connect gate is
+one `GetItem` on the connecting player's **license**, so that row does not stop
+anybody joining. Two reasons not to "fix" that by widening the gate: FiveM only
+reports a `discord:` identifier when the player has Discord's activity
+integration switched on, which is opt-in and therefore evadable by switching it
+off (the same doc says so about the grants table); and the console's ban list
+links each row to `/players/<key>`, which for one of these resolves to nothing.
+Pass a `playerName` so the list reads as a person rather than as a snowflake.
+
 ## The audit log has two writers now
 
-**This is the one thing in this document that is a hazard rather than a
-setting.**
+**This and the section above it are the two things in this document that are
+hazards rather than settings.**
 
 Every row in `ringmaster-audit` is `pk = 'AUDIT'` with a millisecond `ts` as its
 sort key. Those two together are the whole primary key, so a `PutItem` at a key

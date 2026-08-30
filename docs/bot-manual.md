@@ -85,7 +85,8 @@ filling the channel.
 # The deploy notice
 
 When the bot starts on a commit different from the one it last reported, it
-posts `running commit` and the short sha to the status channel.
+posts `Update installed.` to the status channel, naming the short sha as a
+link to that commit on GitHub.
 
 It restarts on every deploy and on every crash. A restart on the same commit
 says nothing, which is why a crash loop does not fill the channel.
@@ -146,9 +147,16 @@ read is no use to the person it is for; tagged at nobody it is ephemeral. The
 mention renders as a name and notifies nobody, as every mention this bot sends
 does.
 
-`/profile` takes a user, is admin-only, and its reply is always ephemeral. It
+`/profile` takes an OPTIONAL user, and its reply is always ephemeral.
+
+Naming somebody is admin-only, and that half is the one this rule exists for. It
 carries a member's ban history, every licence the account has played under and
-every name it has used, and a copy in the channel cannot be taken back. It
+every name it has used, and a copy in the channel cannot be taken back.
+
+Naming nobody is open to anyone and shows you your own progression and match
+record, plus a ban if one is in force right now. It cannot show you the licence
+list or any lifted ban: those are what a moderator uses to join up alternate
+accounts, and the bot never reads them for this half at all. It
 reports the licences that Discord account has connected under, the bans on the
 ten most recent of those, the game's career numbers, the server registry row and
 the recent matches. Whatever could not be read is named in the reply rather than
