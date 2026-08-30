@@ -1,4 +1,4 @@
-import type { ChatInputApplicationCommandData } from 'discord.js'
+import type { APIEmbed, ChatInputApplicationCommandData } from 'discord.js'
 
 import type { Config } from '../config.ts'
 import { log } from '../log.ts'
@@ -9,15 +9,15 @@ import { log } from '../log.ts'
  *
  * SPLIT THE WAY client.ts IS SPLIT, for the same reason. Everything here is a
  * function of plain records: an `Invocation` says who ran what, `refusalFor`
- * answers whether they may, and a handler returns the STRING it wants said
+ * answers whether they may, and a handler returns the ANSWER it wants said
  * rather than reaching for the interaction and saying it. The half that touches
- * discord.js — turning a real interaction into an `Invocation`, turning a
- * string into a reply with the right flags on it — is in ./index.ts and is
+ * discord.js — turning a real interaction into an `Invocation`, turning an
+ * answer into a reply with the right flags on it — is in ./index.ts and is
  * three small functions long. So the gate, the dispatch and every failure path
  * are exercised offline against objects written three lines above the
  * assertion, with no gateway and no application to register against.
  *
- * A HANDLER RETURNS TEXT AND NEVER REPLIES ITSELF. That is what keeps
+ * A HANDLER RETURNS A VALUE AND NEVER REPLIES ITSELF. That is what keeps
  * `MessageFlags.Ephemeral` in ONE place instead of in every command file, and
  * one place is the difference between a rule and a habit: the deprecated
  * `ephemeral: true` boolean cannot creep back in through a command written six
@@ -77,6 +77,32 @@ export interface Invocation {
    * cheaper price than the one it replaces.
    */
   readonly targetId: string | null
+
+  /**
+   * The channel the command was run in, or null when the payload carried none.
+   *
+   * NOT AN OPTION, AND THAT IS THE POINT OF READING IT OFF THE INTERACTION.
+   * `/sticky` acts on the channel the admin is standing in; a channel OPTION
+   * would be a thing to mistype, and mistyping it means a message reposting
+   * itself every fifteen seconds somewhere nobody is looking. The interaction
+   * already says where it came from, so there is nothing to get wrong.
+   *
+   * NULLABLE FOR THE REASON `guildId` IS. discord.js types it `Snowflake | null`
+   * and a command has to answer rather than assume — see `channelOf` in
+   * ./sticky.ts, which refuses in the channel instead of guessing one.
+   */
+  readonly channelId: string | null
+
+  /**
+   * The text of the command's `text` option, when it has one and one was given.
+   *
+   * THE SECOND OPTION THIS RECORD CARRIES, and it is here for the reason
+   * `targetId` is: the alternative is handing a handler discord.js's live option
+   * resolver, which drags the whole untestable half back into the part of this
+   * file that exists to be tested. `invocationOf` reads it by the name
+   * `STICKY_TEXT_OPTION` declares, so the two halves cannot be renamed apart.
+   */
+  readonly text: string | null
 }
 
 /**
@@ -104,6 +130,31 @@ export const TARGET_OPTION = 'user'
  * `not-admin` is the ordinary case: a member who does not hold the role.
  */
 export type Refusal = 'not-in-guild' | 'admin-role-unset' | 'roles-unreadable' | 'not-admin'
+
+/**
+ * What a handler answers with: a line of text, or embeds.
+ *
+ * THE SEAM WAS A `string` AND THAT WAS A BUDGET DECISION NOBODY MADE. Discord
+ * allows 2000 UTF-16 units in a message's content and 6000 across an embed, so a
+ * command whose answer is a table of facts — `/profile` is the one that exists —
+ * had to build an embed and then flatten it to text under a THIRD of the budget
+ * it had already been fitted to. Flattening also meant a second cut with a
+ * second set of rules, in a reply whose whole job is to be honest about what it
+ * could not show. Widening the seam deletes both, and it deletes them rather
+ * than leaving a fallback: two budget policies drift, and the one that drifts is
+ * the one nothing exercises.
+ *
+ * A UNION RATHER THAN AN EMBED FOR EVERYTHING, because /help's answer is one
+ * sentence with a mention in it and an embed would be a box drawn around it for
+ * no reason. A command that has a string to say keeps returning a string, and
+ * `runCommand` did not have to learn which commands are which.
+ *
+ * `APIEmbed` — THE PLAIN RECORD — RATHER THAN `EmbedBuilder`. Every other
+ * boundary in this repo is a record; a builder is a live object whose only real
+ * offer is validation of a shape `tsc` already checks, and `profileEmbed` in
+ * ./profile.ts has to measure its own result against Discord's limits anyway.
+ */
+export type CommandReply = string | { readonly embeds: readonly APIEmbed[] }
 
 /**
  * One command: what Discord is told about it, who may run it, and what it does.
@@ -139,13 +190,16 @@ export interface BotCommand {
   readonly onlyInvoker: (invocation: Invocation) => boolean
 
   /**
-   * What to say back. Returns the text; does not send it.
+   * What to say back. Returns the answer; does not send it.
    *
    * ALLOWED TO THROW. `runCommand` turns a throw into a reply — see there —
    * because the alternative Discord shows the admin is "The application did
    * not respond", which says nothing about what broke.
    */
-  readonly run: (invocation: Invocation, config: Config) => string | Promise<string>
+  readonly run: (
+    invocation: Invocation,
+    config: Config,
+  ) => CommandReply | Promise<CommandReply>
 }
 
 /**
@@ -162,10 +216,23 @@ export interface Responder {
    */
   defer: (onlyInvoker: boolean) => Promise<void>
 
-  /** Fill in a reply that was deferred. */
-  edit: (content: string) => Promise<void>
+  /**
+   * Fill in a reply that was deferred.
+   *
+   * TAKES WHATEVER A HANDLER MAY RETURN, which is the other half of widening
+   * `run`: a `run` that can answer with an embed and an `edit` that cannot send
+   * one is a seam that is only half open, and the flattening it forces back is
+   * exactly what `CommandReply` exists to delete.
+   */
+  edit: (reply: CommandReply) => Promise<void>
 
-  /** Answer at once, without deferring. Only the refusals take this path. */
+  /**
+   * Answer at once, without deferring. Only the refusals take this path.
+   *
+   * STILL A STRING, DELIBERATELY. Every caller is one of the four sentences in
+   * `COPY` below — a refusal or an unknown command — and none of them is a thing
+   * to draw a box around. There is no handler on this path to want more.
+   */
   reply: (content: string, onlyInvoker: boolean) => Promise<void>
 }
 
@@ -286,18 +353,18 @@ export async function runCommand(
 
   await respond.defer(command.onlyInvoker(invocation))
 
-  let content: string
+  let answer: CommandReply
 
   try {
     // Awaited inside the try so that a handler which rejects and a handler
     // which throws before returning a promise land in the same place. A bare
     // `.catch()` on the returned value would only catch the first.
-    content = await command.run(invocation, config)
+    answer = await command.run(invocation, config)
   } catch (error) {
     log('error', 'slash command handler failed', { ...where, error })
     await respond.edit(COPY.failed)
     return
   }
 
-  await respond.edit(content)
+  await respond.edit(answer)
 }

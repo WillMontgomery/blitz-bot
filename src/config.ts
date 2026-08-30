@@ -128,6 +128,24 @@ export interface Config {
    */
   docsChannelId: string | null
 
+  /**
+   * Where the outage is announced to players, or null for "do not announce it".
+   *
+   * UNSET TURNS THE WATCHER OFF ENTIRELY, which is the same rule every other
+   * optional id here follows and matters more for this one: with no channel to
+   * post to there is nothing to poll for, so `ringmaster-maintenance` is not
+   * read at all and the bot makes no AWS call it would otherwise make four times
+   * a minute. Null is not a degraded mode.
+   *
+   * A FOURTH CHANNEL, AND IT IS THE ONLY ONE PLAYERS READ. `logChannelId` is the
+   * moderation record, `statusChannelId` is the bot's own faults, `docsChannelId`
+   * is a document the bot edits — all three are for whoever runs the server.
+   * This one carries two sentences an ordinary member is meant to see: the
+   * server is going down, and the server is back. Pointing it at any of the
+   * other three would put an announcement in a channel of evidence.
+   */
+  maintenanceChannelId: string | null
+
   exemptChannelIds: string[]
   exemptAdmins: boolean
   dryRun: boolean
@@ -214,6 +232,7 @@ const schema = z.object({
   BLITZ_LOG_CHANNEL_ID: optionalId,
   BLITZ_STATUS_CHANNEL_ID: optionalId,
   BLITZ_DOCS_CHANNEL_ID: optionalId,
+  BLITZ_MAINTENANCE_CHANNEL_ID: optionalId,
   BLITZ_EXEMPT_CHANNEL_IDS: idList,
   BLITZ_EXEMPT_ADMINS: flag(true),
   BLITZ_DRY_RUN: flag(false),
@@ -238,6 +257,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     logChannelId: parsedEnv.BLITZ_LOG_CHANNEL_ID,
     statusChannelId: parsedEnv.BLITZ_STATUS_CHANNEL_ID,
     docsChannelId: parsedEnv.BLITZ_DOCS_CHANNEL_ID,
+    maintenanceChannelId: parsedEnv.BLITZ_MAINTENANCE_CHANNEL_ID,
     exemptChannelIds: parsedEnv.BLITZ_EXEMPT_CHANNEL_IDS,
     exemptAdmins: parsedEnv.BLITZ_EXEMPT_ADMINS,
     dryRun: parsedEnv.BLITZ_DRY_RUN,

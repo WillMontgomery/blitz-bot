@@ -7,29 +7,54 @@ import {
   type Ddb,
   type DdbFailure,
   type DdbResult,
+  type GameMatch,
   type GameProfile,
   type PlayerRecord,
 } from '../ddb.ts'
 import { log } from '../log.ts'
-import { TARGET_OPTION, type BotCommand } from './command.ts'
+import { TARGET_OPTION, type BotCommand, type Invocation } from './command.ts'
 
 /**
- * `/profile @user` — everything the bot knows about one Discord account.
+ * `/profile` — one command, TWO AUDIENCES, and two of nearly everything below.
  *
- * ADMIN-ONLY AND ALWAYS EPHEMERAL, AND THOSE ARE TWO DIFFERENT GUARANTEES.
- * `adminOnly` decides who may RUN it and is enforced by `refusalFor`;
- * `onlyInvoker` decides who SEES the answer and is fixed at the defer. Both are
- * needed and neither substitutes for the other: an admin-only command whose
- * reply landed in the channel would put a member's ban history, their licence
- * list and their name history in front of everybody who happened to be reading,
- * and there is no undo for that. `onlyInvoker` is therefore a constant here
- * rather than a function of anything — see below.
+ * `/profile @someone` IS THE MODERATION VIEW and is admin-only. `/profile` with
+ * no target is the SELF view: anybody may run it and it answers about the
+ * person who ran it. "No target means me" is the whole rule, which also means
+ * an ADMIN with no target gets the self view — they cannot see their own
+ * licence list this way, and that is a decision rather than an oversight. An
+ * admin who wants the moderation view of themselves tags themselves.
  *
- * SPLIT IN THREE, THE WAY command.ts IS SPLIT. `gatherProfile` does the reads
- * and produces a record; `profileEmbed` turns that record into an embed and is
- * pure; `profileCommand` is four lines of wiring. So the interesting halves —
- * what happens when three of five reads fail, and what happens when the answer
- * is too big for Discord — are exercised against objects written above the
+ * THE TWO VIEWS SHARE NO FIELD-ASSEMBLY CODE, AND THAT IS THE POINT.
+ * `gatherProfile`/`profileEmbed` build the admin answer; `gatherSelf`/
+ * `selfEmbed` build the player's. They share `cut`, `packed`, `stamp`, `span`,
+ * `oneLine`, `trimEmbed` and the caps — every one of which is about Discord's
+ * limits and none of which decides what a field says. The alternative was one
+ * builder with an `isSelf` flag, and that is one forgotten branch away from a
+ * moderation field reappearing in a player's reply the day somebody adds the
+ * next one. A flag has to be remembered at every future edit; a separate
+ * function cannot be forgotten into.
+ *
+ * THE LICENCE LIST IS NEVER FETCHED ON THE SELF PATH, rather than fetched and
+ * omitted. `SelfReads` is a NARROWER type than `ProfileReads` and has no
+ * `licencesFor` on it at all, so `gatherSelf` calling it is a compile error
+ * rather than a review comment. This matters because more than one licence on
+ * one Discord account is the ban-evasion signal, and showing a player that
+ * count tells a ban evader exactly how many of their alts the system has
+ * already joined up. Ban HISTORY — lifted and expired rows — is a moderation
+ * record about the subject rather than the subject's own data, so it is
+ * discarded in `gatherSelf` and `SelfData` has no shape that could carry it.
+ *
+ * ALWAYS EPHEMERAL, WHICHEVER VIEW IT IS. `onlyInvoker` decides who SEES the
+ * answer and is fixed at the defer, before the handler has run. The admin view
+ * carries a member's ban history, their licence list and their name history;
+ * the self view carries somebody's own ban, which is theirs to show and not
+ * the channel's to read. `onlyInvoker` is therefore a constant `true`.
+ *
+ * SPLIT IN THREE PER PATH, THE WAY command.ts IS SPLIT. A `gather*` does the
+ * reads and produces a record; an `*Embed` turns that record into an embed and
+ * is pure; `profileCommand` is the wiring. So the interesting halves — what
+ * happens when three of five reads fail, and what happens when the answer is
+ * too big for Discord — are exercised against objects written above the
  * assertion, with no AWS and no gateway.
  *
  * NOTHING HERE THROWS ON A FAILED READ. Every `ddb.ts` call returns a result,
@@ -40,36 +65,37 @@ import { TARGET_OPTION, type BotCommand } from './command.ts'
  * denied by the role the bot holds today (docs/aws-notes.md), so the partial
  * answer is the EXPECTED one rather than the unlucky one.
  *
- * TWO THINGS THIS FILE CANNOT FINISH ON ITS OWN, both named here because they
- * are visible in the reply rather than hidden in a TODO:
+ * THE REPLY IS THE EMBED, AND THE WHOLE 6000 IS ITS BUDGET. `BotCommand.run` may
+ * answer with embeds — see `CommandReply` in ./command.ts — so this file returns
+ * `{ embeds: [embed] }` and nothing between here and Discord reshapes it. It did
+ * not used to: the seam took a `string`, so the embed was flattened to message
+ * content under a THIRD of the budget it had just been fitted to, by a second
+ * cut with a second set of rules. Both are deleted rather than kept as a
+ * fallback — two budget policies drift, and the one that drifts is the one
+ * nothing exercises.
  *
- *   THE REPLY IS TEXT, NOT AN EMBED, UNTIL THE SEAM IS WIDENED. `BotCommand.run`
- *   returns a `string` and `Responder.edit` takes a `string`, so the embed this
- *   file builds is flattened by `flattenEmbed` before it goes out. The embed is
- *   the artifact and the flattening is mechanical — when `run` may return
- *   embeds, `profileCommand` returns `{ embeds: [embed] }` and `flattenEmbed`
- *   is deleted. Both halves of the budget are on the embed, which is why the
- *   flattening has a cap of its own: a message's content limit is 2000 and an
- *   embed's is 6000.
- *
- *   THERE IS NO MATCH-HISTORY READER. `br-players` hangs one `match#…` row off
- *   a player's partition per match, and `Ddb` offers `gamePlayers.profile` and
- *   nothing else — no Query, and no `dynamodb:Query` on `br-players` in the
- *   policy table in docs/aws-notes.md either. `ProfileReads.matches` is
- *   therefore OPTIONAL, and a build without one says so in the reply under
- *   "could not be read" instead of quietly rendering an empty history. The
- *   truncation the history needs is written and tested against an injected
- *   reader; wiring it is one line in `readsFrom`.
+ * THE MATCH HISTORY IS READ BY `ddb.gamePlayers.matches`, a Query with a
+ * `begins_with` on the sort key, wired in `readsFrom` below.
+ * `ProfileReads.matches` stays OPTIONAL, which is now about the SEAM rather than
+ * about a missing reader: a `ProfileReads` built without one — every fixture in
+ * profile.test.ts that is not about history — reports `matches: unavailable` and
+ * never renders an empty history it cannot vouch for. `unavailable` and a
+ * DynamoDB failure are two different sentences and stay two.
  */
 
 /**
  * PLACEHOLDER-FREE, DELIBERATELY, AND THAT IS A DIFFERENT CALL FROM command.ts.
  * The strings in `COPY` there are things a MEMBER reads — a refusal, a failure
- * — and the owner supplies those verbatim. Everything here is read by an admin,
- * in a reply only they can see, and every one of these strings is either a
- * label on a number or one of the three statements the command exists to make:
- * how many licences there are, how much was cut, and what could not be read.
- * A placeholder in any of those is a command that cannot answer its question.
+ * — and the owner supplies those verbatim. Every one of these is either a label
+ * on a number or one of the three statements the command exists to make: how
+ * many licences there are, how much was cut, and what could not be read. A
+ * placeholder in any of those is a command that cannot answer its question.
+ *
+ * A MEMBER NOW READS SOME OF THESE, which was not true when this record was
+ * written: the self view reuses the labels and the two honest-absence
+ * sentences. They are labels on facts rather than prose written at anybody, so
+ * they ship as they are — but the wording is the owner's to take back, and
+ * `SELF` below is the record to hand him first.
  *
  * ONE RECORD ANYWAY, for the reason command.ts gives: changing the wording is
  * an edit to one object rather than a hunt through the file.
@@ -84,9 +110,6 @@ const COPY = {
 
   /** Same limit, on the option. */
   userOption: 'Whose profile to show',
-
-  /** Discord guarantees a required option; this is what is said if it ever does not. */
-  noTarget: 'No user was given.',
 
   /** The embed title when no in-game name is known. */
   title: 'Player profile',
@@ -165,10 +188,7 @@ const COPY = {
    * words and is the difference between "try again" and "call whoever runs the
    * box". The message goes to the journal, where it belongs.
    */
-  unreachedLine: (source: ProfileSource, why: ProfileFault) => `${source}: ${why}`,
-
-  /** The embed did not fit a message. Only reachable while the reply is text. */
-  blocksDropped: (count: number) => `${count} further sections did not fit.`,
+  unreachedLine: (source: ProfileSource | SelfSource, why: ProfileFault) => `${source}: ${why}`,
 
   /**
    * The last-resort trim in `trimEmbed`. A field of its own rather than a line
@@ -179,6 +199,29 @@ const COPY = {
   fieldsDropped: (count: number) => `${count} further sections did not fit.`,
 
   unknownTime: 'unknown',
+}
+
+/**
+ * The strings that exist only for the self view, kept apart from `COPY` for the
+ * reason the builders are kept apart.
+ *
+ * THREE STRINGS, AND ALL THREE ARE ABOUT THE ONE THING THE SELF VIEW SAYS THAT
+ * THE PLAYER DOES NOT ALREADY SEE IN GAME. Everything else the self view shows
+ * is progression and match history under the same labels the admin view uses,
+ * so it borrows those from `COPY`; a ban needs its own words because the admin
+ * wording — `licence: ACTIVE until …, by An Admin …` — names a licence and the
+ * moderator who issued it, and neither belongs in a reply to the person banned.
+ *
+ * WHAT IS SAID HERE IS WHAT THE CONNECT GATE ALREADY SAYS: the reason, and when
+ * it runs out. Nothing is revealed that the player was not told the last time
+ * they tried to join, which is the test any line added here has to pass.
+ */
+const SELF = {
+  /** Singular: the self view shows at most one ban, and only an active one. */
+  ban: 'Ban',
+
+  banPermanent: 'Permanent.',
+  banUntil: (at: string) => `Until ${at}.`,
 }
 
 /* ------------------------------------------------------------------ *
@@ -204,9 +247,6 @@ const EMBED_DESCRIPTION_CAP = 4096
 const EMBED_FIELD_CAP = 25
 const EMBED_FIELD_VALUE_CAP = 1024
 const EMBED_TOTAL_CAP = 6000
-
-/** A message's own content limit, which is a third of an embed's. See the header. */
-const MESSAGE_CONTENT_CAP = 2000
 
 /**
  * How much of a line of somebody else's text survives.
@@ -251,7 +291,9 @@ const MATCH_FIELD_FLOOR = 120
 
 /* ------------------------------------------------------------------ */
 
-/** What Discord is told, and what `flattenEmbed` reads. Assignable to `APIEmbed`. */
+/**
+ * What Discord is told. Assignable to `APIEmbed`, which is what `run` returns.
+ */
 export interface ProfileEmbed {
   readonly title: string
   readonly description: string
@@ -261,25 +303,16 @@ export interface ProfileEmbed {
 /**
  * One match, reduced to what a line of history says.
  *
- * NOT TRANSCRIBED FROM A KNOWN SHAPE, UNLIKE EVERY ROW TYPE IN ddb.ts, AND
- * THAT IS THE POINT OF IT BEING HERE. The `match#…` rows are written by
- * br_ddb, in Lua, in another repo, and nothing in this repo has ever read one —
- * so the attribute names are not established fact and this file must not
- * pretend otherwise. This is what the RENDERER needs; projecting a game row
- * into it is the reader's job, in ddb.ts, next to `gamePlayers.profile`, which
- * already projects field by field for the same reason. Every field but the sort
- * key is nullable because a field that arrives missing should cost that field
- * and not the line.
+ * AN ALIAS RATHER THAN A SECOND DECLARATION OF THE SAME FOUR FIELDS. This is the
+ * RENDERER's requirement and `GameMatch` is the READER's projection of a
+ * `match#…` row, which is ddb.ts's job for the reason `gamePlayers.profile`
+ * projects field by field: those rows are written by br_ddb, in Lua, in another
+ * repo, so a field that arrives missing must cost that field and not the line.
+ * Today they are the same four fields, and writing them out twice would be two
+ * lists with nothing to make them agree — a field renamed in ddb.ts would then
+ * compile here and render `undefined`. The alias makes that a type error.
  */
-export interface MatchSummary {
-  /** The row's sort key, `match#…`. The one thing a row certainly has. */
-  readonly sk: string
-  /** When it was played, ms. */
-  readonly at: number | null
-  /** Where they finished. */
-  readonly placement: number | null
-  readonly kills: number | null
-}
+export type MatchSummary = GameMatch
 
 /** The five things a profile is assembled from, named so an absence can be too. */
 export type ProfileSource = 'licences' | 'bans' | 'career' | 'registry' | 'matches'
@@ -297,6 +330,49 @@ export type ProfileFault = DdbFailure['kind'] | 'unavailable'
 export interface Unreached {
   readonly source: ProfileSource
   readonly why: ProfileFault
+}
+
+/**
+ * The sources a SELF profile is assembled from. Three, and none of them is the
+ * licence list.
+ *
+ * `lookup` RATHER THAN `licences`, AND THE NAME IS THE POINT. The admin view
+ * says `licences: denied` and, one field up, `The Discord-to-licence index
+ * could not be read` — both of which tell the reader that a Discord account is
+ * indexed to licences and that the bot went looking. That is exactly the fact
+ * the self view is built not to disclose, so the one read the self path makes
+ * against that table reports under a name that describes what it was FOR
+ * rather than what it read.
+ *
+ * `ban` IS SINGULAR HERE AND `bans` IS PLURAL THERE, for the same reason: the
+ * admin path fans out over every licence and the self path reads exactly one.
+ */
+export type SelfSource = 'lookup' | 'ban' | 'career' | 'matches'
+
+export interface SelfUnreached {
+  readonly source: SelfSource
+  readonly why: ProfileFault
+}
+
+/**
+ * A ban as the person under it is allowed to see it.
+ *
+ * A PROJECTION AND NOT A `Ban`, WHICH IS THE WHOLE DEFENCE. `Ban` carries
+ * `license` — the licence itself — plus `by`, `byName`, `liftedAt`, `liftedBy`
+ * and `liftReason`, which are the moderation record rather than the subject's
+ * data. Handing the self builder a `Ban` and trusting it to render two fields
+ * off it is the "careful" version; handing it a record that has nothing else on
+ * it means the licence cannot appear in a player's reply however the rendering
+ * is edited later. `gatherSelf` is the one place that narrows, and it narrows
+ * where the row is read.
+ *
+ * THERE IS NO `liftedAt` OR `at` HERE BECAUSE THERE IS NO STATE TO SHOW. Only
+ * an ACTIVE ban reaches this type at all — see `gatherSelf` — so "when does it
+ * end" is the only question left, and `expiresAt: null` is permanent.
+ */
+export interface SelfBan {
+  readonly reason: string
+  readonly expiresAt: number | null
 }
 
 /** A licence and the ban row read for it, which is usually null. */
@@ -339,6 +415,37 @@ export interface ProfileData {
 }
 
 /**
+ * Everything the SELF reply is built from. Note what is not here.
+ *
+ * NO `licences`, NO `current`, NO `bansSkipped`, NO `registry`. Those are not
+ * omitted from the rendering — there is no field on this record for the self
+ * builder to reach for, so a licence cannot be rendered by a later edit to
+ * `selfEmbed` without first adding it here, which is a change nobody makes by
+ * accident. `ProfileData` and this are two records rather than one with
+ * optional halves for exactly that reason.
+ *
+ * `known` RATHER THAN A NULLABLE LICENCE. The self path does resolve one
+ * licence in order to key its three reads on it — there is no other route from
+ * a Discord account to a career row — but that licence is a local in
+ * `gatherSelf` and it stops there. What the reply needs to know is only whether
+ * there was one, which is a boolean, and a boolean cannot be printed by mistake.
+ */
+export interface SelfData {
+  readonly discordId: string
+
+  /** Whether this Discord account resolved to a licence at all. */
+  readonly known: boolean
+
+  /** An ACTIVE ban, or null. A lifted or expired one never reaches this record. */
+  readonly ban: SelfBan | null
+
+  readonly career: GameProfile | null
+  readonly matches: readonly MatchSummary[]
+
+  readonly unreached: readonly SelfUnreached[]
+}
+
+/**
  * The reads one profile needs, and nothing else this bot can do.
  *
  * NARROWER THAN `Ddb` ON PURPOSE. `Ddb` also writes the audit log and the bot's
@@ -346,17 +453,76 @@ export interface ProfileData {
  * interface is what a test builds in six lines and what the real thing is
  * adapted down to by `readsFrom`.
  *
- * `matches` IS OPTIONAL BECAUSE NO READER EXISTS YET. See the file header. An
- * absent one is reported as `unavailable`, not as an empty history.
+ * `matches` IS OPTIONAL BECAUSE THE SEAM ALLOWS ONE WITHOUT IT, not because
+ * none exists — `readsFrom` wires the real one. An absent reader is reported as
+ * `unavailable`, which is not a DynamoDB failure and must never be shown as an
+ * empty history. See the file header.
  */
 export interface ProfileReads {
-  /** By RAW Discord id; qualifying it is this seam's job, not the caller's. */
+  /**
+   * By RAW Discord id; qualifying it is this seam's job, not the caller's.
+   *
+   * THE ADMIN PATH'S READ, AND ONLY THE ADMIN PATH'S. It is the reverse
+   * identifier index — the thing that answers "how many licences has this
+   * Discord account played under" — and that answer is the ban-evasion signal
+   * the moderation view leads with. `SelfReads` below deliberately does not
+   * include it.
+   */
   licencesFor: (discordId: string) => Promise<DdbResult<string[]>>
+
+  /**
+   * The ONE licence this Discord account is on now, or null for an account
+   * that has never connected. The self path's only route from a Discord id to
+   * anything.
+   *
+   * A SECOND, NARROWER SEAM RATHER THAN `licencesFor(…).at(-1)` AT THE CALL
+   * SITE, and the narrowness is the feature. The self path needs a licence —
+   * `br-players` and `ringmaster-bans` are keyed on one and there is no other
+   * way in — but it must never be handed the LIST, because a list is a count
+   * and the count is the disclosure. Returning `string | null` means the list
+   * does not exist as a value anywhere the self view can reach: not in
+   * `SelfData`, not in `selfEmbed`, not in a future field somebody adds.
+   *
+   * THE NARROWING HAPPENS ONCE, IN `readsFrom`, IN ONE EXPRESSION. That is the
+   * one place in this repo where both shapes are in scope at the same time,
+   * and it is four lines long — see there for why it cannot yet be pushed
+   * down into `ddb.ts` as a projection.
+   */
+  currentLicenceFor: (discordId: string) => Promise<DdbResult<string | null>>
+
   ban: (licence: string) => Promise<DdbResult<Ban | null>>
   career: (licence: string) => Promise<DdbResult<GameProfile | null>>
   registry: (licence: string) => Promise<DdbResult<PlayerRecord | null>>
   matches?: (licence: string, limit: number) => Promise<DdbResult<MatchSummary[]>>
 }
+
+/**
+ * What the SELF path is allowed to read, which is `ProfileReads` minus two.
+ *
+ * A TYPE AND NOT A CONVENTION. `gatherSelf` takes this rather than
+ * `ProfileReads`, so `reads.licencesFor(...)` inside it is a COMPILE ERROR
+ * rather than a thing a reviewer has to notice. The command hands the same
+ * object to both paths — one seam, one wiring, one client — and structural
+ * typing is what makes handing a wider object to a narrower parameter free.
+ *
+ * `registry` IS OUT TOO, and for a second reason on top of the first. The
+ * registry row carries `names` — every in-game name the licence has used — and
+ * `identifiers`, which is the same reuse signal as the licence list arriving by
+ * a different road. The self view shows progression and match record; it does
+ * not need a name history, so it does not get a seam to read one.
+ */
+export type SelfReads = Pick<ProfileReads, 'currentLicenceFor' | 'ban' | 'career' | 'matches'>
+
+/**
+ * A `ProfileReads` that certainly has a match reader on it.
+ *
+ * THE RETURN TYPE OF THE TWO FUNCTIONS BELOW, AND THAT IS THE WHOLE POINT OF IT.
+ * `ProfileReads.matches` is optional so a fixture can leave it out; a REAL build
+ * leaving it out is a `/profile` quietly reporting `unavailable` about a table
+ * it was never going to ask — a regression that looks exactly like the honest
+ * answer. Naming the wired shape makes dropping the line a compile error.
+ */
+export type WiredReads = ProfileReads & Required<Pick<ProfileReads, 'matches'>>
 
 /**
  * The real module, adapted down.
@@ -371,16 +537,42 @@ export interface ProfileReads {
  * reads exactly as stored. Qualifying them a second time would produce
  * `license:license:…` and, again, an empty answer rather than an error.
  */
-export function readsFrom(ddb: Ddb): ProfileReads {
+export function readsFrom(ddb: Ddb): WiredReads {
   return {
     licencesFor: (discordId) => ddb.playerIds.licensesFor(qualifyId('discord', discordId)),
+
+    /**
+     * THE ONE PLACE THE LIST BECOMES A LICENCE, AND IT IS ONE EXPRESSION LONG.
+     * `ddb.playerIds.licensesFor` is the only reader this bot has for that
+     * table, so the row does arrive whole here and `at(-1)` — most recent LAST,
+     * which is how the index stores them — is what leaves this function. The
+     * value returned is a `string | null`, so nothing downstream of this line
+     * has a list to render, to count, or to leak.
+     *
+     * WHY THIS IS NOT PUSHED INTO ddb.ts, WHICH IS WHERE IT BELONGS. The narrow
+     * read wants a `ProjectionExpression` so DynamoDB itself returns one
+     * element, and `Ddb` exposes no such reader — adding
+     * `playerIds.currentLicenseFor` is an edit to a file this change does not
+     * own. Until then the narrowing is here, at the seam, where it is one line
+     * that no caller can bypass rather than a rule every caller has to keep.
+     */
+    currentLicenceFor: async (discordId) => {
+      const found = await ddb.playerIds.licensesFor(qualifyId('discord', discordId))
+
+      // A failure is passed through as itself: `null` means "this account has
+      // never connected", and reporting a denied table as that would be the
+      // same confident wrong answer `qualifyId` exists to prevent.
+      return found.ok ? { ok: true, value: found.value.at(-1) ?? null } : found
+    },
+
     ban: (licence) => ddb.bans.get(licence),
     career: (licence) => ddb.gamePlayers.profile(licence),
     registry: (licence) => ddb.players.get(licence),
 
-    // `matches` is deliberately absent: `Ddb` has no match-history reader and
-    // the policy in docs/aws-notes.md has no Query on `br-players`. See the
-    // file header for the one line that turns it on.
+    // The limit is passed through rather than left to the reader's default:
+    // `MATCH_FETCH` is what THIS reply can render and say it cut, and the
+    // reader's own cap is a ceiling over it rather than a substitute for it.
+    matches: (licence, limit) => ddb.gamePlayers.matches(licence, limit),
   }
 }
 
@@ -406,21 +598,18 @@ export function readsFrom(ddb: Ddb): ProfileReads {
  * holds the connection pool and the resolved credentials, and rebuilding it per
  * command would re-resolve the instance role on every lookup.
  */
-export function lazyReadsFrom(make: () => Ddb): ProfileReads {
-  let built: ProfileReads | null = null
+export function lazyReadsFrom(make: () => Ddb): WiredReads {
+  let built: WiredReads | null = null
 
-  const reads = (): ProfileReads => (built ??= readsFrom(make()))
+  const reads = (): WiredReads => (built ??= readsFrom(make()))
 
   return {
     licencesFor: (discordId) => reads().licencesFor(discordId),
+    currentLicenceFor: (discordId) => reads().currentLicenceFor(discordId),
     ban: (licence) => reads().ban(licence),
     career: (licence) => reads().career(licence),
     registry: (licence) => reads().registry(licence),
-
-    // Absent for the reason it is absent above, and it has to be absent HERE
-    // too: an arrow function delegating to `reads().matches` would be a
-    // `matches` that exists, and the reply would show an empty history instead
-    // of saying there is no reader.
+    matches: (licence, limit) => reads().matches(licence, limit),
   }
 }
 
@@ -626,6 +815,107 @@ export async function gatherProfile(
     career: career.ok ? career.value : null,
     registry: registry.ok ? registry.value : null,
     matches: matches !== null && matches.ok ? matches.value : [],
+    unreached,
+  }
+}
+
+/** Nothing resolved, or nothing could be. Both are answers rather than errors. */
+function nobody(discordId: string, unreached: readonly SelfUnreached[]): SelfData {
+  return { discordId, known: false, ban: null, career: null, matches: [], unreached }
+}
+
+/**
+ * Read what a player is allowed to see about themselves, and never throw.
+ *
+ * THREE READS AND A RESOLUTION, AGAINST `gatherProfile`'S FIVE-PLUS-A-FAN-OUT.
+ * The difference is not efficiency, it is reach: this function is handed a
+ * `SelfReads`, which has no `licencesFor` and no `registry` on it, so the two
+ * sources that carry the ban-evasion signal are not merely unread here — they
+ * are unreachable from here, and `tsc` is what enforces that.
+ *
+ * `now` IS A PARAMETER BECAUSE THE FILTER IS HERE AND NOT IN THE RENDERER.
+ * Whether a ban is in force is a comparison against the clock, and the choice
+ * that matters is WHERE it happens: a renderer handed every ban row and trusted
+ * to print only the active one is one `if` away from printing a lifted one, and
+ * lifted and expired bans are moderation history rather than the subject's
+ * data. Discarding them at the read means `SelfData` has no shape that could
+ * carry one — see `SelfBan`.
+ *
+ * ONE LICENCE'S BAN, NOT EVERY LICENCE'S, WHICH IS THE OTHER HALF OF THE SAME
+ * RULE. `bansField` deliberately reports a ban on ANY licence because an
+ * account whose current licence is clean and whose previous one is banned is
+ * the thing the admin view exists to surface. Doing that here would disclose
+ * that there IS a previous licence. What this reads is the ban on the licence
+ * the player is connecting with, which is word for word what the connect gate
+ * already tells them.
+ */
+export async function gatherSelf(
+  reads: SelfReads,
+  discordId: string,
+  now: number,
+): Promise<SelfData> {
+  const unreached: SelfUnreached[] = []
+
+  function missed(source: SelfSource, failure: DdbFailure): void {
+    log('warn', 'self profile could not read a source', {
+      source,
+      discord: discordId,
+      kind: failure.kind,
+      op: failure.op,
+      table: failure.table,
+      error: failure.message,
+    })
+
+    unreached.push({ source, why: failure.kind })
+  }
+
+  const found = await reads.currentLicenceFor(discordId)
+
+  // Reported as itself rather than as an account with no record: those are the
+  // same reply for opposite reasons, and only one of them is true.
+  if (!found.ok) {
+    missed('lookup', found.failure)
+    return nobody(discordId, unreached)
+  }
+
+  const licence = found.value
+
+  // Not an error. A Discord account that has never played is a normal answer,
+  // and it is the answer a brand-new member gets the first time they try this.
+  if (licence === null) return nobody(discordId, unreached)
+
+  const [banRead, careerRead, matchesRead] = await Promise.all([
+    reads.ban(licence),
+    reads.career(licence),
+    reads.matches?.(licence, MATCH_FETCH) ?? null,
+  ])
+
+  if (!banRead.ok) missed('ban', banRead.failure)
+  if (!careerRead.ok) missed('career', careerRead.failure)
+
+  if (matchesRead === null) {
+    // Not a failure: this build has no reader. See the file header.
+    unreached.push({ source: 'matches', why: 'unavailable' })
+  } else if (!matchesRead.ok) {
+    missed('matches', matchesRead.failure)
+  }
+
+  const row = banRead.ok ? banRead.value : null
+
+  return {
+    discordId,
+    known: true,
+
+    // The narrowing, and the only place it happens: an inactive row becomes
+    // null and an active one becomes two fields. Nothing past this line holds
+    // a `Ban`.
+    ban:
+      row !== null && isBanActive(row, now)
+        ? { reason: row.reason, expiresAt: row.expiresAt }
+        : null,
+
+    career: careerRead.ok ? careerRead.value : null,
+    matches: matchesRead !== null && matchesRead.ok ? matchesRead.value : [],
     unreached,
   }
 }
@@ -915,61 +1205,245 @@ export function profileEmbed(data: ProfileData, now: number): ProfileEmbed {
   return trimEmbed(embed)
 }
 
+/* ------------------------------------------------------------------ *
+ * The SELF embed: a second builder, sharing nothing above that decides what a
+ * field says.
+ *
+ * THE DUPLICATION BELOW IS DELIBERATE RATHER THAN LAZY, and ddb.ts's own
+ * `isBanActive` is the precedent: some things are copied because the copy is
+ * what stops two readers being forced to agree. `selfCareerField` renders the
+ * same six lines `careerField` renders TODAY, and the day one of them changes —
+ * a stat that turns out to be moderation-only, a number the owner wants phrased
+ * differently for players — it changes on one side without a flag, a parameter
+ * or a branch anybody has to remember. The shared function was the version
+ * where that edit silently changes both.
+ *
+ * WHAT IS SHARED IS `field`, `cut`, `oneLine`, `stamp`, `span`, `packed`,
+ * `units`, `embedUnits` and `trimEmbed`. Every one of those is about Discord's
+ * limits or about turning somebody else's text into one safe line. None of them
+ * is handed a licence, a `Ban`, or a decision about who may see what.
+ * ------------------------------------------------------------------ */
+
 /**
- * The embed as message content.
+ * The player's own ban, as the connect gate states it: why, and until when.
  *
- * TEMPORARY, AND IT IS THE HALF OF THIS COMMAND THAT IS NOT FINISHED. See the
- * file header: `Responder.edit` takes a string, so this is what goes out until
- * the reply seam carries embeds, at which point this function is deleted rather
- * than kept as a fallback. It is deliberately mechanical — no wording of its
- * own, no second budget policy — so that it cannot drift from the embed.
- *
- * ITS OWN CAP, BECAUSE A MESSAGE'S IS NOT AN EMBED'S. Discord allows 6000 units
- * across an embed and 2000 in a message's content, so an embed that is
- * perfectly legal flattens to something that is not. Whole sections go, newest
- * information first in the field order above, and the count of what went is
- * stated for the same reason every other count here is.
+ * TAKES A `SelfBan` AND NOT A `Ban`. There is no licence on the record it is
+ * given, no issuing admin and no lift, so this function could not disclose one
+ * if it were rewritten carelessly. See `SelfBan`.
  */
-export function flattenEmbed(embed: ProfileEmbed): string {
-  const blocks = [
-    embed.title,
-    embed.description,
-    ...embed.fields.map((entry) => `**${entry.name}**\n${entry.value}`),
-  ].filter((block) => block.length > 0)
+function selfBanField(ban: SelfBan): APIEmbedField {
+  const lines: string[] = []
+  const reason = oneLine(ban.reason)
 
-  for (let kept = blocks.length; kept > 0; kept--) {
-    const body = blocks.slice(0, kept).join('\n\n')
-    const tail = kept === blocks.length ? '' : `\n\n${COPY.blocksDropped(blocks.length - kept)}`
+  // A ban row with an empty reason is a row the console should not have
+  // written, but it is not this reply's job to invent one — the expiry line
+  // below is always present, so the field is never empty either way.
+  if (reason) lines.push(cut(reason, LINE_CAP))
 
-    if (units(body) + units(tail) <= MESSAGE_CONTENT_CAP) return `${body}${tail}`
+  lines.push(ban.expiresAt === null ? SELF.banPermanent : SELF.banUntil(stamp(ban.expiresAt)))
+
+  return field(SELF.ban, packed(lines, COPY.linesOmitted, EMBED_FIELD_VALUE_CAP))
+}
+
+/** The game's own numbers — the progression a player already sees in game. */
+function selfCareerField(career: GameProfile | null): APIEmbedField {
+  if (career === null) return field(COPY.career, COPY.noCareer)
+
+  const lines = [
+    `Level ${career.level} · ${career.xp} XP · balance ${career.balance}`,
+    `${career.matches} matches · ${career.wins} wins · ${career.top10s} top 10s`,
+    `${career.kills} kills · ${career.deaths} deaths · ${career.downs} downs · ` +
+      `${career.revives} revives`,
+    `${career.damageDealt} damage · ${span(career.playtimeSec * 1000)} in match`,
+    `${career.soloMatches} solo · ${career.squadMatches} squad`,
+    `Last match ${stamp(career.lastMatchAt)}`,
+  ]
+
+  return field(COPY.career, packed(lines, COPY.linesOmitted, EMBED_FIELD_VALUE_CAP))
+}
+
+function selfMatchLine(match: MatchSummary): string {
+  const parts = [stamp(match.at)]
+
+  if (match.placement !== null) parts.push(`#${match.placement}`)
+  if (match.kills !== null) parts.push(`${match.kills} kills`)
+
+  // The sort key is what identifies the row when it carried no timestamp.
+  if (match.at === null) parts.push(oneLine(match.sk))
+
+  return cut(parts.join(' · '), LINE_CAP)
+}
+
+/**
+ * As much history as the budget allows.
+ *
+ * `packed` RATHER THAN `matchesValue`'S TWO-NUMBER NOTE. The admin view
+ * distinguishes what the reader fetched from what the career row says exists,
+ * because an admin is deciding whether they have seen everything. A player is
+ * reading their own recent matches; "+N more not shown" is the honest sentence
+ * and the second number is a statement about the bot's fetch limit rather than
+ * about them.
+ */
+function selfMatchesField(matches: readonly MatchSummary[], budget: number): APIEmbedField {
+  if (matches.length === 0) return field(COPY.matches, COPY.noMatches)
+
+  return field(COPY.matches, packed(matches.map(selfMatchLine), COPY.linesOmitted, budget))
+}
+
+/**
+ * What could not be read, named by SOURCE and never by SDK message — the same
+ * rule the admin view follows, over the source names in `SelfSource`.
+ *
+ * KEPT RATHER THAN SWALLOWED. A denied `br-players` rendered as an absent
+ * career row is a player told they have never played, which is worse than a
+ * word they have to ask about.
+ */
+function selfUnreachedField(unreached: readonly SelfUnreached[]): APIEmbedField {
+  return field(
+    COPY.unreached,
+    packed(
+      unreached.map((entry) => COPY.unreachedLine(entry.source, entry.why)),
+      COPY.linesOmitted,
+      EMBED_FIELD_VALUE_CAP,
+    ),
+  )
+}
+
+/**
+ * The whole self answer, as one embed.
+ *
+ * PURE, AND WITH NO CLOCK. `profileEmbed` takes `now` because it decides
+ * whether each ban is active while rendering it; this one cannot, because
+ * `gatherSelf` has already discarded every ban that is not. That is the same
+ * separation stated twice — the clock belongs where the discarding happens.
+ *
+ * THE BAN GOES FIRST, WHICH IS BOTH THE RIGHT ORDER AND THE SAFE ONE. It is the
+ * one thing in this reply a player needs before anything else, and `trimEmbed`
+ * drops fields from the END — so the field that must never be lost is the field
+ * that cannot be. Match history, the one thing here that grows, goes last and
+ * takes what the budget leaves.
+ *
+ * NO TITLE FROM THE REGISTRY. `profileEmbed` titles itself with the in-game
+ * name off the registry row; the self path never reads that row, so the title
+ * is the constant. That is a consequence of the narrower seam rather than a
+ * separate decision.
+ */
+export function selfEmbed(data: SelfData): ProfileEmbed {
+  const description: string[] = [COPY.subject(data.discordId)]
+  const unreadable = data.unreached.some((entry) => entry.source === 'lookup')
+
+  // "No record" is said only when the lookup actually answered. When it failed,
+  // the field below names it and the description stays quiet rather than
+  // telling somebody who has played for a year that they have never been here.
+  if (!unreadable && !data.known) description.push(COPY.noRecord)
+
+  const embed: ProfileEmbed = {
+    title: COPY.title,
+    description: cut(description.join('\n'), EMBED_DESCRIPTION_CAP),
+    fields: [],
   }
 
-  return cut(blocks[0] ?? COPY.title, MESSAGE_CONTENT_CAP)
+  if (data.ban !== null) embed.fields.push(selfBanField(data.ban))
+  if (data.known) embed.fields.push(selfCareerField(data.career))
+  if (data.unreached.length > 0) embed.fields.push(selfUnreachedField(data.unreached))
+
+  if (data.known) {
+    const budget = Math.min(
+      EMBED_FIELD_VALUE_CAP,
+      EMBED_TOTAL_CAP - embedUnits(embed) - units(COPY.matches),
+    )
+
+    if (budget >= MATCH_FIELD_FLOOR) embed.fields.push(selfMatchesField(data.matches, budget))
+  }
+
+  return trimEmbed(embed)
 }
 
 /* ------------------------------------------------------------------ */
 
 /**
- * `/profile @user`.
+ * Is THIS invocation of `/profile` the admin-only one?
+ *
+ * THE GATE, AS A FUNCTION OF THE INVOCATION, WHICH IS WHAT THIS COMMAND NOW
+ * NEEDS AND WHAT `BotCommand.adminOnly` CANNOT YET EXPRESS. Asking about
+ * somebody else is a moderation lookup and requires the role; asking about
+ * yourself is not, and requires nothing. There is exactly one bit of the
+ * invocation that decides it, and it is the one Discord already fills in.
+ *
+ * A PREDICATE HERE RATHER THAN AN `if` IN `run`, EVEN THOUGH `run` IS WHERE IT
+ * WOULD BE EASIEST. `refusalFor` in command.ts is the gate — the one that fails
+ * closed on an unset `DISCORD_ADMIN_ROLE_ID`, on a payload with no member on it
+ * and on a missing guild, all three of which a hand-rolled check in a command
+ * file gets wrong on the first try. Re-implementing four refusal reasons here
+ * to make one of them conditional is how a command ends up with a gate that
+ * agrees with the framework's on the day it is written and not after. So this
+ * file states the CONDITION and command.ts keeps the enforcement.
+ *
+ * WHAT IT IS WIRED TO TODAY, AND WHAT IT IS NOT. `BotCommand.adminOnly` is a
+ * `boolean` property of the COMMAND, so `refusalFor` cannot ask a question
+ * about the invocation and this predicate has nothing to attach to yet. Until
+ * command.ts can take it, the command below ships `adminOnly: true` — the
+ * CLOSED direction: a member who has no role is refused whichever way they run
+ * it, which discloses nothing and disappoints somebody. The exact edit that
+ * lands the open half is written on the command below.
+ */
+export function profileAdminOnly(invocation: Invocation): boolean {
+  return invocation.targetId !== null
+}
+
+/**
+ * `/profile` and `/profile @user`.
  *
  * A FACTORY RATHER THAN A CONSTANT, unlike `help`, because this one needs
  * DynamoDB and `BotCommand.run` is handed an invocation and a config and
  * nothing else. Closing over the reads keeps the injection at the one place
  * that builds the command list, and keeps every test in this file offline
- * without a module mock.
+ * without a module mock. ONE `ProfileReads` FOR BOTH PATHS: the self path is
+ * handed the same object narrowed to `SelfReads` by the parameter type, so
+ * there is still one client, one wiring and one thing to inject.
  *
  * `onlyInvoker` IS A CONSTANT `true` AND MUST STAY ONE. Discord fixes a
- * reply's visibility at the defer, and this reply carries a member's ban
- * history, their licence list and every name they have used. Ephemeral is the
- * only setting under which that is not a disclosure, and a public copy cannot
- * be taken back — deleting the message does not unsee it. There is no
- * invocation that should make this false.
+ * reply's visibility at the defer. The admin view carries a member's ban
+ * history, their licence list and every name they have used; the self view
+ * carries somebody's own active ban, which is theirs and not the channel's.
+ * A public copy cannot be taken back — deleting the message does not unsee it.
+ * There is no invocation that should make this false.
  *
- * `adminOnly` IS THE OTHER HALF AND IS NOT THE SAME QUESTION. It decides who
- * may RUN the command; `refusalFor` in command.ts is what enforces it, because
- * the `defaultMemberPermissions: 0n` that `commandData` derives from this word
- * only HIDES the command in the client and can be re-granted by anybody holding
- * Manage Server.
+ * `adminOnly: true` IS NOT THE RULE THIS COMMAND WANTS, AND IT IS HERE ON
+ * PURPOSE UNTIL THE FRAMEWORK CAN CARRY THE RULE IT DOES WANT. The rule is
+ * `profileAdminOnly` above: gated when a target is given, open when it is not.
+ * `BotCommand.adminOnly` is a `boolean`, and `refusalFor` reads it without ever
+ * seeing the invocation, so there is nowhere to put a predicate. Shipping
+ * `false` to get the open half would open the TARGETED half too — a member
+ * could look up anybody — so the value here is the closed one. What it costs is
+ * the self view being unreachable by non-admins; what it buys is that no
+ * arrangement of this file can leak a licence list to one. THE EDIT THAT
+ * FINISHES IT, in three files this change does not own:
+ *
+ *   command.ts   `readonly adminOnly: boolean | ((i: Invocation) => boolean)`,
+ *                and in `refusalFor`, above the `if (!command.adminOnly)`:
+ *                  `const gated = typeof command.adminOnly === 'function'`
+ *                  `  ? command.adminOnly(invocation) : command.adminOnly`
+ *                then test `gated`. Every refusal reason below it is untouched,
+ *                which is the whole reason to make the edit there.
+ *
+ *   index.ts     in `commandData`, `command.adminOnly === true ? 0n : null`.
+ *                It MUST be the identity check and not the truthiness one: a
+ *                function is truthy, so `command.adminOnly ? 0n : null` would
+ *                hide `/profile` from everybody in the client and the open half
+ *                would be unreachable in the picker even once the gate allows
+ *                it. `0n` is a DEFAULT and never a guard, so un-hiding it costs
+ *                nothing — `refusalFor` is still what refuses.
+ *
+ *   commands.test.ts  'hides exactly the admin-only commands from the client'
+ *                expects `['profile', 'sticky', 'unsticky']`; after the two
+ *                edits above, `/profile` is no longer hidden and the list is
+ *                `['sticky', 'unsticky']`. That assertion failing IS the edit
+ *                landing, and it is worth a case of its own saying that a
+ *                command with a per-invocation gate is registered visible.
+ *
+ * Then this line becomes `adminOnly: profileAdminOnly` and nothing else in this
+ * file changes: both handlers below are already written for it.
  */
 export function profileCommand(reads: ProfileReads, now: () => number = Date.now): BotCommand {
   return {
@@ -985,10 +1459,11 @@ export function profileCommand(reads: ProfileReads, now: () => number = Date.now
           name: TARGET_OPTION,
           description: COPY.userOption,
 
-          // Required, unlike /help's: there is no sensible subject for this
-          // command other than the person who was named, and falling back to
-          // the invoker would be inventing a behaviour nobody asked for.
-          required: true,
+          // OPTIONAL, AND THAT IS THE FEATURE RATHER THAN A RELAXATION. It used
+          // to be required because there was no sensible subject other than the
+          // person named; now the absence of one IS a subject — the caller. A
+          // required option would make the self view unaskable.
+          required: false,
         },
       ],
     },
@@ -997,11 +1472,26 @@ export function profileCommand(reads: ProfileReads, now: () => number = Date.now
     onlyInvoker: () => true,
 
     run: async (invocation) => {
-      // Discord enforces a required option, so this is a payload that is not
-      // what this file expects rather than an admin who forgot.
-      if (invocation.targetId === null) return COPY.noTarget
+      // NO TARGET MEANS ME, and this is the whole of that rule. It reads
+      // `userId` and never `targetId`, so there is no path on which a caller
+      // chooses whose self view they get.
+      //
+      // AN ADMIN LANDS HERE TOO WHEN THEY GIVE NO TARGET, which means an admin
+      // cannot see their own licence list this way. That is deliberate: "no
+      // target means me" is one rule for everybody, and a second reading of it
+      // for admins would be a branch on the caller's role inside the half of
+      // this file that is meant not to know about roles. An admin who wants the
+      // moderation view of their own account tags themselves.
+      if (invocation.targetId === null) {
+        return { embeds: [selfEmbed(await gatherSelf(reads, invocation.userId, now()))] }
+      }
 
-      return flattenEmbed(profileEmbed(await gatherProfile(reads, invocation.targetId), now()))
+      const embed = profileEmbed(await gatherProfile(reads, invocation.targetId), now())
+
+      // `profileEmbed` has already fitted this to the 6000 an embed may carry
+      // and `trimEmbed` is its last guard, so nothing between here and Discord
+      // measures it again — which is the whole of what widening the seam bought.
+      return { embeds: [embed] }
     },
   }
 }

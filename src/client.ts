@@ -13,8 +13,11 @@ import {
 } from 'discord.js'
 
 import type { Config } from './config.ts'
+import { createDdb } from './ddb.ts'
 import { scanMessage, type InviteResolver, type ScanResult } from './invites.ts'
 import { log, type Fault, type Sink } from './log.ts'
+import { watchMaintenance } from './maintenance.ts'
+import { installStickies } from './sticky.ts'
 
 /**
  * The bot: the discord.js client, and the decision it makes about a message.
@@ -1540,6 +1543,60 @@ export function createClient(config: Config): Client {
   })
 
   /**
+   * THE STICKY, AND IT IS A SECOND `messageCreate` LISTENER RATHER THAN A LINE
+   * IN `onMessage`. Both see every message and that is the whole of what they
+   * share: the scanner reads content and can delete, the sticky counts arrivals
+   * and cares about nothing else on the message. Folding the count into the
+   * moderation handler would put a repost behind an `await` on an invite lookup
+   * and, worse, behind every `return` in `decide` — an exempt channel, an admin's
+   * message, a halted bot — so a channel full of exempt traffic would drift with
+   * the counter reading zero. Nothing in the invite path changes; it does not
+   * know this listener exists.
+   *
+   * `messageCreate` ONLY, WHICH IS WHY IT CANNOT BE THE SAME LISTENER. The line
+   * above deliberately routes `messageUpdate` through `onMessage` as well,
+   * because an edited message has to be scanned the way a new one is. AN EDIT IS
+   * NOT DRIFT: nothing moved and nothing was pushed down, and counting one would
+   * repost the sticky because somebody fixed a typo.
+   *
+   * REGISTERED HERE SO THE HALT TAKES IT OFF WITH THE OTHERS. `removeAllListeners`
+   * above means "stop moderating", and a bot that is not in its configured guild
+   * registers no commands either — so there is nothing left to stick, and a
+   * sticky engine still counting messages in some other guild would be the one
+   * listener the halt missed.
+   *
+   * ONE CALL, BECAUSE EVERYTHING IT NEEDS IS ON THE OTHER SIDE OF IT. The
+   * poster, the state file under `StateDirectory=` and the restore-at-boot are
+   * all in sticky.ts; see `installStickies` there.
+   */
+  installStickies(client)
+
+  /**
+   * THE MAINTENANCE WATCHER, AND NOTHING AT ALL WHEN NO CHANNEL IS SET — the
+   * same rule the status channel and the manual follow, and the one that matters
+   * most here: with no channel there is nowhere to announce an outage, so the
+   * `ringmaster-maintenance` row is not polled and this process makes no AWS
+   * call it would otherwise make four times a minute.
+   *
+   * IT BUILDS THE `Ddb` ITSELF, and that is the one place in this file that
+   * reaches AWS. `createDdb` opens no socket and resolves no credentials — the
+   * first poll does, after `clientReady` — and it is called here rather than at
+   * module scope for the reason its own comment gives. `Pick<Ddb, 'maintenance'>`
+   * is what `watchMaintenance` asks for, so the watcher cannot read a ban or
+   * write an audit row however it is edited later.
+   *
+   * REGISTERED AFTER THE GUILD CHECK, like the deploy notice and the manual, so
+   * a bot that cannot find its guild says the halt line first. It is NOT taken
+   * off by the halt, and that is deliberate: announcing an outage is not
+   * moderation, it posts to an id from the config rather than to anything it
+   * discovered in the guild, and an outage during a misconfiguration is exactly
+   * when players are asking what is going on.
+   */
+  if (config.maintenanceChannelId !== null) {
+    watchMaintenance(client, config.maintenanceChannelId, createDdb())
+  }
+
+  /**
    * WIRED HERE RATHER THAN IN index.ts, because it is one more `clientReady`
    * listener and every listener this bot has is registered in this function.
    * Registered last so it runs after the guild check: a bot that came up on a
@@ -2213,11 +2270,21 @@ const STATUS_BACKLOG = 20
 const STATUS_EARLY = 20
 
 /**
- * How much of a rendered line survives into the channel.
+ * How much of a rendered line survives into the channel, in UTF-16 code units.
  *
  * DISCORD REFUSES A MESSAGE OVER 2000 CHARACTERS OUTRIGHT, and a rejected send
  * is a fault that never gets reported at all. The rest of the budget is the
  * code fence and the repeat count.
+ *
+ * UTF-16 UNITS, WHICH IS WHAT DISCORD COUNTS, AND THIS USED TO COUNT CODE
+ * POINTS. It is the same fault `fitEmbed` had and the same one profile.ts's
+ * limits block is written around: the 2000 applies to the JSON string as it
+ * arrives, which is UTF-16, so a code-point count UNDERSTATES every astral
+ * character by half. 1800 musical symbols measured 1800 here and reached Discord
+ * as 3600 units inside a fence, and the send came back 50035 — a fault that
+ * never got reported, which is precisely what this cap exists to prevent. It was
+ * only ever reachable through a value written by somebody else (a webhook's
+ * name, an error's text), which is why nothing tripped over it by accident.
  */
 const STATUS_LINE_CAP = 1800
 
@@ -2284,12 +2351,25 @@ function redact(line: string): string {
     .replace(/[\w-]{20,}\.[\w-]{6,}\.[\w-]{25,}/gu, '[redacted]')
     .replace(/`/gu, '')
 
-  // Cut by code point: a UTF-16 slice can land inside a surrogate pair and
-  // leave half a character in the post.
-  const points = [...scrubbed]
-  return points.length > STATUS_LINE_CAP
-    ? `${points.slice(0, STATUS_LINE_CAP).join('')}…`
-    : scrubbed
+  // MEASURED IN THE UNITS DISCORD COUNTS, AND CUT WHERE A CHARACTER ACTUALLY
+  // ENDS. Two different questions with two different answers: `String#length`
+  // is the number the 2000 is checked against, so that is what decides whether
+  // this is too long; but a `slice` at that number can land inside a surrogate
+  // pair and leave half a character in the post, so the walk is over CODE
+  // POINTS and stops when the UTF-16 total would be exceeded.
+  if (scrubbed.length <= STATUS_LINE_CAP) return scrubbed
+
+  // The ellipsis is inside the budget rather than added to it, so what comes
+  // back always satisfies the cap it was measured against.
+  const room = STATUS_LINE_CAP - 1
+  let kept = ''
+
+  for (const point of scrubbed) {
+    if (kept.length + point.length > room) break
+    kept += point
+  }
+
+  return `${kept}…`
 }
 
 /**

@@ -19,6 +19,7 @@ import {
   type Responder,
 } from './command.ts'
 import { help } from './help.ts'
+import { STICKY_TEXT_OPTION } from './sticky.ts'
 import {
   COMMANDS,
   commandData,
@@ -62,6 +63,7 @@ const ADMIN_ROLE = '222222222222222222'
 const OTHER_ROLE = '333333333333333333'
 const MEMBER = '444444444444444444'
 const TARGET = '555555555555555555'
+const CHANNEL = '666666666666666666'
 
 const stderr: string[] = []
 const stdout: string[] = []
@@ -96,6 +98,7 @@ function cfg(over: Partial<Config> = {}): Config {
     logChannelId: null,
     statusChannelId: null,
     docsChannelId: null,
+    maintenanceChannelId: null,
     exemptChannelIds: [],
     exemptAdmins: true,
     dryRun: false,
@@ -107,9 +110,11 @@ function invocation(over: Partial<Invocation> = {}): Invocation {
   return {
     commandName: 'guarded',
     guildId: GUILD,
+    channelId: CHANNEL,
     userId: MEMBER,
     roleIds: [OTHER_ROLE],
     targetId: null,
+    text: null,
     ...over,
   }
 }
@@ -313,6 +318,33 @@ describe('runCommand — the refusal is an answer, never a silence', () => {
     expect(respond.reply).toHaveBeenCalledWith(expect.any(String), true)
     expect(stderr.join('')).toContain('not one this bot has')
   })
+
+  /**
+   * THE WIDENED SEAM, END TO END. A handler that answers with embeds has them
+   * carried through untouched — `runCommand` does not measure, reshape or
+   * flatten what it was given, which is the whole reason /profile stopped
+   * flattening its own embed under a message's 2000 instead of an embed's 6000.
+   */
+  it('carries an embed answer through to the reply exactly as the handler built it', async () => {
+    const respond = responder()
+    const embed = { title: 'Player profile', description: '<@444>' }
+    const command = guarded({ adminOnly: false, run: () => ({ embeds: [embed] }) })
+
+    await runCommand(invocation(), cfg(), respond, [command])
+
+    expect(respond.edit).toHaveBeenCalledWith({ embeds: [embed] })
+  })
+
+  /** And a string answer is still a string. /help returns one and must not
+   * grow a box around it because another command needed one. */
+  it('leaves a text answer as text', async () => {
+    const respond = responder()
+    const command = guarded({ adminOnly: false, run: () => 'just a sentence' })
+
+    await runCommand(invocation(), cfg(), respond, [command])
+
+    expect(respond.edit).toHaveBeenCalledWith('just a sentence')
+  })
 })
 
 /**
@@ -427,6 +459,38 @@ describe('responderFor — how an interaction is actually answered', () => {
 
     expect(interaction.editReply).toHaveBeenCalledWith({ content: 'hello' })
   })
+
+  /**
+   * THE OTHER HALF OF THE SEAM, and the reason `/profile` no longer flattens its
+   * embed to text. A reply that is embeds goes out as `embeds` and carries NO
+   * `content` — an empty content field beside them would be a blank line above
+   * the box in every client.
+   */
+  it('edits with the embeds when that is what the handler answered', async () => {
+    const interaction = target()
+    const embed = { title: 'Player profile', description: 'somebody' }
+
+    await responderFor(interaction).edit({ embeds: [embed] })
+
+    expect(interaction.editReply).toHaveBeenCalledWith({ embeds: [embed] })
+    expect(interaction.editReply.mock.calls.at(0)?.at(0)).not.toHaveProperty('content')
+  })
+
+  /**
+   * The array Discord is handed is this bot's own, not the command's. Two
+   * elements at most, and the alternative is a live view of a value somebody
+   * else still holds.
+   */
+  it('copies the array rather than handing over the one the command built', async () => {
+    const interaction = target()
+    const embeds = [{ title: 'one' }]
+
+    await responderFor(interaction).edit({ embeds })
+
+    const sent = interaction.editReply.mock.calls.at(0)?.at(0)
+    expect(sent).toEqual({ embeds: [{ title: 'one' }] })
+    expect((sent as { embeds?: unknown }).embeds).not.toBe(embeds)
+  })
 })
 
 describe('roleIdsOf — Discord ships the roles, in either of two shapes', () => {
@@ -458,6 +522,7 @@ describe('invocationOf — a live interaction reduced to a record', () => {
     return {
       commandName: 'help',
       guildId: GUILD,
+      channelId: CHANNEL,
       user: { id: MEMBER },
       member: { roles: [OTHER_ROLE] },
       options: { get: () => null },
@@ -470,14 +535,28 @@ describe('invocationOf — a live interaction reduced to a record', () => {
     return { get: (asked) => (asked === name ? option : null) }
   }
 
-  it('carries who ran what, and their roles', () => {
+  it('carries who ran what, where, and their roles', () => {
     expect(invocationOf(source())).toEqual({
       commandName: 'help',
       guildId: GUILD,
+      channelId: CHANNEL,
       userId: MEMBER,
       roleIds: [OTHER_ROLE],
       targetId: null,
+      text: null,
     })
+  })
+
+  /**
+   * THE CHANNEL IS READ OFF THE INTERACTION AND IS NOT AN OPTION. `/sticky` acts
+   * on the channel the admin is standing in, and a channel option would be a
+   * thing to mistype — a message reposting itself every fifteen seconds in a
+   * channel nobody is watching. Carried through exactly as discord.js hands it
+   * over, null included, so a command can refuse rather than guess.
+   */
+  it('carries the channel the command was run in, and null when there is none', () => {
+    expect(invocationOf(source()).channelId).toBe(CHANNEL)
+    expect(invocationOf(source({ channelId: null })).channelId).toBeNull()
   })
 
   it('reads the target out of the option both halves agree on', () => {
@@ -517,6 +596,58 @@ describe('invocationOf — a live interaction reduced to a record', () => {
 
     expect(invocationOf(source({ options })).targetId).toBeNull()
   })
+
+  /**
+   * THE TEXT OPTION, READ BY THE NAME ./sticky.ts DECLARES IT UNDER. A rename in
+   * only one of the two places is not a compile error — it is a `/sticky` that
+   * reports an empty message however much text was typed into it.
+   */
+  it('reads the text out of the option both halves agree on', () => {
+    const options = optionNamed(STICKY_TEXT_OPTION, {
+      type: ApplicationCommandOptionType.String,
+      value: 'the server is down',
+    })
+
+    expect(invocationOf(source({ options })).text).toBe('the server is down')
+  })
+
+  it('is null for a command that supplied no text option', () => {
+    expect(invocationOf(source()).text).toBeNull()
+  })
+
+  /** The same trap `targetOf` avoids: a USER option named `text` is not text. */
+  it('ignores a text-named option of the wrong type, rather than throwing', () => {
+    const options = optionNamed(STICKY_TEXT_OPTION, {
+      type: ApplicationCommandOptionType.User,
+      user: { id: TARGET },
+    })
+
+    expect(invocationOf(source({ options })).text).toBeNull()
+  })
+
+  /**
+   * Discord types an option's value across every kind at once, so a string
+   * option carrying a number is a payload that is not what this file expects
+   * rather than text. Null is the honest reading of it.
+   */
+  it('is null for a string option whose value did not arrive as a string', () => {
+    const options = optionNamed(STICKY_TEXT_OPTION, {
+      type: ApplicationCommandOptionType.String,
+      value: 7,
+    })
+
+    expect(invocationOf(source({ options })).text).toBeNull()
+  })
+
+  /** An empty string is text the admin typed, not an absent option. */
+  it('carries an empty string through as itself', () => {
+    const options = optionNamed(STICKY_TEXT_OPTION, {
+      type: ApplicationCommandOptionType.String,
+      value: '',
+    })
+
+    expect(invocationOf(source({ options })).text).toBe('')
+  })
 })
 
 /**
@@ -545,8 +676,42 @@ describe('registerCommands', () => {
     expect(sent(set).map((entry) => entry.name)).toEqual(COMMANDS.map((one) => one.data.name))
   })
 
-  it('registers /help as a chat input command', () => {
-    expect(COMMANDS.map((one) => one.data.name)).toContain('help')
+  /**
+   * THE LIST IS THE ONE PLACE A FINISHED COMMAND CAN GO MISSING. Every one of
+   * these is built, tested and reachable from Discord only if it is in this
+   * array — a command file that nothing imports is a feature that exists in the
+   * repo and not in the guild, which is exactly the state /profile, /sticky and
+   * /unsticky were in.
+   */
+  it('registers every command this bot has', () => {
+    expect(COMMANDS.map((one) => one.data.name)).toEqual([
+      'help',
+      'profile',
+      'sticky',
+      'unsticky',
+    ])
+  })
+
+  /**
+   * AND BUILDING THE LIST REACHES NOTHING. This module is imported by this test
+   * file, so an eager `createDdb()` in the array would construct an SDK client
+   * here — which is why /profile is registered through `lazyReadsFrom`. The
+   * assertion is that the import above happened at all.
+   */
+  it('is a module that can be imported offline', () => {
+    expect(COMMANDS.length).toBeGreaterThan(0)
+  })
+
+  /**
+   * THE THREE ADMIN COMMANDS ARE HIDDEN AS WELL AS GATED, and `commandData`
+   * derives the hiding from the gate so the two cannot disagree. /help is open
+   * to everybody and must stay that way — it is the one command a member runs.
+   */
+  it('hides exactly the admin-only commands from the client', () => {
+    const hidden = COMMANDS.filter((one) => commandData(one).defaultMemberPermissions === 0n)
+
+    expect(hidden.map((one) => one.data.name)).toEqual(['profile', 'sticky', 'unsticky'])
+    expect(hidden.every((one) => one.adminOnly)).toBe(true)
   })
 
   /**

@@ -124,12 +124,62 @@ carry, and any run that would delete more than half of what it found. Each of
 those is far more often a broken file or a broken deploy than somebody's edit,
 and a deleted message cannot be got back. All four say so in the status channel.
 
+# The slash commands
+
+Four of them, and the whole list is registered into this guild again on every
+start, so what Discord offers cannot drift from what the bot has.
+
+Admin-only means holding the role named by `DISCORD_ADMIN_ROLE_ID`. Discord also
+hides an admin-only command from everybody else in the client, but that is a
+default anybody with Manage Server can grant back, so the bot checks the role
+itself on every use. With the variable unset nobody is an admin and no
+admin-only command runs at all.
+
+Who may run a command and who sees the answer are two separate questions.
+Ephemeral means the reply is delivered to the person who ran the command and to
+nobody else.
+
+`/help` is open to everybody. It replies with a link to the player guide and one
+mention in it: whoever was tagged, or the sender when nobody was. Tagged at
+somebody the reply is posted in the channel, because a guide only the tagger can
+read is no use to the person it is for; tagged at nobody it is ephemeral. The
+mention renders as a name and notifies nobody, as every mention this bot sends
+does.
+
+`/profile` takes a user, is admin-only, and its reply is always ephemeral. It
+carries a member's ban history, every licence the account has played under and
+every name it has used, and a copy in the channel cannot be taken back. It
+reports the licences that Discord account has connected under, the bans on the
+ten most recent of those, the game's career numbers, the server registry row and
+the recent matches. Whatever could not be read is named in the reply rather than
+left out, because "no record" and "the table would not answer" are opposite
+answers to the same question.
+
+`/sticky` takes the text of a message, is admin-only, and its reply is
+ephemeral. It keeps that message at the bottom of the channel it was run in: up
+to 2000 characters, reposted at most once every fifteen seconds and not at all
+until five messages have arrived on top of it. Run in a channel that already has
+one, it replaces that one rather than adding a second. The reply is ephemeral
+because a visible confirmation would be one more message pushing the sticky
+down.
+
+`/unsticky` is admin-only and its reply is ephemeral. It takes down the sticky in
+the channel it was run in, and says so when there was not one. Neither sticky
+command takes a channel: both act on the channel the admin is standing in, so
+there is no channel id to mistype.
+
+Several of the replies are still placeholder text and say so in their first
+word. The wording is the owner's to supply; what this section describes is the
+behaviour under it.
+
 # What it does not have
 
-No slash commands. There are none registered and none planned in this version.
+No kick, no ban, no mute, no warning. The four commands above are the whole
+list, and none of them acts on a member or on a message.
 
-The bot never contacts a member: no DM, no reply, no "your message was removed".
-A removal is a journal line and a line in the removals channel, and that is all.
+The bot never contacts a member about a removal: no DM, no reply, no "your
+message was removed". A removal is a journal line and a line in the removals
+channel, and that is all.
 
-There is nothing to type at it. Everything it does is decided by its
-environment variables and by `docs/bot-manual.md`.
+Nothing else is typed at it. What it does about invites is decided by its
+environment variables alone, and this channel by `docs/bot-manual.md`.

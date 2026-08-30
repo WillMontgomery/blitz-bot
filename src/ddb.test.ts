@@ -162,6 +162,7 @@ const EXERCISES: Array<{ name: string; run: (ddb: Ddb) => Promise<DdbResult<unkn
   { name: 'players.get', run: (d) => d.players.get(LICENSE) },
   { name: 'playerIds.licensesFor', run: (d) => d.playerIds.licensesFor(qualifyId('discord', '280')) },
   { name: 'gamePlayers.profile', run: (d) => d.gamePlayers.profile(LICENSE) },
+  { name: 'gamePlayers.matches', run: (d) => d.gamePlayers.matches(LICENSE, 25) },
   { name: 'maintenance.current', run: (d) => d.maintenance.current() },
   { name: 'audit.begin', run: (d) => d.audit.begin({ action: 'player.kick', actor: ACTOR }) },
   { name: 'audit.resolve', run: (d) => d.audit.resolve({ commandId: 'c1', ts: 1 }, 'ok') },
@@ -561,6 +562,113 @@ describe('reads', () => {
       TableName: 'ringmaster-maintenance',
       Key: { id: 'current' },
     })
+  })
+
+  /**
+   * THE MATCH HISTORY IS A QUERY, NOT A SCAN AND NOT A SECOND TABLE.
+   *
+   * The game hangs one row per match off the PLAYER's own partition with a sort
+   * key of `match#<endedAt>#<matchId>`, so walking that key backwards with a
+   * `Limit` already is "the most recent N". Three things have to be right at
+   * once and every one of them fails quietly: a missing `begins_with` returns
+   * `profile` and `purchases` as if they were matches, a forward scan returns
+   * the player's FIRST twenty-five, and a `Limit` taken on trust is an
+   * unbounded read on a two-second deadline.
+   */
+  it("read the match rows off the player's own partition, newest first", async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    await ddb.gamePlayers.matches(LICENSE, 25)
+
+    expect(fake.calls[0]?.op).toBe('query')
+    expect(fake.calls[0]?.input).toMatchObject({
+      TableName: 'br-players',
+      KeyConditionExpression: 'pk = :pk AND begins_with(sk, :sk)',
+      ExpressionAttributeValues: { ':pk': LICENSE, ':sk': 'match#' },
+      ScanIndexForward: false,
+      Limit: 25,
+    })
+  })
+
+  /**
+   * THE CAP IS THE READER'S AND NOT THE CALLER'S. A limit is a parameter because
+   * the caller knows what it can render; a parameter with no ceiling is one bad
+   * call away from paging a player with two thousand matches into Discord's
+   * three seconds.
+   */
+  it('never ask for more rows than the reader will allow, whatever it is told', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    await ddb.gamePlayers.matches(LICENSE, 5_000)
+    await ddb.gamePlayers.matches(LICENSE)
+
+    expect(fake.calls[0]?.input).toMatchObject({ Limit: 50 })
+
+    // And the default is the same ceiling rather than a second number.
+    expect(fake.calls[1]?.input).toMatchObject({ Limit: 50 })
+  })
+
+  /** DynamoDB reads `Limit: 0` as its own thing; a caller asking for none of
+   * something is a caller with a bug, and one row is the cheapest honest answer. */
+  it('never ask for zero rows or a fraction of one', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    await ddb.gamePlayers.matches(LICENSE, 0)
+    await ddb.gamePlayers.matches(LICENSE, 2.7)
+
+    expect(fake.calls[0]?.input).toMatchObject({ Limit: 1 })
+    expect(fake.calls[1]?.input).toMatchObject({ Limit: 2 })
+  })
+
+  /**
+   * PROJECTED FIELD BY FIELD, like the career row beside it and for the same
+   * reason — br_ddb writes these, in Lua, in another repo.
+   *
+   * AND AN ABSENT FIELD IS NULL RATHER THAN ZERO, which is the one place this
+   * differs from `profile`. `0 kills` is a sentence about a match that was
+   * played; a row from a build of the game that did not record kills would say
+   * exactly the same thing and be inventing it.
+   */
+  it('project a match row, and leave a field that did not arrive absent', async () => {
+    const fake = fakeDocument({
+      query: async () => ({
+        ...META,
+        Items: [
+          { sk: 'match#000001700000000000#42', endedAt: 1_700_000_000_000, placement: 3, kills: 7 },
+          { sk: 'match#000001600000000000#41', placement: 'second' },
+        ],
+      }),
+    })
+    const ddb = createDdb({ document: fake.doc })
+
+    const result = await ddb.gamePlayers.matches(LICENSE, 25)
+
+    expect(result).toEqual({
+      ok: true,
+      value: [
+        { sk: 'match#000001700000000000#42', at: 1_700_000_000_000, placement: 3, kills: 7 },
+        { sk: 'match#000001600000000000#41', at: null, placement: null, kills: null },
+      ],
+    })
+  })
+
+  /**
+   * AN EMPTY LIST IS AN ANSWER AND A FAILURE IS NOT ONE. A player with no
+   * per-match rows has never played, or played only before the game recorded
+   * them individually; a read that was denied is `{ ok: false }` and must never
+   * reach anybody as "no matches".
+   */
+  it('answer an empty history and a denied read differently', async () => {
+    const empty = createDdb({ document: fakeDocument().doc })
+    await expect(empty.gamePlayers.matches(LICENSE, 25)).resolves.toEqual({ ok: true, value: [] })
+
+    const denied = createDdb({ document: failingDocument(awsError('AccessDeniedException')) })
+    const result = await denied.gamePlayers.matches(LICENSE, 25)
+
+    expect(result).toMatchObject({ ok: false, failure: { kind: 'denied', op: 'query' } })
   })
 
   it('read the audit log newest first', async () => {

@@ -59,9 +59,15 @@ import {
   type ScannedMessage,
   type StickerText,
 } from './client.ts'
+// The registered command list, so the manual can be checked against the code
+// rather than against a second list kept by hand. Importing it is offline:
+// `COMMANDS` builds `/profile`'s DynamoDB client lazily, on the first use of
+// the command, which is why this costs no SDK client here. See ./commands/index.ts.
+import { COMMANDS } from './commands/index.ts'
 import type { Config } from './config.ts'
 import { findInviteCodes, type InviteResolver } from './invites.ts'
 import { log, setSink } from './log.ts'
+import { setStickies, stickies } from './sticky.ts'
 
 /**
  * The decision, and what gets done about it.
@@ -110,6 +116,7 @@ function cfg(over: Partial<Config> = {}): Config {
     logChannelId: null,
     statusChannelId: null,
     docsChannelId: null,
+    maintenanceChannelId: null,
     exemptChannelIds: [],
     exemptAdmins: true,
     dryRun: false,
@@ -184,6 +191,11 @@ afterEach(() => {
   // The sink is module state in log.ts, so a case that installs one and leaves
   // it there would send every later case's log lines to a fake Discord.
   setSink(null)
+
+  // And the sticky engine is module state in sticky.ts. `createClient` installs
+  // one now, so every case that builds a client leaves an engine behind holding
+  // a destroyed client's channel fetcher.
+  setStickies(null)
 })
 
 describe('decide — messages that are never scanned at all', () => {
@@ -2071,11 +2083,19 @@ describe('createClient — the wiring that would otherwise fail silently', () =>
     await client.destroy()
   })
 
-  /** REGRESSION. `messageCreate` was the only listener; edits went unseen. */
-  it('listens for edits as well as new messages', async () => {
+  /**
+   * REGRESSION. `messageCreate` was the only listener; edits went unseen.
+   *
+   * TWO ON `messageCreate` AND ONE ON `messageUpdate`, AND THE ASYMMETRY IS THE
+   * DESIGN. The scanner takes both, because an edited message has to be looked
+   * at the way a new one is. The sticky takes only the first, because an edit is
+   * not drift — nothing moved and nothing was pushed down, and counting one
+   * would repost the sticky because somebody fixed a typo.
+   */
+  it('listens for edits as well as new messages, and sticks only to new ones', async () => {
     const client = createClient(cfg())
 
-    expect(client.listenerCount(Events.MessageCreate)).toBe(1)
+    expect(client.listenerCount(Events.MessageCreate)).toBe(2)
     expect(client.listenerCount(Events.MessageUpdate)).toBe(1)
 
     await client.destroy()
@@ -2108,6 +2128,48 @@ describe('createClient — the wiring that would otherwise fail silently', () =>
     expect(edited.fetch).toHaveBeenCalledTimes(1)
 
     await client.destroy()
+  })
+
+  /**
+   * THE STICKY ENGINE IS INSTALLED, AND THAT IS THE GAP THIS CLOSES. The
+   * commands were written against a module singleton that nothing set: `/sticky`
+   * answered "the engine is not installed" in a bot with the feature fully
+   * built. A null here is that bot.
+   */
+  it('installs the sticky engine, so /sticky has something to reach', async () => {
+    const client = createClient(cfg())
+
+    expect(stickies()).not.toBeNull()
+
+    await client.destroy()
+    setStickies(null)
+  })
+
+  /**
+   * THE TWO `messageCreate` LISTENERS DO NOT KNOW ABOUT EACH OTHER, which is
+   * what "the sticky must not interfere with invite scanning" means in practice.
+   * A message with a foreign invite in it is still deleted with the counter
+   * running beside it — and the sticky's own listener cannot be the reason a
+   * delete does not happen, because it is a separate function that reads a
+   * channel id and nothing else.
+   */
+  it('still scans a message for invites with the sticky counting the same one', async () => {
+    const client = createClient(cfg())
+
+    expect(stickies()).not.toBeNull()
+
+    // The default `live()` carries `discord.gg/abc123`. Nothing here is logged
+    // in, so the lookup fails and the code goes unresolved — which is a `leave`
+    // and a journal line, and the journal line is the proof that the scanner
+    // saw this message with the sticky's listener attached beside it.
+    client.emit(Events.MessageCreate, asGateway(live()))
+
+    await vi.waitFor(() => {
+      expect(stderr.join('')).toContain('invite lookup failed')
+    })
+
+    await client.destroy()
+    setStickies(null)
   })
 })
 
@@ -2403,7 +2465,11 @@ describe('a guild id the bot is not in is fatal to moderation', () => {
     const mod = await freshModule()
     const client = mod.createClient(cfg())
 
-    expect(client.listenerCount(Events.MessageCreate)).toBe(1)
+    // Two: the scanner and the sticky's counter. Both go, and the sticky's
+    // going is right rather than collateral — a bot that is not in its
+    // configured guild registers no commands either, so there is nothing left
+    // to stick and nothing that could take one down.
+    expect(client.listenerCount(Events.MessageCreate)).toBe(2)
 
     client.emit(Events.ClientReady, readyPayload([OTHER_GUILD]))
 
@@ -2460,7 +2526,7 @@ describe('a guild id the bot is not in is fatal to moderation', () => {
     client.emit(Events.ClientReady, readyPayload([OURS, OTHER_GUILD]))
 
     expect(stdout.join('')).toContain('msg="ready"')
-    expect(client.listenerCount(Events.MessageCreate)).toBe(1)
+    expect(client.listenerCount(Events.MessageCreate)).toBe(2)
     expect(await mod.decide(msg(), cfg(), foreignResolver)).toMatchObject({ action: 'delete' })
 
     await client.destroy()
@@ -3189,6 +3255,53 @@ describe('statusReporter — what never reaches the channel', () => {
 
     expect(at(sent, 0).length).toBeLessThan(2000)
     expect(at(sent, 0)).toContain('…')
+  })
+
+  /**
+   * THE SAME CAP, MEASURED IN THE UNITS DISCORD COUNTS. This is the fault
+   * `fitEmbed` had and the one profile.ts's limits block is written around: the
+   * 2000 applies to the JSON string as it arrives, which is UTF-16, so counting
+   * CODE POINTS understates every astral character by half. 1800 musical
+   * symbols measured 1800 against a 1800 cap and reached Discord as 3600 units
+   * inside a fence — a 50035 on the send, which is a fault that never got
+   * reported at all, which is precisely what the cap exists to prevent.
+   *
+   * IT IS ONLY REACHABLE THROUGH SOMEBODY ELSE'S TEXT — a webhook's name, an
+   * error message reflected back — which is why nothing tripped over it by
+   * accident. `redact` is exactly where a hostile value is handled.
+   */
+  it('caps the line in UTF-16 units, so astral text cannot get the post refused', async () => {
+    const { client, sent } = statusHarness()
+
+    // 1800 code points, 3600 UTF-16 units: under a code-point cap of 1800 and
+    // twice it in the units the 2000 is checked against.
+    await statusReporter(client, STATUS_CHANNEL)(
+      'error',
+      'invite scan capped',
+      line('invite scan capped', `codes="${'𝄞'.repeat(1800)}"`),
+    )
+
+    expect(at(sent, 0).length).toBeLessThan(2000)
+    expect(at(sent, 0)).toContain('…')
+  })
+
+  /** And a cut that lands mid-character is half a symbol in the channel. The
+   * measurement is UTF-16; the cut is still on a code-point boundary. */
+  it('cuts where a character ends, never inside a surrogate pair', async () => {
+    const { client, sent } = statusHarness()
+
+    await statusReporter(client, STATUS_CHANNEL)(
+      'error',
+      'invite scan capped',
+      line('invite scan capped', `codes="${'𝄞'.repeat(1800)}"`),
+    )
+
+    // A lone surrogate is what a mid-pair slice leaves behind, and it survives
+    // JSON and the gateway as U+FFFD rather than as an error anybody sees.
+    for (const unit of at(sent, 0)) {
+      const code = unit.codePointAt(0) ?? 0
+      expect(code >= 0xd800 && code <= 0xdfff).toBe(false)
+    }
   })
 
   /**
@@ -5139,7 +5252,7 @@ describe('the manual — the file, and the bot carrying on without it', () => {
   it('leaves the message listeners armed when the manual cannot be published', async () => {
     const client = createClient(cfg({ docsChannelId: DOCS_CHANNEL }))
 
-    expect(client.listenerCount(Events.MessageCreate)).toBe(1)
+    expect(client.listenerCount(Events.MessageCreate)).toBe(2)
     expect(client.listenerCount(Events.MessageUpdate)).toBe(1)
 
     await client.destroy()
@@ -5181,6 +5294,65 @@ describe('the manual — the file, and the bot carrying on without it', () => {
 
     expect(source).toContain('syncDocsChannel(client, config.docsChannelId)')
     expect(source).not.toMatch(/syncDocsChannel\([^)]*(?:logChannelId|statusChannelId)/u)
+  })
+})
+
+/**
+ * THE MAINTENANCE WATCHER, AS FAR AS THIS FILE OWNS IT. Everything it does once
+ * it is running — which states post, what a blind read means, what a restart
+ * must not re-announce — is maintenance.ts's own file. What is decided HERE is
+ * whether it is installed at all, and against which of four channel ids.
+ */
+describe('the maintenance watcher — installed, and only when there is a channel', () => {
+  const MAINTENANCE_CHANNEL = '999999999999999999'
+
+  /**
+   * UNSET DOES MORE THAN "POST NOWHERE". With no channel there is nothing to
+   * announce to, so the row is not polled — this process makes no AWS call it
+   * would otherwise make four times a minute, for the life of a bot that is live
+   * today with the variable unset.
+   */
+  it('registers nothing at all when no maintenance channel is configured', async () => {
+    const quiet = createClient(cfg())
+    expect(quiet.listenerCount(Events.ClientReady)).toBe(1)
+    await quiet.destroy()
+
+    const wired = createClient(cfg({ maintenanceChannelId: MAINTENANCE_CHANNEL }))
+    expect(wired.listenerCount(Events.ClientReady)).toBe(2)
+    await wired.destroy()
+  })
+
+  /**
+   * A SOURCE ASSERTION, for the reason the docs channel's is one: all four
+   * optional ids are strings, so no fake client can tell which of them was
+   * handed over — and this is the only one of the four that players read. An
+   * outage notice in the moderation log is an announcement nobody sees; the
+   * moderation log in an announcement channel is worse.
+   */
+  it('is wired to the maintenance channel id and to no other', async () => {
+    const source = await readFile(new URL('./client.ts', import.meta.url), 'utf8')
+
+    expect(source).toContain('watchMaintenance(client, config.maintenanceChannelId, createDdb())')
+    expect(source).not.toMatch(
+      /watchMaintenance\([^)]*(?:logChannelId|statusChannelId|docsChannelId)/u,
+    )
+  })
+
+  /**
+   * IT SURVIVES THE HALT, UNLIKE THE MESSAGE LISTENERS, and that is asserted
+   * from the source rather than by emitting `clientReady` — the first poll runs
+   * immediately, and a case that fired it would be a test making a real
+   * DynamoDB call. The halt names the two events it takes off; a third name
+   * appearing in that list is what this would catch.
+   */
+  it('is not among the listeners the halt takes off', async () => {
+    const source = await readFile(new URL('./client.ts', import.meta.url), 'utf8')
+
+    const removed = [...source.matchAll(/removeAllListeners\(Events\.(\w+)\)/gu)].map(
+      (match) => match[1],
+    )
+
+    expect(removed.sort()).toEqual(['MessageCreate', 'MessageUpdate'])
   })
 })
 
@@ -5246,14 +5418,56 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
   })
 
   /**
-   * AND IT DOES NOT DESCRIBE A COMMAND THAT DOES NOT EXIST. There is no
-   * interaction listener anywhere in this bot; a manual that implied otherwise
-   * would have admins typing at a channel that answers nothing.
+   * AND IT NAMES EVERY COMMAND THE BOT REGISTERS, NO MORE AND NO FEWER.
+   *
+   * THE LIST IS READ OUT OF `COMMANDS` RATHER THAN TYPED HERE, and that is the
+   * whole point of this test. What stood here before asserted the manual
+   * contained the words "No slash commands" — true when it was written, and
+   * four commands later it was a test holding a false statement in place in a
+   * document a live bot posts to a channel admins read. A name typed into this
+   * file would be the same mistake one step along: registering a fifth command
+   * has to fail something until the manual describes it, and the only list that
+   * cannot drift from the code is the code's own.
+   *
+   * BOTH DIRECTIONS, because the old assertion guarded one of them. A command
+   * missing from the manual is an admin who cannot find out what the bot can
+   * do; a command in the manual and not in `COMMANDS` is worse — several are
+   * specced and unbuilt, and a manual promising one has admins typing at a bot
+   * that answers nothing.
    */
-  it('does not invent a command the bot does not have', async () => {
+  it('names every command the bot registers, and no others', async () => {
+    const markdown = await shipped()
+
+    // How a command is written in the file: slash, lowercase, and preceded by
+    // the start of a line, a space or a backtick so that `docs/bot-manual.md`
+    // is not read as a command — and not followed by `/` or `.`, so that an
+    // absolute path added to the file later is not read as one either.
+    const mentioned = [
+      ...markdown.matchAll(/(?:^|[\s`(])\/([a-z][a-z0-9-]*)(?![\w/.])/gmu),
+    ].map((match) => match[1] ?? '')
+
+    const registered = COMMANDS.map((command) => command.data.name)
+
+    // Not a vacuous pass on the day both are empty: the bot has commands, and a
+    // build where it does not is a different question from this one.
+    expect(registered.length).toBeGreaterThan(0)
+    expect([...new Set(mentioned)].sort()).toEqual([...registered].sort())
+  })
+})
+
+/**
+ * WHERE THE COMMANDS ARE WIRED, which is the half of the old manual test worth
+ * keeping. It read the absence of an interaction listener in client.ts as proof
+ * that the bot had no commands at all; it has four, and they are installed from
+ * index.ts instead. The absence still means something, and it is the reason
+ * this file's subject can be described on its own: moderation's listeners and
+ * the command listener go on separately, so a fault in one cannot take the
+ * other off.
+ */
+describe('the command listener — installed apart from moderation', () => {
+  it('is not registered anywhere in client.ts', async () => {
     const source = await readFile(new URL('./client.ts', import.meta.url), 'utf8')
 
     expect(source).not.toContain('InteractionCreate')
-    expect(await shipped()).toContain('No slash commands')
   })
 })

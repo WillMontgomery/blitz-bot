@@ -1,29 +1,41 @@
-import { ApplicationCommandOptionType } from 'discord.js'
+import { ApplicationCommandOptionType, type APIEmbedField } from 'discord.js'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { Config } from '../config.ts'
 import {
   tableNames,
   type Ban,
   type Ddb,
   type DdbFailure,
   type DdbResult,
+  type GameMatch,
   type GameProfile,
   type PlayerRecord,
 } from '../ddb.ts'
 import { setSink } from '../log.ts'
-import { TARGET_OPTION, type Invocation } from './command.ts'
+import {
+  refusalFor,
+  TARGET_OPTION,
+  type BotCommand,
+  type CommandReply,
+  type Invocation,
+  type Refusal,
+} from './command.ts'
 import {
   embedUnits,
-  flattenEmbed,
   gatherProfile,
+  gatherSelf,
   lazyReadsFrom,
+  profileAdminOnly,
   profileCommand,
   profileEmbed,
   readsFrom,
+  selfEmbed,
   trimEmbed,
   type MatchSummary,
   type ProfileData,
   type ProfileReads,
+  type SelfData,
 } from './profile.ts'
 
 /**
@@ -60,6 +72,23 @@ const GUILD = '111111111111111111'
 const OLDEST = 'license:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 const MIDDLE = 'license:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 const NEWEST = 'license:cccccccccccccccccccccccccccccccccccccccc'
+
+/**
+ * A licence with a ban row on it that the index no longer lists. See the
+ * three-licence fixture below, which is what needs a FOURTH ban to exist.
+ */
+const FORGOTTEN = 'license:dddddddddddddddddddddddddddddddddddddddd'
+
+const ADMIN_ROLE = '222222222222222222'
+const MEMBER_ROLE = '333333333333333333'
+
+/**
+ * Who RAN the command, which is a different person from `DISCORD` — the account
+ * being looked up — and the self cases below turn on the difference. A fixture
+ * where the caller and the subject are the same id cannot tell "reads the
+ * caller" from "reads the target".
+ */
+const CALLER = '555555555555555555'
 
 /** One code point, TWO UTF-16 units. The whole point of the astral cases. */
 const ASTRAL = '𝄞'
@@ -114,9 +143,31 @@ function failed(kind: DdbFailure['kind']): { ok: false; failure: DdbFailure } {
 function reads(over: Partial<ProfileReads> = {}): ProfileReads {
   return {
     licencesFor: () => Promise.resolve(ok([NEWEST])),
+
+    // The self path's only route in, and a SEPARATE member of the seam rather
+    // than a derivation of the one above — which is what lets a case below
+    // assert that one of the two was never called at all.
+    currentLicenceFor: () => Promise.resolve(ok(NEWEST)),
+
     ban: () => Promise.resolve(ok(null)),
     career: () => Promise.resolve(ok(null)),
     registry: () => Promise.resolve(ok(null)),
+    ...over,
+  }
+}
+
+function cfg(over: Partial<Config> = {}): Config {
+  return {
+    discordToken: 'token',
+    guildId: GUILD,
+    adminRoleId: ADMIN_ROLE,
+    logChannelId: null,
+    statusChannelId: null,
+    docsChannelId: null,
+    maintenanceChannelId: null,
+    exemptChannelIds: [],
+    exemptAdmins: true,
+    dryRun: false,
     ...over,
   }
 }
@@ -194,11 +245,45 @@ function invocation(over: Partial<Invocation> = {}): Invocation {
   return {
     commandName: 'profile',
     guildId: GUILD,
-    userId: '555555555555555555',
-    roleIds: ['222222222222222222'],
+    channelId: '666666666666666666',
+    userId: CALLER,
+    roleIds: [ADMIN_ROLE],
     targetId: DISCORD,
+    text: null,
     ...over,
   }
+}
+
+/**
+ * The one embed a reply carries, or a failure that says what arrived instead.
+ *
+ * A HELPER RATHER THAN A CAST, because "the command answered with a string" is
+ * the regression worth catching by name: it is what this command did before the
+ * seam was widened, and a cast would turn it into `undefined` three assertions
+ * later.
+ */
+function replyEmbed(reply: CommandReply): { title: string; description: string; fields: APIEmbedField[] } {
+  if (typeof reply === 'string') throw new Error(`expected an embed, got text: ${reply}`)
+
+  const [embed] = reply.embeds
+  if (embed === undefined) throw new Error('the reply carried no embed at all')
+
+  return {
+    title: embed.title ?? '',
+    description: embed.description ?? '',
+    fields: [...(embed.fields ?? [])],
+  }
+}
+
+/** Everything in an embed that a reader sees, as one string. */
+function rendered(reply: CommandReply): string {
+  const embed = replyEmbed(reply)
+
+  return [
+    embed.title,
+    embed.description,
+    ...embed.fields.map((entry) => `${entry.name}\n${entry.value}`),
+  ].join('\n')
 }
 
 /** Every field value the embed carries, for the cap assertions. */
@@ -431,6 +516,10 @@ describe('readsFrom', () => {
           seen.push(['gamePlayers', licence])
           return Promise.resolve(ok(null))
         },
+        matches: (licence, limit) => {
+          seen.push(['gameMatches', `${licence}|${String(limit)}`])
+          return Promise.resolve(ok([] as GameMatch[]))
+        },
       },
 
       maintenance: { current: unused },
@@ -456,13 +545,31 @@ describe('readsFrom', () => {
     expect(seen).toContainEqual(['gamePlayers', NEWEST])
   })
 
-  it('supplies no match reader, so a real profile says so instead of showing none', () => {
-    expect(readsFrom(fakeDdb([])).matches).toBeUndefined()
+  /**
+   * THE MATCH READER IS WIRED, THROUGH BOTH. A `readsFrom` that dropped the line
+   * is not a crash and not a wrong number: the reply says `matches: unavailable`,
+   * which is word for word what an honest build with no reader says. The
+   * regression is invisible in the channel, so it has to be visible here.
+   */
+  it('wires the match reader, with the limit this reply can actually render', async () => {
+    const seen: Array<[string, string]> = []
 
-    // And the lazy one must not accidentally supply one by delegating: a
-    // `matches` that exists would render an empty history instead of saying
-    // there is no reader for it.
-    expect(lazyReadsFrom(() => fakeDdb([])).matches).toBeUndefined()
+    await gatherProfile(readsFrom(fakeDdb(seen)), DISCORD)
+
+    // 25, from `MATCH_FETCH` — what the embed can show and say it cut — rather
+    // than the reader's own ceiling.
+    expect(seen).toContainEqual(['gameMatches', `${NEWEST}|25`])
+  })
+
+  it('wires it through the lazy one as well, which is the one ./index.ts registers', async () => {
+    const seen: Array<[string, string]> = []
+
+    await gatherProfile(
+      lazyReadsFrom(() => fakeDdb(seen)),
+      DISCORD,
+    )
+
+    expect(seen).toContainEqual(['gameMatches', `${NEWEST}|25`])
   })
 
   it('builds no client until a profile is actually asked for', async () => {
@@ -914,44 +1021,76 @@ describe('trimEmbed', () => {
   })
 })
 
-describe('flattenEmbed', () => {
-  it('carries the title, the description and every field', () => {
-    const text = flattenEmbed(profileEmbed(data({ licences: [OLDEST, NEWEST] }), NOW))
+/**
+ * THE REPLY IS THE EMBED, AND THE WHOLE 6000 IS ITS BUDGET.
+ *
+ * THE REGRESSION THIS BLOCK IS FOR is the shape this command shipped in before
+ * the seam carried embeds: the same embed flattened into message content and
+ * cut again at 2000, so an answer that was perfectly legal lost whole sections
+ * on the way out — and lost them by a second set of rules that nothing forced to
+ * agree with the first. A `/profile` that answers with a string is that
+ * behaviour coming back, whatever the string says.
+ */
+describe('the reply is an embed and nothing cuts it twice', () => {
+  it('answers with one embed rather than with text', async () => {
+    const reply = await profileCommand(reads(), () => NOW).run(invocation(), {} as never)
 
-    expect(text).toContain('**Licences**')
-    expect(text).toContain(NEWEST)
-    expect(text).toContain('2 licences')
+    expect(typeof reply).not.toBe('string')
+    expect(replyEmbed(reply).fields.length).toBeGreaterThan(0)
   })
 
-  it('fits a message, which is a third of what an embed may carry', () => {
-    const big = profileEmbed(
-      data({
-        licences: Array.from({ length: 10 }, (_, index) => `license:${String(index).repeat(60)}`),
-        bans: Array.from({ length: 10 }, (_, index) => ({
-          licence: `license:${String(index).repeat(60)}`,
-          ban: ban({ reason: ASTRAL.repeat(200) }),
-        })),
-        matches: Array.from({ length: 25 }, (_, index) => match(index)),
+  /**
+   * The case that used to be cut down. Ten sixty-character licences, ten bans
+   * whose reasons are astral text, and twenty-five matches: over a message's
+   * 2000 and inside an embed's 6000, so every section survives now and none of
+   * them did before.
+   */
+  it('sends an answer a message could not have carried, whole', async () => {
+    const big = data({
+      licences: Array.from({ length: 10 }, (_, index) => `license:${String(index).repeat(60)}`),
+      bans: Array.from({ length: 10 }, (_, index) => ({
+        licence: `license:${String(index).repeat(60)}`,
+        ban: ban({ reason: ASTRAL.repeat(200) }),
+      })),
+      matches: Array.from({ length: 25 }, (_, index) => match(index)),
+    })
+
+    const embed = profileEmbed(big, NOW)
+
+    expect(embedUnits(embed)).toBeGreaterThan(2000)
+    expect(embedUnits(embed)).toBeLessThanOrEqual(6000)
+
+    // Every section the embed built is a section the admin gets: nothing
+    // between `profileEmbed` and Discord measures this again.
+    const command = profileCommand(
+      reads({
+        licencesFor: () => Promise.resolve(ok([...big.licences])),
+        ban: (licence) =>
+          Promise.resolve(ok(big.bans.find((row) => row.licence === licence)?.ban ?? null)),
+        career: () => Promise.resolve(ok(big.career)),
+        registry: () => Promise.resolve(ok(big.registry)),
+        matches: () => Promise.resolve(ok([...big.matches])),
       }),
-      NOW,
+      () => NOW,
     )
 
-    // The embed is legal and the message it flattens to would not be.
-    expect(embedUnits(big)).toBeGreaterThan(2000)
+    const sent = replyEmbed(await command.run(invocation(), {} as never))
 
-    const text = flattenEmbed(big)
-
-    expect(text.length).toBeLessThanOrEqual(2000)
-    expect(text).toMatch(/\d+ further sections did not fit\./u)
-  })
-
-  it('says nothing about dropped sections when none were dropped', () => {
-    expect(flattenEmbed(profileEmbed(data(), NOW))).not.toContain('did not fit')
+    expect(sent.fields.map((entry) => entry.name)).toEqual(
+      embed.fields.map((entry) => entry.name),
+    )
+    expect(rendered(await command.run(invocation(), {} as never))).not.toContain('did not fit')
   })
 })
 
 describe('profileCommand', () => {
-  it('registers one required user option under the name the dispatcher reads', () => {
+  /**
+   * OPTIONAL, AND A REQUIRED ONE WOULD MAKE THE SELF VIEW UNASKABLE. Discord
+   * will not let a member send `/profile` at all while the option is required,
+   * so this is not a nicety — it is the difference between the self view
+   * existing and not.
+   */
+  it('registers one OPTIONAL user option under the name the dispatcher reads', () => {
     const command = profileCommand(reads())
 
     expect(command.data.name).toBe('profile')
@@ -962,10 +1101,20 @@ describe('profileCommand', () => {
     const [option] = options
     expect(option?.name).toBe(TARGET_OPTION)
     expect(option?.type).toBe(ApplicationCommandOptionType.User)
-    expect(option && 'required' in option ? option.required : undefined).toBe(true)
+    expect(option && 'required' in option ? option.required : undefined).toBe(false)
   })
 
-  it('is admin-only, which is what turns the gate in refusalFor on', () => {
+  /**
+   * THE GATE THIS COMMAND SHIPS WITH IS THE CLOSED ONE, AND THAT IS ON PURPOSE.
+   * `BotCommand.adminOnly` is a `boolean` property of the COMMAND, so
+   * `refusalFor` cannot ask a question about the invocation; the rule this
+   * command wants is in `profileAdminOnly` and is exercised below. Until
+   * command.ts can carry a predicate, shipping `false` here would open the
+   * TARGETED half to everybody, which is the one thing that must not happen.
+   * This assertion is the reminder that the self view is gated shut meanwhile —
+   * change it in the same commit that changes command.ts, and not before.
+   */
+  it('ships admin-only until the framework can gate per invocation', () => {
     expect(profileCommand(reads()).adminOnly).toBe(true)
   })
 
@@ -990,17 +1139,40 @@ describe('profileCommand', () => {
       () => NOW,
     )
 
-    const text = await command.run(invocation(), {} as never)
+    const text = rendered(await command.run(invocation(), {} as never))
 
     expect(text).toContain('2 licences')
     expect(text).toContain(OLDEST)
     expect(text).toContain(NEWEST)
   })
 
-  it('says so rather than guessing when no user came with the interaction', async () => {
-    const text = await profileCommand(reads()).run(invocation({ targetId: null }), {} as never)
+  /**
+   * NO TARGET IS NO LONGER A PAYLOAD PROBLEM, IT IS A SUBJECT. This used to
+   * answer `No user was given.` because Discord guaranteed a required option;
+   * now the absence of one means "me", and the reply is the self view of the
+   * person who ran it. The regression this case names is a build that went back
+   * to refusing, which would look like the command being broken for everybody
+   * who is not an admin looking somebody up.
+   */
+  it('reads the CALLER and not the target when no user was given', async () => {
+    const asked: string[] = []
 
-    expect(text).toBe('No user was given.')
+    const command = profileCommand(
+      reads({
+        currentLicenceFor: (id) => {
+          asked.push(id)
+          return Promise.resolve(ok(NEWEST))
+        },
+        career: () => Promise.resolve(ok(career())),
+      }),
+      () => NOW,
+    )
+
+    const text = rendered(await command.run(invocation({ targetId: null }), cfg()))
+
+    expect(asked).toEqual([CALLER])
+    expect(text).toContain(`<@${CALLER}>`)
+    expect(text).toContain('Level 7')
   })
 
   it('answers instead of throwing when every read fails', async () => {
@@ -1015,7 +1187,7 @@ describe('profileCommand', () => {
       () => NOW,
     )
 
-    const text = await command.run(invocation(), {} as never)
+    const text = rendered(await command.run(invocation(), {} as never))
 
     // `runCommand` turns a throw into a line that names nothing. A named
     // absence beside the licence that WAS read is a better answer.
@@ -1027,5 +1199,488 @@ describe('profileCommand', () => {
 
     // And none of the operator-facing detail went out with it.
     expect(text).not.toContain('RingmasterTableAccess')
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * THE SELF VIEW.
+ *
+ * `/profile` with no target answers about the person who ran it, and the whole
+ * of what these cases are for is the FIELD THAT MUST NOT BE THERE. The admin
+ * view leads with the licence list because more than one licence on one Discord
+ * account is the ban-evasion signal and the most interesting thing this bot
+ * knows; showing that to the player tells a ban evader exactly how many of
+ * their alts the system has already joined up. Ban HISTORY — lifted and expired
+ * rows — is a moderation record about them rather than their own data.
+ *
+ * ASSERTED AGAINST THE RENDERED TEXT AND AGAINST THE INJECTED READS, and
+ * neither on its own would do. Rendered text is what a player actually sees, so
+ * it catches a licence that arrives by some route nobody predicted. The reads
+ * are the data-flow claim: a value that was never fetched cannot leak, and
+ * which functions were called is the only way to say that out loud.
+ * ------------------------------------------------------------------ */
+
+/** A ban that has been lifted. `isBanActive` is false for any `liftedAt`. */
+function lifted(over: Partial<Ban> = {}): Ban {
+  return ban({
+    liftedAt: NOW - 86_400_000,
+    liftedBy: OLDEST,
+    liftedByName: 'An Admin',
+    liftReason: 'appeal upheld',
+    ...over,
+  })
+}
+
+/**
+ * THE FIXTURE THE SEPARATION IS TESTED AGAINST: three licences, four bans, two
+ * of them lifted.
+ *
+ * WHY THE FOURTH BAN IS ON A LICENCE THE INDEX NO LONGER LISTS. `ringmaster-
+ * bans` is keyed on ONE licence and holds ONE row per licence, so three
+ * licences can carry at most three ban rows — a subject with four has a fourth
+ * licence somewhere, and `FORGOTTEN` is it: a licence of theirs the index row
+ * no longer carries. Neither view reads it, which is worth having in the
+ * fixture rather than out of it.
+ *
+ * `seen` RECORDS EVERY READ THE PATH UNDER TEST MADE, which is what turns "the
+ * self view does not show the licences" into "the self view never asked for
+ * them".
+ */
+function subject(seen: string[]): ProfileReads {
+  const rows = new Map<string, Ban>([
+    // The one the player is under right now, and the only one they may see.
+    [NEWEST, ban({ license: NEWEST, reason: 'aimbot', expiresAt: NOW + 86_400_000 })],
+
+    // Two lifted. Moderation history, and not theirs to read.
+    [MIDDLE, lifted({ license: MIDDLE, reason: 'wrongly banned for desync' })],
+    [OLDEST, lifted({ license: OLDEST, reason: 'evading on an alt' })],
+
+    // Expired, on the licence the index has forgotten.
+    [FORGOTTEN, ban({ license: FORGOTTEN, reason: 'chat abuse', expiresAt: NOW - 1 })],
+  ])
+
+  return reads({
+    licencesFor: (id) => {
+      seen.push(`licencesFor:${id}`)
+      // Most recent LAST, which is how the index stores them.
+      return Promise.resolve(ok([OLDEST, MIDDLE, NEWEST]))
+    },
+
+    currentLicenceFor: (id) => {
+      seen.push(`currentLicenceFor:${id}`)
+      return Promise.resolve(ok(NEWEST))
+    },
+
+    ban: (licence) => {
+      seen.push(`ban:${licence}`)
+      return Promise.resolve(ok(rows.get(licence) ?? null))
+    },
+
+    career: (licence) => {
+      seen.push(`career:${licence}`)
+      return Promise.resolve(ok(career()))
+    },
+
+    registry: (licence) => {
+      seen.push(`registry:${licence}`)
+      return Promise.resolve(ok(registry()))
+    },
+
+    matches: (licence, limit) => {
+      seen.push(`matches:${licence}|${String(limit)}`)
+      return Promise.resolve(ok([match(1), match(2)]))
+    },
+  })
+}
+
+describe('the self view: a player’s own record, and nothing about their licences', () => {
+  /**
+   * THE ONE THIS WHOLE CHANGE EXISTS FOR. Three licences, four bans, two
+   * lifted — and the reply the player gets carries none of the licences, no
+   * count of them, and neither lifted ban.
+   *
+   * AGAINST THE RENDERED TEXT rather than against which builder ran, because a
+   * case that asserts `selfEmbed` was called says nothing about what
+   * `selfEmbed` put in it. Every string below is a thing a reader sees in
+   * Discord.
+   */
+  it('shows none of the three licences, no count of them, and neither lifted ban', async () => {
+    const seen: string[] = []
+    const command = profileCommand(subject(seen), () => NOW)
+
+    const text = rendered(await command.run(invocation({ targetId: null }), cfg()))
+
+    // Not one of the licences, by value.
+    expect(text).not.toContain(OLDEST)
+    expect(text).not.toContain(MIDDLE)
+    expect(text).not.toContain(NEWEST)
+    expect(text).not.toContain(FORGOTTEN)
+
+    // Nor the count, which is the disclosure even without the values: "3
+    // licences" tells a ban evader how many of their alts have been joined up.
+    expect(text).not.toContain('3 licences')
+    expect(text).not.toContain('licence')
+
+    // Neither lifted ban, by reason or by state.
+    expect(text).not.toContain('wrongly banned for desync')
+    expect(text).not.toContain('evading on an alt')
+    expect(text).not.toContain('lifted')
+    expect(text).not.toContain('An Admin')
+
+    // Nor the expired one on the licence the index has forgotten.
+    expect(text).not.toContain('chat abuse')
+
+    // And what it DOES show: their own progression, and the ban they are under.
+    expect(text).toContain('Level 7')
+    expect(text).toContain('aimbot')
+  })
+
+  /**
+   * THE SAME FIXTURE, THE ADMIN VIEW, AND THE OPPOSITE ASSERTIONS. Without this
+   * the case above passes just as well against a build whose self view is empty
+   * and against a fixture that never had a licence in it.
+   */
+  it('is the same subject the admin view leads with the licence list for', async () => {
+    const seen: string[] = []
+    const command = profileCommand(subject(seen), () => NOW)
+
+    const text = rendered(await command.run(invocation({ targetId: DISCORD }), cfg()))
+
+    expect(text).toContain('3 licences')
+    expect(text).toContain(OLDEST)
+    expect(text).toContain(MIDDLE)
+    expect(text).toContain(NEWEST)
+    expect(text).toContain('wrongly banned for desync')
+    expect(text).toContain('evading on an alt')
+  })
+
+  /**
+   * THE DATA-FLOW CLAIM, AND IT IS A DIFFERENT CLAIM FROM THE ONE ABOVE. A
+   * build that fetched the licence list and then left it out of the rendering
+   * passes every assertion in the first case and is still one edit away from
+   * putting it back. This one says the value never existed.
+   *
+   * `SelfReads` MAKES IT A COMPILE ERROR TOO — it is `ProfileReads` without
+   * `licencesFor` or `registry` on it, so `gatherSelf` cannot name either. This
+   * case is the runtime backstop, and it is what fails if that is widened back.
+   */
+  it('issues no read at all against the reverse identifier index', async () => {
+    const seen: string[] = []
+    const command = profileCommand(subject(seen), () => NOW)
+
+    await command.run(invocation({ targetId: null }), cfg())
+
+    expect(seen.filter((one) => one.startsWith('licencesFor:'))).toEqual([])
+
+    // Nor the registry, which carries the name history and the identifier
+    // sightings — the same reuse signal arriving by a different road.
+    expect(seen.filter((one) => one.startsWith('registry:'))).toEqual([])
+
+    // What it DID read: one resolution against the CALLER, and three reads
+    // keyed on the one licence that came back.
+    expect(seen).toEqual([
+      `currentLicenceFor:${CALLER}`,
+      `ban:${NEWEST}`,
+      `career:${NEWEST}`,
+      `matches:${NEWEST}|25`,
+    ])
+  })
+
+  it('reads the index only for the admin view, over the same injected seam', async () => {
+    const seen: string[] = []
+    const command = profileCommand(subject(seen), () => NOW)
+
+    await command.run(invocation({ targetId: DISCORD }), cfg())
+
+    expect(seen).toContain(`licencesFor:${DISCORD}`)
+    expect(seen.filter((one) => one.startsWith('currentLicenceFor:'))).toEqual([])
+  })
+})
+
+describe('gatherSelf', () => {
+  it('keeps an ACTIVE ban and discards the rest AT THE READ, not at the rendering', async () => {
+    const active = await gatherSelf(
+      reads({ ban: () => Promise.resolve(ok(ban({ expiresAt: NOW + 1000 }))) }),
+      DISCORD,
+      NOW,
+    )
+
+    expect(active.ban).toEqual({ reason: 'cheating', expiresAt: NOW + 1000 })
+
+    // A lifted row and an expired row both become null HERE, so `SelfData` has
+    // no shape that could carry either into `selfEmbed`.
+    for (const row of [lifted(), ban({ expiresAt: NOW - 1 })]) {
+      const got = await gatherSelf(reads({ ban: () => Promise.resolve(ok(row)) }), DISCORD, NOW)
+      expect(got.ban).toBeNull()
+    }
+  })
+
+  /**
+   * A PROJECTION AND NOT THE ROW. `Ban` carries `license` — the licence itself
+   * — plus `by`, `byName` and the three lift fields. `SelfBan` carries two.
+   * Handing the builder the row and trusting it to render two fields off it is
+   * the version this is not.
+   */
+  it('hands the builder two fields and not a ban row', async () => {
+    const got = await gatherSelf(
+      reads({ ban: () => Promise.resolve(ok(ban({ license: NEWEST, expiresAt: null }))) }),
+      DISCORD,
+      NOW,
+    )
+
+    expect(Object.keys(got.ban ?? {}).sort()).toEqual(['expiresAt', 'reason'])
+  })
+
+  it('treats a Discord account with no player record as an answer, not a failure', async () => {
+    const got = await gatherSelf(
+      reads({ currentLicenceFor: () => Promise.resolve(ok(null)) }),
+      DISCORD,
+      NOW,
+    )
+
+    expect(got.known).toBe(false)
+    expect(got.unreached).toEqual([])
+    expect(rendered({ embeds: [selfEmbed(got)] })).toContain('No player record')
+  })
+
+  /**
+   * AND A LOOKUP THAT FAILED IS THE OPPOSITE SENTENCE. "You have never played
+   * here", said with confidence to somebody who has played for a year, is the
+   * one answer worse than saying nothing.
+   */
+  it('reports a failed lookup as itself rather than as no record', async () => {
+    const got = await gatherSelf(
+      reads({ currentLicenceFor: () => Promise.resolve(failed('denied')) }),
+      DISCORD,
+      NOW,
+    )
+
+    expect(got.unreached).toEqual([{ source: 'lookup', why: 'denied' }])
+
+    const text = rendered({ embeds: [selfEmbed(got)] })
+
+    expect(text).not.toContain('No player record')
+    expect(text).toContain('lookup: denied')
+
+    // `lookup` AND NOT `licences`: the admin view says `licences: denied` and,
+    // a line above it, names the Discord-to-licence index outright. Saying
+    // either here would disclose the very thing the self view is built not to.
+    expect(text).not.toContain('licence')
+    expect(text).not.toContain('index')
+  })
+
+  it('names a source it could not read and keeps the SDK message out of the reply', async () => {
+    const got = await gatherSelf(
+      reads({
+        career: () => Promise.resolve(failed('timeout')),
+        matches: () => Promise.resolve(failed('no-such-table')),
+      }),
+      DISCORD,
+      NOW,
+    )
+
+    const text = rendered({ embeds: [selfEmbed(got)] })
+
+    expect(text).toContain('career: timeout')
+    expect(text).toContain('matches: no-such-table')
+    expect(text).not.toContain('RingmasterTableAccess')
+
+    // The operator-facing text goes to the journal, where table names belong.
+    expect([...stdout, ...stderr].join('')).toContain('RingmasterTableAccess')
+  })
+
+  it('says match history is unavailable when this build has no reader for it', async () => {
+    const got = await gatherSelf(reads(), DISCORD, NOW)
+
+    expect(got.unreached).toEqual([{ source: 'matches', why: 'unavailable' }])
+  })
+})
+
+describe('selfEmbed', () => {
+  function selfData(over: Partial<SelfData> = {}): SelfData {
+    return {
+      discordId: DISCORD,
+      known: true,
+      ban: null,
+      career: career(),
+      matches: [],
+      unreached: [],
+      ...over,
+    }
+  }
+
+  function self(over: Partial<SelfData> = {}): string {
+    return rendered({ embeds: [selfEmbed(selfData(over))] })
+  }
+
+  /**
+   * THE BAN GOES FIRST, WHICH IS BOTH THE RIGHT ORDER AND THE SAFE ONE:
+   * `trimEmbed` drops fields from the END, so the field a player must not lose
+   * is the one field that cannot be lost.
+   */
+  it('leads with an active ban, saying the reason and when it runs out', () => {
+    const embed = selfEmbed(
+      selfData({ ban: { reason: 'aimbot', expiresAt: Date.parse('2026-09-05T00:00:00.000Z') } }),
+    )
+
+    expect(embed.fields.at(0)?.name).toBe('Ban')
+    expect(embed.fields.at(0)?.value).toContain('aimbot')
+    expect(embed.fields.at(0)?.value).toContain('Until 2026-09-05T00:00:00.000Z')
+  })
+
+  it('says permanent rather than an expiry there is not', () => {
+    expect(self({ ban: { reason: 'aimbot', expiresAt: null } })).toContain('Permanent')
+  })
+
+  /**
+   * NO FIELD AT ALL RATHER THAN A SENTENCE SAYING THERE IS NO BAN. The admin
+   * view says `No ban on any licence read.` because an admin asked that
+   * question; a player did not, and inventing copy to answer a question nobody
+   * put is how a reply grows text the owner never wrote.
+   */
+  it('shows no ban section at all when there is no active ban', () => {
+    expect(selfEmbed(selfData()).fields.map((one) => one.name)).not.toContain('Ban')
+  })
+
+  it('shows the progression and the match record a player already sees in game', () => {
+    const text = self({ matches: [match(1), match(2)] })
+
+    expect(text).toContain('Level 7 · 4500 XP · balance 250')
+    expect(text).toContain('12 matches · 2 wins · 5 top 10s')
+    expect(text).toContain('#2')
+  })
+
+  it('does not let a newline in a ban reason forge a line', () => {
+    expect(self({ ban: { reason: 'aimbot\nPermanent.', expiresAt: NOW + 1000 } })).toContain(
+      'aimbot Permanent.',
+    )
+  })
+
+  it('offers no fields keyed on a licence for an account that has never played', () => {
+    const embed = selfEmbed(selfData({ known: false, career: null }))
+
+    expect(embed.fields).toEqual([])
+    expect(embed.description).toContain('No player record')
+  })
+
+  /**
+   * THE SAME BUDGET THE ADMIN VIEW IS HELD TO, because it is the same set of
+   * measuring and cutting helpers — those are about Discord's limits and are
+   * exactly what the two builders are meant to share.
+   */
+  it('keeps the whole reply inside the limits Discord actually counts', () => {
+    const embed = selfEmbed(
+      selfData({
+        ban: { reason: ASTRAL.repeat(4000), expiresAt: NOW + 1000 },
+        matches: Array.from({ length: 60 }, (unused, index) => match(index)),
+        unreached: [{ source: 'lookup', why: 'timeout' }],
+      }),
+    )
+
+    expect(embedUnits(embed)).toBeLessThanOrEqual(6000)
+    expect(embed.fields.length).toBeLessThanOrEqual(25)
+
+    for (const value of values(embed)) expect(value.length).toBeLessThanOrEqual(1024)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * THE GATE.
+ *
+ * `/profile @someone` NEEDS THE ROLE AND `/profile` DOES NOT, which is a
+ * question about the INVOCATION rather than about the command.
+ * `BotCommand.adminOnly` is a `boolean` property of the command, so
+ * `refusalFor` never sees an invocation and cannot answer it; `profileAdminOnly`
+ * states the CONDITION and command.ts is still what enforces it.
+ *
+ * ASSERTED THROUGH `refusalFor` AND NOT AGAINST A RE-IMPLEMENTATION. The four
+ * refusal reasons — no guild, unset admin role, no member on the payload, no
+ * role — are the framework's, and the point of stating only the condition here
+ * is that this command does not get its own copy of them to drift from.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The gate as it will be composed once command.ts can take a predicate: resolve
+ * `adminOnly` against the invocation, then hand it to `refusalFor` unchanged.
+ *
+ * TWO LINES, AND THEY ARE THE TWO LINES `refusalFor` GAINS — see the comment on
+ * `profileCommand`. That is what makes this a claim about the real gate rather
+ * than a mock of one: every refusal reason below the resolution is the
+ * framework's own, untouched.
+ */
+function gate(command: BotCommand, one: Invocation, config: Config = cfg()): Refusal | null {
+  return refusalFor({ ...command, adminOnly: profileAdminOnly(one) }, one, config)
+}
+
+describe('/profile is admin-only only when a target is given', () => {
+  const command = profileCommand(reads(), () => NOW)
+
+  const admin = { roleIds: [ADMIN_ROLE] }
+  const member = { roleIds: [MEMBER_ROLE] }
+
+  it('refuses a non-admin who named somebody else', () => {
+    expect(gate(command, invocation({ ...member, targetId: DISCORD }))).toBe('not-admin')
+  })
+
+  it('serves a non-admin who named nobody', () => {
+    expect(gate(command, invocation({ ...member, targetId: null }))).toBeNull()
+  })
+
+  it('serves an admin either way', () => {
+    expect(gate(command, invocation({ ...admin, targetId: DISCORD }))).toBeNull()
+    expect(gate(command, invocation({ ...admin, targetId: null }))).toBeNull()
+  })
+
+  /**
+   * THE GATE IS NOT WEAKENED FOR THE TARGETED CASE, WHICH IS THE HALF THAT
+   * MATTERS. Every closed direction `refusalFor` has still applies the moment a
+   * target is given: an unset DISCORD_ADMIN_ROLE_ID refuses everybody, and a
+   * payload that arrived with no member on it refuses. An unset variable must
+   * never be the thing that opens a door.
+   */
+  it('keeps every closed direction the framework has, once a target is given', () => {
+    const targeted = invocation({ ...admin, targetId: DISCORD })
+
+    expect(gate(command, targeted, cfg({ adminRoleId: null }))).toBe('admin-role-unset')
+    expect(gate(command, invocation({ roleIds: null, targetId: DISCORD }))).toBe('roles-unreadable')
+  })
+
+  /**
+   * AND `not-in-guild` STILL REFUSES THE SELF VIEW, because the roles on a
+   * payload that arrived without a guild are meaningless too. That check sits
+   * ahead of `adminOnly` in `refusalFor` and stays ahead of it.
+   */
+  it('still refuses a payload that carried no guild, target or not', () => {
+    expect(gate(command, invocation({ ...member, guildId: null, targetId: null }))).toBe(
+      'not-in-guild',
+    )
+    expect(gate(command, invocation({ ...admin, guildId: null, targetId: DISCORD }))).toBe(
+      'not-in-guild',
+    )
+  })
+
+  it('is ephemeral either way, which is a different guarantee from the gate', () => {
+    for (const over of [{ targetId: null }, { targetId: DISCORD }, admin, member]) {
+      expect(command.onlyInvoker(invocation(over))).toBe(true)
+    }
+  })
+
+  /**
+   * AN ADMIN WITH NO TARGET GETS THE SELF VIEW, NOT THE ADMIN VIEW. "No target
+   * means me" is one rule for everybody; a second reading of it for admins
+   * would be a branch on the caller's role inside the half of the file that is
+   * meant not to know about roles. It means an admin cannot see their own
+   * licence list this way — the decision, not an oversight. They tag themselves
+   * if they want it.
+   */
+  it('gives an admin who named nobody the self view and not the admin view', async () => {
+    const seen: string[] = []
+    const one = profileCommand(subject(seen), () => NOW)
+
+    const text = rendered(await one.run(invocation({ ...admin, targetId: null }), cfg()))
+
+    expect(text).not.toContain(NEWEST)
+    expect(text).not.toContain('licence')
+    expect(seen.filter((entry) => entry.startsWith('licencesFor:'))).toEqual([])
   })
 })

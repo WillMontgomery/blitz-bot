@@ -64,6 +64,7 @@ function cfg(over: Partial<Config> = {}): Config {
     logChannelId: null,
     statusChannelId: null,
     docsChannelId: null,
+    maintenanceChannelId: null,
     exemptChannelIds: [],
     exemptAdmins: true,
     dryRun: false,
@@ -141,8 +142,14 @@ function responder(): Responder & {
       deferred.push(onlyInvoker)
       return Promise.resolve()
     },
-    edit: (content) => {
-      edited.push(content)
+    edit: (reply) => {
+      // `Responder.edit` takes a string OR embeds since /profile stopped
+      // flattening its own. Neither of these two commands has anything but a
+      // sentence to say, so an embed arriving here is a case worth failing on
+      // rather than one to render.
+      if (typeof reply !== 'string') throw new Error('a sticky command answered with an embed')
+
+      edited.push(reply)
       return Promise.resolve()
     },
     reply: (content, onlyInvoker) => {

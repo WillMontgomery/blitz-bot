@@ -47,6 +47,7 @@ const schemaVariables = [
   'BLITZ_LOG_CHANNEL_ID',
   'BLITZ_STATUS_CHANNEL_ID',
   'BLITZ_DOCS_CHANNEL_ID',
+  'BLITZ_MAINTENANCE_CHANNEL_ID',
   'BLITZ_EXEMPT_CHANNEL_IDS',
   'BLITZ_EXEMPT_ADMINS',
   'BLITZ_DRY_RUN',
@@ -311,6 +312,63 @@ describe('BLITZ_DOCS_CHANNEL_ID', () => {
    */
   it('is in the template operators copy', () => {
     expect(repoFile('.env.example')).toContain('BLITZ_DOCS_CHANNEL_ID=')
+  })
+})
+
+/**
+ * The channel the outage is announced in.
+ *
+ * OPTIONAL, AND UNSET DOES MORE HERE THAN IN THE OTHER THREE. With no channel
+ * there is nowhere to announce anything, so the watcher is not installed at all
+ * and `ringmaster-maintenance` is never read — the bot makes no AWS call it
+ * would otherwise make four times a minute for the life of the process. That is
+ * why the null case is worth its own assertion rather than being read off the
+ * shape of the other ids.
+ */
+describe('BLITZ_MAINTENANCE_CHANNEL_ID', () => {
+  it('is null when it is not set, so the bot boots announcing nothing', () => {
+    const config = loadConfig({ DISCORD_BOT_TOKEN: 'token', DISCORD_GUILD_ID: 'guild' })
+
+    expect(config.maintenanceChannelId).toBeNull()
+  })
+
+  /**
+   * THE FOUR OPTIONAL CHANNEL IDS ARE FOUR DIFFERENT FIELDS, and this is the
+   * only one an ordinary member reads. The other three carry the moderation
+   * record, the bot's own faults and a document the bot edits; an outage notice
+   * landing in any of them is an announcement posted where nobody is looking and
+   * a channel of evidence with a player-facing message in it.
+   */
+  it('is carried through, and is none of the other three channels', () => {
+    const config = loadConfig({
+      DISCORD_BOT_TOKEN: 'token',
+      DISCORD_GUILD_ID: 'guild',
+      BLITZ_LOG_CHANNEL_ID: '111',
+      BLITZ_STATUS_CHANNEL_ID: '222',
+      BLITZ_DOCS_CHANNEL_ID: '333',
+      BLITZ_MAINTENANCE_CHANNEL_ID: '444',
+    })
+
+    expect(config.logChannelId).toBe('111')
+    expect(config.statusChannelId).toBe('222')
+    expect(config.docsChannelId).toBe('333')
+    expect(config.maintenanceChannelId).toBe('444')
+  })
+
+  /** Blank is absent, like every other optional id: a copied-but-unedited
+   * `.env` must turn the watcher off rather than name a channel called "". */
+  it('reads a blank line as unset', () => {
+    const config = loadConfig({
+      DISCORD_BOT_TOKEN: 'token',
+      DISCORD_GUILD_ID: 'guild',
+      BLITZ_MAINTENANCE_CHANNEL_ID: '   ',
+    })
+
+    expect(config.maintenanceChannelId).toBeNull()
+  })
+
+  it('is in the template operators copy', () => {
+    expect(repoFile('.env.example')).toContain('BLITZ_MAINTENANCE_CHANNEL_ID=')
   })
 })
 

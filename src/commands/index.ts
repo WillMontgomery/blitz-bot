@@ -2,20 +2,25 @@ import {
   ApplicationCommandOptionType,
   Events,
   MessageFlags,
+  type APIEmbed,
   type ChatInputApplicationCommandData,
   type Client,
 } from 'discord.js'
 
 import type { Config } from '../config.ts'
+import { createDdb } from '../ddb.ts'
 import { log } from '../log.ts'
 import {
   runCommand,
   TARGET_OPTION,
   type BotCommand,
+  type CommandReply,
   type Invocation,
   type Responder,
 } from './command.ts'
 import { help } from './help.ts'
+import { lazyReadsFrom, profileCommand } from './profile.ts'
+import { sticky, STICKY_TEXT_OPTION, unsticky } from './sticky.ts'
 
 /**
  * The command list, and the half of the slash-command foundation that touches
@@ -24,8 +29,21 @@ import { help } from './help.ts'
  * ADDING A COMMAND IS A NEW FILE AND ONE LINE. Import it, put it in the array
  * below, and registration, the gate, the defer and the reply all follow from
  * the record it exports. There is no second place to remember.
+ *
+ * `/profile` IS BUILT LAZILY AND THAT IS NOT A STYLE CHOICE. This array is
+ * module-level, so `profileCommand(readsFrom(createDdb()))` here would construct
+ * a DynamoDB client while this module is being IMPORTED — including by
+ * commands.test.ts, which runs offline and has no business holding an SDK
+ * client. `lazyReadsFrom` defers that to the first `/profile` and then keeps the
+ * one client for the life of the process, which is what `createDdb`'s own
+ * comment asks for. See ./profile.ts.
  */
-export const COMMANDS: readonly BotCommand[] = [help]
+export const COMMANDS: readonly BotCommand[] = [
+  help,
+  profileCommand(lazyReadsFrom(() => createDdb())),
+  sticky,
+  unsticky,
+]
 
 /**
  * What Discord is told about one command.
@@ -127,16 +145,30 @@ export function roleIdsOf(member: InteractionMember | null): readonly string[] |
   return 'cache' in roles ? [...roles.cache.keys()] : roles
 }
 
-/** One option as it arrived, reduced to what the target is read out of. */
+/** One option as it arrived, reduced to what the two options are read out of. */
 export interface SuppliedOption {
   readonly type: number
   readonly user?: { readonly id: string } | null
+
+  /**
+   * The option's own value, which is what a string option carries.
+   *
+   * WIDER THAN `string` BECAUSE DISCORD'S IS. discord.js types this
+   * `string | number | boolean` across every option kind, so narrowing it here
+   * would make the real interaction stop being assignable to this record — and
+   * `textOf` has to check the type anyway.
+   */
+  readonly value?: string | number | boolean | null
 }
 
 /** A live chat-input interaction, as far as building an `Invocation` reads it. */
 export interface CommandSource {
   readonly commandName: string
   readonly guildId: string | null
+
+  /** discord.js types this `Snowflake | null`; `Invocation` carries it as-is. */
+  readonly channelId: string | null
+
   readonly user: { readonly id: string }
   readonly member: InteractionMember | null
   readonly options: { get: (name: string) => SuppliedOption | null }
@@ -163,6 +195,29 @@ function targetOf(options: CommandSource['options']): string | null {
 }
 
 /**
+ * The `text` option a command supplied, or null.
+ *
+ * THE SAME TWO CHECKS `targetOf` MAKES, AND FOR THE SAME REASONS. `get` rather
+ * than `getString`, because discord.js's typed getters THROW when an option by
+ * that name exists and is not the kind asked for — and that throw would happen
+ * while assembling `runCommand`'s arguments, outside the promise the listener
+ * catches, so it would escape into discord.js's own emit rather than becoming a
+ * reply. And the type is compared rather than trusted: a USER option named
+ * `text` is not this command's text.
+ *
+ * NAMED BY `STICKY_TEXT_OPTION` SO THE TWO HALVES CANNOT DRIFT. ./sticky.ts
+ * declares the option by that constant and this asks Discord for it by the same
+ * one; a rename in only one place is not a compile error, it is a `/sticky` that
+ * reports an empty message however much text was typed into it.
+ */
+function textOf(options: CommandSource['options']): string | null {
+  const option = options.get(STICKY_TEXT_OPTION)
+
+  if (option === null || option.type !== ApplicationCommandOptionType.String) return null
+  return typeof option.value === 'string' ? option.value : null
+}
+
+/**
  * Reduce a live interaction to the record the gate and the handlers read.
  *
  * STRUCTURAL RATHER THAN discord.js's `ChatInputCommandInteraction`, for the
@@ -174,20 +229,39 @@ export function invocationOf(interaction: CommandSource): Invocation {
   return {
     commandName: interaction.commandName,
     guildId: interaction.guildId,
+    channelId: interaction.channelId,
     userId: interaction.user.id,
     roleIds: roleIdsOf(interaction.member),
 
-    // Null for every command that does not declare a user option by that name,
-    // so this costs nothing to ask on behalf of a command that never uses it.
+    // Null for every command that does not declare an option by that name, so
+    // both cost nothing to ask on behalf of a command that never uses them.
     targetId: targetOf(interaction.options),
+    text: textOf(interaction.options),
   }
 }
 
 /** A live interaction, as far as answering it goes. */
 export interface ReplyTarget {
   deferReply: (options: { flags?: MessageFlags.Ephemeral }) => Promise<unknown>
-  editReply: (options: { content: string }) => Promise<unknown>
+  editReply: (options: { content?: string; embeds?: readonly APIEmbed[] }) => Promise<unknown>
   reply: (options: { content: string; flags?: MessageFlags.Ephemeral }) => Promise<unknown>
+}
+
+/**
+ * One `CommandReply` as the payload discord.js takes.
+ *
+ * THE WHOLE OF WHAT WIDENING THE SEAM COSTS THE LIVE HALF, and it is one
+ * function. A string becomes `content`, embeds become `embeds`, and this is the
+ * one place in the bot that knows the difference — which is the same argument
+ * that keeps `MessageFlags.Ephemeral` here rather than in every command file.
+ *
+ * `[...reply.embeds]` RATHER THAN THE ARRAY ITSELF, so nothing this bot hands
+ * discord.js is a live view of a value a command still holds. One element today
+ * and ten at Discord's limit; the alternative is a shared array somebody mutates
+ * after the reply has been sent.
+ */
+function payload(reply: CommandReply): { content?: string; embeds?: APIEmbed[] } {
+  return typeof reply === 'string' ? { content: reply } : { embeds: [...reply.embeds] }
 }
 
 /**
@@ -222,8 +296,8 @@ export function responderFor(interaction: ReplyTarget): Responder {
       await interaction.deferReply(visibility(onlyInvoker))
     },
 
-    edit: async (content) => {
-      await interaction.editReply({ content })
+    edit: async (reply) => {
+      await interaction.editReply(payload(reply))
     },
 
     reply: async (content, onlyInvoker) => {

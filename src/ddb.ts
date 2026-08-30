@@ -480,6 +480,68 @@ export interface GameProfile {
 
 const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
 
+/**
+ * The same, but an absent field stays absent.
+ *
+ * ZERO IS A RESULT AND `num` CANNOT SAY OTHERWISE, which is fine for the career
+ * totals — a player with no `kills` attribute really has killed nobody — and is
+ * wrong for one match. `#7 · 0 kills` is a sentence about a match that was
+ * played; a `match#…` row written by a build of the game that did not record
+ * kills would say exactly the same thing and be inventing it. Null lets the
+ * renderer drop that part of the line instead.
+ */
+const numOrNull = (v: unknown): number | null =>
+  typeof v === 'number' && Number.isFinite(v) ? v : null
+
+/**
+ * One `match#…` row, projected to what a history line is made of.
+ *
+ * NOT A TRANSCRIPTION OF `GameMatch` IN lib/gameProfile.ts, AND THAT IS WHY THE
+ * FIELDS ARE NAMED DIFFERENTLY. The console's page renders twelve fields off one
+ * of these rows — the mode, how many were in the match, XP, volts, whether it
+ * was won; a Discord embed shows one LINE per match beside four other fields, so
+ * what it can carry is when, where they finished and how many they killed.
+ * Transcribing the other eight would be eight more chances to drift for a repo
+ * that never reads them.
+ *
+ * EVERY FIELD BUT THE SORT KEY IS NULLABLE. These rows come out of br_ddb, in
+ * Lua, in another repo, and nothing in THIS repo has ever read one — so a field
+ * arriving missing or renamed should cost that field and not the line. `sk` is
+ * the one thing a row certainly has, because the query selects on it.
+ */
+export interface GameMatch {
+  /** The row's sort key, `match#<endedAt>#<matchId>`. */
+  sk: string
+  /** When it was played, ms. From `endedAt`, which is also the key's first part. */
+  at: number | null
+  /** Where they finished. */
+  placement: number | null
+  kills: number | null
+}
+
+/**
+ * The sort-key prefix the match rows share, and the whole reason this is a Query
+ * rather than a Scan. Same literal as `MATCH_PREFIX` in the console's
+ * lib/gameProfile.ts.
+ */
+const MATCH_PREFIX = 'match#'
+
+/**
+ * How many match rows one Query may ask for, whatever the caller says.
+ *
+ * A CEILING ON A ROW COUNT SOMEBODY ELSE PICKS. The limit is a parameter because
+ * the caller knows how many it can render — `/profile` asks for 25 — and a
+ * parameter with no ceiling is one bad call away from paging a player with two
+ * thousand matches into a two-second deadline. Fifty is the console's own
+ * default for the same read (lib/gameProfile.ts) and is already more than twice
+ * what anything here displays.
+ *
+ * IT IS A `Limit`, WHICH IS ROWS READ AND NOT ROWS MATCHED. DynamoDB stops at
+ * that many items and answers; there is no pagination here and none is wanted,
+ * because "the most recent N" is the whole question.
+ */
+const MATCH_LIMIT_CAP = 50
+
 /** From lib/maintenance.ts. */
 export type MaintenanceState = 'scheduled' | 'draining' | 'deploying' | 'complete' | 'cancelled'
 
@@ -685,6 +747,18 @@ export interface Ddb {
   gamePlayers: {
     /** The game's career row. `null` means never played, not zeroed. */
     profile(license: string): Promise<DdbResult<GameProfile | null>>
+
+    /**
+     * The player's most recent matches, newest first, at most `MATCH_LIMIT_CAP`.
+     *
+     * AN EMPTY LIST IS AN ANSWER AND NOT AN ABSENCE, and the caller has to keep
+     * the two apart: `{ ok: true, value: [] }` means the query ran and this
+     * player has no per-match rows — they have never played, or every match they
+     * played predates the game recording them individually and is only in the
+     * career totals. A read that FAILED is `{ ok: false }` and must never be
+     * shown as "no matches". The console's `gameMatchesFor` draws the same line.
+     */
+    matches(license: string, limit?: number): Promise<DdbResult<GameMatch[]>>
   }
 
   maintenance: {
@@ -866,6 +940,65 @@ export function createDdb(options: DdbOptions = {}): Ddb {
             balance: num(row.balance),
             lastMatchAt: typeof row.lastMatchAt === 'number' ? row.lastMatchAt : null,
           }
+        })
+      },
+
+      /**
+       * The most recent `match#…` rows off the same partition as the profile.
+       *
+       * A PLAIN QUERY, NO INDEX AND NO SCAN, and the key design is what makes
+       * that possible. The game hangs one row per match off the player's own
+       * partition with a sort key of `match#<endedAt>#<matchId>`, so walking the
+       * sort key BACKWARDS with a `Limit` already is "the most recent N" — the
+       * zero-padded timestamp is what makes the lexicographic order the
+       * chronological one. `begins_with` is what keeps `profile` and `purchases`
+       * out of the answer rather than fetching them and throwing them away.
+       * Copied in shape from `gameMatchesFor` in the console's
+       * lib/gameProfile.ts, which is the only code that has ever read these rows.
+       *
+       * IT IS THE ONLY QUERY THIS MODULE MAKES OUTSIDE `ringmaster-audit`, AND
+       * IT NEEDS AN ACTION THE POLICY NOTE DOES NOT LIST. The table in
+       * docs/aws-notes.md grants `dynamodb:Query` on `ringmaster-audit` and
+       * `dynamodb:GetItem` on `br-players`; this call is a Query on `br-players`
+       * and belongs in that table when blitz-bot#4 writes the bot's own policy.
+       * Until then a role without it answers `denied`, which the caller shows as
+       * a named absence rather than as a broken command — and that same note
+       * already records `br-players` as denied outright to the role the bot
+       * shares today, so `denied` is the expected answer either way.
+       *
+       * PROJECTED FIELD BY FIELD RATHER THAN CAST, exactly as `profile` above is
+       * and for the same reason: another repo, another box, another language
+       * writes these. See `GameMatch`.
+       */
+      matches(license, limit = MATCH_LIMIT_CAP) {
+        return call('query', tables.gamePlayers, async (o) => {
+          const res = await doc.query(
+            {
+              TableName: tables.gamePlayers,
+              KeyConditionExpression: 'pk = :pk AND begins_with(sk, :sk)',
+              ExpressionAttributeValues: { ':pk': license, ':sk': MATCH_PREFIX },
+
+              // Backwards along the sort key, which is how "the latest" comes
+              // out of DynamoDB without sorting client-side.
+              ScanIndexForward: false,
+
+              // Clamped rather than trusted: the caller decides how many it can
+              // render, this decides how many the bot will ever ask for. A
+              // caller asking for none gets one row rather than DynamoDB's own
+              // reading of `Limit: 0`.
+              Limit: Math.max(1, Math.min(Math.floor(limit), MATCH_LIMIT_CAP)),
+            },
+            o,
+          )
+
+          const rows = (res.Items ?? []) as Record<string, unknown>[]
+
+          return rows.map((row) => ({
+            sk: typeof row.sk === 'string' ? row.sk : '',
+            at: numOrNull(row.endedAt),
+            placement: numOrNull(row.placement),
+            kills: numOrNull(row.kills),
+          }))
         })
       },
     },
