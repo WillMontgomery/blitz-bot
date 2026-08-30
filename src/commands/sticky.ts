@@ -70,7 +70,7 @@ export interface StickyFields {
  * option and will not accept an empty one. They are deliberately plain and they
  * are the two strings to hand back when he wants his own.
  */
-const COPY = {
+export const COPY = {
   /** Discord allows 1-100 characters here. */
   stickyDescription: 'Keep a message at the bottom of this channel',
   unstickyDescription: 'Stop keeping a message at the bottom of this channel',
@@ -78,14 +78,14 @@ const COPY = {
   /** Same limit, on the option. */
   textOption: 'What the message says',
 
-  set: 'PLACEHOLDER: no wording supplied yet for a sticky that is now up.',
-  replaced: 'PLACEHOLDER: no wording supplied yet for a sticky that replaced another.',
-  cleared: 'PLACEHOLDER: no wording supplied yet for a sticky that was taken down.',
-  nothingToClear: 'PLACEHOLDER: no wording supplied yet for a channel that had no sticky.',
+  set: "Sticky note set. To turn it off, use `/unsticky`",
+  replaced: "Sticky note set. To turn it off, use `/unsticky`",
+  cleared: "Sticky turned off.",
+  nothingToClear: "There's nothing to unstick in this channel.",
   empty: 'PLACEHOLDER: no wording supplied yet for a sticky with no text in it.',
   tooLong: `PLACEHOLDER: no wording supplied yet for a sticky longer than ${STICKY_TEXT_CAP} characters.`,
-  noChannel: 'PLACEHOLDER: no wording supplied yet for a command that could not tell which channel it was run in.',
-  unavailable: 'PLACEHOLDER: no wording supplied yet for a sticky engine that is not installed.',
+  noChannel: "Something went wrong. Try again.",
+  unavailable: "Something went wrong. Try again.",
 }
 
 /**

@@ -455,7 +455,7 @@ const USERNAME = 'your_username'
  */
 const FOREIGN_INVITE = capture(
   clientSource,
-  /result\.foreign\.length > 0\) return removal\('([^']+)'/,
+  /result\.foreign\.length > 0\) return removal\(fromScan\('([^']+)'/,
   'the reason a confirmed-foreign removal carries in src/client.ts',
 )
 

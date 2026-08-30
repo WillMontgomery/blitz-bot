@@ -8,7 +8,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { setSink } from './log.ts'
 import {
   installStickies,
-  REPOST_AFTER_MESSAGES,
   REPOST_COOLDOWN_MS,
   setStickies,
   stickies,
@@ -30,9 +29,18 @@ import {
  * reposts is easy; a sticky that reposts twice per user message would pass any
  * test that only asked "is it last again" and would empty the channel's send
  * bucket the first time an outage got people talking. So the assertions below
- * are mostly counts: how many API calls did fifty messages cost, how many
- * reposts did a burst produce, and — the one that is easy to leave out — does a
+ * are mostly counts: how many API calls did a burst of twenty cost, how many
+ * reposts did it produce, and — the one that is easy to leave out — does a
  * burst that STOPS still bring the sticky back.
+ *
+ * AND THE OTHER DIRECTION, WHICH IS THE ONE THAT REACHED THE LIVE SERVER. Every
+ * count above is also satisfied by a sticky that comes back too rarely, and by
+ * one that never comes back at all — a throttle is only interesting next to the
+ * thing it is throttling. So the cases come in pairs: one message brings the
+ * sticky back, and silence does not; a burst costs one repost, and a message
+ * inside a running window is not lost by it. The bug the owner found was a
+ * sticky set, one message posted, and nothing after it, which is the smallest
+ * pair there is and is the first test here.
  *
  * NOTHING HERE TOUCHES DISCORD OR A REAL CLOCK. The engine is handed two
  * functions for the channel and two for the file, so a delete that is refused,
@@ -263,17 +271,67 @@ describe('the sticky throttle', () => {
   })
 
   /**
-   * THE FIRST HALF OF THE THROTTLE. Four messages is the deepest the sticky is
-   * ever allowed to sit in a channel that goes quiet, and it sits there
-   * indefinitely: nothing is scheduled, nothing is retried, and the channel
-   * costs the bot nothing at all until somebody says a fifth thing.
+   * THE BUG THE OWNER FOUND ON THE LIVE SERVER, AS THE SMALLEST TEST THAT SHOWS
+   * IT. He set a sticky, one person said one thing, and the sticky never came
+   * back — because the repost used to be gated on a message COUNT as well as
+   * the cooldown, and one is not five. One message is drift, and undoing drift
+   * is the whole of what this feature is.
    */
-  it('does nothing at all until the message count is reached', async () => {
+  it('brings the sticky back for a single message, with nothing else said', async () => {
+    const channels = fakeChannels()
+    const engine = stickyEngine(channels, fakeStore())
+
+    await engine.set(CHANNEL, 'the server is down')
+
+    // One person, one message, inside the cooldown — which is what `/sticky`
+    // and then somebody replying to it actually looks like.
+    chatter(engine, 1)
+
+    // And then nothing more is said. The trailing repost has to carry it.
+    await tick(REPOST_COOLDOWN_MS)
+
+    expect(channels.calls).toEqual([
+      { kind: 'post', channelId: CHANNEL, what: 'the server is down' },
+      { kind: 'remove', channelId: CHANNEL, what: 'm1' },
+      { kind: 'post', channelId: CHANNEL, what: 'the server is down' },
+    ])
+  })
+
+  /**
+   * THE CHANNEL THE FEATURE IS FOR, AT THE TRAFFIC IT ACTUALLY SEES. An admin
+   * channel during an outage is four messages an hour, not four a minute, and
+   * that is precisely where "we know the server is down" has to stay last. A
+   * rule that waited for a fifth message would leave the notice under all four
+   * for the whole hour; each of them earns a repost, because each of them
+   * pushed the notice down.
+   */
+  it('keeps up with a channel that says one thing an hour', async () => {
     const channels = fakeChannels()
     const engine = stickyEngine(channels, fakeStore())
 
     await engine.set(CHANNEL, 'down')
-    chatter(engine, REPOST_AFTER_MESSAGES - 1)
+
+    for (let hour = 0; hour < 4; hour += 1) {
+      chatter(engine, 1)
+      await tick(60 * 60 * 1000)
+    }
+
+    // The one from the set, and one for each of the four messages.
+    expect(channels.posts()).toHaveLength(5)
+  })
+
+  /**
+   * AND A CHANNEL WHERE NOBODY SAYS ANYTHING COSTS NOTHING. The counterpart to
+   * the test above and the reason the counter is still there at all: a sticky
+   * that is still the last message has not drifted, so nothing is scheduled and
+   * nothing is retried until somebody speaks. Without this the bot reposts into
+   * an empty channel every fifteen seconds for as long as it runs.
+   */
+  it('does nothing at all while the channel is silent', async () => {
+    const channels = fakeChannels()
+    const engine = stickyEngine(channels, fakeStore())
+
+    await engine.set(CHANNEL, 'down')
 
     // An hour, so that this is "never" rather than "not yet".
     await tick(60 * 60 * 1000)
@@ -281,14 +339,14 @@ describe('the sticky throttle', () => {
     expect(channels.posts()).toHaveLength(1)
   })
 
-  it('comes back once the count is reached and the window has passed', async () => {
+  it('takes the old copy down before it puts the new one up', async () => {
     const channels = fakeChannels()
     const engine = stickyEngine(channels, fakeStore())
 
     await engine.set(CHANNEL, 'down')
     await tick(REPOST_COOLDOWN_MS)
 
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     // The old copy comes down before the new one goes up, so the channel never
@@ -301,27 +359,63 @@ describe('the sticky throttle', () => {
   })
 
   /**
-   * THE WHOLE ISSUE, AS A NUMBER. Reposting per message would be a delete and a
-   * send for each of fifty — a hundred API calls into a bucket that holds five
-   * sends per five seconds. This is the same fifty messages costing one repost,
-   * because they all landed inside one window.
+   * THE WHOLE COST OF THE FEATURE, AS A NUMBER, AND THE ONE THING THE COOLDOWN
+   * HAS TO GET RIGHT NOW THAT IT IS THE ONLY GUARD. One message earns a repost,
+   * so twenty messages must not earn twenty: that would be twenty deletes and
+   * twenty sends into a bucket that holds five sends per five seconds, and the
+   * queue behind it is the moderation log. Twenty inside one window is one
+   * repost, and so is a thousand.
    */
-  it('costs one repost for a burst, not one per message', async () => {
+  it('costs one repost for a burst of twenty, not twenty', async () => {
     const channels = fakeChannels()
     const engine = stickyEngine(channels, fakeStore())
 
     await engine.set(CHANNEL, 'down')
 
-    chatter(engine, 50)
+    chatter(engine, 20)
     await tick(REPOST_COOLDOWN_MS)
 
+    // One delete and one send on top of the original post, whatever the twenty
+    // would have cost on their own.
     expect(channels.posts()).toHaveLength(2)
     expect(channels.calls).toHaveLength(3)
   })
 
   /**
-   * THE GUARANTEE THE COUNT AND THE COOLDOWN CANNOT MAKE ON THEIR OWN, and the
-   * one an implementation that only reposts on a message would fail. Twenty
+   * A MESSAGE THAT LANDS DURING THE COOLDOWN IS DELAYED, NEVER DROPPED, and the
+   * distinction is what the trailing timer is for. The cooldown is now the only
+   * thing standing between a message and a repost, so it is also the only thing
+   * that could swallow one: a message whose repost was skipped because a window
+   * happened to be running would leave the sticky buried until somebody spoke
+   * again after the window closed, which is the owner's bug with an extra step
+   * in front of it.
+   */
+  it('holds a message that lands during the cooldown rather than losing it', async () => {
+    const channels = fakeChannels()
+    const engine = stickyEngine(channels, fakeStore())
+
+    await engine.set(CHANNEL, 'down')
+    await tick(REPOST_COOLDOWN_MS)
+
+    // The first message is free: the window from the set has closed.
+    chatter(engine, 1)
+    await tick(0)
+    expect(channels.posts()).toHaveLength(2)
+
+    // The second lands a second into the window that repost opened, and then
+    // the channel goes quiet for good.
+    await tick(1_000)
+    chatter(engine, 1)
+    await tick(0)
+    expect(channels.posts()).toHaveLength(2)
+
+    await tick(REPOST_COOLDOWN_MS)
+    expect(channels.posts()).toHaveLength(3)
+  })
+
+  /**
+   * THE GUARANTEE THE COOLDOWN CANNOT MAKE ON ITS OWN, and the one an
+   * implementation that only reposts on a message would fail. Twenty
    * people say something and then stop — the ordinary shape of an outage. There
    * is no later message to carry the repost, so if the trailing timer is not
    * armed the sticky stays buried under all twenty until somebody speaks again,
@@ -414,10 +508,10 @@ describe('the sticky throttle', () => {
 
     // Five people talk while the repost's send is in the air.
     faults.duringPost = () => {
-      chatter(engine, REPOST_AFTER_MESSAGES)
+      chatter(engine, 5)
     }
 
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     faults.duringPost = undefined
@@ -448,10 +542,10 @@ describe('the sticky throttle', () => {
     // Five people talk after the send landed, while the file is being written.
     storeFaults.duringSave = () => {
       storeFaults.duringSave = undefined
-      chatter(engine, REPOST_AFTER_MESSAGES)
+      chatter(engine, 5)
     }
 
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     expect(channels.posts()).toHaveLength(2)
@@ -475,7 +569,7 @@ describe('the sticky throttle', () => {
       chatter(engine, 100)
     }
 
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     faults.duringPost = undefined
@@ -505,7 +599,7 @@ describe('a sticky that goes wrong', () => {
     await engine.set(CHANNEL, 'down')
     await tick(REPOST_COOLDOWN_MS)
 
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     expect(channels.posts()).toHaveLength(1)
@@ -525,14 +619,15 @@ describe('a sticky that goes wrong', () => {
     await engine.set(CHANNEL, 'down')
 
     for (let window = 0; window < 5; window += 1) {
-      chatter(engine, REPOST_AFTER_MESSAGES)
+      chatter(engine, 5)
       await tick(REPOST_COOLDOWN_MS)
     }
 
     const complaints = stderr.join('').match(/the sticky cannot be moved/gu) ?? []
     expect(complaints).toHaveLength(1)
 
-    // And the retries are a window apart rather than one per message: five
+    // And the retries are a window apart rather than one per message, which
+    // matters more now that one message is enough to earn a repost: five
     // windows of five messages is five attempts, not twenty-five.
     const attempts = stderr.join('').match(/could not delete the sticky/gu) ?? []
     expect(attempts).toHaveLength(5)
@@ -551,7 +646,7 @@ describe('a sticky that goes wrong', () => {
     await engine.set(CHANNEL, 'down')
     await tick(REPOST_COOLDOWN_MS)
 
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     expect(channels.posts()).toHaveLength(2)
@@ -574,7 +669,7 @@ describe('a sticky that goes wrong', () => {
 
     faults.post = apiError(RESTJSONErrorCodes.UnknownChannel)
 
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     expect(stderr.join('')).toContain('the sticky channel is gone')
@@ -601,7 +696,7 @@ describe('a sticky that goes wrong', () => {
     // The bot was removed from the channel between the delete and the send.
     faults.post = apiError(RESTJSONErrorCodes.MissingPermissions)
 
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     faults.post = undefined
@@ -617,8 +712,8 @@ describe('a sticky that goes wrong', () => {
    * A SEND THAT FAILED FOR A MOMENT LEAVES THE CHANNEL WITH NO STICKY AT ALL,
    * because the old copy was deleted first — and that is worse than one which
    * has drifted, since an outage notice has simply vanished. So the retry does
-   * not wait for five more people to speak: the count is about how far a
-   * VISIBLE notice has sunk, and there is nothing visible to sink.
+   * not wait for anybody to speak at all: drift is about how far a VISIBLE
+   * notice has sunk, and there is nothing visible to sink.
    */
   it('brings a sticky back on its own after a send that failed for a moment', async () => {
     const faults: ChannelFaults = {}
@@ -632,7 +727,7 @@ describe('a sticky that goes wrong', () => {
     // code that says anything is permanently wrong.
     faults.post = new Error('503 Service Unavailable')
 
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     expect(channels.posts()).toHaveLength(1)
@@ -658,7 +753,7 @@ describe('a sticky that goes wrong', () => {
 
     const before = channels.attempts()
 
-    chatter(retried, REPOST_AFTER_MESSAGES)
+    chatter(retried, 1)
     await tick(REPOST_COOLDOWN_MS * 5)
 
     // It kept trying — one send per window, which is what the retry is for —
@@ -688,7 +783,7 @@ describe('a sticky that goes wrong', () => {
     // Nothing was deleted, so `m1` is still in the channel, and it is still the
     // text the engine reposts.
     await tick(REPOST_COOLDOWN_MS)
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     expect(channels.calls).toEqual([
@@ -755,7 +850,7 @@ describe('setting and clearing a sticky', () => {
     await engine.set(CHANNEL, 'back up in ten')
 
     await tick(REPOST_COOLDOWN_MS)
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     expect(channels.posts().at(-1)?.what).toBe('back up in ten')
@@ -810,7 +905,7 @@ describe('setting and clearing a sticky', () => {
       cleared = engine.clear(CHANNEL)
     }
 
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
     await cleared
 
@@ -859,7 +954,7 @@ describe('the sticky state across a restart', () => {
     await engine.restore()
     await tick(REPOST_COOLDOWN_MS)
 
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     // It knows which copy is standing, so it takes THAT one down rather than
@@ -952,7 +1047,7 @@ describe('the sticky state across a restart', () => {
     await engine.restore()
     await tick(REPOST_COOLDOWN_MS)
 
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     // Nothing to delete, so the repost is one call rather than two.
@@ -968,7 +1063,7 @@ describe('the sticky state across a restart', () => {
     await engine.restore()
 
     await tick(REPOST_COOLDOWN_MS)
-    chatter(engine, REPOST_AFTER_MESSAGES)
+    chatter(engine, 1)
     await tick(0)
 
     expect(channels.posts().at(-1)?.what).toBe('new')

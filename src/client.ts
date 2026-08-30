@@ -15,6 +15,7 @@ import {
 import type { Config } from './config.ts'
 import { createDdb } from './ddb.ts'
 import { scanMessage, type InviteResolver, type ScanResult } from './invites.ts'
+import { scanLinks, type LinkReason } from './links.ts'
 import { log, type Fault, type Sink } from './log.ts'
 import { watchMaintenance } from './maintenance.ts'
 import { installStickies } from './sticky.ts'
@@ -197,8 +198,8 @@ export type SkipReason =
   | 'exempt-admin'
 
 /**
- * Why a message is being removed. Two grounds, and they are not the same kind
- * of statement, so nothing downstream may present them as one.
+ * Why a message is being removed. Six grounds, and they are not all the same
+ * kind of statement, so nothing downstream may present them as one.
  *
  * `foreign-invite` is evidence about a specific invite: a code was resolved, and
  * the guild it points at is not ours.
@@ -207,23 +208,52 @@ export type SkipReason =
  * the cap were, and that is precisely why it is grounds to act. An admin reading
  * the log has to be able to tell the two apart, because only the first one names
  * an invite that was actually confirmed.
+ *
+ * THE OTHER FOUR COME FROM src/links.ts AND ARE A THIRD KIND AGAIN: each of them
+ * is a string that was literally in the message, established without asking
+ * anybody anything. They are not folded into one `bad-link` reason, because the
+ * whole point of a reason is that the channel line and the journal line say
+ * WHICH RULE FIRED — an admin who reads `link-shortener` knows the bot never saw
+ * the destination, and one who reads `fivem-connect` knows it did.
  */
-export type DeleteReason = 'foreign-invite' | 'over-lookup-cap'
+export type DeleteReason = 'foreign-invite' | 'over-lookup-cap' | LinkReason
 
 /**
- * What the two removing verdicts carry.
+ * What a removal carries, which depends on what kind of thing established it.
+ *
+ * A UNION RATHER THAN ONE RECORD WITH EMPTY FIELDS ON THE LINK BRANCH, and it is
+ * the same argument this file already makes about `over-lookup-cap` not being a
+ * `foreign-invite` with an empty list. A link removal happens BEFORE any invite
+ * is resolved — before `scanMessage` runs at all, see `decide` — so `found: 0`
+ * would not be a tidy default, it would be a claim that the message carried no
+ * invite codes, made by code that never looked. The union makes that claim
+ * impossible to print by accident.
  *
  * `found` IS THE COUNT OF DISTINCT CODES IN THE MESSAGE, not the length of
  * `foreign`. It is the only evidence an `over-lookup-cap` removal has: `foreign`
  * is empty on one of those whenever the codes that would have filled it are the
  * ones that fell past the cap, which is the whole shape of the attack.
  */
-interface Removal {
-  why: DeleteReason
+interface InviteRemoval {
+  why: 'foreign-invite' | 'over-lookup-cap'
   found: number
   foreign: string[]
   unresolved: string[]
 }
+
+/**
+ * A link removal carries the reason and NOTHING ELSE, and the emptiness is the
+ * design. links.ts does not hand back the text that matched — every one of its
+ * rules matches a working link, and the log channel is inside the guild, so a
+ * line quoting the match would repost the advert the bot has just removed. That
+ * is this file's existing rule about bare invite codes, arrived at from the
+ * other direction; see `removedLine`.
+ */
+interface LinkRemoval {
+  why: LinkReason
+}
+
+type Removal = InviteRemoval | LinkRemoval
 
 /**
  * What should happen to one message.
@@ -347,12 +377,31 @@ export async function decide(
     }
   }
 
+  /**
+   * THE LINK POLICY RUNS BEFORE THE INVITE SCAN, AND THAT ORDER IS THE SAME
+   * RATE-LIMIT DECISION THE EXEMPTIONS ABOVE ARE. `scanLinks` is pure string
+   * matching over a string already in hand: no resolver, no cache, no network,
+   * and nothing it can spend. `scanMessage` below can fire up to ten Discord
+   * lookups. A message carrying a bare IP is going to be removed either way, so
+   * resolving its invite codes first would be paying the API budget to learn
+   * something that changes no verdict — and a wall of spam is exactly where that
+   * budget matters, because every legitimate deletion queues behind it.
+   *
+   * SO A MESSAGE THAT BREAKS BOTH POLICIES REPORTS THE LINK RULE, and that is
+   * not a loss of evidence. A link verdict is a string that was in the message;
+   * a `foreign-invite` verdict is a string that was in the message plus an
+   * answer from Discord about it. Neither is more certain than the other, and
+   * only one of them costs anything to establish.
+   */
+  const link = scanLinks(message.text, config.serverIps)
+  if (link !== null) return removal({ why: link }, config)
+
   const result = await scanMessage(message.text, config.guildId, resolve)
 
   // A confirmed foreign guild is tested first because it is the better-evidenced
   // of the two grounds: it names an invite Discord actually answered for. Both
   // can be true of one message, and that is the one worth putting in the log.
-  if (result.foreign.length > 0) return removal('foreign-invite', result, config)
+  if (result.foreign.length > 0) return removal(fromScan('foreign-invite', result), config)
 
   /**
    * REGRESSION, AND IT WAS A WORKING BYPASS. `scanMessage` resolves only the
@@ -377,7 +426,7 @@ export async function decide(
    * being said here is "we could not look", and an admin who reads this removal
    * as a confirmed foreign invite has been told something we never established.
    */
-  if (result.truncated) return removal('over-lookup-cap', result, config)
+  if (result.truncated) return removal(fromScan('over-lookup-cap', result), config)
 
   // Unresolved codes are carried through rather than acted on. invites.ts is
   // the file that explains why an unresolved code is never a delete; this only
@@ -393,15 +442,25 @@ export async function decide(
  * dry-run guarantee a property of one line instead of a rule each new caller has
  * to remember; see the `Verdict` header.
  */
-function removal(why: DeleteReason, result: ScanResult, config: Config): Verdict {
-  const grounds = {
+function removal(grounds: Removal, config: Config): Verdict {
+  return config.dryRun ? { action: 'would-delete', ...grounds } : { action: 'delete', ...grounds }
+}
+
+/**
+ * The evidence an invite-grounds removal carries, read off one scan.
+ *
+ * A SEPARATE FUNCTION FROM `removal` RATHER THAN A SECOND PARAMETER ON IT,
+ * because `removal` is the one place `dryRun` is read and that has to stay
+ * readable in one screen. This one knows about `ScanResult` and nothing about
+ * the flag; that one knows about the flag and nothing about invites.
+ */
+function fromScan(why: InviteRemoval['why'], result: ScanResult): InviteRemoval {
+  return {
     why,
     found: result.codes.length,
     foreign: result.foreign,
     unresolved: result.unresolved,
   }
-
-  return config.dryRun ? { action: 'would-delete', ...grounds } : { action: 'delete', ...grounds }
 }
 
 /**
@@ -523,19 +582,39 @@ export async function handleMessage(
 const CARRIED: Record<DeleteReason, string> = {
   'foreign-invite': 'message carrying a foreign invite',
   'over-lookup-cap': 'message carrying more distinct invite codes than the scan will resolve',
+  'fivem-connect': 'message carrying a connect link to another game server',
+  'server-listing': 'message carrying a public listing for another game server',
+  'foreign-ip': 'message naming a server address that is not ours',
+  'link-shortener': 'message carrying a shortened link, whose destination is not read',
 }
 
 /**
  * The fields every removal line carries, so the journal and the channel post
  * can be matched up by grepping one token.
  *
- * `codes` STAYS THE CONFIRMED-FOREIGN LIST ON BOTH REASONS, and is empty on the
- * over-cap removal that confirmed nothing. Filling it with the codes we did not
- * look at would put unexamined strings in the field the other line uses for
- * established ones — `found` and `reason` are what carry that case.
+ * `codes` STAYS THE CONFIRMED-FOREIGN LIST ON BOTH INVITE REASONS, and is empty
+ * on the over-cap removal that confirmed nothing. Filling it with the codes we
+ * did not look at would put unexamined strings in the field the other line uses
+ * for established ones — `found` and `reason` are what carry that case.
+ *
+ * A LINK REMOVAL PRINTS `reason` AND NOTHING ELSE, because there is nothing else
+ * true about it. It is decided before `scanMessage` runs, so `found=0` would be
+ * a count of invite codes in a message nothing ever counted, and `codes=""` an
+ * empty list of confirmed invites that were never sought. A field that is a lie
+ * in one case is worse than a field that is absent in it.
  */
 function logFields(verdict: Removal): Record<string, unknown> {
-  return { reason: verdict.why, found: verdict.found, codes: verdict.foreign.join(',') }
+  // THE FULLER BRANCH IS FIRST, AND THAT ORDER IS LOAD-BEARING RATHER THAN
+  // STYLISTIC. log.test.ts reads the field list of a verdict-carrying journal
+  // line out of the FIRST `return {` in this function and holds docs/deploy.md's
+  // worked examples to it. A one-field branch in front of it would leave that
+  // cross-check green while checking three fields fewer, which is the silent
+  // weakening that whole mechanism exists to prevent.
+  if ('found' in verdict) {
+    return { reason: verdict.why, found: verdict.found, codes: verdict.foreign.join(',') }
+  }
+
+  return { reason: verdict.why }
 }
 
 /**
@@ -683,8 +762,18 @@ function plainName(username: string | null): string | null {
  * the codes are unexamined strings a stranger chose and there can be two hundred
  * of them, which is a wall of noise long enough to push the post past Discord's
  * 2000-character limit and fail the send outright.
+ *
+ * A LINK LINE IS THE REASON ALONE, AND THAT IS A SAFETY PROPERTY RATHER THAN A
+ * STYLE ONE. The thing a link removal found is a WORKING LINK — an address, a
+ * cfx code, a `fivem://` target, a shortened url — and this string is posted
+ * into the guild the message was removed from. Quoting it would repost the
+ * advert, which is the same reason the invite lines carry bare codes and never
+ * `discord.gg/x`. links.ts does not even hand the text back, so there is nothing
+ * here to leak; this branch exists to say that the omission is deliberate.
  */
 function statedGrounds(verdict: Removal): string {
+  if (!('found' in verdict)) return `reason: ${verdict.why}`
+
   return verdict.why === 'over-lookup-cap'
     ? `reason: ${verdict.why}, distinct invite codes: ${verdict.found}`
     : `reason: ${verdict.why}, invite codes: ${verdict.foreign.join(', ')}`

@@ -20,6 +20,11 @@ import { log } from './log.ts'
  * including the twentieth person to arrive, and that therefore cannot be
  * allowed to scroll away under "is it down?" asked nineteen times.
  *
+ * ONE MESSAGE IS DRIFT, AND EVERY MESSAGE EARNS A REPOST. There is no minimum,
+ * no quorum and nothing to reach: the sticky is not last any more, so it goes
+ * back to last. What that costs is bounded by the cooldown below and by nothing
+ * else.
+ *
  * THE HARD PART IS NOT KEEPING IT LAST, IT IS NOT DOING SO ON EVERY MESSAGE.
  * A sticky that reposts per message costs a delete and a send for every single
  * thing anybody says, and the binding limit is Discord's per-channel send
@@ -27,36 +32,53 @@ import { log } from './log.ts'
  * during an outage — which is the only channel this feature is ever used in —
  * fills that bucket with the bot's OWN reposts, and once it is full the sends
  * that get queued behind it are the moderation log and everything else this
- * bot has to say. So the reposting is throttled two ways at once, and the
- * throttle is the feature rather than a refinement of it:
+ * bot has to say. Two rules hold that down, and they are the feature rather
+ * than a refinement of it:
  *
  *   AT MOST ONE REPOST PER `REPOST_COOLDOWN_MS` PER CHANNEL. Two API calls
  *   every fifteen seconds is one send per fifteen seconds, which is a fifteenth
- *   of the bucket and leaves the rest for everything else.
+ *   of the bucket and leaves the rest for everything else. This holds at ANY
+ *   traffic: one message in the window and a thousand cost the same one repost,
+ *   because the cooldown does not count messages and cannot be made to.
  *
- *   AND NOTHING AT ALL UNTIL `REPOST_AFTER_MESSAGES` HAVE ARRIVED. The cooldown
- *   alone would still repost for a single "k" posted twenty seconds apart,
- *   forever, in a channel nobody is really using — a bot talking to itself. A
- *   sticky four messages up is still on screen; one twenty messages up is not.
+ *   AND A GUARANTEED TRAILING REPOST, which is what makes the cooldown safe to
+ *   be the only rule. A message arriving while the cooldown is running arms a
+ *   timer for the remainder of the window, so the repost happens when the
+ *   window closes whether or not anybody says anything else. Without it, a
+ *   message inside the window is simply DROPPED — and since most messages
+ *   arrive inside somebody's window, the ordinary shape of an outage (a handful
+ *   of messages and then quiet) would leave the sticky buried until the next
+ *   person spoke, which is precisely the moment it stopped being read.
  *
- *   AND A GUARANTEED TRAILING REPOST, which is what makes the two above safe.
- *   A burst that trips the count while the cooldown is running arms a timer for
- *   the remainder of the window, so the repost happens when the window closes
- *   whether or not anybody says anything else. Without it a burst that ENDS —
- *   the ordinary shape of an outage, twenty messages and then quiet — would
- *   leave the sticky buried until the next person spoke, which is precisely the
- *   moment it stopped being read.
+ * THERE WAS A THIRD RULE — NOTHING AT ALL UNTIL FIVE MESSAGES HAD ARRIVED — AND
+ * IT WAS A BUG, NOT A SAFEGUARD. Do not put it back. The convention it was
+ * copied from is "repost every fifteen seconds OR every five messages,
+ * whichever comes FIRST"; it was written into the brief for this file as an
+ * AND, and the code implemented the AND faithfully. The owner found it on the
+ * live server the first time he used the feature: he set a sticky, one person
+ * posted one message, and the sticky never came back.
  *
- * HOW FAR THE STICKY CAN DRIFT BEFORE IT COMES BACK. Two answers, and both are
- * deliberate. In a channel that goes quiet it sits under at most
- * `REPOST_AFTER_MESSAGES - 1` — four messages — and stays there until somebody
- * posts a fifth; four is inside one screen of Discord on any client, so it has
- * drifted without going away. In a channel that is busy it sits under those
- * four plus everything posted during one cooldown window, and THAT number is
- * not bounded by anything this bot controls: fifteen seconds of a raid is as
- * many messages as Discord will accept. The trade is stated rather than fixed —
- * a shorter window buys a shallower burst at the price of the send bucket, and
- * the bucket is the thing that must not be spent.
+ * IT PROTECTED NOTHING THE COOLDOWN DOES NOT ALREADY PROTECT. The cost of this
+ * feature is sends, the cooldown bounds the sends at one per window per channel
+ * whatever the traffic, and a count cannot lower a bound that is already there.
+ * In a busy channel the cooldown was doing the whole of the work and the count
+ * was never the binding rule. What the count DID do was break the case the
+ * feature exists for: a quiet channel is exactly where a sticky matters — "we
+ * know the server is down" in an admin channel that sees four messages an hour
+ * — and there the count was the only rule in play, so the notice sat under
+ * those four for the whole hour. It was load-bearing in precisely the place it
+ * was wrong.
+ *
+ * HOW FAR THE STICKY CAN DRIFT BEFORE IT COMES BACK IS NOW A TIME, NOT A COUNT,
+ * and that is the honest way to say it: at most one cooldown out of place. In a
+ * quiet channel that is fifteen seconds under a single message. In a busy one
+ * it is fifteen seconds under everything said in fifteen seconds, and THAT
+ * number is not bounded by anything this bot controls — a raid is as many
+ * messages as Discord will accept. The trade is stated rather than fixed: a
+ * shorter window buys a shallower burst at the price of the send bucket, and
+ * the bucket is the thing that must not be spent. Fifteen seconds of an outage
+ * notice sitting second-to-last is not a thing anybody notices; a channel whose
+ * bucket is full of this bot talking to itself is.
  *
  * THE STATE OUTLIVES THE PROCESS, and it has to. `Restart=always` means this
  * bot comes back five seconds after every crash and every deploy, and a sticky
@@ -65,25 +87,30 @@ import { log } from './log.ts'
  * and never returns. So the channel, the text and the id of the copy currently
  * standing are written to `STATE_DIRECTORY`; see `stickyStatePath`.
  *
- * NOTHING IS REPOSTED AT STARTUP. The copy from before the restart is still in
- * the channel and the file says which one it is, so the bot picks up where it
- * left off. Reposting on boot would put a message in the channel on every crash
- * of a process that restarts on every crash, which is the noise the deploy
- * notice in client.ts goes to some trouble to avoid.
+ * NOTHING IS REPOSTED AT STARTUP, and losing the message count is not a reason
+ * to revisit that. The rule above is about messages, and a restart is not one:
+ * nothing moved, nobody said anything, and the copy from before the restart is
+ * still exactly where it was. The file says which copy that is, so the bot
+ * picks up where it left off. Reposting on boot would instead put a message in
+ * the channel on every crash of a process that restarts on every crash, which
+ * is the noise the deploy notice in client.ts goes to some trouble to avoid.
  */
 
 /**
- * The two numbers the throttle is made of.
+ * The one number the throttle is made of.
  *
  * FIFTEEN SECONDS AGAINST THE FIVE-PER-FIVE-SECONDS SEND BUCKET: a repost is
  * one send, so this spends a fifteenth of what the channel allows and leaves
  * the rest for the moderation log, the status channel and anything added later.
  *
- * FIVE MESSAGES BECAUSE FOUR IS STILL ON SCREEN. The count is what stops a
- * near-idle channel being reposted into forever; see the header.
+ * IT IS THE ONLY GUARD, WHICH IS THE REASON TO LEAVE IT AT FIFTEEN RATHER THAN
+ * A REASON TO SHORTEN IT. Every send this feature makes is paced by this value
+ * and nothing else, so lowering it raises the ceiling on what the bot spends in
+ * a channel that is already busy — which is the one channel that cannot afford
+ * it. What it costs at fifteen is stated in the header and is small: a sticky
+ * up to fifteen seconds out of place.
  */
 export const REPOST_COOLDOWN_MS = 15_000
-export const REPOST_AFTER_MESSAGES = 5
 
 /**
  * Discord's own limit on the content of a message, in UTF-16 code units, which
@@ -262,10 +289,17 @@ interface ChannelState {
   /** The copy standing in the channel, or null when none was posted. */
   messageId: string | null
 
-  /** Messages seen since that copy was posted. The `REPOST_AFTER_MESSAGES` half. */
+  /**
+   * Messages seen since that copy was posted, from anybody but this bot.
+   *
+   * IT IS A YES-OR-NO THAT HAPPENS TO BE A NUMBER. One earns a repost and so
+   * does a hundred; zero is the only value that earns nothing. It is counted
+   * rather than flagged because `repost` has to subtract exactly what its new
+   * copy buried and leave the rest owed — see there.
+   */
   since: number
 
-  /** When that copy was posted. The `REPOST_COOLDOWN_MS` half. */
+  /** When that copy was posted. The cooldown is measured from here. */
   lastPost: number
 
   /** The trailing repost, waiting to fire. Unreffed. */
@@ -406,7 +440,10 @@ export function stickyEngine(channels: StickyChannels, store: StickyStore): Stic
    * that is worth the zero-delay `setTimeout` it costs. Two things fall out of
    * it. A burst delivered in one tick — which is what a gateway that was behind
    * catching up looks like — is counted in full before anything is posted,
-   * rather than reposting on the fifth message and again on the tenth. And
+   * rather than reposting on the first message of it and again on the second.
+   * That matters more now than it used to: one message is enough to earn a
+   * repost, so without the timer the first of twenty would start a send with
+   * the other nineteen still in the queue behind it. And
    * `saw` stays synchronous with no promise to lose, which is what a listener
    * on an EventEmitter needs.
    *
@@ -422,16 +459,23 @@ export function stickyEngine(channels: StickyChannels, store: StickyStore): Stic
     if (state === undefined || state.busy || state.timer !== null) return
 
     /**
-     * THE COUNT IS ABOUT DRIFT, AND A STICKY WITH NO COPY STANDING HAS NOT
-     * DRIFTED — IT IS ABSENT. That is a repost whose delete succeeded and whose
-     * send then failed for a reason that was not permanent: a 500, a rate
-     * limit, a connection that went away. Holding the retry until five more
-     * people speak would mean an outage notice that vanished from the channel
-     * and came back only if the channel happened to get busy, which is the
-     * opposite of what it is for. The cooldown still applies, so the retry is
-     * one send every fifteen seconds and no faster.
+     * NOTHING HAS MOVED, SO THERE IS NOTHING TO DO. `since` is zero only when
+     * nobody has spoken since the copy went up, which means it is still the
+     * last message in the channel. This is the whole of what stops the bot
+     * reposting into a silent channel every fifteen seconds forever, and it is
+     * what makes `arm` safe to call from the end of every repost — the repost
+     * clears the counter, so the next one has to be earned by somebody talking.
+     *
+     * A STICKY WITH NO COPY STANDING IS EXEMPT, because it has not drifted — it
+     * is ABSENT. That is a repost whose delete succeeded and whose send then
+     * failed for a reason that was not permanent: a 500, a rate limit, a
+     * connection that went away. Holding the retry until somebody speaks would
+     * mean an outage notice that vanished from the channel and came back only
+     * if somebody happened to post, which is the opposite of what it is for.
+     * The cooldown still applies, so the retry is one send every fifteen
+     * seconds and no faster.
      */
-    if (state.messageId !== null && state.since < REPOST_AFTER_MESSAGES) return
+    if (state.messageId !== null && state.since === 0) return
 
     const waited = Date.now() - state.lastPost
     const delay = Math.max(0, REPOST_COOLDOWN_MS - waited)
@@ -565,8 +609,9 @@ export function stickyEngine(channels: StickyChannels, store: StickyStore): Stic
        * that created it has resolved, so at that instant the sticky's own id is
        * not yet written down and matching on it would count the sticky as
        * having drifted past itself. The cost of the blunt rule is that a
-       * moderation line posted into a sticky channel does not count toward the
-       * five; the cost of the precise one is a repost triggered by nothing.
+       * moderation line posted into a sticky channel does not count as drift
+       * and earns no repost; the cost of the precise one is a repost triggered
+       * by nothing at all, every window, for the life of the process.
        */
       if (fromSelf) return
 
@@ -705,7 +750,9 @@ export function stickyEngine(channels: StickyChannels, store: StickyStore): Stic
 
           // Now, rather than zero. A restart is not a reason to repost, and a
           // channel that was busy when the bot went down would otherwise get
-          // one on its fifth message with no cooldown behind it.
+          // one on its very first message with no cooldown behind it — which
+          // is a send in the same instant as the deploy notice, on every
+          // restart, in the channel least able to spare one.
           lastPost: Date.now(),
           timer: null,
           busy: false,

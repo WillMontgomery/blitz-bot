@@ -14,6 +14,7 @@ import {
   runCommand,
   TARGET_OPTION,
   type BotCommand,
+  type CommandComponentRow,
   type CommandReply,
   type Invocation,
   type Responder,
@@ -261,7 +262,13 @@ export function invocationOf(interaction: CommandSource): Invocation {
 /** A live interaction, as far as answering it goes. */
 export interface ReplyTarget {
   deferReply: (options: { flags?: MessageFlags.Ephemeral }) => Promise<unknown>
-  editReply: (options: { content?: string; embeds?: readonly APIEmbed[] }) => Promise<unknown>
+
+  editReply: (options: {
+    content?: string
+    embeds?: readonly APIEmbed[]
+    components?: readonly CommandComponentRow[]
+  }) => Promise<unknown>
+
   reply: (options: { content: string; flags?: MessageFlags.Ephemeral }) => Promise<unknown>
 }
 
@@ -269,17 +276,40 @@ export interface ReplyTarget {
  * One `CommandReply` as the payload discord.js takes.
  *
  * THE WHOLE OF WHAT WIDENING THE SEAM COSTS THE LIVE HALF, and it is one
- * function. A string becomes `content`, embeds become `embeds`, and this is the
- * one place in the bot that knows the difference — which is the same argument
- * that keeps `MessageFlags.Ephemeral` here rather than in every command file.
+ * function. A string becomes `content`, embeds become `embeds`, components
+ * become `components`, and this is the one place in the bot that knows the
+ * difference — which is the same argument that keeps `MessageFlags.Ephemeral`
+ * here rather than in every command file.
  *
  * `[...reply.embeds]` RATHER THAN THE ARRAY ITSELF, so nothing this bot hands
  * discord.js is a live view of a value a command still holds. One element today
  * and ten at Discord's limit; the alternative is a shared array somebody mutates
- * after the reply has been sent.
+ * after the reply has been sent. The rows are copied one level deeper for the
+ * same reason: a row IS its `components` array, so copying only the outer array
+ * would hand over the inner one.
+ *
+ * NO `components` KEY AT ALL WHEN THE HANDLER GAVE NONE, and that is not
+ * tidiness. `editReply` is an EDIT: `components: []` means "take away the ones
+ * that are there" and an absent key means "leave them alone", and the two are
+ * only the same on a reply that never had any. Sending the empty array anyway
+ * would make every text answer in this bot carry an instruction about
+ * components it has no opinion on.
  */
-function payload(reply: CommandReply): { content?: string; embeds?: APIEmbed[] } {
-  return typeof reply === 'string' ? { content: reply } : { embeds: [...reply.embeds] }
+function payload(reply: CommandReply): {
+  content?: string
+  embeds?: APIEmbed[]
+  components?: CommandComponentRow[]
+} {
+  if (typeof reply === 'string') return { content: reply }
+
+  const embeds = [...reply.embeds]
+
+  if (reply.components === undefined) return { embeds }
+
+  return {
+    embeds,
+    components: reply.components.map((row) => ({ ...row, components: [...row.components] })),
+  }
 }
 
 /**

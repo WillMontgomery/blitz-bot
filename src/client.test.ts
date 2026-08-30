@@ -108,6 +108,16 @@ const LOG_CHANNEL = '666666666666666666'
 const WEBHOOK = '777777777777777777'
 const OTHER_GUILD = '888888888888888888'
 
+/**
+ * This community's own game server addresses, as `loadConfig` would hand them
+ * over. Written out rather than imported from links.ts, because the point of the
+ * cases below is that `decide` passes `config.serverIps` down — a test that
+ * shared a constant with the matcher could not tell a wired-up allowlist from a
+ * hard-coded one.
+ */
+const OUR_IP = '3.130.92.28'
+const OUR_OTHER_IP = '18.222.244.205'
+
 function cfg(over: Partial<Config> = {}): Config {
   return {
     discordToken: 'token',
@@ -118,6 +128,7 @@ function cfg(over: Partial<Config> = {}): Config {
     docsChannelId: null,
     maintenanceChannelId: null,
     exemptChannelIds: [],
+    serverIps: [OUR_IP, OUR_OTHER_IP],
     exemptAdmins: true,
     dryRun: false,
     ...over,
@@ -550,6 +561,129 @@ describe('decide — dry run', () => {
 })
 
 /**
+ * The link policy, as `decide` consults it. src/links.test.ts is where the
+ * patterns are exercised; these cases are about the WIRING — that the rules are
+ * consulted at all, where they sit relative to the exemptions and the invite
+ * scan, that the allowlist arrives from config, and what a link verdict is
+ * shaped like.
+ */
+describe('decide — the link policy', () => {
+  it('removes a message naming an address that is not ours, under its own reason', async () => {
+    const verdict = await decide(msg({ text: 'come play on 5.6.7.8' }), cfg(), foreignResolver)
+
+    expect(verdict).toEqual({ action: 'delete', why: 'foreign-ip' })
+  })
+
+  it.each([
+    ['cfx.re/join/kvkq6v', 'server-listing'],
+    ['servers.fivem.net/servers/detail/9m4vjq', 'server-listing'],
+    ['fivem://connect/play.someserver.com', 'fivem-connect'],
+    ['bit.ly/3xY9k', 'link-shortener'],
+    ['dsc.gg/someguild', 'link-shortener'],
+  ])('removes %s under %s', async (text: string, why: string) => {
+    expect(await decide(msg({ text }), cfg(), foreignResolver)).toEqual({ action: 'delete', why })
+  })
+
+  it('leaves this community s own address alone', async () => {
+    const verdict = await decide(
+      msg({ text: `we are back up on ${OUR_IP}:30120` }),
+      cfg(),
+      deadResolver,
+    )
+
+    expect(verdict).toEqual({ action: 'leave', codes: [], unresolved: [] })
+  })
+
+  /**
+   * THE ALLOWLIST COMES FROM `config.serverIps` AND FROM NOWHERE ELSE. Without
+   * this pair the wire could be missing — links.ts would still pass its own
+   * tests, and the bot would delete the one address the channel is for.
+   */
+  it('exempts whatever the config names, and only that', async () => {
+    const elsewhere = cfg({ serverIps: ['9.9.9.9'] })
+
+    expect(await decide(msg({ text: '9.9.9.9' }), elsewhere, deadResolver)).toMatchObject({
+      action: 'leave',
+    })
+    expect(await decide(msg({ text: OUR_IP }), elsewhere, deadResolver)).toEqual({
+      action: 'delete',
+      why: 'foreign-ip',
+    })
+  })
+
+  /**
+   * A RATE-LIMIT PROPERTY AS MUCH AS AN ORDERING ONE, and the reason the link
+   * rules sit above the scan. `scanLinks` costs nothing; `scanMessage` can fire
+   * ten Discord lookups. A message that is going to be removed either way must
+   * not be paid for out of the API budget that every legitimate deletion queues
+   * behind.
+   */
+  it('never resolves an invite for a message a link rule already condemns', async () => {
+    const resolve = vi.fn(foreignResolver)
+
+    const verdict = await decide(
+      msg({ text: 'discord.gg/abc123 and 5.6.7.8' }),
+      cfg(),
+      resolve,
+    )
+
+    expect(resolve).not.toHaveBeenCalled()
+    // Both policies are broken; the one that cost nothing to establish is the
+    // one reported, and it is no less certain than the other.
+    expect(verdict).toEqual({ action: 'delete', why: 'foreign-ip' })
+  })
+
+  /**
+   * BELOW EVERY EXEMPTION, THOUGH. The link rules are cheap, not privileged: a
+   * channel the operator excluded and an admin's own post are excluded from
+   * these too, or `BLITZ_EXEMPT_CHANNEL_IDS` would mean something different
+   * depending on which rule fired.
+   */
+  it('is not consulted for a message that is never scanned at all', async () => {
+    const text = 'cfx.re/join/kvkq6v'
+
+    expect(
+      await decide(msg({ text }), cfg({ exemptChannelIds: [CHANNEL] }), foreignResolver),
+    ).toEqual({ action: 'skip', why: 'exempt-channel' })
+
+    expect(
+      await decide(
+        msg({ text, authorRoleIds: [ADMIN_ROLE] }),
+        cfg({ adminRoleId: ADMIN_ROLE }),
+        foreignResolver,
+      ),
+    ).toEqual({ action: 'skip', why: 'exempt-admin' })
+
+    expect(await decide(msg({ text, guildId: OTHER_GUILD }), cfg(), foreignResolver)).toEqual({
+      action: 'skip',
+      why: 'other-guild',
+    })
+  })
+
+  /**
+   * A LINK REMOVAL CARRIES THE REASON AND NOTHING ELSE, and `toEqual` rather
+   * than `toMatchObject` is what makes that an assertion. `found: 0` would be a
+   * count of invite codes in a message nothing ever counted — the scan does not
+   * run on this path — and `codes: []` an empty list of confirmed invites that
+   * were never sought.
+   */
+  it('claims nothing about invite codes it never looked for', async () => {
+    const verdict = await decide(msg({ text: 'bit.ly/3xY9k' }), cfg(), foreignResolver)
+
+    expect(verdict).toEqual({ action: 'delete', why: 'link-shortener' })
+    expect(verdict).not.toHaveProperty('found')
+    expect(verdict).not.toHaveProperty('foreign')
+    expect(verdict).not.toHaveProperty('unresolved')
+  })
+
+  it('passes the same dry-run gate every other removal does', async () => {
+    const verdict = await decide(msg({ text: '5.6.7.8' }), cfg({ dryRun: true }), foreignResolver)
+
+    expect(verdict).toEqual({ action: 'would-delete', why: 'foreign-ip' })
+  })
+})
+
+/**
  * The side effects, as spies.
  *
  * `remove` IS ALWAYS A SPY, INCLUDING WHEN THE CASE OVERRIDES IT with a
@@ -831,6 +965,115 @@ describe('handleMessage — an over-cap removal is never mistaken for an ordinar
     expect(stderr.join('')).toContain('dry run: would have deleted')
     expect(posted[0] ?? '').toContain('Dry run')
     expect(posted[0] ?? '').toContain('over-lookup-cap')
+  })
+})
+
+/**
+ * A link removal, carried out.
+ *
+ * THE LINK IS NEVER QUOTED BACK, AND THAT IS THE POINT OF HALF THESE CASES. Every
+ * rule in links.ts matches a WORKING link, and the log channel is inside the
+ * guild the message was removed from — so a line quoting the match would repost
+ * the advert the bot has just taken down. That is the same rule this file already
+ * follows for invite codes, reached from the other direction, and it holds by
+ * construction because `scanLinks` hands back a reason and nothing else.
+ */
+describe('handleMessage — a link removal names its own rule and quotes nothing', () => {
+  it('deletes, and says which rule in the journal', async () => {
+    const acts = actions()
+
+    await handleMessage(msg({ text: 'come play on 5.6.7.8:30120' }), cfg(), acts)
+
+    expect(acts.remove).toHaveBeenCalledTimes(1)
+
+    const journal = stdout.join('')
+    expect(journal).toContain('reason="foreign-ip"')
+    expect(journal).toContain('deleted message naming a server address that is not ours')
+    // The two invite lines would each be a false statement about this removal.
+    expect(journal).not.toContain('foreign invite')
+    expect(journal).not.toContain('over-lookup-cap')
+  })
+
+  it('claims no invite evidence it never gathered', async () => {
+    const acts = actions()
+
+    await handleMessage(msg({ text: 'bit.ly/3xY9k' }), cfg(), acts)
+
+    const journal = stdout.join('')
+    expect(journal).toContain('reason="link-shortener"')
+    // `found` counts distinct invite codes and `codes` lists confirmed foreign
+    // ones. Neither was established: the scan does not run on this path.
+    expect(journal).not.toContain('found=')
+    expect(journal).not.toContain('codes=')
+  })
+
+  it('does not repost the link into the channel it was removed from', async () => {
+    const posted: string[] = []
+    const acts = actions({ announce: collect(posted) })
+
+    await handleMessage(
+      msg({ text: 'real deal here: cfx.re/join/kvkq6v' }),
+      cfg({ logChannelId: LOG_CHANNEL }),
+      acts,
+    )
+
+    const line = posted[0] ?? ''
+    expect(line).toContain('reason: server-listing')
+    expect(line).not.toContain('cfx.re')
+    expect(line).not.toContain('kvkq6v')
+    expect(line).not.toContain('join')
+  })
+
+  it('does not repost an address either, in the removal line or the dry-run one', async () => {
+    const posted: string[] = []
+
+    await handleMessage(
+      msg({ text: 'come play on 5.6.7.8' }),
+      cfg({ logChannelId: LOG_CHANNEL }),
+      actions({ announce: collect(posted) }),
+    )
+    await handleMessage(
+      msg({ text: 'come play on 5.6.7.8' }),
+      cfg({ logChannelId: LOG_CHANNEL, dryRun: true }),
+      actions({ announce: collect(posted) }),
+    )
+
+    expect(posted).toHaveLength(2)
+    for (const line of posted) {
+      expect(line).toContain('reason: foreign-ip')
+      expect(line).not.toContain('5.6.7.8')
+    }
+  })
+
+  it('removes nothing on this path either when the dry run is on', async () => {
+    const posted: string[] = []
+    const acts = actions({ announce: collect(posted) })
+
+    await handleMessage(
+      msg({ text: 'fivem://connect/play.someserver.com' }),
+      cfg({ dryRun: true, logChannelId: LOG_CHANNEL }),
+      acts,
+    )
+
+    expect(acts.remove).not.toHaveBeenCalled()
+    expect(stderr.join('')).toContain('dry run: would have deleted')
+    expect(stderr.join('')).toContain('reason="fivem-connect"')
+    expect(posted[0] ?? '').toContain('Dry run')
+    expect(posted[0] ?? '').toContain('fivem-connect')
+  })
+
+  it('leaves this community s own address alone, and posts nothing about it', async () => {
+    const posted: string[] = []
+    const acts = actions({ resolve: deadResolver, announce: collect(posted) })
+
+    await handleMessage(
+      msg({ text: `we are back up on ${OUR_IP}. see you there` }),
+      cfg({ logChannelId: LOG_CHANNEL }),
+      acts,
+    )
+
+    expect(acts.remove).not.toHaveBeenCalled()
+    expect(posted).toHaveLength(0)
   })
 })
 
@@ -1471,6 +1714,53 @@ function liveActions(over: Partial<LiveActions> = {}): LiveActions {
 function asGateway(message: LiveMessage): OmitPartialGroupDMChannel<Message> {
   return message as unknown as OmitPartialGroupDMChannel<Message>
 }
+
+/**
+ * THE LINK RULES READ THE STRING `scanText` ALREADY BUILDS, and this is the case
+ * that says so.
+ *
+ * IT IS NOT A THEORETICAL TIDINESS POINT. The history of `scanText` is four
+ * separate bypasses, each one a surface somebody forgot: an embed, a forward, a
+ * Components V2 text display, an attachment name. A second flattening path in
+ * links.ts would be a second list of surfaces to keep in step, and the surface
+ * that fell off it would be a hole in the new policy only — invisible in every
+ * invite test, and only found by somebody trying it.
+ */
+describe('the link policy reads the same flattened text the invite scan does', () => {
+  it.each([
+    ['an embed description', scannable({ embeds: [embed({ description: 'join 5.6.7.8:30120' })] })],
+    ['a link button url', scannable({ components: [actionRow([linkButton('click', 'https://bit.ly/3xY9k')])] })],
+    // A filename cannot hold a slash, so the form that shows up here is the bare
+    // address — which is exactly why the policy does not need a `fivem://`
+    // wrapper to see one.
+    ['an attachment name', scannable({ attachments: attached(attachment({ name: 'join-us-at-5.6.7.8.png' })) })],
+    ['a poll question', scannable({ poll: poll('who is moving to 5.6.7.8?') })],
+    [
+      'a forwarded message',
+      scannable({
+        messageSnapshots: new Map([['s0', parts({ content: 'fivem://connect/play.someserver.com' })]]),
+      }),
+    ],
+  ])('removes a message whose only text is in %s', async (_where: string, source) => {
+    const verdict = await decide(msg({ text: scanText(source) }), cfg(), deadResolver)
+
+    expect(verdict).toMatchObject({ action: 'delete' })
+  })
+
+  it('is not fooled into inventing a link across two surfaces', async () => {
+    // `scanText` joins parts with newlines precisely so that two adjacent pieces
+    // cannot weld into something neither of them said. A host at the end of one
+    // and a path at the start of the next must not become a match.
+    const source = scannable({
+      content: 'cfx.re',
+      embeds: [embed({ description: '/join/kvkq6v' })],
+    })
+
+    expect(await decide(msg({ text: scanText(source) }), cfg(), deadResolver)).toMatchObject({
+      action: 'leave',
+    })
+  })
+})
 
 describe('handleLive — from a gateway message to a removal', () => {
   it('deletes a message carrying somebody else s invite', async () => {

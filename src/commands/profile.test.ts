@@ -1,4 +1,9 @@
-import { ApplicationCommandOptionType, type APIEmbedField } from 'discord.js'
+import {
+  ApplicationCommandOptionType,
+  ButtonStyle,
+  ComponentType,
+  type APIEmbedField,
+} from 'discord.js'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { Config } from '../config.ts'
@@ -23,7 +28,9 @@ import {
   type Refusal,
   type Responder,
 } from './command.ts'
+import { responderFor } from './index.ts'
 import {
+  consoleRow,
   embedUnits,
   gatherProfile,
   gatherSelf,
@@ -168,6 +175,7 @@ function cfg(over: Partial<Config> = {}): Config {
     docsChannelId: null,
     maintenanceChannelId: null,
     exemptChannelIds: [],
+    serverIps: ['3.130.92.28'],
     exemptAdmins: true,
     dryRun: false,
     ...over,
@@ -264,7 +272,12 @@ function invocation(over: Partial<Invocation> = {}): Invocation {
  * seam was widened, and a cast would turn it into `undefined` three assertions
  * later.
  */
-function replyEmbed(reply: CommandReply): { title: string; description: string; fields: APIEmbedField[] } {
+function replyEmbed(reply: CommandReply): {
+  title: string
+  description: string
+  color: number
+  fields: APIEmbedField[]
+} {
   if (typeof reply === 'string') throw new Error(`expected an embed, got text: ${reply}`)
 
   const [embed] = reply.embeds
@@ -273,11 +286,38 @@ function replyEmbed(reply: CommandReply): { title: string; description: string; 
   return {
     title: embed.title ?? '',
     description: embed.description ?? '',
+    color: embed.color ?? 0,
     fields: [...(embed.fields ?? [])],
   }
 }
 
-/** Everything in an embed that a reader sees, as one string. */
+/**
+ * Every link button on a reply, as label and url.
+ *
+ * A HELPER RATHER THAN REACHING THROUGH `reply.components` AT EACH ASSERTION,
+ * because a row is two levels deep and half the cases below are about the button
+ * NOT being there — and `undefined?.[0]?.components?.[0]` reads the same whether
+ * the button is absent or the shape changed under it.
+ */
+function buttons(reply: CommandReply): { label: string; url: string }[] {
+  if (typeof reply === 'string') return []
+
+  return (reply.components ?? []).flatMap((row) =>
+    row.components.flatMap((one) =>
+      'url' in one ? [{ label: one.label ?? '', url: one.url }] : [],
+    ),
+  )
+}
+
+/**
+ * Everything a reader sees, as one string — THE COMPONENTS INCLUDED.
+ *
+ * THE BUTTON IS PART OF THE REPLY AND THEREFORE PART OF WHAT LEAKS. Every
+ * separation case below is written as "this string is not in what the player
+ * sees", and a licence that is absent from the embed and present in a button's
+ * url is a licence the player has been shown. Folding the components in here
+ * means those cases cover the button without one of them having to remember it.
+ */
 function rendered(reply: CommandReply): string {
   const embed = replyEmbed(reply)
 
@@ -285,7 +325,21 @@ function rendered(reply: CommandReply): string {
     embed.title,
     embed.description,
     ...embed.fields.map((entry) => `${entry.name}\n${entry.value}`),
+    ...buttons(reply).map((one) => `${one.label}\n${one.url}`),
   ].join('\n')
+}
+
+/**
+ * The rendered reply with every mention's markup taken out.
+ *
+ * WHAT "NO RAW DISCORD ID" HAS TO BE ASSERTED AGAINST. `<@444…>` contains the
+ * id by construction — that is what a mention IS — so a bare `not.toContain(id)`
+ * would be a test the feature cannot pass and an invitation to delete the
+ * mention along with the id. What the owner asked for is the id appearing
+ * NOWHERE ELSE, which is exactly this string.
+ */
+function withoutMentions(text: string): string {
+  return text.replace(/<@!?\d+>/gu, '')
 }
 
 /** Every field value the embed carries, for the cap assertions. */
@@ -470,7 +524,10 @@ describe('gatherProfile', () => {
       DISCORD,
     )
 
-    expect(asked).toEqual([[NEWEST, 25]])
+    // FIVE, not twenty-five. Asking for what is displayed is what keeps the
+    // ordinary reply from reporting a cut of the bot's own making — see the
+    // history cases below.
+    expect(asked).toEqual([[NEWEST, 5]])
     expect(got.matches).toHaveLength(2)
     expect(got.unreached).toEqual([])
   })
@@ -566,9 +623,10 @@ describe('readsFrom', () => {
 
     await gatherProfile(readsFrom(fakeDdb(seen)), DISCORD)
 
-    // 25, from `MATCH_FETCH` — what the embed can show and say it cut — rather
-    // than the reader's own ceiling.
-    expect(seen).toContainEqual(['gameMatches', `${NEWEST}|25`])
+    // 5, from `RECENT_MATCHES` — what the embed shows — rather than the
+    // reader's own ceiling of 50, and rather than the 25 it used to fetch to
+    // render a five-line field out of.
+    expect(seen).toContainEqual(['gameMatches', `${NEWEST}|5`])
   })
 
   it('wires it through the lazy one as well, which is the one ./index.ts registers', async () => {
@@ -579,7 +637,7 @@ describe('readsFrom', () => {
       DISCORD,
     )
 
-    expect(seen).toContainEqual(['gameMatches', `${NEWEST}|25`])
+    expect(seen).toContainEqual(['gameMatches', `${NEWEST}|5`])
   })
 
   it('builds no client until a profile is actually asked for', async () => {
@@ -706,27 +764,30 @@ describe('profileEmbed: bans', () => {
     const bans = fieldNamed(embed, 'Bans') ?? ''
 
     expect(bans).toContain(OLDEST)
-    expect(bans).toContain('ACTIVE, permanent')
+    expect(bans).toContain('**ACTIVE**, permanent')
     expect(bans).toContain('ban evasion')
   })
 
+  /**
+   * THE THREE STATES, AND THE THREE STAMPS UNDER THEM. Lifted and expired are
+   * `R` — an admin reading a ban list is asking "recently?" — and the one still
+   * in force says its expiry as a DATE, because that is the thing somebody has
+   * to honour rather than estimate. Asserted as the markup Discord is actually
+   * sent, seconds included: a stamp built from milliseconds renders a date fifty
+   * thousand years out and looks like a working feature.
+   */
   it('distinguishes lifted, expired and active against the injected clock', () => {
+    const lift = Date.parse('2026-02-01T00:00:00.000Z')
+    const gone = Date.parse('2026-03-01T00:00:00.000Z')
+    const ends = Date.parse('2026-12-01T00:00:00.000Z')
+
     const embed = profileEmbed(
       data({
         licences: [OLDEST, MIDDLE, NEWEST],
         bans: [
-          {
-            licence: OLDEST,
-            ban: ban({ license: OLDEST, liftedAt: Date.parse('2026-02-01T00:00:00.000Z') }),
-          },
-          {
-            licence: MIDDLE,
-            ban: ban({ license: MIDDLE, expiresAt: Date.parse('2026-03-01T00:00:00.000Z') }),
-          },
-          {
-            licence: NEWEST,
-            ban: ban({ license: NEWEST, expiresAt: Date.parse('2026-12-01T00:00:00.000Z') }),
-          },
+          { licence: OLDEST, ban: ban({ license: OLDEST, liftedAt: lift }) },
+          { licence: MIDDLE, ban: ban({ license: MIDDLE, expiresAt: gone }) },
+          { licence: NEWEST, ban: ban({ license: NEWEST, expiresAt: ends }) },
         ],
       }),
       NOW,
@@ -734,9 +795,13 @@ describe('profileEmbed: bans', () => {
 
     const bans = fieldNamed(embed, 'Bans') ?? ''
 
-    expect(bans).toContain(`${OLDEST}: lifted 2026-02-01T00:00:00.000Z`)
-    expect(bans).toContain(`${MIDDLE}: expired 2026-03-01T00:00:00.000Z`)
-    expect(bans).toContain(`${NEWEST}: ACTIVE until 2026-12-01T00:00:00.000Z`)
+    expect(bans).toContain(`${OLDEST}: lifted <t:${String(lift / 1000)}:R>`)
+    expect(bans).toContain(`${MIDDLE}: expired <t:${String(gone / 1000)}:R>`)
+    expect(bans).toContain(`${NEWEST}: **ACTIVE** until <t:${String(ends / 1000)}:f>`)
+
+    // And not one ISO string anywhere in the field, which is what was there
+    // before and what a half-done edit would leave behind.
+    expect(bans).not.toMatch(/\d{4}-\d{2}-\d{2}T/u)
   })
 
   it('says so when nothing read carries a ban', () => {
@@ -842,6 +907,62 @@ describe('profileEmbed: match history', () => {
     expect(matches.length).toBeLessThanOrEqual(1024)
   })
 
+  /**
+   * FIVE, BY THE OWNER, AND THE TOTAL STILL SAID.
+   *
+   * THE TWO HALVES ARE ONE FEATURE. A history cut to five that says nothing
+   * about the rest is a reply that reads as a complete record of somebody who
+   * has played forty times — which is the failure `COPY.matchesNote` was written
+   * against, arriving by a different road than the one it was written for. So
+   * this asserts the count of LINES and the sentence in the same case: neither
+   * alone is the thing that was asked for.
+   */
+  it('shows five matches at most and still says how many were played in all', () => {
+    const matches =
+      fieldNamed(
+        profileEmbed(
+          data({
+            matches: Array.from({ length: 5 }, (unused, index) => match(index)),
+            career: career({ matches: 40 }),
+          }),
+          NOW,
+        ),
+        'Recent matches',
+      ) ?? ''
+
+    const lines = matches.split('\n')
+
+    // Five matches and the sentence about the rest, and nothing else.
+    expect(lines).toHaveLength(6)
+    expect(lines.at(-1)).toBe('40 matches recorded in all.')
+
+    // And not the plumbing sentence: the reader was asked for five and gave
+    // five, so nothing about this reply was cut by the bot's own limit.
+    expect(matches).not.toContain('read were not shown')
+  })
+
+  /**
+   * AND THE SLICE IS IN THE RENDERER TOO, not only in the number passed to the
+   * reader. A seam is a seam: a fixture, or a reader written later with its own
+   * idea of a default, must not be able to make this a nine-line field.
+   */
+  it('renders five even when the reader hands back more, and says it read more', () => {
+    const matches =
+      fieldNamed(
+        profileEmbed(
+          data({
+            matches: Array.from({ length: 9 }, (unused, index) => match(index)),
+            career: career({ matches: 9 }),
+          }),
+          NOW,
+        ),
+        'Recent matches',
+      ) ?? ''
+
+    expect(matches.split('\n')).toHaveLength(6)
+    expect(matches).toContain('4 of the 9 read were not shown.')
+  })
+
   it('says the history was empty rather than implying there is none', () => {
     expect(fieldNamed(profileEmbed(data({ matches: [] }), NOW), 'Recent matches')).toBe(
       'No matches read.',
@@ -858,6 +979,242 @@ describe('profileEmbed: match history', () => {
     )
 
     expect(matches).toContain('match#01J0')
+  })
+
+  /**
+   * THE TIME IS A DISCORD TIMESTAMP AND THE PLACEMENT IS BOLD.
+   *
+   * `R` HERE, WHICH IS THE FIELD THE STYLE RULE WAS WRITTEN FOR: a list of
+   * recent matches is read as "how long ago", and the reader's own client is the
+   * only thing that knows what timezone to say that in. An ISO string was
+   * correct and made everybody do the arithmetic themselves.
+   */
+  it('writes each match time as a Discord timestamp and never as an ISO string', () => {
+    const played = Date.parse('2026-08-30T09:00:00.000Z')
+
+    const matches =
+      fieldNamed(
+        profileEmbed(
+          data({ matches: [{ sk: 'match#1', at: played, placement: 3, kills: 4 }] }),
+          NOW,
+        ),
+        'Recent matches',
+      ) ?? ''
+
+    expect(matches).toContain(`<t:${String(played / 1000)}:R> · **#3** · 4 kills`)
+    expect(matches).not.toContain('2026-08-30T')
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * THE PRESENTATION.
+ *
+ * These cases are about what a READER sees, which is a different question from
+ * every other block in this file and is the owner's to answer. He looked at
+ * `/profile` and asked for four things by name: the balance is in Volts, the
+ * times are Discord's own timestamps, the short numbers are a table, and his
+ * Discord id is not in it.
+ *
+ * WORTH TESTING BECAUSE ALL FOUR FAIL SILENTLY. A column that lost its
+ * `inline: true` still renders, as a row; a timestamp built from milliseconds
+ * still renders, as a date in the year 57000; an id put back into the
+ * description looks exactly like the mention beside it. None of these is a
+ * crash and none of them is visible in a diff of the reply's text.
+ * ------------------------------------------------------------------ */
+
+describe('profileEmbed: the numbers read as a table', () => {
+  function fieldAt(
+    embed: ReturnType<typeof profileEmbed>,
+    name: string,
+  ): APIEmbedField | undefined {
+    return embed.fields.find((entry) => entry.name === name)
+  }
+
+  /**
+   * THE COLUMNS, AS DISCORD ACTUALLY LAYS THEM OUT. `inline: true` is the whole
+   * of the instruction — it means "put this beside the last one if it fits" —
+   * and three consecutive ones is a row. Asserting the flag rather than the
+   * order is what makes this a test of the layout instead of a test of the
+   * array: without the flag these six are six full-width fields, which renders
+   * and is not a table.
+   */
+  it('marks the six career numbers inline, in two rows of three', () => {
+    const embed = profileEmbed(data(), NOW)
+
+    const columns = ['Level', 'Volts', 'Matches', 'Kills', 'Damage', 'In match']
+
+    for (const name of columns) expect(fieldAt(embed, name)?.inline).toBe(true)
+
+    // Consecutive, because a full-width field between them would break the row.
+    const names = embed.fields.map((entry) => entry.name)
+    const first = names.indexOf('Level')
+
+    expect(names.slice(first, first + columns.length)).toEqual(columns)
+  })
+
+  /**
+   * AND THE LONG ONES ARE NOT INLINE. A licence list or a ban history in a third
+   * of the width is a ribbon of two-word lines — the layout working exactly as
+   * asked and reading worse than what it replaced.
+   */
+  it('leaves everything that grows at full width', () => {
+    const embed = profileEmbed(
+      data({ matches: [match(1)], unreached: [{ source: 'matches', why: 'unavailable' }] }),
+      NOW,
+    )
+
+    for (const name of ['Licences', 'Bans', 'Server record', 'Could not be read', 'Recent matches']) {
+      expect(fieldAt(embed, name)?.inline).toBeUndefined()
+    }
+  })
+
+  /**
+   * THE CURRENCY HAS A NAME AND IT IS NOT "BALANCE". The game says so itself —
+   * `BR.Config.Market.currency = 'Volts'` — and a player who earns Volts, spends
+   * Volts and sees Volts on every shop screen was being shown `balance 250`.
+   */
+  it('calls the balance Volts, which is what the game calls it', () => {
+    const embed = profileEmbed(data({ career: career({ balance: 250 }) }), NOW)
+
+    expect(fieldAt(embed, 'Volts')?.value).toBe('**250**')
+
+    // And the old label is gone rather than sitting beside the new one.
+    expect(rendered({ embeds: [embed] })).not.toContain('balance')
+  })
+
+  /** The headline number in each column is bold; the context under it is not. */
+  it('bolds the number a column is named for', () => {
+    const embed = profileEmbed(data(), NOW)
+
+    expect(fieldAt(embed, 'Level')?.value).toBe('**7**\n4500 XP')
+    expect(fieldAt(embed, 'Kills')?.value).toBe('**30**\n10 deaths · 14 downs · 3 revives')
+    expect(fieldAt(embed, 'Damage')?.value).toBe('**9001**')
+    expect(fieldAt(embed, 'In match')?.value).toBe('**2h 0m**\n4 solo · 8 squad')
+  })
+
+  /** Every number `GameProfile` carries is still somewhere, in one field or another. */
+  it('drops none of the career numbers on the way into the columns', () => {
+    const shown = rendered({ embeds: [profileEmbed(data(), NOW)] })
+
+    for (const number of ['7', '4500', '250', '12', '2 wins', '5 top 10s', '30', '10 deaths',
+      '14 downs', '3 revives', '9001', '2h 0m', '4 solo', '8 squad']) {
+      expect(shown).toContain(number)
+    }
+  })
+
+  it('still answers with one full-width sentence when there is no career row', () => {
+    const embed = profileEmbed(data({ career: null }), NOW)
+
+    expect(fieldAt(embed, 'Career')?.value).toBe('No match record on the game side.')
+    expect(fieldAt(embed, 'Career')?.inline).toBeUndefined()
+    expect(fieldAt(embed, 'Volts')).toBeUndefined()
+  })
+})
+
+describe('profileEmbed: times are the reader’s own, not UTC', () => {
+  /**
+   * `f` FOR FIRST SEEN AND `R` FOR LAST SEEN, which look like the same kind of
+   * fact and are not. When an account started is a date somebody quotes; when it
+   * was last here is freshness, and "yesterday" is the answer.
+   */
+  it('writes first seen as a date and last seen as how long ago', () => {
+    const first = Date.parse('2025-01-01T00:00:00.000Z')
+    const last = Date.parse('2026-08-29T00:00:00.000Z')
+
+    const record =
+      fieldNamed(
+        profileEmbed(data({ registry: registry({ firstSeen: first, lastSeen: last }) }), NOW),
+        'Server record',
+      ) ?? ''
+
+    expect(record).toContain(`First seen <t:${String(first / 1000)}:f>`)
+    expect(record).toContain(`last seen <t:${String(last / 1000)}:R>`)
+  })
+
+  /**
+   * SECONDS, AND THIS IS THE CASE THAT CATCHES THE ONE MISTAKE THIS FEATURE HAS.
+   * Discord's markup takes a unix time in SECONDS; handed milliseconds it
+   * renders a date fifty thousand years out, which is a bug that looks exactly
+   * like the feature working until somebody reads the date.
+   */
+  it('writes the timestamp in seconds and not in milliseconds', () => {
+    const at = Date.parse('2026-08-30T09:00:00.000Z')
+    const shown = rendered({
+      embeds: [profileEmbed(data({ registry: registry({ lastSeen: at }) }), NOW)],
+    })
+
+    expect(shown).toContain(`<t:${String(Math.floor(at / 1000))}:`)
+    expect(shown).not.toContain(String(at))
+  })
+
+  /** No ISO string survives anywhere in a reply that has every field filled in. */
+  it('leaves no ISO string anywhere in the whole reply', () => {
+    const shown = rendered({
+      embeds: [
+        profileEmbed(
+          data({
+            bans: [{ licence: NEWEST, ban: ban({ expiresAt: NOW + 86_400_000 }) }],
+            matches: [match(1), match(2)],
+          }),
+          NOW,
+        ),
+      ],
+    })
+
+    expect(shown).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/u)
+  })
+
+  /**
+   * AND A ROW WITH NO USABLE TIME ON IT SAYS SO. `unknown` rather than
+   * `<t:NaN:R>`, which Discord renders as the literal characters and reads as a
+   * bug in the bot rather than as a gap in the row.
+   */
+  it('says the time is unknown rather than building a stamp out of one that is not', () => {
+    const record =
+      fieldNamed(
+        profileEmbed(
+          // Finite, and far outside the range a Date can hold — the case
+          // `Number.isFinite` alone does not catch.
+          data({ registry: registry({ firstSeen: 1e300, lastSeen: Number.NaN }) }),
+          NOW,
+        ),
+        'Server record',
+      ) ?? ''
+
+    expect(record).toContain('First seen unknown · last seen unknown')
+    expect(record).not.toContain('<t:')
+  })
+})
+
+describe('profileEmbed: the colour says the one thing the fields say in words', () => {
+  it('is red when a ban is in force on any licence', () => {
+    const embed = profileEmbed(
+      data({
+        licences: [OLDEST, NEWEST],
+        // The CURRENT licence is clean and the old one is not, which is the
+        // case the whole admin view exists for. A colour off the current
+        // licence alone would say the opposite of the field under it.
+        bans: [
+          { licence: OLDEST, ban: ban({ license: OLDEST }) },
+          { licence: NEWEST, ban: null },
+        ],
+      }),
+      NOW,
+    )
+
+    expect(embed.color).toBe(0xed4245)
+  })
+
+  it('is not red for a ban that is lifted or expired', () => {
+    for (const row of [lifted(), ban({ expiresAt: NOW - 1 })]) {
+      const embed = profileEmbed(data({ bans: [{ licence: NEWEST, ban: row }] }), NOW)
+
+      expect(embed.color).toBe(0x5865f2)
+    }
+  })
+
+  it('is the ordinary colour when nothing read carries a ban', () => {
+    expect(profileEmbed(data(), NOW).color).toBe(0x5865f2)
   })
 })
 
@@ -998,6 +1355,7 @@ describe('trimEmbed', () => {
     return {
       title: 'Player profile',
       description: 'a description',
+      color: 0x5865f2,
       fields: Array.from({ length: count }, (_, index) => ({ name: `f${index}`, value })),
     }
   }
@@ -1006,6 +1364,18 @@ describe('trimEmbed', () => {
     const embed = embedOf(6, 'short')
 
     expect(trimEmbed(embed)).toBe(embed)
+  })
+
+  /**
+   * THE COLOUR SURVIVES THE TRIM. This function rebuilds the record rather than
+   * mutating it, so a field left off the new one is a fact silently dropped —
+   * and the colour is the one fact in this reply that says "banned" without
+   * costing a single unit of the budget being trimmed.
+   */
+  it('carries the colour through rather than rebuilding an embed without one', () => {
+    const trimmed = trimEmbed(embedOf(40, 'v'))
+
+    expect(trimmed.color).toBe(0x5865f2)
   })
 
   it('drops fields until the total fits and says how many went', () => {
@@ -1180,7 +1550,10 @@ describe('profileCommand', () => {
 
     expect(asked).toEqual([CALLER])
     expect(text).toContain(`<@${CALLER}>`)
-    expect(text).toContain('Level 7')
+
+    // The career column, which is how "their own progression came back" looks
+    // now that the numbers are a table rather than a line of `a · b · c`.
+    expect(text).toContain('Level\n**7**')
   })
 
   it('answers instead of throwing when every read fails', async () => {
@@ -1339,8 +1712,13 @@ describe('the self view: a player’s own record, and nothing about their licenc
     expect(text).not.toContain('chat abuse')
 
     // And what it DOES show: their own progression, and the ban they are under.
-    expect(text).toContain('Level 7')
+    expect(text).toContain('Level\n**7**')
     expect(text).toContain('aimbot')
+
+    // NOR A BUTTON, and `rendered` folds the components in so that this line
+    // covers one. The console is behind a sign-in a player does not have, and
+    // the url would carry the licence every assertion above is about.
+    expect(buttons(await command.run(invocation({ targetId: null }), cfg()))).toEqual([])
   })
 
   /**
@@ -1390,7 +1768,7 @@ describe('the self view: a player’s own record, and nothing about their licenc
       `currentLicenceFor:${CALLER}`,
       `ban:${NEWEST}`,
       `career:${NEWEST}`,
-      `matches:${NEWEST}|25`,
+      `matches:${NEWEST}|5`,
     ])
   })
 
@@ -1533,11 +1911,27 @@ describe('selfEmbed', () => {
 
     expect(embed.fields.at(0)?.name).toBe('Ban')
     expect(embed.fields.at(0)?.value).toContain('aimbot')
-    expect(embed.fields.at(0)?.value).toContain('Until 2026-09-05T00:00:00.000Z')
+
+    // `f` AND NOT `R`, WHICH IS THE ONE PLACE THE STYLE RULE GOES THE OTHER WAY.
+    // An expiry is a deadline a player plans around, so it is the date — in
+    // their own timezone, which is exactly what the ISO string here was not.
+    expect(embed.fields.at(0)?.value).toContain(
+      `Until **<t:${String(Date.parse('2026-09-05T00:00:00.000Z') / 1000)}:f>**.`,
+    )
+    expect(embed.fields.at(0)?.value).not.toContain('2026-09-05T')
   })
 
   it('says permanent rather than an expiry there is not', () => {
     expect(self({ ban: { reason: 'aimbot', expiresAt: null } })).toContain('Permanent')
+  })
+
+  /** The bar down the side says it before the field does. */
+  it('is red for a player who is banned and ordinary for one who is not', () => {
+    expect(selfEmbed(selfData({ ban: { reason: 'aimbot', expiresAt: null } })).color).toBe(
+      0xed4245,
+    )
+
+    expect(selfEmbed(selfData()).color).toBe(0x5865f2)
   })
 
   /**
@@ -1550,12 +1944,77 @@ describe('selfEmbed', () => {
     expect(selfEmbed(selfData()).fields.map((one) => one.name)).not.toContain('Ban')
   })
 
+  /**
+   * THE SAME COLUMNS THE ADMIN VIEW SHOWS, out of the second builder. The two
+   * render the same six numbers today and are two functions so that the day one
+   * of them stops being the same, it changes on one side.
+   */
   it('shows the progression and the match record a player already sees in game', () => {
-    const text = self({ matches: [match(1), match(2)] })
+    const embed = selfEmbed(selfData({ matches: [match(1), match(2)] }))
+    const text = rendered({ embeds: [embed] })
 
-    expect(text).toContain('Level 7 · 4500 XP · balance 250')
-    expect(text).toContain('12 matches · 2 wins · 5 top 10s')
-    expect(text).toContain('#2')
+    expect(text).toContain('Level\n**7**\n4500 XP')
+    expect(text).toContain('Volts\n**250**')
+    expect(text).toContain('Matches\n**12**\n2 wins · 5 top 10s')
+    expect(text).toContain('**#2**')
+
+    // Columns there and columns here: the flag is what makes them a table.
+    for (const name of ['Level', 'Volts', 'Matches', 'Kills', 'Damage', 'In match']) {
+      expect(embed.fields.find((one) => one.name === name)?.inline).toBe(true)
+    }
+
+    // And the player's own balance is in Volts, not in `balance`.
+    expect(text).not.toContain('balance')
+  })
+
+  /**
+   * FIVE FOR A PLAYER TOO, AND THE TOTAL SAID.
+   *
+   * THIS IS THE HALF THAT WAS MISSING. The self view cut its history with
+   * `packed`, which reports only what IT dropped — so a five-row history handed
+   * to it whole would have been five lines with nothing under them, read by
+   * somebody with forty matches as the whole of their record. `SELF.matchesNote`
+   * says the count in a player's words rather than the admin view's two numbers.
+   */
+  it('shows five matches at most and says how many they have played in all', () => {
+    const value =
+      selfEmbed(
+        selfData({
+          matches: Array.from({ length: 5 }, (unused, index) => match(index)),
+          career: career({ matches: 40 }),
+        }),
+      ).fields.find((one) => one.name === 'Recent matches')?.value ?? ''
+
+    const lines = value.split('\n')
+
+    expect(lines).toHaveLength(6)
+    expect(lines.at(-1)).toBe('40 matches played in all.')
+
+    // A player is not auditing the bot's fetch limit, so the admin view's
+    // sentence about how many rows were read does not appear here.
+    expect(value).not.toContain('read were not shown')
+  })
+
+  it('renders five even when the reader hands back more', () => {
+    const value =
+      selfEmbed(
+        selfData({
+          matches: Array.from({ length: 12 }, (unused, index) => match(index)),
+          career: career({ matches: 12 }),
+        }),
+      ).fields.find((one) => one.name === 'Recent matches')?.value ?? ''
+
+    expect(value.split('\n')).toHaveLength(6)
+    expect(value).toContain('+7 more not shown.')
+  })
+
+  /** Their match times are Discord timestamps too, in their own timezone. */
+  it('writes a player’s match times as Discord timestamps', () => {
+    const at = Date.parse('2026-08-30T09:00:00.000Z')
+    const text = self({ matches: [{ sk: 'match#1', at, placement: 2, kills: 6 }] })
+
+    expect(text).toContain(`<t:${String(at / 1000)}:R> · **#2** · 6 kills`)
+    expect(text).not.toContain('2026-08-30T')
   })
 
   it('does not let a newline in a ban reason forge a line', () => {
@@ -1589,6 +2048,207 @@ describe('selfEmbed', () => {
     expect(embed.fields.length).toBeLessThanOrEqual(25)
 
     for (const value of values(embed)) expect(value.length).toBeLessThanOrEqual(1024)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * THE CONSOLE BUTTON.
+ *
+ * A LINK BUTTON IS A COMPONENT, WHICH IS THE THIRD THING A REPLY CAN CARRY, and
+ * these cases are about the two halves that would fail quietly. The url is
+ * built out of a licence with a COLON in it, and a colon that reaches a URL path
+ * unencoded is a link that is wrong in the one character nobody reads. And the
+ * button belongs to the ADMIN view alone: the console is behind a sign-in a
+ * player does not have, so a button on their own reply is a dead end that also
+ * implies there is a page about them they may open.
+ * ------------------------------------------------------------------ */
+
+describe('the console button', () => {
+  /**
+   * THE ENCODING, WHERE IT HAPPENS. `license:aaa…` has to reach the console's
+   * `/players/[license]` route as `license%3Aaaa…`: Next.js decodes a dynamic
+   * segment on arrival, so the encoded form is what makes the page read the
+   * licence it was given rather than a truncated one — or refuse the message
+   * outright, since Discord validates a button's url before accepting it.
+   */
+  it('percent-encodes the licence into the path', () => {
+    const row = consoleRow(NEWEST)
+    const [button] = row?.components ?? []
+
+    expect(button && 'url' in button ? button.url : null).toBe(
+      `https://ringmaster.blitz-royale.com/players/license%3A${'c'.repeat(40)}`,
+    )
+
+    // The colon is gone from the path, which is the whole of the encoding.
+    expect(button && 'url' in button ? button.url : '').not.toContain('license:')
+  })
+
+  /**
+   * A LINK BUTTON AND NOT A CUSTOM-ID ONE, which is what makes this a widening
+   * of the reply seam rather than a feature with a listener. Nothing in this bot
+   * handles a component interaction — ./index.ts ignores everything that is not
+   * a chat-input command — so a button with a `custom_id` would be one that does
+   * nothing at all the day somebody pressed it.
+   */
+  it('is a link button, so nothing has to listen for it', () => {
+    const [button] = consoleRow(NEWEST)?.components ?? []
+
+    expect(button?.type).toBe(ComponentType.Button)
+    expect(button && 'style' in button ? button.style : null).toBe(ButtonStyle.Link)
+    expect(button).not.toHaveProperty('custom_id')
+    expect(button && 'label' in button ? button.label : null).toBe('Open in Ringmaster')
+  })
+
+  /**
+   * A url Discord would refuse costs the BUTTON and not the reply. Over the cap
+   * the whole message is rejected and the admin gets `runCommand`'s failure line
+   * instead of a profile; cut to fit, the button silently opens another page.
+   */
+  it('drops the button rather than the answer when the url will not fit', () => {
+    expect(consoleRow(`license:${'a'.repeat(600)}`)).toBeNull()
+
+    // And it says so where an operator can see it, since the row that caused it
+    // is in DynamoDB rather than in this repo.
+    expect([...stdout, ...stderr].join('')).toContain('too long for a button')
+  })
+
+  it('is on the admin view, pointing at the licence that was looked up', async () => {
+    const command = profileCommand(subject([]), () => NOW)
+    const shown = buttons(await command.run(invocation({ targetId: DISCORD }), cfg()))
+
+    expect(shown).toHaveLength(1)
+    expect(shown.at(0)?.label).toBe('Open in Ringmaster')
+
+    // The CURRENT licence, which is the one every other read was keyed on.
+    expect(shown.at(0)?.url).toContain(encodeURIComponent(NEWEST))
+  })
+
+  /**
+   * AND IT IS NOT ON THE SELF VIEW. Enforced by there being nothing to build one
+   * from — `SelfData` carries `known: boolean` and no licence — but asserted
+   * here anyway, because "the type makes it impossible" is a claim about the
+   * code as it stands and this is a claim about the reply a player receives.
+   */
+  it('is absent from the self view entirely', async () => {
+    const command = profileCommand(subject([]), () => NOW)
+    const reply = await command.run(invocation({ targetId: null }), cfg())
+
+    expect(buttons(reply)).toEqual([])
+
+    // No empty row either: an absent `components` and an empty one are different
+    // instructions to Discord on an edit. See `payload` in ./index.ts.
+    expect(typeof reply === 'string' ? undefined : reply.components).toBeUndefined()
+  })
+
+  /**
+   * NO LICENCE, NO BUTTON — and both ways of having no licence land here. An
+   * account the index has never heard of and an index that could not be read
+   * both arrive with `current: null`, and the console has a page for neither.
+   */
+  it('offers no button when there is no licence to link to', async () => {
+    const unknown = profileCommand(
+      reads({ licencesFor: () => Promise.resolve(ok([])) }),
+      () => NOW,
+    )
+
+    expect(buttons(await unknown.run(invocation(), cfg()))).toEqual([])
+
+    const unreadable = profileCommand(
+      reads({ licencesFor: () => Promise.resolve(failed('denied')) }),
+      () => NOW,
+    )
+
+    expect(buttons(await unreadable.run(invocation(), cfg()))).toEqual([])
+  })
+
+  /**
+   * THE SEAM CARRIES IT UNTOUCHED, END TO END. `runCommand` does not measure or
+   * reshape what a handler answered with, and `responderFor` is what turns it
+   * into the payload discord.js takes — so this is the case that fails if the
+   * button is built correctly and dropped on the way out.
+   */
+  it('reaches the interaction as components beside the embed', async () => {
+    const sent: Array<{ embeds?: unknown; components?: unknown }> = []
+
+    const interaction = {
+      deferReply: () => Promise.resolve(null),
+      editReply: (options: { embeds?: unknown; components?: unknown }) => {
+        sent.push(options)
+        return Promise.resolve(null)
+      },
+      reply: () => Promise.resolve(null),
+    }
+
+    await runCommand(invocation({ targetId: DISCORD }), cfg(), responderFor(interaction), [
+      profileCommand(subject([]), () => NOW),
+    ])
+
+    const [payload] = sent
+    expect(payload?.embeds).toHaveLength(1)
+    expect(payload?.components).toHaveLength(1)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * THE RAW DISCORD ID, WHICH IS IN NEITHER VIEW.
+ *
+ * THE MENTION IS NOT THE LEAK AND MUST NOT BE READ AS ONE. `<@444…>` contains
+ * the id because that is what a mention is made of, so every case here strips
+ * the mention markup first and asserts on what is left — otherwise the only way
+ * to pass would be to delete the tag the owner asked to keep.
+ *
+ * WHAT WAS THERE: the description said `<@id> \`id\``, the mention and the
+ * snowflake in backticks beside it, copied from the removals channel where a
+ * mention that stops rendering after somebody leaves would leave a record naming
+ * nobody. This reply is ephemeral and read once, about an account in front of
+ * the reader.
+ * ------------------------------------------------------------------ */
+
+describe('no raw Discord id in either view', () => {
+  /**
+   * AN ID CHOSEN TO BE EASY TO CATCH. Eighteen digits with no repetition, so a
+   * substring match cannot pass by accident against a level, a kill count or a
+   * unix timestamp that happens to share a prefix.
+   */
+  const LEAKY = '135792468013579246'
+
+  it('tags the subject and prints their id nowhere else', async () => {
+    const command = profileCommand(subject([]), () => NOW)
+    const reply = await command.run(invocation({ targetId: LEAKY }), cfg())
+
+    // The tag is there, which is how the reader knows who this is about.
+    expect(rendered(reply)).toContain(`<@${LEAKY}>`)
+
+    // And the id appears nowhere a mention is not.
+    expect(withoutMentions(rendered(reply))).not.toContain(LEAKY)
+  })
+
+  it('does the same for a player looking at their own profile', async () => {
+    const command = profileCommand(subject([]), () => NOW)
+    const reply = await command.run(invocation({ targetId: null, userId: LEAKY }), cfg())
+
+    expect(rendered(reply)).toContain(`<@${LEAKY}>`)
+    expect(withoutMentions(rendered(reply))).not.toContain(LEAKY)
+  })
+
+  /**
+   * AND ON THE TWO PATHS THAT ANSWER WITHOUT READING ANYTHING, which are the
+   * ones a change to the description would be written against and forget: a
+   * Discord account with no player record, and an index that would not answer.
+   */
+  it('does the same when there is no record and when nothing could be read', async () => {
+    for (const over of [
+      { licencesFor: () => Promise.resolve(ok([])) },
+      { licencesFor: () => Promise.resolve(failed('denied')) },
+    ]) {
+      const reply = await profileCommand(reads(over), () => NOW).run(
+        invocation({ targetId: LEAKY }),
+        cfg(),
+      )
+
+      expect(rendered(reply)).toContain(`<@${LEAKY}>`)
+      expect(withoutMentions(rendered(reply))).not.toContain(LEAKY)
+    }
   })
 })
 

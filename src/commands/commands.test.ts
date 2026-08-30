@@ -1,6 +1,8 @@
 import {
   ApplicationCommandOptionType,
   ApplicationCommandType,
+  ButtonStyle,
+  ComponentType,
   Events,
   MessageFlags,
   type ChatInputApplicationCommandData,
@@ -15,6 +17,7 @@ import {
   runCommand,
   TARGET_OPTION,
   type BotCommand,
+  type CommandComponentRow,
   type Invocation,
   type Responder,
 } from './command.ts'
@@ -100,6 +103,7 @@ function cfg(over: Partial<Config> = {}): Config {
     docsChannelId: null,
     maintenanceChannelId: null,
     exemptChannelIds: [],
+    serverIps: ['3.130.92.28'],
     exemptAdmins: true,
     dryRun: false,
     ...over,
@@ -550,6 +554,72 @@ describe('responderFor — how an interaction is actually answered', () => {
     const sent = interaction.editReply.mock.calls.at(0)?.at(0)
     expect(sent).toEqual({ embeds: [{ title: 'one' }] })
     expect((sent as { embeds?: unknown }).embeds).not.toBe(embeds)
+  })
+
+  /**
+   * THE SEAM WIDENED A SECOND TIME, and `/profile`'s link button to the
+   * Ringmaster console is what asked for it. A component is neither content nor
+   * part of an embed, so a seam that carries only the first two leaves a command
+   * with nothing to answer with but a bare url glued into a field.
+   */
+  it('edits with the components when the handler answered with some', async () => {
+    const interaction = target()
+
+    const row: CommandComponentRow = {
+      type: ComponentType.ActionRow,
+      components: [
+        {
+          type: ComponentType.Button,
+          style: ButtonStyle.Link,
+          label: 'Open in Ringmaster',
+          url: 'https://ringmaster.blitz-royale.com/players/license%3Aabc',
+        },
+      ],
+    }
+
+    await responderFor(interaction).edit({ embeds: [{ title: 'Player profile' }], components: [row] })
+
+    expect(interaction.editReply).toHaveBeenCalledWith({
+      embeds: [{ title: 'Player profile' }],
+      components: [row],
+    })
+  })
+
+  /**
+   * AND NO `components` KEY AT ALL WHEN THERE WERE NONE, which is not tidiness.
+   * `editReply` is an EDIT: `components: []` tells Discord to take away the ones
+   * that are there and an absent key tells it to leave them alone. Sending the
+   * empty array anyway would make every reply in this bot carry an instruction
+   * about components it has no opinion on.
+   */
+  it('sends no components key for a reply that has none', async () => {
+    const interaction = target()
+
+    await responderFor(interaction).edit({ embeds: [{ title: 'one' }] })
+
+    expect(interaction.editReply.mock.calls.at(0)?.at(0)).not.toHaveProperty('components')
+  })
+
+  /** The rows are copied a level deeper, because a row IS its inner array. */
+  it('copies the rows rather than handing over the ones the command built', async () => {
+    const interaction = target()
+
+    const row: CommandComponentRow = {
+      type: ComponentType.ActionRow,
+      components: [
+        { type: ComponentType.Button, style: ButtonStyle.Link, label: 'go', url: 'https://x.test' },
+      ],
+    }
+
+    await responderFor(interaction).edit({ embeds: [], components: [row] })
+
+    const sent = interaction.editReply.mock.calls.at(0)?.at(0) as {
+      components?: CommandComponentRow[]
+    }
+
+    expect(sent.components).toEqual([row])
+    expect(sent.components?.at(0)).not.toBe(row)
+    expect(sent.components?.at(0)?.components).not.toBe(row.components)
   })
 })
 

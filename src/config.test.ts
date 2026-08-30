@@ -49,6 +49,7 @@ const schemaVariables = [
   'BLITZ_DOCS_CHANNEL_ID',
   'BLITZ_MAINTENANCE_CHANNEL_ID',
   'BLITZ_EXEMPT_CHANNEL_IDS',
+  'BLITZ_SERVER_IPS',
   'BLITZ_EXEMPT_ADMINS',
   'BLITZ_DRY_RUN',
 ]
@@ -421,6 +422,95 @@ describe('DISCORD_ADMIN_ROLE_ID', () => {
   it('tells operators in the template that it gates the commands too', () => {
     expect(repoFile('.env.example')).toContain('DISCORD_ADMIN_ROLE_ID=')
     expect(repoFile('.env.example')).toContain('slash commands')
+  })
+})
+
+/**
+ * The addresses the link policy treats as this community's own.
+ *
+ * OPTIONAL, BUT UNSET MEANS SOMETHING DIFFERENT HERE FROM EVERY OTHER OPTIONAL
+ * VARIABLE IN THIS FILE, which is why it is worth its own cases. Everywhere else
+ * unset turns a feature off. Here an empty list would leave the feature fully on
+ * and pointed at the wrong target: every IPv4-shaped string is removed, so an
+ * allowlist of nothing deletes the message that names this server. The default
+ * is what stops an unset variable being that.
+ */
+describe('BLITZ_SERVER_IPS', () => {
+  const base = { DISCORD_BOT_TOKEN: 'token', DISCORD_GUILD_ID: 'guild' }
+
+  it('falls back to this deployment s own two addresses when it is not set', () => {
+    expect(loadConfig(base).serverIps).toEqual(['3.130.92.28', '18.222.244.205'])
+  })
+
+  /**
+   * A copied-but-unedited `.env` and a systemd unit with `BLITZ_SERVER_IPS=` in
+   * it look identical from here, and neither is a request for an empty
+   * allowlist — there is deliberately no way to spell that.
+   */
+  it('reads a blank line as unset rather than as an empty allowlist', () => {
+    expect(loadConfig({ ...base, BLITZ_SERVER_IPS: '' }).serverIps).toHaveLength(2)
+    expect(loadConfig({ ...base, BLITZ_SERVER_IPS: '   ' }).serverIps).toHaveLength(2)
+    expect(loadConfig({ ...base, BLITZ_SERVER_IPS: ' , ,, ' }).serverIps).toHaveLength(2)
+  })
+
+  it('takes a comma-separated list, so a third server needs no deploy', () => {
+    const config = loadConfig({
+      ...base,
+      BLITZ_SERVER_IPS: '3.130.92.28, 18.222.244.205 ,10.0.0.7',
+    })
+
+    expect(config.serverIps).toEqual(['3.130.92.28', '18.222.244.205', '10.0.0.7'])
+  })
+
+  it('drops the formatting accidents the channel id list drops', () => {
+    const config = loadConfig({ ...base, BLITZ_SERVER_IPS: '10.0.0.7,,\n10.0.0.8,' })
+
+    expect(config.serverIps).toEqual(['10.0.0.7', '10.0.0.8'])
+  })
+
+  /**
+   * A MALFORMED ENTRY STOPS THE PROCESS, WITH THE VARIABLE NAMED. Dropping it
+   * silently is the expensive direction twice over: the entry that was meant to
+   * exempt this server does not, so the bot boots, looks healthy, and deletes
+   * the one link the channel is for — and links.ts uses this list to exempt a
+   * `fivem://connect/` target, so a hostname smuggled in here would be an
+   * allowlisted destination rather than a dead line.
+   */
+  it.each(['evil.com', '3.130.92', '3.130.92.28.1', '3.130.92.2 8', 'fivem://connect/evil.com'])(
+    'refuses to boot on the entry %s',
+    (entry: string) => {
+      let message = ''
+      try {
+        loadConfig({ ...base, BLITZ_SERVER_IPS: entry })
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error)
+      }
+
+      expect(message).toContain('BLITZ_SERVER_IPS')
+      expect(message).toContain(entry)
+    },
+  )
+
+  it('names every bad entry at once, like every other variable here', () => {
+    let message = ''
+    try {
+      loadConfig({ ...base, BLITZ_SERVER_IPS: 'evil.com,3.130.92.28,also-bad' })
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+
+    expect(message).toContain('evil.com')
+    expect(message).toContain('also-bad')
+  })
+
+  /**
+   * THE TEMPLATE AND THE SOURCE DEFAULT HAVE TO SAY THE SAME THING. They are two
+   * copies of one fact, and the one that ships to a box running systemd's
+   * `EnvironmentFile=` — which never reads `.env.example` — is the source one.
+   * A template that drifted would send an operator looking for the wrong list.
+   */
+  it('is in the template operators copy, with the same two addresses', () => {
+    expect(repoFile('.env.example')).toContain('BLITZ_SERVER_IPS=3.130.92.28,18.222.244.205')
   })
 })
 

@@ -147,6 +147,32 @@ export interface Config {
   maintenanceChannelId: string | null
 
   exemptChannelIds: string[]
+
+  /**
+   * The IPv4 addresses this community's own game servers answer on. Every other
+   * IPv4-shaped string in a message is somebody else's server — see src/links.ts.
+   *
+   * CONFIGURATION RATHER THAN A CONSTANT, BECAUSE A THIRD SERVER MUST NOT NEED A
+   * DEPLOY. This is the one thing in the link policy that is a fact about this
+   * deployment rather than a fact about the internet — the shortener list is the
+   * other way round and lives in the code, where it is testable and reviewable.
+   *
+   * IT DEFAULTS TO THE TWO ADDRESSES RATHER THAN TO AN EMPTY LIST, and unlike
+   * every other optional variable here that default is not "the feature is off".
+   * An empty allowlist would delete the owner's own server address out of his own
+   * guild the first time anybody posted it, so an unset variable has to keep the
+   * bot working rather than turn it into a filter that removes the one link the
+   * channel is for.
+   *
+   * EVERY ENTRY IS CHECKED FOR SHAPE, NOT MERELY TRIMMED. A typo here does not
+   * announce itself: the bot boots, moderates, and quietly deletes the message
+   * that names its own server, which looks exactly like the bot working. And
+   * links.ts trusts this list to hold ADDRESSES — it uses it to exempt a
+   * `fivem://connect/` target, so a hostname smuggled into this variable would
+   * be an allowlisted destination rather than a dead entry.
+   */
+  serverIps: string[]
+
   exemptAdmins: boolean
   dryRun: boolean
 }
@@ -196,6 +222,63 @@ const idList = z
   )
 
 /**
+ * The addresses the bot's own guild runs on, used when the operator names none.
+ *
+ * THE SAME TWO THE OWNER GAVE, AND THEY ARE IN THE SOURCE ON PURPOSE. A default
+ * that lived only in `.env.example` would be a default that a systemd
+ * `EnvironmentFile=` — which never reads that file — silently does not have; see
+ * this file's header for how that class of bug already bit this repo once.
+ */
+const DEFAULT_SERVER_IPS = ['3.130.92.28', '18.222.244.205']
+
+/**
+ * What an entry in `BLITZ_SERVER_IPS` has to look like.
+ *
+ * EXACTLY WHAT src/links.ts CALLS IPv4-SHAPED, deliberately: one to three digits
+ * per octet and four of them, with no range check on top. An entry this accepts
+ * that the matcher could never produce would be an allowlist line that silently
+ * exempts nothing, and an entry the matcher can produce that this rejects would
+ * be an address the operator cannot allowlist. The two notions have to be the
+ * same one.
+ */
+const IPV4_ENTRY = /^\d{1,3}(?:\.\d{1,3}){3}$/
+
+/**
+ * The IP allowlist: a comma-separated list, defaulted and shape-checked.
+ *
+ * BLANK IS UNSET, LIKE EVERY OTHER OPTIONAL VARIABLE HERE, so a copied-but-
+ * unedited `.env` gets the two real addresses rather than an allowlist of
+ * nothing. There is deliberately no way to spell "allowlist nothing": the only
+ * thing it could achieve is deleting messages that name this community's own
+ * server, and a blank line is what a template looks like, not a request.
+ *
+ * A BAD ENTRY STOPS THE PROCESS instead of being dropped, which is the same
+ * argument `flag` makes about `BLITZ_DRY_RUN=ture`. A silently ignored entry
+ * here is a bot that boots, looks healthy, and deletes the one link the channel
+ * exists for.
+ */
+const ipList = z
+  .string()
+  .optional()
+  .transform((raw, ctx) => {
+    const entries = (raw ?? '')
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0)
+
+    if (entries.length === 0) return [...DEFAULT_SERVER_IPS]
+
+    const malformed = entries.filter((entry) => !IPV4_ENTRY.test(entry))
+    if (malformed.length === 0) return entries
+
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `must be comma-separated IPv4 addresses, got "${malformed.join('", "')}"`,
+    })
+    return z.NEVER
+  })
+
+/**
  * A "true"/"false" flag with a default.
  *
  * CASE-INSENSITIVE BUT OTHERWISE EXACT. `True` is obviously the same intent;
@@ -234,6 +317,7 @@ const schema = z.object({
   BLITZ_DOCS_CHANNEL_ID: optionalId,
   BLITZ_MAINTENANCE_CHANNEL_ID: optionalId,
   BLITZ_EXEMPT_CHANNEL_IDS: idList,
+  BLITZ_SERVER_IPS: ipList,
   BLITZ_EXEMPT_ADMINS: flag(true),
   BLITZ_DRY_RUN: flag(false),
 })
@@ -259,6 +343,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     docsChannelId: parsedEnv.BLITZ_DOCS_CHANNEL_ID,
     maintenanceChannelId: parsedEnv.BLITZ_MAINTENANCE_CHANNEL_ID,
     exemptChannelIds: parsedEnv.BLITZ_EXEMPT_CHANNEL_IDS,
+    serverIps: parsedEnv.BLITZ_SERVER_IPS,
     exemptAdmins: parsedEnv.BLITZ_EXEMPT_ADMINS,
     dryRun: parsedEnv.BLITZ_DRY_RUN,
   }

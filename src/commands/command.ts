@@ -1,4 +1,9 @@
-import type { APIEmbed, ChatInputApplicationCommandData } from 'discord.js'
+import type {
+  APIActionRowComponent,
+  APIComponentInMessageActionRow,
+  APIEmbed,
+  ChatInputApplicationCommandData,
+} from 'discord.js'
 
 import type { Config } from '../config.ts'
 import { log } from '../log.ts'
@@ -150,7 +155,19 @@ export type AdminGate = boolean | ((invocation: Invocation) => boolean)
 export type Refusal = 'not-in-guild' | 'admin-role-unset' | 'roles-unreadable' | 'not-admin'
 
 /**
- * What a handler answers with: a line of text, or embeds.
+ * One row of message components, as the plain record Discord takes.
+ *
+ * A MESSAGE COMPONENT IS THE THIRD THING A REPLY CAN CARRY, beside content and
+ * embeds, and Discord will only accept one inside an ACTION ROW — a button is
+ * never a top-level thing. So the seam carries rows rather than buttons, which
+ * is also what makes "at most five per row, at most five rows" a shape the
+ * caller can see rather than a rule it has to remember.
+ */
+export type CommandComponentRow = APIActionRowComponent<APIComponentInMessageActionRow>
+
+/**
+ * What a handler answers with: a line of text, or embeds and optionally the
+ * components under them.
  *
  * THE SEAM WAS A `string` AND THAT WAS A BUDGET DECISION NOBODY MADE. Discord
  * allows 2000 UTF-16 units in a message's content and 6000 across an embed, so a
@@ -162,6 +179,27 @@ export type Refusal = 'not-in-guild' | 'admin-role-unset' | 'roles-unreadable' |
  * than leaving a fallback: two budget policies drift, and the one that drifts is
  * the one nothing exercises.
  *
+ * `components` IS THE SAME WIDENING A SECOND TIME, AND FOR THE SAME REASON. A
+ * link button — `/profile`'s route to the player's page in the Ringmaster
+ * console — is a COMPONENT, not text and not part of an embed, so a seam that
+ * carries only embeds leaves a command with nothing to answer with but a bare
+ * URL glued into a field. The alternative was a command reaching for the
+ * interaction to attach one itself, which is exactly what `Responder` exists to
+ * stop.
+ *
+ * NOTHING NEW HAS TO LISTEN, WHICH IS WHY THIS IS A WIDENING AND NOT A FEATURE.
+ * A LINK button carries a `url` and has no `custom_id`: clicking it opens a
+ * page and sends this bot no interaction at all. Every other button style does
+ * send one, and the day one of those is wanted this seam is not enough on its
+ * own — there would have to be a component handler in ./index.ts, which today
+ * deliberately ignores everything that is not a chat-input command.
+ *
+ * OPTIONAL, so that a reply with no components is the same value it was before
+ * and `payload` in ./index.ts sends no `components` key at all. An empty array
+ * is not the same thing to Discord on an EDIT — it means "remove the ones that
+ * are there" — and a seam whose absent case and empty case differ is one nobody
+ * can read.
+ *
  * A UNION RATHER THAN AN EMBED FOR EVERYTHING, because /help's answer is one
  * sentence with a mention in it and an embed would be a box drawn around it for
  * no reason. A command that has a string to say keeps returning a string, and
@@ -171,8 +209,14 @@ export type Refusal = 'not-in-guild' | 'admin-role-unset' | 'roles-unreadable' |
  * boundary in this repo is a record; a builder is a live object whose only real
  * offer is validation of a shape `tsc` already checks, and `profileEmbed` in
  * ./profile.ts has to measure its own result against Discord's limits anyway.
+ * The same argument answers `ActionRowBuilder` for the row above.
  */
-export type CommandReply = string | { readonly embeds: readonly APIEmbed[] }
+export type CommandReply =
+  | string
+  | {
+      readonly embeds: readonly APIEmbed[]
+      readonly components?: readonly CommandComponentRow[]
+    }
 
 /**
  * One command: what Discord is told about it, who may run it, and what it does.

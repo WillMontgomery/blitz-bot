@@ -5,7 +5,7 @@ import type { Config } from '../config.ts'
 import { setSink } from '../log.ts'
 import { setStickies, STICKY_TEXT_CAP, type Stickies } from '../sticky.ts'
 import { refusalFor, runCommand, type Invocation, type Responder } from './command.ts'
-import { sticky, STICKY_TEXT_OPTION, unsticky, type StickyFields } from './sticky.ts'
+import { sticky, STICKY_TEXT_OPTION, unsticky, type StickyFields, COPY } from './sticky.ts'
 
 /**
  * `/sticky` and `/unsticky`, offline.
@@ -66,6 +66,7 @@ function cfg(over: Partial<Config> = {}): Config {
     docsChannelId: null,
     maintenanceChannelId: null,
     exemptChannelIds: [],
+    serverIps: ['3.130.92.28'],
     exemptAdmins: true,
     dryRun: false,
     ...over,
@@ -205,7 +206,7 @@ describe('what Discord is told about the two commands', () => {
    * descriptions are the exception ./help.ts already names: Discord requires
    * them and will not take an empty one.
    */
-  it('says PLACEHOLDER in every reply, because no wording was supplied', async () => {
+  it('carries the owner’s wording, and marks only what he has not supplied', async () => {
     const engine = fakeEngine()
     setStickies(engine)
 
@@ -217,7 +218,16 @@ describe('what Discord is told about the two commands', () => {
       await unsticky.run(invocation(), cfg()),
     ]
 
-    for (const reply of replies) expect(reply).toContain('PLACEHOLDER')
+    // His words, verbatim, for the six he supplied.
+    expect(replies[0]).toBe(COPY.set)
+    expect(replies[3]).toBe(COPY.noChannel)
+    expect(replies[4]).toBe(COPY.nothingToClear)
+
+    // `empty` and `tooLong` are the two he has NOT supplied. They must stay
+    // obviously unfinished rather than quietly shipping wording nobody chose,
+    // and this is what fails the moment somebody invents some.
+    expect(replies[1]).toContain('PLACEHOLDER')
+    expect(replies[2]).toContain('PLACEHOLDER')
   })
 })
 
@@ -268,7 +278,7 @@ describe('putting a sticky up', () => {
       { kind: 'set', channelId: CHANNEL, text: '  the server is down  ' },
     ])
 
-    expect(reply).toContain('a sticky that is now up')
+    expect(reply).toBe(COPY.set)
   })
 
   /**
@@ -279,7 +289,7 @@ describe('putting a sticky up', () => {
   it('says so when it replaced a sticky that was already there', async () => {
     setStickies(fakeEngine(true))
 
-    await expect(sticky.run(invocation(), cfg())).resolves.toContain('replaced another')
+    await expect(sticky.run(invocation(), cfg())).resolves.toBe(COPY.replaced)
   })
 
   /**
@@ -331,7 +341,7 @@ describe('putting a sticky up', () => {
     for (const missing of [{ channelId: null }, { channelId: undefined }, { channelId: '' }]) {
       const reply = await sticky.run(invocation(missing), cfg())
 
-      expect(reply).toContain('could not tell which channel')
+      expect(reply).toBe(COPY.noChannel)
     }
 
     expect(engine.calls).toHaveLength(0)
@@ -354,8 +364,8 @@ describe('putting a sticky up', () => {
    * failed, which tells an operator nothing about which half is missing.
    */
   it('says so when no engine has been installed', async () => {
-    await expect(sticky.run(invocation(), cfg())).resolves.toContain('not installed')
-    await expect(unsticky.run(invocation(), cfg())).resolves.toContain('not installed')
+    await expect(sticky.run(invocation(), cfg())).resolves.toBe(COPY.unavailable)
+    await expect(unsticky.run(invocation(), cfg())).resolves.toBe(COPY.unavailable)
   })
 })
 
@@ -367,7 +377,7 @@ describe('taking a sticky down', () => {
     const reply = await unsticky.run(invocation({ commandName: 'unsticky' }), cfg())
 
     expect(engine.calls).toEqual([{ kind: 'clear', channelId: CHANNEL, text: null }])
-    expect(reply).toContain('taken down')
+    expect(reply).toBe(COPY.cleared)
   })
 
   /**
@@ -378,16 +388,14 @@ describe('taking a sticky down', () => {
   it('says there was nothing there rather than confirming twice', async () => {
     setStickies(fakeEngine(false))
 
-    await expect(unsticky.run(invocation(), cfg())).resolves.toContain('had no sticky')
+    await expect(unsticky.run(invocation(), cfg())).resolves.toBe(COPY.nothingToClear)
   })
 
   it('refuses when the invocation carries no channel', async () => {
     const engine = fakeEngine()
     setStickies(engine)
 
-    await expect(unsticky.run(invocation({ channelId: null }), cfg())).resolves.toContain(
-      'could not tell which channel',
-    )
+    await expect(unsticky.run(invocation({ channelId: null }), cfg())).resolves.toBe(COPY.noChannel)
 
     expect(engine.calls).toHaveLength(0)
   })
@@ -420,7 +428,7 @@ describe('through runCommand', () => {
     await runCommand(invocation(), cfg(), respond, [sticky])
 
     expect(respond.deferred).toEqual([true])
-    expect(respond.edited[0]).toContain('a sticky that is now up')
+    expect(respond.edited[0]).toBe(COPY.set)
   })
 
   /**
