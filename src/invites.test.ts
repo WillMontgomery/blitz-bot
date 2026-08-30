@@ -308,6 +308,56 @@ const HOSTILE_MATCHES: string[] = [
   `join discord.gg:443/${CODE}.`,
   `discord.gg:443/${CODE}?event=1`,
   `discord.gg:443/${CODE}/whatever`,
+
+  // A BACKSLASH IS A SLASH. The WHATWG URL spec folds `\` into `/` for http and
+  // https, so a browser handed any of these loads the invite — measured with
+  // node's own parser, `discord.gg\x` comes out as the host `discord.gg` and the
+  // path `/x`, `\invite\x` as `/invite/x`, and `\\x` as `//x`.
+  `https://discord.gg\\${CODE}`,
+  `discord.gg\\${CODE}`,
+  `https://discord.com\\invite\\${CODE}`,
+  `discord.gg\\invite\\${CODE}`,
+  `https://discord.gg\\\\${CODE}`,
+  // A backslash and a slash in either order. The markdown reading calls the
+  // first of these one escaped slash and the URL reading calls it two
+  // separators; the pattern is written so that it never has to choose.
+  `https://discord.gg\\/${CODE}`,
+  `https://discord.gg/\\${CODE}`,
+  `https://discord.gg.:443\\${CODE}`,
+  `discord.gg.:80\\\\invite\\${CODE}`,
+
+  // The unicode label separators. RFC 3490 and UTS #46 map all three to `.`
+  // before the host is looked up, so these are not lookalikes of the real link —
+  // after mapping they ARE it, and node's URL parser resolves every one of them
+  // to the host discord.gg. Written as escapes rather than as the characters:
+  // three dots that differ only in width are three rows nobody can tell apart in
+  // a review, and which one a row is about is the entire content of the row.
+  `https://discord\u3002gg/${CODE}`, // IDEOGRAPHIC FULL STOP
+  `discord\uFF0Egg/${CODE}`, // FULLWIDTH FULL STOP
+  `discord\uFF61gg/${CODE}`, // HALFWIDTH IDEOGRAPHIC FULL STOP
+  `https://discord\u3002com/invite/${CODE}`,
+  `https://www\u3002discord\uFF0Egg/${CODE}`,
+  // The same character in the FQDN root position, and next to the other forms.
+  `https://discord.gg\u3002:443//${CODE}`,
+  `discord\uFF61gg\\${CODE}`,
+
+  // Percent-encoding, which is decoded once before the pattern runs. Every one
+  // of these yields nothing from the raw pass, so the decoded pass is the whole
+  // of the answer for them.
+  `https://discord.gg/%61%42%63%2D%31%32%33`,
+  `https://discord.com/invite/%61%42%63%2D%31%32%33`,
+  `https://discord.gg:443//%61%42%63%2D%31%32%33`,
+  // The trick moved off the code and onto the host dot, the separator and the
+  // path — the places a `%` bolted into the code class would never have reached.
+  `https://discord%2Egg/${CODE}`,
+  `discord.gg/%2F${CODE}`,
+  `discord.gg/%69%6E%76%69%74%65/${CODE}`,
+  `https://discord%2Egg:443\\${CODE}`,
+  // A malformed escape elsewhere in the message must not cost the decode. This
+  // is the row that rules out `decodeURIComponent`, which throws on the whole
+  // string for the `%` in `100%` and would hand anyone who noticed a four
+  // character bypass.
+  `100% sure, discord.gg/%61%42%63%2D%31%32%33`,
 ]
 
 /**
@@ -353,6 +403,34 @@ const HOSTILE_NON_MATCHES: string[] = [
   `discord.gg:44a3/${CODE}`,
   `discord.gg:443:443/${CODE}`,
   `discord.gg,443/${CODE}`,
+
+  // A backslash separator must not smuggle a foreign host past the lookbehind
+  // either. `mydiscord.gg\x` is a URL that loads — it just is not Discord's.
+  `mydiscord.gg\\${CODE}`,
+  `not-discord.gg\\${CODE}`,
+  `notdiscord.com\\invite\\${CODE}`,
+  // A separator and then nothing, in the new spelling.
+  `discord.gg\\`,
+  `discord.gg\\\\`,
+  `discord.gg.:443\\`,
+
+  // The unicode label separators do not loosen anything else. The lookbehind
+  // still ends the argument, `gg` is still not `ggg`, and a `.com` host is still
+  // only an invite on the `/invite` path.
+  `mydiscord。gg/${CODE}`,
+  `discord。ggg:443/${CODE}`,
+  `discord．com/${CODE}`,
+  `discord。gg。example。com/invite/${CODE}`,
+
+  // Percent-encoding does not either. The decoded pass runs the same pattern,
+  // so everything the pattern refuses it still refuses.
+  `mydiscord.gg/%61%42%63%2D%31%32%33`,
+  `discord.gg/%20`,
+  `discord.gg/%2F`,
+  // DECODED ONCE, LIKE A BROWSER. `%2561` is the literal text `%61` to every
+  // client that will ever load this, so decoding to a fixed point would invent
+  // an invite out of text nobody can click.
+  `discord.gg/%2561%2542%2563%252D%2531%2532%2533`,
 ]
 
 describe('findInviteCodes — the host boundary', () => {
@@ -407,6 +485,41 @@ describe('findInviteCodes — what a hostile message costs', () => {
     expect(codes).toEqual([])
     expect(elapsed).toBeLessThan(1_000)
   })
+
+  it('finishes in bounded time when the decoded pass runs as well', () => {
+    /**
+     * THE SECOND PASS IS A SECOND PLACE TO PUT A BOMB, and it is the cheaper of
+     * the two to arm: one `%` anywhere in the message is enough to make the
+     * pattern run twice, over a string the poster wrote both versions of. The
+     * guard above cannot see this one, because its string has no `%` in it and
+     * so never reaches the decode at all.
+     *
+     * THE UNIT SPELLS ITS SEPARATORS BOTH WAYS. `%2F` and `%5C` are invisible to
+     * the raw pass and become the long run the decoded pass has to walk, which
+     * is the shape that drives each pass to the far end of a different part of
+     * the pattern before failing on a trailing `.` that no code can start with.
+     *
+     * SAME ONE-SECOND WALL, deliberately. Two passes and a decode over 50k
+     * characters is a couple of milliseconds in the real pattern; the bound is
+     * loose enough that only a catastrophic pattern reaches it.
+     */
+    const nearGg = `discord.gg.:${'9'.repeat(24)}${'%2F'.repeat(8)}${'\\'.repeat(12)}.`
+    const nearCom = `discord.com.:${'9'.repeat(24)}${'%2F'.repeat(12)}invite${'%5C'.repeat(8)}.`
+    const unit = nearGg + nearCom
+    const hostile = unit.repeat(Math.ceil(50_000 / unit.length))
+
+    expect(hostile.length).toBeGreaterThanOrEqual(50_000)
+    // If this ever stopped holding the test would be timing one pass and
+    // claiming to have timed two.
+    expect(hostile).toContain('%')
+
+    const started = performance.now()
+    const codes = findInviteCodes(hostile)
+    const elapsed = performance.now() - started
+
+    expect(codes).toEqual([])
+    expect(elapsed).toBeLessThan(1_000)
+  })
 })
 
 describe('findInviteCodes — deliberately loose to the left of the host', () => {
@@ -429,6 +542,17 @@ describe('findInviteCodes — deliberately loose to the left of the host', () =>
   it('is not stopped by emoji or other non-ascii pressed against the link', () => {
     expect(findInviteCodes('🎉discord.gg/abc123🎉')).toEqual(['abc123'])
     expect(findInviteCodes('до discord.gg/abc123')).toEqual(['abc123'])
+  })
+
+  it('reads a half-encoded code both ways and keeps both', () => {
+    // The price of reading the message twice, and it is the cheap direction.
+    // The raw pass stops at the `%` and the decoded pass sees the whole code, so
+    // a code written half in hex costs one extra lookup on a fragment that
+    // resolves to nothing and is therefore never deleted on. Pinned rather than
+    // left to be discovered, because the alternative — dropping the raw reading
+    // whenever a `%` appears — trades this for a miss, which is the failure
+    // nothing downstream can recover from.
+    expect(findInviteCodes('discord.gg/ab%63123')).toEqual(['ab', 'abc123'])
   })
 })
 
@@ -475,6 +599,18 @@ describe('findInviteCodes — statelessness', () => {
     expect(findInviteCodes('discord.gg/first')).toEqual(['first'])
     expect(findInviteCodes('nothing here')).toEqual([])
     expect(findInviteCodes('discord.gg/second')).toEqual(['second'])
+  })
+
+  it('gives the same answer every time on the decoded path too', () => {
+    // The percent decoder is a second global regex, and a global regex is the
+    // one kind of constant that can answer differently on the second call. This
+    // is the same bug as above, in the piece that was added later: it would show
+    // up as the bot scanning every other percent-encoded invite and nothing
+    // about it would be visible in production.
+    const content = 'discord.gg/%61%62%63 and discord.gg/%64%65%66'
+    expect(findInviteCodes(content)).toEqual(['abc', 'def'])
+    expect(findInviteCodes(content)).toEqual(['abc', 'def'])
+    expect(findInviteCodes(content)).toEqual(['abc', 'def'])
   })
 })
 

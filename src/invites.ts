@@ -41,8 +41,9 @@ import { log } from './log.ts'
  */
 
 /**
- * An optional markdown backslash escape, allowed before every literal
- * punctuation character in the pattern.
+ * An optional markdown backslash escape, allowed before each literal
+ * punctuation character in the pattern that still needs one: the dot and the
+ * port's colon.
  *
  * DISCORD RENDERS `discord\.gg/abc123` AS A WORKING LINK. Its markdown drops a
  * backslash that precedes punctuation, so the escape survives the round trip
@@ -54,25 +55,83 @@ import { log } from './log.ts'
  * false positive costs one lookup that comes back unresolved.
  *
  * ALLOWED EVERYWHERE A DELIMITER APPEARS, not just on the host dot. Somebody who
- * has just learned that `discord\.gg` gets through will try `discord\.gg\/x`
- * next, and a rule applied to one delimiter out of three is the same bug in a
- * new place.
+ * has just learned that `discord\.gg` gets through will try `discord\.gg\:443`
+ * next, and a rule applied to one delimiter out of two is the same bug in a new
+ * place.
+ *
+ * THE SLASHES NO LONGER USE IT, and that is not an exception carved out of the
+ * rule above. A backslash in front of a slash is still handled — by `SLASHES`
+ * below, which absorbs the backslash for an entirely different reason and comes
+ * out at the same answer. See the note there: keeping `ESC` on the slash as well
+ * is what makes that pattern ambiguous, and ambiguous is what makes it explode.
  */
 const ESC = '\\\\?'
 
-/** `.` as it can be written: bare, or escaped by Discord's markdown. */
-const DOT = `${ESC}\\.`
-
-/** `/` as it can be written. */
-const SLASH = `${ESC}/`
+/**
+ * THE DOT THAT SEPARATES HOSTNAME LABELS IS FOUR CHARACTERS, not one.
+ *
+ * RFC 3490 NAMES EXACTLY THIS SET, and the WHATWG URL parser inherits it through
+ * UTS #46: U+3002 IDEOGRAPHIC FULL STOP, U+FF0E FULLWIDTH FULL STOP and U+FF61
+ * HALFWIDTH IDEOGRAPHIC FULL STOP are each mapped to `.` before a host is
+ * looked up. `https://discord。gg/abc123` is therefore not a lookalike OF the
+ * real link — after mapping it IS the real link. Measured with node's own URL
+ * parser, all three normalise to the host `discord.gg` and the path
+ * `/abc123`.
+ *
+ * THIS WAS REFUSED ONCE, on the grounds that a unicode host is an IDN question
+ * wanting the real normalisation this pattern does not have. That was wrong
+ * about the facts rather than about the principle: the separator set is CLOSED
+ * and has three members, written down in a standard, so it is a rule about a
+ * class in exactly the way the boundary below is — not a character bolted on for
+ * one instance.
+ *
+ * WHAT IS STILL NOT COVERED, and the distinction is the whole reason this stops
+ * at the dot: the LETTERS of a host are mapped too, so `ｄｉｓｃｏｒｄ.gg` is
+ * also a working link and still yields nothing here. That set is not closed — it
+ * is the whole compatibility mapping, and spelling `discord` as seven two-way
+ * character classes would cover the fullwidth block and miss the next one. It
+ * wants a normalisation pass over a candidate host, which is a larger change
+ * than this file. Written down so the gap is a known one.
+ *
+ * SPELLED `\uXXXX` IN THE PATTERN ITSELF, whatever the prose above does. Three
+ * dots that differ only in width are three characters nobody can tell apart in a
+ * diff, and this is a security pattern that has to be readable to be reviewed.
+ * The hostile-form table spells them the same way and for the same reason.
+ */
+const DOT = `${ESC}[.\\u3002\\uFF0E\\uFF61]`
 
 /**
- * One or more slashes.
+ * ONE OR MORE SEPARATORS between the hostname and the path, or between path
+ * segments.
  *
  * `//` IS NOT A TYPO TO A URL PARSER. `https://discord.gg//abc123` loads the
  * same invite as one slash does, and `discord.gg/invite//abc123` likewise.
+ *
+ * A BACKSLASH IS A SLASH TO A URL PARSER. The WHATWG spec folds `\` into `/`
+ * for special schemes, so `https://discord.gg\abc123` normalises to
+ * `https://discord.gg/abc123` and loads the invite — measured, along with
+ * `\invite\abc123` and `\\abc123`, which come out as `/invite/abc123` and
+ * `//abc123`. That form yielded NOTHING, which is an advert left standing.
+ *
+ * THE TWO READINGS OF A BACKSLASH COEXIST, AND THAT IS WHY THIS IS A CHARACTER
+ * CLASS AND NOT AN ALTERNATION. A backslash was already meaningful here as
+ * Discord's markdown escape, where `\/` is one escaped slash; it is now also a
+ * separator in its own right, where `\/` is two separators. Neither reading has
+ * to win, because the only thing either is allowed to conclude is "the separator
+ * run continues", and one slash and two have meant the same thing here from the
+ * start. `[\\/]+` says exactly that and never has to decide which reading
+ * applies.
+ *
+ * SPELLING IT AS THE ALTERNATION `(?:\\?/|\\)+` IS THE BUG THIS AVOIDS, and it
+ * is the obvious way to write the fix. There the two readings are two distinct
+ * PARSES of `\/`, so a run of k of them has 2^k parses and the engine walks all
+ * of them before giving up on a string that ends in something no code can start
+ * with. Measured on that form: 9.8ms at k=20, 38.4ms at 22, 153ms at 24 — a
+ * clean doubling per token, so a 40-token run is hours. The class does k=5000 in
+ * 0.04ms. This is the same catastrophic backtracking the timed test guards, and
+ * it arrives through the one edit that looks like a one-character fix.
  */
-const SLASHES = `(?:${SLASH})+`
+const SLASHES = `[\\\\/]+`
 
 /**
  * EVERYTHING THAT MAY LEGALLY SIT BETWEEN THE HOSTNAME AND THE PATH. This is
@@ -103,12 +162,14 @@ const SLASHES = `(?:${SLASH})+`
  * and load the invite. `\d*` rather than `\d+` costs nothing and closes the
  * variant somebody would otherwise reach for the day `:443` stops working.
  *
- * DELIBERATELY NOT COVERED: a host written with a unicode full stop
- * (`discord。gg`) or percent-encoding. Those are IDN/encoding questions about
- * the HOSTNAME rather than about the boundary after it, they need the same
- * normalisation a URL parser does, and this pattern does not have one. If one
- * of them ever turns up in a real message it wants its own rule, not a
- * character bolted into `DOT`.
+ * THE UNICODE FULL STOP AND PERCENT-ENCODING WERE ONCE EXCLUDED HERE, on the
+ * grounds that they are questions about the HOSTNAME rather than about the
+ * boundary after it and want a real normalisation. The second half of that was
+ * right and the first half was the mistake: they are both covered now, and
+ * neither one is a character bolted into this rule. The unicode dots are a
+ * closed set that belongs to `DOT`; percent-encoding is a normalisation, so it
+ * is done as one, to the message, before the pattern ever runs. See
+ * `percentDecode`.
  */
 const AFTER_HOST = `(?:${DOT})?(?:${ESC}:\\d*)?${SLASHES}`
 
@@ -151,16 +212,17 @@ const AFTER_HOST = `(?:${DOT})?(?:${ESC}:\\d*)?${SLASHES}`
  * CASE-INSENSITIVE ON THE DOMAIN, CASE-PRESERVING ON THE CODE. `DISCORD.GG`
  * is the same host; `AbC123` and `abc123` are two different servers.
  *
- * NO QUANTIFIER HERE NESTS INSIDE ANOTHER, and that is a property to preserve
- * rather than a coincidence. This regex is run against attacker-chosen strings
- * of up to 4000 characters on the message handler's own path, so a pattern that
- * backtracks exponentially is a way to stop the bot with one post — the same
- * outage the lookup cap below was fitted for, reached through the CPU instead of
- * through the API budget. Writing the slash run as `(?:(?:\\?\/)+)+` rather than
- * `(?:\\?\/)+` is enough to do it, and it is still a correct fix for every form
- * the tests list: on the test suite's 50k-character string of near-misses that
- * one extra pair of parentheses takes 0.3ms to 3.4 seconds. There is a timed
- * test pinning this; keep it passing.
+ * NO QUANTIFIER HERE NESTS INSIDE ANOTHER AND NO REPEATED PIECE IS AMBIGUOUS,
+ * and both are properties to preserve rather than coincidences. This regex is
+ * run against attacker-chosen strings of up to 4000 characters on the message
+ * handler's own path, so a pattern that backtracks exponentially is a way to
+ * stop the bot with one post — the same outage the lookup cap below was fitted
+ * for, reached through the CPU instead of through the API budget. Writing the
+ * separator run as `(?:[\\/]+)+` is enough to do it, and so is the alternation
+ * `(?:\\?/|\\)+` that `SLASHES` explains at length, which is worse because it
+ * looks like the natural way to say what it says. Both are still correct fixes
+ * for every form the tests list, which is exactly why neither is caught by
+ * reading. There are timed tests pinning this, one per pass; keep them passing.
  */
 const INVITE = new RegExp(
   `(?<![A-Za-z0-9-])` +
@@ -171,23 +233,101 @@ const INVITE = new RegExp(
 )
 
 /**
+ * A well-formed percent escape. Global because `percentDecode` replaces every
+ * one of them; `String.prototype.replace` resets `lastIndex` on a global regex
+ * itself, so this constant carries no state between calls the way the `exec`
+ * loop `findInviteCodes` avoids would.
+ */
+const PERCENT_ESCAPE = /%([0-9A-Fa-f]{2})/g
+
+/**
+ * The message as a URL parser would read it: ONE pass of percent-decoding.
+ *
+ * `https://discord.gg/%61%62%63` yielded nothing, because an invite code is
+ * alphanumeric and `%` is not. The fix is not to teach the code class about
+ * `%` — that extracts the string `%61%62%63`, which no resolver can look up, so
+ * the bot would find the invite and then be unable to say anything about it.
+ * Decoding the message and running the UNCHANGED pattern over the result gets
+ * the code Discord would see, and one rule then also covers `discord%2Egg/x`
+ * (measured: node's URL parser resolves that host to `discord.gg`) and
+ * `discord.gg/%69%6E%76%69%74%65/x`, which are the same trick moved onto the
+ * host dot and onto the path. A `%` in the code class would have missed both.
+ *
+ * LOWER CONFIDENCE THAN THE REST OF THIS FILE, SAID PLAINLY. `new URL()` does
+ * NOT decode a path — measured, the path stays `/%61%62%63` — so whether
+ * Discord's own router resolves that to the invite `abc` is not something this
+ * repo has verified, and it cannot be verified offline. It is done anyway
+ * because the two directions are not the same size: if Discord decodes, leaving
+ * this out is an advert left standing, which is unrecoverable. If it does not,
+ * the cost is one lookup spent on a message that spelled a foreign guild's
+ * invite code out in hex, and a deletion still only ever follows a CONFIRMED
+ * foreign guild.
+ *
+ * BYTE-WISE, AND DELIBERATELY NOT `decodeURIComponent`. That function throws on
+ * the WHOLE string for one malformed escape, so `100% sure, discord.gg/%61%62%63`
+ * would take the entire pass down with it — a bypass costing four characters of
+ * prose, and one nobody would ever see reported. This rewrites well-formed
+ * escapes only and cannot throw. It is not UTF-8 aware and does not need to be:
+ * a multi-byte sequence decodes to characters that can be part of neither a
+ * hostname nor a code, so getting them right would change no answer.
+ *
+ * ONCE, NOT TO A FIXED POINT, because a browser decodes a path once. `%2561` is
+ * the literal text `%61` to every client that will ever load it, and decoding
+ * until nothing changes would invent invites out of text nobody can click.
+ */
+function percentDecode(content: string): string {
+  if (!content.includes('%')) return content
+
+  return content.replace(PERCENT_ESCAPE, (_escape, hex: string) =>
+    String.fromCharCode(Number.parseInt(hex, 16)),
+  )
+}
+
+/**
  * Every invite code in a message, in the order they appear, each one once.
+ *
+ * READ TWICE: ONCE AS POSTED AND ONCE DECODED, and the union of the two. Neither
+ * pass is redundant. The raw text is what a reader copies, and the decoded text
+ * is what a client resolves; a form that only one of them can see is a form the
+ * other has to be there to catch, and this file's premise is that a miss is the
+ * failure nothing downstream can recover from. The second pass is skipped
+ * outright when there is no `%` in the message, which is nearly every message,
+ * so the ordinary path still runs the pattern exactly once.
+ *
+ * THE PRICE, WHICH IS THE CHEAP DIRECTION: a code half-written in hex is seen
+ * twice and differently. `discord.gg/ab%63123` yields `ab` from the raw pass and
+ * `abc123` from the decoded one. The junk half resolves to nothing and is never
+ * deleted on, which is the same bargain every other loose rule in this file
+ * takes.
  *
  * DEDUPLICATION IS CASE-SENSITIVE, unlike the domain match above. Two codes
  * that differ only in case are two different invites to two different guilds,
  * and folding them together would resolve one and delete on behalf of the
  * other.
- *
- * `matchAll` RATHER THAN A `while (re.exec(...))` LOOP over a module-level
- * regex. A global regex carries `lastIndex` between calls, so the loop form on
- * a shared constant returns different answers on the second call with the same
- * input — the classic version of this bug scans every other message. `matchAll`
- * works on its own clone and cannot do that.
  */
 export function findInviteCodes(content: string): string[] {
   const seen = new Set<string>()
   const codes: string[] = []
 
+  collectInto(content, seen, codes)
+
+  const decoded = percentDecode(content)
+  if (decoded !== content) collectInto(decoded, seen, codes)
+
+  return codes
+}
+
+/**
+ * One pass of the pattern over one string, appending what is new.
+ *
+ * `matchAll` RATHER THAN A `while (re.exec(...))` LOOP over a module-level
+ * regex. A global regex carries `lastIndex` between calls, so the loop form on
+ * a shared constant returns different answers on the second call with the same
+ * input — the classic version of this bug scans every other message. `matchAll`
+ * works on its own clone and cannot do that, which is also what makes calling
+ * this twice in a row safe.
+ */
+function collectInto(content: string, seen: Set<string>, codes: string[]): void {
   for (const match of content.matchAll(INVITE)) {
     // The group cannot be absent when the pattern matched, but the compiler is
     // told to assume otherwise and this is a regex over hostile input — the one
@@ -199,8 +339,6 @@ export function findInviteCodes(content: string): string[] {
     seen.add(code)
     codes.push(code)
   }
-
-  return codes
 }
 
 /** Answers "which guild is this code for", or null if it cannot say. */
