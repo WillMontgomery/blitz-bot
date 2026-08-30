@@ -70,7 +70,25 @@ import { z } from 'zod'
 export interface Config {
   discordToken: string
   guildId: string
+
+  /**
+   * The role that counts as admin, or null for "there is no such role".
+   *
+   * IT NOW ANSWERS TWO QUESTIONS AND UNSET MEANS THE OPPOSITE THING IN EACH,
+   * which is worth stating here because it reads like an inconsistency and is
+   * not one. On the moderation path it turns the admin EXEMPTION on: unset
+   * means nobody is skipped and every message is scanned (`decide` in
+   * client.ts). On the slash-command path it is the gate: unset means nobody
+   * holds the role, so an admin-only command refuses everybody (`refusalFor` in
+   * commands/command.ts).
+   *
+   * BOTH OF THOSE ARE THE CLOSED DIRECTION FOR WHAT THEY GUARD. A filter that
+   * cannot identify an admin has to keep filtering, and a door that cannot
+   * identify an admin has to stay shut. An unset variable is never the thing
+   * that lets somebody through.
+   */
   adminRoleId: string | null
+
   logChannelId: string | null
 
   /**

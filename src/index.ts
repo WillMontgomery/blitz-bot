@@ -1,16 +1,17 @@
 import { createClient, statusReporter } from './client.ts'
+import { installCommands } from './commands/index.ts'
 import { loadConfig, type Config } from './config.ts'
 import { log, setSink } from './log.ts'
 
 /**
  * The entrypoint, and the only file that owns the process.
  *
- * FOUR THINGS HAPPEN HERE AND NOTHING ELSE DOES: read the config, build the
- * client, arrange to die cleanly, log in. Everything about what the bot
- * actually does lives in client.ts, which is why that file can be tested and
- * this one cannot — this is where the token, the signals and `process.exit`
- * are, and each of those is a thing a test would have to fake in order to
- * observe nothing interesting.
+ * FIVE THINGS HAPPEN HERE AND NOTHING ELSE DOES: read the config, build the
+ * client, wire the slash commands onto it, arrange to die cleanly, log in.
+ * Everything about what the bot actually does lives in client.ts and
+ * commands/, which is why those can be tested and this one cannot — this is
+ * where the token, the signals and `process.exit` are, and each of those is a
+ * thing a test would have to fake in order to observe nothing interesting.
  *
  * THIS RUNS UNDER systemd IN PRODUCTION, and most of what follows is decided by
  * that: it is stopped with SIGTERM, its stdout and stderr are the journal, and
@@ -53,6 +54,26 @@ try {
 }
 
 const client = createClient(config)
+
+/**
+ * THE SLASH COMMANDS ARE WIRED HERE AND NOT INSIDE `createClient`, which is the
+ * one structural decision in this file worth defending.
+ *
+ * client.ts is the moderation bot: the message listeners, the halt latch, the
+ * removals channel. Slash commands are a separate feature that happens to need
+ * the same gateway connection, and mixing them would mean a fault in one
+ * sitting in the same function as the other's listeners — the halt path in
+ * `createClient` already calls `removeAllListeners`, and it must go on meaning
+ * exactly "stop moderating" rather than "stop moderating and also stop
+ * answering the owner". Keeping them apart is also why gaining slash commands
+ * needed no edit to client.ts at all.
+ *
+ * IT REGISTERS NOTHING NOW. `installCommands` adds one `clientReady` listener
+ * and one `interactionCreate` listener; the registration request goes out when
+ * the gateway is up and the guild cache is populated, which is after the login
+ * below.
+ */
+installCommands(client, config)
 
 /**
  * WARNINGS AND ERRORS GET A SECOND COPY IN DISCORD, if a channel was configured

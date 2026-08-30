@@ -314,6 +314,58 @@ describe('BLITZ_DOCS_CHANNEL_ID', () => {
   })
 })
 
+/**
+ * The role that decides who is an admin.
+ *
+ * IT NOW ANSWERS TWO QUESTIONS AND UNSET MEANS THE OPPOSITE IN EACH, which is
+ * why it is worth its own cases rather than being left to whoever reads it. On
+ * the moderation path unset turns the admin EXEMPTION off, so every message is
+ * scanned. On the slash-command path it is the gate, so an admin-only command
+ * refuses everybody. Both are the closed direction for what they guard, and
+ * `loadConfig` has to keep saying "null" rather than inventing a default,
+ * because either half given a made-up role id would be guarding nothing.
+ */
+describe('DISCORD_ADMIN_ROLE_ID', () => {
+  it('is null when it is not set, and is never given a default', () => {
+    const config = loadConfig({ DISCORD_BOT_TOKEN: 'token', DISCORD_GUILD_ID: 'guild' })
+
+    expect(config.adminRoleId).toBeNull()
+  })
+
+  /** Blank is absent, like every other optional id: a copied-but-unedited
+   * `.env` must leave the bot with no admin role rather than one called "". */
+  it('reads a blank line as unset', () => {
+    const config = loadConfig({
+      DISCORD_BOT_TOKEN: 'token',
+      DISCORD_GUILD_ID: 'guild',
+      DISCORD_ADMIN_ROLE_ID: '   ',
+    })
+
+    expect(config.adminRoleId).toBeNull()
+  })
+
+  it('is carried through when it is set', () => {
+    const config = loadConfig({
+      DISCORD_BOT_TOKEN: 'token',
+      DISCORD_GUILD_ID: 'guild',
+      DISCORD_ADMIN_ROLE_ID: '444',
+    })
+
+    expect(config.adminRoleId).toBe('444')
+  })
+
+  /**
+   * `.env.example` IS THE DOCUMENT OPERATORS ACTUALLY COPY, and this variable
+   * gained a second meaning without gaining a line there — which is how an
+   * operator ends up unsetting it to turn the moderation exemption off and
+   * silently switching off every admin-only command at the same time.
+   */
+  it('tells operators in the template that it gates the commands too', () => {
+    expect(repoFile('.env.example')).toContain('DISCORD_ADMIN_ROLE_ID=')
+    expect(repoFile('.env.example')).toContain('slash commands')
+  })
+})
+
 describe('loadConfig, when neither source supplies the required variables', () => {
   /**
    * THIS BEHAVIOUR IS WHAT MADE THE BUG DIAGNOSABLE and must not regress. The

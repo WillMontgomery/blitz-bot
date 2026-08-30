@@ -2391,6 +2391,31 @@ export function announceDeployedCommit(
  * stirs each time is a channel nobody reads — the same argument the deploy
  * notice above is built around.
  *
+ * AND THE PRICE OF THAT DESIGN, WHICH IS THE THING THE REST OF THIS HALF IS
+ * SHAPED BY: the file is authoritative and the channel is the state, so ANY
+ * misreading of the file becomes DELETIONS from the channel. An unclosed code
+ * fence, a file that arrived empty, a read that stopped at its own limit — each
+ * of those is a parse or a transport fault, and each of them used to come out
+ * the far end as "these sections are no longer in the file", said about
+ * sections that were still in it. The file cannot be trusted to be well formed
+ * and the channel cannot be recovered from a git history, so the two are not
+ * symmetrical: a run that is about to remove a large share of the channel is
+ * far more likely to be this bot misreading a document than a human deleting
+ * most of one. `syncManual` refuses the whole destructive half when that
+ * happens, says so at error, and leaves the channel exactly as it found it.
+ * Every individual guard below — the empty parse, the unclosed fence, the
+ * truncated read — is a second line of defence in front of that one, not a
+ * replacement for it.
+ *
+ * A SECTION THAT CANNOT BE PUBLISHED IS MARKED IN THE CHANNEL, AND THE MARK IS
+ * THE MEMORY. There is no local record of anything here by design, so the only
+ * thing that survives a restart is what is in the channel — which means a
+ * refusal reported at error on every start is a refusal reported forever. A
+ * section this bot cannot carry (too long for an embed, or refused outright by
+ * Discord) therefore has its message stamped with `STALE_FOOTER`, so a reader
+ * of the channel is told that message is not the file, and so the next start
+ * can see it has already said so and stay quiet. See `unpublishable`.
+ *
  * NOTHING HERE MAY DELAY OR BREAK MODERATION. Every failure in this half is
  * caught, written down and dropped; a missing manual is one warn and the bot
  * carries on scanning. Documentation is the least important thing this process
@@ -2421,6 +2446,37 @@ export interface PostedSection {
   readonly id: string
   readonly title: string
   readonly description: string
+
+  /**
+   * The embed's footer, verbatim, and never part of the comparison.
+   *
+   * IT IS READ BACK BECAUSE IT IS THE ONLY DURABLE MEMORY THIS FEATURE HAS.
+   * Nothing about the channel is written down anywhere else — that is the whole
+   * design — so a fault reported at start-up is a fault reported on every
+   * start-up unless the channel itself is carrying the fact that it was already
+   * said. A section this bot could not publish is stamped with `STALE_FOOTER`,
+   * and reading that stamp back is what makes the second report silent. See
+   * `unpublishable`.
+   */
+  readonly footer: string
+}
+
+/**
+ * What one read of the channel says: the bot's sections oldest first, and
+ * whether that is the whole channel or only as much of it as one request
+ * carries.
+ *
+ * `complete` IS NOT A DETAIL OF THE TRANSPORT, IT IS THE VALIDITY OF EVERYTHING
+ * BELOW. Every decision here is derived from what the read came back with: a
+ * section whose message is not in it looks deleted by hand and is posted again,
+ * and a message no section claims looks removed from the file and is deleted.
+ * A read that stopped at its own limit is therefore not a smaller answer to the
+ * same question — it is a confident wrong answer to it, and the only safe thing
+ * to do with one is nothing at all.
+ */
+export interface ChannelRead {
+  readonly sections: PostedSection[]
+  readonly complete: boolean
 }
 
 /** One section as it goes out: the embed's three fields and nothing else. */
@@ -2440,18 +2496,53 @@ export interface ManualEmbed {
  * against a live channel that would have to be vandalised on purpose.
  */
 export interface DocsChannel {
-  /** The bot's own manual messages, oldest first. Rejects if unreadable. */
-  readonly read: () => Promise<PostedSection[]>
+  /** The bot's own manual messages, and whether that is all of them. Rejects if unreadable. */
+  readonly read: () => Promise<ChannelRead>
 
   readonly post: (embed: ManualEmbed) => Promise<void>
   readonly edit: (id: string, embed: ManualEmbed) => Promise<void>
   readonly remove: (id: string) => Promise<void>
 }
 
-/** Discord's own limits on one embed, and on a message's embeds together. */
+/**
+ * Discord's own limits on one embed, and on a message's embeds together.
+ *
+ * COUNTED IN UTF-16 CODE UNITS, WHICH IS WHAT DISCORD COUNTS. See `fitEmbed`.
+ */
 const EMBED_TITLE_CAP = 256
 const EMBED_DESCRIPTION_CAP = 4096
 const EMBED_TOTAL_CAP = 6000
+
+/**
+ * The footer on a message this bot could not bring into agreement with the
+ * file, and the one piece of state it keeps anywhere but in its own source.
+ *
+ * WHAT A READER OF THE CHANNEL SHOULD SEE. A section that is too long for an
+ * embed, or that Discord refuses outright, leaves the previous version of that
+ * section standing — which is the right call, because a truncated section reads
+ * like the whole of it. What is NOT right is leaving it standing with nothing
+ * to say so: the channel's entire claim is that it says what the file says, and
+ * a message that quietly does not is the exact drift this feature exists to
+ * make visible. So the message keeps its text and its footer says the text is
+ * not current.
+ *
+ * IT REPLACES THE `updated` STAMP RATHER THAN SITTING BESIDE IT, because the
+ * stamp is a claim about when this message last matched the file and that claim
+ * is now false. The date is recoverable from the file's history, which is where
+ * a record of a change belongs.
+ *
+ * AND IT IS THE MEMORY. `unpublishable` reports a refusal only when it puts
+ * this mark up, so the second start finds the mark already there and says
+ * nothing. Without it the same error is written to the journal and posted to
+ * the status channel on every restart, forever, for a document nobody can fix
+ * from Discord — a slow flood in the one channel that has to stay readable.
+ *
+ * A SECTION THAT COMES BACK UNDER THE LIMITS IS WRITTEN AND STAMPED AGAIN LIKE
+ * ANY OTHER CHANGE, which is what clears this. `syncManual` therefore treats a
+ * marked message as different from the file even when the description matches
+ * — see the comparison there.
+ */
+const STALE_FOOTER = 'out of date: this section could not be published'
 
 /**
  * The shortest gap between two writes to the docs channel.
@@ -2473,8 +2564,45 @@ const DOCS_WRITE_GAP_MS = 1000
  * of it. A manual with more than a hundred top-level headings is not a manual,
  * and paginating would mean a bot that walks a channel's entire history on
  * every start.
+ *
+ * A READ THAT CAME BACK FULL IS A READ THAT STOPPED HERE, AND THAT USED TO BE
+ * SILENT — which made this constant the ugliest bug in the feature. Discord
+ * answers newest-first, so the messages that fell off the end were the OLDEST:
+ * the first sections of the manual looked as though somebody had deleted them
+ * by hand, were posted again at the bottom of the channel, and the channel grew
+ * by one duplicate per section on every single restart, unbounded, while the
+ * sections at the top were deleted as "no longer in the file". So the read now
+ * says whether it saw the whole channel (`ChannelRead`) and a truncated one
+ * stops the run, and a manual with more sections than one read can cover is
+ * refused before anything is written rather than posted into that state.
  */
 const DOCS_FETCH_LIMIT = 100
+
+/**
+ * How much of the channel one run may delete before the run is treated as a
+ * fault rather than as an edit somebody made.
+ *
+ * THE THRESHOLD IS A JUDGEMENT AND HERE IS THE JUDGEMENT. Deleting sections is
+ * the only irreversible thing this feature does, and every way it has gone
+ * wrong — an unclosed fence truncating the parse, an empty file, a read that
+ * stopped at its limit — arrives here looking exactly like "the author removed
+ * most of the manual". The two are not equally likely: a person removing one or
+ * two sections is an ordinary edit and happens; a person removing most of the
+ * document in one commit and restarting the bot is not, and when it does happen
+ * the cost of making them restart the bot a second time after emptying the
+ * channel by hand is a minute. The cost of guessing the other way is a
+ * documentation channel deleted by a parser bug.
+ *
+ * SO: UP TO `DOCS_DELETE_FLOOR` DELETIONS ALWAYS GO THROUGH, whatever share of
+ * the channel they are — that is what keeps a two-section manual losing a
+ * section from needing anybody's attention — and above that floor a run may
+ * remove at most `DOCS_DELETE_SHARE` of what it found. Half is chosen because
+ * it is the point where "most of it" starts being true; the exact number
+ * matters far less than that there is one, since the fault cases are all at or
+ * near a hundred per cent.
+ */
+const DOCS_DELETE_FLOOR = 2
+const DOCS_DELETE_SHARE = 0.5
 
 /**
  * Where the manual lives.
@@ -2514,19 +2642,81 @@ export async function readManual(path: string = botManualPath()): Promise<string
   }
 }
 
-/** A top-level heading: one `#`, whitespace, then something. `##` is body. */
-const TOP_LEVEL_HEADING = /^#\s+(\S.*?)\s*$/u
+/**
+ * A top-level heading: one `#`, whitespace, then something. `##` is body.
+ *
+ * WHAT A HEADING MAY CONTAIN, DECIDED: one line of plain text. It is not a
+ * paragraph of markdown, because it does not become one — it becomes an embed
+ * TITLE, and Discord renders nothing in a title. `**Never do this**` in the
+ * file is the four asterisks, shown, in the channel. It is also the key the
+ * whole reconciliation turns on, so it is the one string in the document whose
+ * exact bytes matter; see `HEADING_MARKUP` for what is said about markdown that
+ * gets in anyway, and docs/bot-manual.md, which states the rule for the people
+ * who write the file.
+ *
+ * A TRAILING RUN OF `#` IS A CLOSING SEQUENCE AND IS DROPPED. `# Heading #` is
+ * one heading called "Heading" to every markdown renderer there is, and it used
+ * to be one called "Heading #" here — which is a different key, so the section
+ * matched no message, was posted as a new one, and the message it should have
+ * matched was deleted as no longer being in the file. The closing run has to be
+ * separated by whitespace, exactly as the rest of markdown has it, so a heading
+ * that ends in a real `#` — `C#` — keeps it.
+ *
+ * THE `#` IS IN THE FIRST COLUMN OR IT IS NOT A HEADING. CommonMark allows up
+ * to three spaces in front of one and this deliberately does not: an indented
+ * `#` in a document like this one is far more often a line of an example than a
+ * section of the manual, and the cost of the two mistakes is not the same —
+ * missing a heading leaves a paragraph in the section above it, inventing one
+ * cuts a section in half and posts the half as a message of its own.
+ * docs/bot-manual.md states the rule for the people writing the file.
+ */
+const TOP_LEVEL_HEADING = /^#\s+(\S.*?)(?:\s+#+)?\s*$/u
+
+/**
+ * Inline markdown that got into a heading.
+ *
+ * SAID, NOT STRIPPED AND NOT REFUSED. Stripping would silently change the key
+ * this file matches on — the one thing a heading may not do — and refusing the
+ * section would take a whole page of documentation out of the channel over a
+ * pair of asterisks. So the section is published exactly as written, the
+ * asterisks show up in the title, and there is one line in the journal saying
+ * why it looks like that.
+ *
+ * PAIRS ONLY, AND `_` IS DELIBERATELY NOT HERE. Discord does not italicise an
+ * underscore inside a word, and this repo's headings are full of variable names
+ * like BLITZ_LOG_CHANNEL_ID; a pattern that warned about those would be a
+ * warning nobody could act on and everybody would learn to ignore.
+ */
+const HEADING_MARKUP = /\*[^*\n]+\*|`[^`\n]+`|~~[^~\n]+~~|\|\|[^|\n]+\|\||\[[^\]\n]+\]\([^)\n]+\)/u
 
 /** A fenced code block opening or closing. */
 const CODE_FENCE = /^\s*(?:```|~~~)/u
 
 /**
- * Split the manual into its top-level sections, in file order.
+ * Split the manual into its top-level sections, in file order, or answer none
+ * because the file cannot be split at all.
  *
  * FENCES ARE TRACKED, AND THAT IS NOT FUSSINESS. A shell example in the manual
  * carries `# comment` lines, and a parser that did not know it was inside a
  * fence would cut the section in half there and post a "comment" section — a
  * document that silently loses its shape because somebody documented a command.
+ *
+ * A FENCE THAT NEVER CLOSES IS A FILE THIS CANNOT READ, AND THAT WAS THE WORST
+ * BUG IN THE FEATURE. One unbalanced ``` swallows every line after it into
+ * whichever section it opened in: the sections below it stop existing as far as
+ * the parse is concerned, and the channel is the state, so "stop existing" came
+ * out of the far end as a DELETE of each of their messages, logged as "no
+ * longer in the file" about text that was still in the file, one line above the
+ * fence. Nothing about that is recoverable from the channel. So the answer is
+ * no sections at all, which `syncManual` refuses to act on, and one error line
+ * naming the line the fence was opened on — the fix is a keystroke once you
+ * know where to put it.
+ *
+ * NO SECTIONS IS ALSO THE ANSWER FOR A FILE WITH NO HEADINGS IN IT, and the two
+ * are the same answer on purpose: both mean "there is nothing here that can be
+ * published", and `syncManual` treats that as a reason to leave the channel
+ * alone rather than as an instruction to empty it. The difference between them
+ * is in the log line, not in what happens next.
  *
  * TEXT BEFORE THE FIRST HEADING BELONGS TO NO SECTION AND IS NOT POSTED. It
  * gets a warn rather than being dropped silently, because the whole promise of
@@ -2538,8 +2728,12 @@ export function parseManual(markdown: string): ManualSection[] {
 
   let heading: string | null = null
   let body: string[] = []
-  let fenced = false
   let orphaned = 0
+
+  // The line an unclosed fence was opened on, or 0 while none is open. A line
+  // number rather than a boolean because it is the only thing the operator
+  // needs in order to fix the file.
+  let fenced = 0
 
   const finish = (): void => {
     // `trim` so that the blank line every writer leaves under a heading, and the
@@ -2548,10 +2742,10 @@ export function parseManual(markdown: string): ManualSection[] {
     if (heading !== null) sections.push({ heading, body: body.join('\n').trim() })
   }
 
-  for (const raw of markdown.split(/\r?\n/u)) {
-    if (CODE_FENCE.test(raw)) fenced = !fenced
+  for (const [index, raw] of markdown.split(/\r?\n/u).entries()) {
+    if (CODE_FENCE.test(raw)) fenced = fenced === 0 ? index + 1 : 0
 
-    const found = fenced ? null : TOP_LEVEL_HEADING.exec(raw)
+    const found = fenced !== 0 ? null : TOP_LEVEL_HEADING.exec(raw)
 
     if (found !== null) {
       finish()
@@ -2560,6 +2754,13 @@ export function parseManual(markdown: string): ManualSection[] {
       // here would be the one place in this file that outranks the compiler.
       heading = found[1] ?? ''
       body = []
+
+      if (HEADING_MARKUP.test(heading)) {
+        log('warn', 'a manual heading carries markdown, which an embed title shows literally', {
+          heading: named(heading),
+        })
+      }
+
       continue
     }
 
@@ -2569,6 +2770,16 @@ export function parseManual(markdown: string): ManualSection[] {
     }
 
     body.push(raw)
+  }
+
+  if (fenced !== 0) {
+    log(
+      'error',
+      'the manual has a code fence that is never closed, so it cannot be split into sections',
+      { line: fenced },
+    )
+
+    return []
   }
 
   finish()
@@ -2586,18 +2797,54 @@ export function parseManual(markdown: string): ManualSection[] {
  * What one write to the channel is. A `Record` per outcome below, so a fourth
  * kind of change is a compile error rather than an `undefined` in a log line.
  */
-type Change = 'post' | 'edit' | 'delete'
+type Change = 'post' | 'edit' | 'delete' | 'mark'
 
 const CHANGED: Record<Change, string> = {
   post: 'posted a manual section',
   edit: 'updated a manual section',
   delete: 'deleted a manual section that is no longer in the file',
+  mark: 'marked a manual section in the channel as one that could not be published',
 }
 
 const CHANGE_FAILED: Record<Change, string> = {
   post: 'could not post a manual section',
   edit: 'could not update a manual section',
   delete: 'could not delete a manual section that is no longer in the file',
+  mark: 'could not mark a manual section in the channel as one that could not be published',
+}
+
+/**
+ * The error from a write Discord refused because of what was IN it.
+ *
+ * ANSWERED RATHER THAN LOGGED, which is the whole point of the type. `apply`
+ * knows a write failed and nothing else; only the caller knows whether the
+ * channel is already carrying a mark that says this, and therefore whether
+ * saying it again is a report or a flood. See `unpublishable`.
+ */
+interface Refused {
+  readonly error: unknown
+}
+
+/**
+ * Whether a failed write means this content will never be accepted.
+ *
+ * 50035 IS "INVALID FORM BODY" AND IT IS A STATEMENT ABOUT THE PAYLOAD, not
+ * about the channel or about the moment. Retrying it with the same bytes fails
+ * the same way, so it belongs with the too-long section rather than with the
+ * rate limits and the 500s — and it used to be treated as transient, which
+ * meant one warn per refused section on every restart of a process that
+ * restarts on every crash. That is a slow flood into the one channel that has
+ * to stay readable, and it is the reason `permanentlyUnusable` is not the only
+ * question `apply` asks.
+ *
+ * IT DOES NOT LATCH THE CHANNEL OFF, and that is the difference from
+ * `permanentlyUnusable`. The channel is fine; one section is not. Every other
+ * section still goes out.
+ */
+function contentRefused(error: unknown): boolean {
+  if (!(error instanceof DiscordAPIError)) return false
+
+  return error.code === RESTJSONErrorCodes.InvalidFormBodyOrContentType
 }
 
 /**
@@ -2624,16 +2871,49 @@ const CHANGE_FAILED: Record<Change, string> = {
  * forever because nothing ever clears it, and after a year the channel is
  * mostly tombstones. What the docs used to say is in the file's history, which
  * is where a record of a change belongs.
+ *
+ * AND EVERY ONE OF THOSE DELETIONS IS REFUSED WHEN THERE ARE TOO MANY OF THEM.
+ * See `DOCS_DELETE_FLOOR` for the threshold and the argument; see the header of
+ * this half for why the three bugs that reached it were all parse faults
+ * wearing a deletion's clothes. The refusal is of the destructive half only:
+ * the posts and the edits above it have already happened and are recoverable
+ * from the file on the next start, and a deleted message is not.
+ *
+ * NOTHING IS EVEN READ FOR A MANUAL THAT PARSED TO NOTHING. An empty file, a
+ * file with no top-level headings and a file whose code fence never closes all
+ * arrive here as no sections at all, and "no sections" is the one input for
+ * which the correct behaviour is not "make the channel look like that" but
+ * "leave the channel alone and say so". `readManual` has always guarded the
+ * MISSING file for exactly this reason; the empty one reached the delete loop
+ * and took the whole channel with it.
  */
 export async function syncManual(
   sections: readonly ManualSection[],
   channel: DocsChannel,
   pause: () => Promise<void> = () => sleep(DOCS_WRITE_GAP_MS),
 ): Promise<void> {
-  let posted: PostedSection[]
+  if (sections.length === 0) {
+    log('error', 'the manual has no sections at all, so the docs channel was left alone')
+    return
+  }
+
+  // More sections than one read of the channel can carry means the channel can
+  // never be read back correctly again — see DOCS_FETCH_LIMIT for what that did
+  // — so this is refused before the first of them is posted rather than after
+  // the hundredth.
+  if (sections.length >= DOCS_FETCH_LIMIT) {
+    log('error', 'the manual has more sections than one read of the channel can carry, so it was left alone', {
+      sections: sections.length,
+      limit: DOCS_FETCH_LIMIT,
+    })
+
+    return
+  }
+
+  let state: ChannelRead
 
   try {
-    posted = await channel.read()
+    state = await channel.read()
   } catch (error) {
     // ONE LINE, THEN NOTHING, like `statusReporter` latching off. A wrong id, a
     // channel that was deleted, a missing permission: none of them gets better
@@ -2642,19 +2922,39 @@ export async function syncManual(
     return
   }
 
+  if (!state.complete) {
+    log('error', 'the docs channel holds more messages than one read can carry, so it was left alone', {
+      limit: DOCS_FETCH_LIMIT,
+    })
+
+    return
+  }
+
+  const posted = state.sections
   const unclaimed = groupByTitle(posted)
   warnAboutSharedHeadings(sections)
 
   let stopped = false
   let writes = 0
 
-  /** One write, paced, and never allowed to throw past this function. */
-  async function apply(change: Change, heading: string, run: () => Promise<void>): Promise<void> {
-    if (stopped) return
+  /**
+   * One write, paced, and never allowed to throw past this function.
+   *
+   * ANSWERS `Refused` FOR A WRITE DISCORD WOULD NEVER ACCEPT and null for
+   * everything else, including the failures it has already written down. See
+   * `contentRefused`: whether that one is worth a line depends on what the
+   * channel is already saying, and this function cannot know that.
+   */
+  async function apply(
+    change: Change,
+    heading: string,
+    run: () => Promise<void>,
+  ): Promise<Refused | null> {
+    if (stopped) return null
 
     // Between writes and never before the first, so a run that changes one
     // section costs no wait at all.
-    if (writes > 0) await pause()
+    if (writes > 0) await paced()
     writes += 1
 
     try {
@@ -2667,13 +2967,105 @@ export async function syncManual(
           heading,
           error,
         })
-        return
+
+        return null
       }
+
+      if (contentRefused(error)) return { error }
 
       // Transient: rate limited, a 500, a message somebody deleted underneath
       // us. The next start reads the channel back and reconciles whatever this
       // run did not manage, so there is nothing to retry here.
       log('warn', CHANGE_FAILED[change], { heading, error })
+    }
+
+    return null
+  }
+
+  /**
+   * Wait between two writes, and say so if the process goes while we are
+   * waiting.
+   *
+   * THE WAIT IS UNREFFED, WHICH IS RIGHT AND WHICH MADE THE ABANDONMENT
+   * SILENT. `sleep` deliberately does not hold the process open for a
+   * documentation edit, so a `systemctl stop` in the middle of a ten-section
+   * first run takes the remaining nine writes with it — and used to take them
+   * without a single line anywhere, leaving a half-published channel and no
+   * record of why. The next start does finish the job, and somebody reading the
+   * journal after a restart still has to be able to see that this one did not.
+   *
+   * `exit` AND NOT `beforeExit`, because index.ts calls `process.exit` from its
+   * signal handler once the gateway is closed, and `beforeExit` does not fire
+   * on that path at all — which is the only path a `systemctl restart` takes.
+   * `log()` is synchronous and writes to the journal first, so the line lands
+   * even though nothing async can run any more; the copy in the status channel
+   * is lost with the process, which is the same trade the whole sink makes.
+   */
+  async function paced(): Promise<void> {
+    const abandoned = (): void => {
+      log('warn', 'the process is going down between two manual writes, the rest of the manual was not synchronised', {
+        written: writes,
+      })
+    }
+
+    process.once('exit', abandoned)
+
+    try {
+      await pause()
+    } finally {
+      process.off('exit', abandoned)
+    }
+  }
+
+  /**
+   * Say once that a section is not being published, and leave the channel
+   * saying it too.
+   *
+   * THE MARK IS THE REPORT'S MEMORY, so the two happen together or not at all:
+   * a start that finds the mark already up says nothing and writes nothing, and
+   * a start that puts it up says exactly one line. Reporting without marking is
+   * the flood this replaces — the same error every restart, forever, about a
+   * document that can only be fixed in the repository.
+   *
+   * A HEADING DISCORD WILL NOT TAKE HAS NOWHERE TO PUT THE MARK. No message can
+   * exist under a title over the limit, so there is nothing to stamp and
+   * nothing to read back, and the line is written on every start instead. That
+   * is the honest answer rather than a worse one: the alternative is silence
+   * about a section that is not in the channel at all.
+   */
+  async function unpublishable(
+    section: ManualSection,
+    existing: PostedSection | undefined,
+    refusal: Unpublishable,
+  ): Promise<void> {
+    if (!refusal.markable) {
+      log('error', refusal.why, refusal.fields)
+      return
+    }
+
+    if (existing?.footer === STALE_FOOTER) return
+
+    log('error', refusal.why, refusal.fields)
+
+    // The existing message keeps its own text: it is the last version that
+    // Discord accepted, and replacing it with a shortened copy of the one that
+    // did not is the truncation this feature refuses to do. A section that has
+    // never been posted gets a message with its heading and nothing under it,
+    // so the channel still has one message per heading and a reader can see
+    // which section is missing rather than being left to notice the absence.
+    const mark: ManualEmbed =
+      existing === undefined
+        ? { title: section.heading, description: '', footer: STALE_FOOTER }
+        : { title: existing.title, description: existing.description, footer: STALE_FOOTER }
+
+    const refused = await apply('mark', section.heading, () =>
+      existing === undefined ? channel.post(mark) : channel.edit(existing.id, mark),
+    )
+
+    // Refused in turn — the heading is fine by our arithmetic and Discord
+    // disagrees about something else in it. One line, and no third attempt.
+    if (refused !== null) {
+      log('warn', CHANGE_FAILED.mark, { heading: named(section.heading), error: refused.error })
     }
   }
 
@@ -2687,34 +3079,56 @@ export async function syncManual(
      * key is ambiguous; `warnAboutSharedHeadings` says so out loud.
      */
     const existing = unclaimed.get(section.heading)?.shift()
-    const embed = manualEmbed(section)
+    const fit = fitEmbed(section)
 
-    // Over one of Discord's limits. Already logged at error, and deliberately
-    // NOT written: any existing message stays as it was rather than being
-    // replaced by a truncated copy that reads like the whole section.
-    if (embed === null) continue
+    // Over one of Discord's limits, and deliberately NOT written: any existing
+    // message stays as it was rather than being replaced by a truncated copy
+    // that reads like the whole section. It is marked instead, so the channel
+    // says which of its messages is not the file.
+    if (!fit.ok) {
+      await unpublishable(section, existing, fit)
+      continue
+    }
 
     if (existing === undefined) {
-      await apply('post', section.heading, () => channel.post(embed))
+      const refused = await apply('post', section.heading, () => channel.post(fit.embed))
+      if (refused !== null) await unpublishable(section, undefined, discordRefused(refused))
       continue
     }
 
     // THE COMPARISON, and it is a plain string equality on purpose. Both sides
     // are the stored description: what Discord handed back, against what the
     // file says. Anything cleverer here is a source of edits nobody asked for.
-    if (existing.description === section.body) continue
+    //
+    // THE FOOTER IS NOT COMPARED AND IS STILL READ HERE, for one case: a
+    // section that was marked unpublishable and has since been brought back
+    // under the limits by an edit that restored its previous text. The
+    // descriptions match, and the message is still stamped as out of date, so
+    // the write that clears the stamp has to happen anyway.
+    if (existing.description === section.body && existing.footer !== STALE_FOOTER) continue
 
-    await apply('edit', section.heading, () => channel.edit(existing.id, embed))
+    const refused = await apply('edit', section.heading, () => channel.edit(existing.id, fit.embed))
+    if (refused !== null) await unpublishable(section, existing, discordRefused(refused))
   }
 
   // Whatever is left matched no section in the file. That covers a heading
   // removed from the manual and a second copy of a section left behind by a run
   // that failed after posting — the same treatment, because from the channel's
   // side they are the same thing.
-  for (const leftover of unclaimed.values()) {
-    for (const message of leftover) {
-      await apply('delete', message.title, () => channel.remove(message.id))
-    }
+  const doomed = [...unclaimed.values()].flat()
+
+  if (doomed.length > DOCS_DELETE_FLOOR && doomed.length > posted.length * DOCS_DELETE_SHARE) {
+    log(
+      'error',
+      'refusing to delete most of the docs channel, which is far more likely a misread manual than an edit; nothing was deleted',
+      { deleting: doomed.length, found: posted.length, floor: DOCS_DELETE_FLOOR },
+    )
+
+    return
+  }
+
+  for (const message of doomed) {
+    await apply('delete', message.title, () => channel.remove(message.id))
   }
 }
 
@@ -2769,7 +3183,35 @@ function warnAboutSharedHeadings(sections: readonly ManualSection[]): void {
 }
 
 /**
- * One section as an embed, or null because it will not fit in one.
+ * Why a section is not going into the channel as it stands, in the words of the
+ * line that will say so — and whether the channel can be made to say it.
+ *
+ * THE REASON TRAVELS INSTEAD OF BEING LOGGED WHERE IT IS FOUND, and that is the
+ * fix for the repeat. This used to write its own error line, so a section that
+ * was too long produced one on every start of a process that restarts on every
+ * crash, forever, about a file only a commit can change. The caller is the half
+ * that knows whether the channel is already carrying a mark that says this; see
+ * `unpublishable`.
+ */
+interface Unpublishable {
+  readonly ok: false
+
+  /**
+   * Whether a message saying so can exist. False only when the HEADING is over
+   * the title limit: no message can be posted under a title Discord will not
+   * take, so there is nowhere to put a mark and nothing to read back from it.
+   */
+  readonly markable: boolean
+
+  readonly why: string
+  readonly fields: Record<string, unknown>
+}
+
+/** One section as an embed, or the reason it cannot be one. */
+type Fit = { readonly ok: true; readonly embed: ManualEmbed } | Unpublishable
+
+/**
+ * One section as an embed, or why not.
  *
  * A SECTION THAT IS TOO LONG IS NOT POSTED, NOT TRUNCATED, AND IS SAID AT
  * ERROR. Truncating would put a section in the channel that reads like the
@@ -2779,8 +3221,20 @@ function warnAboutSharedHeadings(sections: readonly ManualSection[]): void {
  * managed to carry, and the error reaches the status channel, where the owner
  * sees it. The fix is to split the section under a second heading.
  *
- * MEASURED IN CODE POINTS. A `length` in UTF-16 units overstates anything
- * outside the basic plane, which would refuse a section Discord would take.
+ * MEASURED IN UTF-16 CODE UNITS, WHICH IS WHAT DISCORD COUNTS. This used to
+ * count code points, on the reasoning that a `length` overstates anything
+ * outside the basic plane and would refuse a section Discord would take — and
+ * it has the failure backwards. Discord's limits are on the JSON string as it
+ * arrives, which is UTF-16, so a code-point count UNDERSTATES every astral
+ * character by half: 4096 musical symbols passed a 4096 guard at 8192 units and
+ * the post came back 50035, which is the one outcome this check exists to
+ * prevent. `length` is the number Discord is checking against.
+ *
+ * THE HEADING IS NAMED IN THE ERROR ABOUT THE HEADING, which sounds too obvious
+ * to write down and was missing: the line said only how long it was, in a
+ * document that can have any number of headings, so the one thing the owner
+ * needed in order to find it was the one thing it did not say. It is capped by
+ * `named` because the whole point of this branch is that the string is enormous.
  *
  * THE FOOTER IS BUILT HERE AND ONLY REACHES DISCORD ON A WRITE. That is what
  * makes it a last-CHANGED stamp rather than a last-checked one: an unchanged
@@ -2789,28 +3243,29 @@ function warnAboutSharedHeadings(sections: readonly ManualSection[]): void {
  * footer is not part of the comparison — comparing it would make every start
  * differ from the last one and rewrite the channel forever.
  */
-function manualEmbed(section: ManualSection): ManualEmbed | null {
+function fitEmbed(section: ManualSection): Fit {
   const footer = `updated ${new Date().toISOString()}`
 
-  const title = [...section.heading].length
-  const description = [...section.body].length
-  const total = title + description + [...footer].length
+  const title = section.heading.length
+  const description = section.body.length
+  const total = title + description + footer.length
 
   if (title > EMBED_TITLE_CAP) {
-    log('error', 'a manual heading is too long for an embed title and was not posted', {
-      length: title,
-      cap: EMBED_TITLE_CAP,
-    })
-    return null
+    return {
+      ok: false,
+      markable: false,
+      why: 'a manual heading is too long for an embed title and was not posted',
+      fields: { heading: named(section.heading), length: title, cap: EMBED_TITLE_CAP },
+    }
   }
 
   if (description > EMBED_DESCRIPTION_CAP) {
-    log('error', 'a manual section is too long for one embed and was not posted', {
-      heading: section.heading,
-      length: description,
-      cap: EMBED_DESCRIPTION_CAP,
-    })
-    return null
+    return {
+      ok: false,
+      markable: true,
+      why: 'a manual section is too long for one embed and was not posted',
+      fields: { heading: section.heading, length: description, cap: EMBED_DESCRIPTION_CAP },
+    }
   }
 
   // The per-embed limits are what a section realistically hits; this is the
@@ -2818,15 +3273,50 @@ function manualEmbed(section: ManualSection): ManualEmbed | null {
   // message means it cannot bite before the two above do — checked anyway, so
   // that the arithmetic saying so is code rather than a comment.
   if (total > EMBED_TOTAL_CAP) {
-    log('error', 'a manual section is too long for one message and was not posted', {
-      heading: section.heading,
-      length: total,
-      cap: EMBED_TOTAL_CAP,
-    })
-    return null
+    return {
+      ok: false,
+      markable: true,
+      why: 'a manual section is too long for one message and was not posted',
+      fields: { heading: section.heading, length: total, cap: EMBED_TOTAL_CAP },
+    }
   }
 
-  return { title: section.heading, description: section.body, footer }
+  return { ok: true, embed: { title: section.heading, description: section.body, footer } }
+}
+
+/**
+ * A write Discord refused, as a refusal of the section that was in it.
+ *
+ * MARKABLE, ALWAYS. Whatever Discord objected to, an embed carrying the title
+ * it already accepted and the text it already stored is a payload it has taken
+ * before — so the mark can go up, and once it is up this stops being said.
+ */
+function discordRefused(refused: Refused): Unpublishable {
+  return {
+    ok: false,
+    markable: true,
+    why: 'Discord refused a manual section outright, so it was not published',
+    fields: { error: refused.error },
+  }
+}
+
+/**
+ * How much of a heading a log line carries.
+ *
+ * A CAP BECAUSE THE LINE THAT MOST NEEDS THE HEADING IS THE ONE ABOUT A HEADING
+ * THAT IS TOO LONG, and the whole of a 4000-character title in a journal line
+ * is a wall that pushes everything else off the status channel post beside it.
+ * The first eighty characters are enough to find the section in an editor.
+ */
+const HEADING_LOG_CAP = 80
+
+function named(heading: string): string {
+  // Cut by code point, like every other cut in this file: a UTF-16 slice can
+  // land inside a surrogate pair and leave half a character in the record.
+  const points = [...heading]
+  if (points.length <= HEADING_LOG_CAP) return heading
+
+  return `${points.slice(0, HEADING_LOG_CAP).join('')}…`
 }
 
 /**
@@ -2853,7 +3343,15 @@ function sleep(ms: number): Promise<void> {
 interface DocsMessage {
   readonly id: string
   readonly author: { readonly id: string }
-  readonly embeds: readonly { readonly title: string | null; readonly description: string | null }[]
+
+  readonly embeds: readonly {
+    readonly title: string | null
+    readonly description: string | null
+
+    /** Read for one reason: the stale mark lives here. See `STALE_FOOTER`. */
+    readonly footer: { readonly text: string } | null
+  }[]
+
   readonly createdTimestamp: number
 }
 
@@ -2897,7 +3395,16 @@ export function docsChannel(client: Client, channelId: string): DocsChannel {
 
       const messages = await channel.messages.fetch({ limit: DOCS_FETCH_LIMIT })
 
-      return ours([...messages.values()], selfId)
+      return {
+        sections: ours([...messages.values()], selfId),
+
+        // A read that came back full is a read that stopped at its own limit,
+        // and there is no way to tell that from a channel holding exactly this
+        // many messages. The conservative reading costs a manual of exactly
+        // ninety-nine sections and buys the certainty that a truncated read is
+        // never mistaken for the state of the channel; see DOCS_FETCH_LIMIT.
+        complete: messages.size < DOCS_FETCH_LIMIT,
+      }
     },
 
     post: async (embed) => {
@@ -2955,13 +3462,18 @@ export function ours(messages: readonly DocsMessage[], selfId: string): PostedSe
       // what an empty section parses to, so the two have to become one value
       // before the comparison can be a plain equality.
       description: embed.description ?? '',
+
+      // Same story, and it is compared against one exact string — the stale
+      // mark — so an absent footer has to be a value rather than a null the
+      // comparison would have to know about.
+      footer: embed.footer?.text ?? '',
       at: message.createdTimestamp,
     })
   }
 
   return mine
     .sort((a, b) => a.at - b.at)
-    .map(({ id, title, description }) => ({ id, title, description }))
+    .map(({ id, title, description, footer }) => ({ id, title, description, footer }))
 }
 
 /**

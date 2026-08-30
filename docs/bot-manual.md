@@ -103,6 +103,27 @@ message deleted by hand is posted again on the next start.
 The file is the source of truth. Editing a message here is undone the next time
 the bot restarts.
 
+A heading is a line beginning `# ` in the first column, and what follows is one
+line of plain text. It becomes the embed's title, where Discord formats nothing,
+so markdown in a heading is shown as the characters that were typed; a trailing
+run of `#` is read as markdown's closing sequence and dropped. An indented `#`
+is not a heading. The heading is also how a section is matched to its message,
+so renaming one posts a new message and deletes the old.
+
+A section that will not fit one embed — 256 characters of heading, 4096 of body
+— is not published and never shortened. Its message keeps the last text that did
+fit and its footer says it is out of date; a section that has never been
+published gets a message with its heading and nothing under it. The same happens
+to a section Discord refuses outright. Either way it is reported once rather than
+on every restart, because the mark in the channel is what the next start reads.
+
+There are four things that stop the bot touching this channel at all: a file it
+cannot split into sections (a code fence that is never closed), a file with no
+top-level headings in it, a channel holding more messages than one read can
+carry, and any run that would delete more than half of what it found. Each of
+those is far more often a broken file or a broken deploy than somebody's edit,
+and a deleted message cannot be got back. All four say so in the status channel.
+
 # What it does not have
 
 No slash commands. There are none registered and none planned in this version.
