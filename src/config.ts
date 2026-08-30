@@ -4,6 +4,43 @@ import { z } from 'zod'
  * Configuration, read from the environment and validated before anything
  * connects.
  *
+ * THE ENVIRONMENT IS POPULATED BY THE START SCRIPT, NOT BY THIS FILE. `npm
+ * start` runs node with `--env-file-if-exists=.env` — Node's own dotenv
+ * loader, which is why there is no dotenv dependency and why nothing here
+ * opens a file. By the time `loadConfig` runs, `.env` has already become
+ * ordinary environment variables, or it has not and the throw below names what
+ * is missing.
+ *
+ * THAT FLAG IS THE FIX FOR A REAL BUG: the start script carried no env-file
+ * flag at all, so the only thing that ever populated the environment was
+ * systemd's `EnvironmentFile=`. Under systemd the bot booted. Every hand-run —
+ * the foreground first start the runbook asks for, a restart to check a config
+ * change — read an empty environment and refused to boot with a correctly
+ * written `.env` sitting right next to it.
+ *
+ * `--env-file-if-exists`, NOT `--env-file`, because both of the awkward cases
+ * are real. The environment is already populated and `.env` is there as well —
+ * a systemd unit with `EnvironmentFile=`, or a variable exported in a shell —
+ * and reading the file a second time changes nothing, since what is already
+ * set is what wins. Or the environment is supplied some other way and no
+ * `.env` was ever put on disk, and that must still boot: `--env-file` exits
+ * non-zero on a file that is not there, `--env-file-if-exists` prints one line
+ * and carries on. (Node 22.9 and later; `engines` already says >=24.)
+ *
+ * AN ALREADY-SET VARIABLE WINS OVER THE FILE. `.env` fills in keys the
+ * environment does not have and overwrites nothing — which is why systemd's
+ * values survive a stale `.env` next to them, and equally why an
+ * `export DISCORD_BOT_TOKEN=...` left over in a shell makes editing `.env`
+ * appear to do nothing at all. Pinned by a test, because a Node release that
+ * quietly flipped it would change which token the bot logs in with.
+ *
+ * THE `.env` PATH IS RELATIVE TO THE WORKING DIRECTORY, and npm always runs a
+ * script from the directory holding package.json — from a subdirectory, or via
+ * `--prefix`, it chdirs there first — so `npm start` finds
+ * `/opt/blitz-bot/.env` wherever the operator is standing. Running
+ * `node src/index.ts` by hand from elsewhere does not get that: npm is what
+ * makes the relative path safe.
+ *
  * A MISSING REQUIRED VARIABLE THROWS, and that is the whole reason this file
  * exists as a file. A bot that starts without a token does not fail at
  * startup — it fails several seconds later inside discord.js, or worse, comes

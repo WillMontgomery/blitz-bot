@@ -12,10 +12,19 @@ import { log } from './log.ts'
  * are, and each of those is a thing a test would have to fake in order to
  * observe nothing interesting.
  *
- * THIS RUNS UNDER systemd, and every decision below follows from that. It is
- * started with the environment already populated from an `EnvironmentFile`, it
- * is stopped with SIGTERM, its stdout and stderr are the journal, and a
- * non-zero exit is a restart. See docs/deploy.md.
+ * THIS RUNS UNDER systemd IN PRODUCTION, and most of what follows is decided by
+ * that: it is stopped with SIGTERM, its stdout and stderr are the journal, and
+ * a non-zero exit is a restart. See docs/deploy.md.
+ *
+ * IT IS ALSO STARTED BY HAND, and the environment is where that distinction
+ * used to bite. This comment claimed the environment always arrived
+ * pre-populated from an `EnvironmentFile`, and the start script was written to
+ * match it — no env-file flag, no dotenv dependency — so a foreground `npm
+ * start` exited on `DISCORD_BOT_TOKEN: not set` with a correctly filled-in
+ * `.env` sitting on disk beside it. Half true is the accurate version: under
+ * systemd the unit's `EnvironmentFile=` populates it, and otherwise `npm
+ * start` does, from `.env`, via Node's `--env-file-if-exists`. `loadConfig()`
+ * neither knows nor cares which of the two got there first (src/config.ts).
  */
 
 let config: Config
