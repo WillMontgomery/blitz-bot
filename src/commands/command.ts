@@ -36,7 +36,14 @@ import { log } from '../log.ts'
  * the reason `ScannedMessage` is a plain record: the real thing is a live
  * object with a REST handle, a token that expires and three different ways to
  * reply on it, and taking one as a parameter would put a reply inside arm's
- * reach of the gate. Building one in a test is six fields.
+ * reach of the gate. Building one in a test is a handful of fields.
+ *
+ * IDS AND STRINGS ONLY, WHICH IS WHY THE AVATARS ARE URLS. `/profile` puts the
+ * subject's Discord avatar on its embed, and the avatar lives on a live `User`
+ * behind a method call. Carrying the `User` would drag the untestable half back
+ * in here; `invocationOf` in ./index.ts makes the call at the seam and what
+ * arrives is a string. The three fields that do it are optional, so the commands
+ * and tests that build one of these without any are unaffected.
  */
 export interface Invocation {
   readonly commandName: string
@@ -52,8 +59,32 @@ export interface Invocation {
    */
   readonly guildId: string | null
 
-  /** Who ran it. For the journal, and for nothing else. */
+  /** Who ran it. For the journal, and for the self view of `/profile`. */
   readonly userId: string
+
+  /**
+   * The caller's Discord avatar, already resolved to a URL.
+   *
+   * A URL AND NOT A `User`, WHICH IS THE WHOLE REASON THIS FIELD EXISTS RATHER
+   * THAN A USER OBJECT ARRIVING ON THIS RECORD. discord.js's `User` is a live
+   * thing with a REST handle on it, and the argument this interface opens with
+   * — a plain record, buildable in a test in six fields — does not survive one
+   * being put on it. `invocationOf` in ./index.ts calls `displayAvatarURL()` at
+   * the seam and what reaches a handler is a string.
+   *
+   * `displayAvatarURL()` RETURNS A STRING AND NEVER NULL, checked against the
+   * installed typings rather than taken on trust: `User.avatarURL()` is
+   * `string | null` and `User.displayAvatarURL()` is `string`, because it falls
+   * back to the default avatar Discord gives every account. So there is no
+   * "this member has no picture" case for a caller to handle.
+   *
+   * OPTIONAL, AND THAT IS ABOUT THIS RECORD'S OTHER CALLERS RATHER THAN ABOUT
+   * DISCORD. Three commands and their tests build an `Invocation` and none of
+   * them has an avatar to put in one; a required field would make every one of
+   * those a compile error over a value they do not read. Absent means "the
+   * seam did not carry one", and `/profile` renders no thumbnail for it.
+   */
+  readonly userAvatarUrl?: string
 
   /**
    * The invoker's role ids as the interaction payload carried them, or null
@@ -82,6 +113,47 @@ export interface Invocation {
    * cheaper price than the one it replaces.
    */
   readonly targetId: string | null
+
+  /**
+   * The target's Discord avatar, already resolved to a URL, when one was given.
+   *
+   * BESIDE `targetId` AND NOT DERIVED FROM IT, which is what "the smallest
+   * honest way" came to. An id is not enough to draw a picture from: the avatar
+   * hash belongs to the user object Discord already put on the interaction, and
+   * the alternative to reading it there is a REST fetch on a path that has three
+   * seconds to answer. `invocationOf` captures it in the one place that has the
+   * live option in its hand, exactly as it captures `targetId`.
+   *
+   * SEPARATE FROM `userAvatarUrl` RATHER THAN ONE "SUBJECT" FIELD RESOLVED AT
+   * THE SEAM. "No target means me" is `/profile`'s rule and is stated in
+   * `/profile`, and a seam that resolved the subject itself would be a second
+   * copy of that rule in the half of the code that is meant not to know what any
+   * command means. These two mirror `userId` and `targetId`, and the handler
+   * picks with the same test it already makes.
+   */
+  readonly targetAvatarUrl?: string
+
+  /**
+   * The target's Discord display name, when one was given.
+   *
+   * ONE COMMAND READS THIS AND IT READS IT FOR ONE COMPARISON: `/profile` drops
+   * the in-game name history when the name is already the Discord name the
+   * reader is looking at. See `registryBody` in ./profile.ts.
+   *
+   * THE GUILD'S NAME FOR THEM WHERE THERE IS ONE. A member may have a nickname
+   * in this server, and the `<@id>` mention `/profile` leads with renders as
+   * that nickname — so comparing against the ACCOUNT's global display name
+   * would weigh the reply against a name the reader cannot see. `displayNameOf`
+   * in ./index.ts resolves the nickname first and falls back to the account's
+   * own display name, which is what Discord itself shows in the same order.
+   *
+   * NO `userDisplayName` BESIDE IT, AND THE ASYMMETRY IS HONEST. The comparison
+   * exists only against a registry row's in-game name, and the self view never
+   * reads a registry row at all — `SelfReads` has no `registry` on it. A field
+   * carried for a view that has no shape to use it is a field somebody later
+   * finds a use for.
+   */
+  readonly targetDisplayName?: string
 
   /**
    * The channel the command was run in, or null when the payload carried none.

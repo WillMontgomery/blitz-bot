@@ -276,6 +276,7 @@ function replyEmbed(reply: CommandReply): {
   title: string
   description: string
   color: number
+  thumbnail: { url: string } | undefined
   fields: APIEmbedField[]
 } {
   if (typeof reply === 'string') throw new Error(`expected an embed, got text: ${reply}`)
@@ -287,6 +288,13 @@ function replyEmbed(reply: CommandReply): {
     title: embed.title ?? '',
     description: embed.description ?? '',
     color: embed.color ?? 0,
+
+    // Carried through rather than dropped, because "the avatar reached the
+    // reply" is a claim about the whole path and not about the renderer: the
+    // thumbnail is built from a field of the INVOCATION, so a unit test of
+    // `profileEmbed` cannot see the wiring that fills it in.
+    thumbnail: embed.thumbnail === undefined ? undefined : { url: embed.thumbnail.url },
+
     fields: [...(embed.fields ?? [])],
   }
 }
@@ -352,6 +360,35 @@ function fieldNamed(
   name: string,
 ): string | undefined {
   return embed.fields.find((entry) => entry.name === name)?.value
+}
+
+/**
+ * One `##` section of the description, by its heading, or undefined.
+ *
+ * THE DESCRIPTION IS WHERE THE PROSE LIVES NOW, so this is the counterpart of
+ * `fieldNamed` and most of the cases below moved from one to the other. Discord
+ * does not render a markdown heading inside a field name or value and does
+ * render one in a description, which is the whole reason the reply is shaped
+ * this way — see the header of ./profile.ts.
+ *
+ * SPLIT ON THE BLANK LINE BETWEEN SECTIONS, which is safe because no section
+ * body contains one: every line reaching a section has been through `oneLine`,
+ * and `packed` joins them with a single newline.
+ *
+ * IT ASSERTS THE `##` BY CONSTRUCTION. Looking a section up by `## Bans` and not
+ * by `Bans` means a build that went back to bold, or to a plain line, finds no
+ * section at all rather than quietly matching the text under it.
+ */
+function section(embed: { description: string }, heading: string): string | undefined {
+  const marker = `## ${heading}\n`
+  const block = embed.description.split('\n\n').find((one) => one.startsWith(marker))
+
+  return block?.slice(marker.length)
+}
+
+/** Every `##` heading in the description, in the order they are read. */
+function headings(embed: { description: string }): string[] {
+  return [...embed.description.matchAll(/^## (.+)$/gmu)].map((found) => found[1] ?? '')
 }
 
 describe('gatherProfile', () => {
@@ -432,7 +469,9 @@ describe('gatherProfile', () => {
       DISCORD,
     )
 
-    expect(got.unreached).toEqual([{ source: 'licences', why: 'timeout' }])
+    // `lookup` and not `licences`: the source name is rendered in the reply, and
+    // the reply may not mention a licence. See `ProfileSource`.
+    expect(got.unreached).toEqual([{ source: 'lookup', why: 'timeout' }])
     expect(got.licences).toEqual([])
   })
 
@@ -494,6 +533,14 @@ describe('gatherProfile', () => {
 
     expect(asked).toHaveLength(10)
     expect(got.bansSkipped).toBe(4)
+
+    // AND IT SAYS SO IN THE JOURNAL, WHICH IS WHERE IT SAYS IT NOW. The reply
+    // used to carry `4 older licences were not checked for bans`; a count of
+    // licences is a count of licences however it is worded, and the owner asked
+    // for none of them. A fan-out that hit its bound is still an operational
+    // fact — an admin has been shown a ban record that is not the whole one —
+    // and the journal is operator-facing, so that is where it goes.
+    expect([...stdout, ...stderr].join('')).toContain('checked=10 skipped=4')
 
     // The MOST RECENT ten, because those are the ones the account is using.
     expect(asked).toEqual(many.slice(-10))
@@ -665,71 +712,99 @@ describe('readsFrom', () => {
   })
 })
 
-describe('profileEmbed: the licence list', () => {
-  it('shows every licence and says plainly that there is more than one', () => {
-    const embed = profileEmbed(
-      data({ licences: [OLDEST, MIDDLE, NEWEST], current: NEWEST }),
-      NOW,
-    )
-
-    expect(embed.description).toContain(
-      '3 licences — this Discord account has played under more than one.',
-    )
-
-    const listed = fieldNamed(embed, 'Licences') ?? ''
-
-    // ALL of them. Showing only the first hides the identifier-reuse signal.
-    expect(listed).toContain(OLDEST)
-    expect(listed).toContain(MIDDLE)
-    expect(listed).toContain(NEWEST)
+/**
+ * THE OWNER'S FIRST CUT, AND THE ONE WITH A TRAP IN IT: "We don't need any list
+ * or mention of licences. Not even in the bans section."
+ *
+ * THESE CASES ASSERT THE ABSENCE AND THE CASES BELOW ASSERT THE READING, and
+ * both halves have to hold at once. It is trivial to satisfy the owner by
+ * looking up one licence and rendering its ban; that would also delete the
+ * signal `/profile` exists for — a clean current licence beside a banned old one
+ * — while every "no licence anywhere" assertion here still passed. So the ban
+ * cases below keep three licences in the fixture and demand the OLD one's ban in
+ * the reply, without its licence beside it.
+ */
+describe('profileEmbed: no licence anywhere in the reply', () => {
+  const three = data({
+    licences: [OLDEST, MIDDLE, NEWEST],
+    current: NEWEST,
+    bans: [
+      { licence: OLDEST, ban: ban({ license: OLDEST, reason: 'ban evasion' }) },
+      { licence: MIDDLE, ban: null },
+      { licence: NEWEST, ban: null },
+    ],
+    registry: registry({ names: [{ name: 'Somebody', firstSeen: 1, lastSeen: 2 }] }),
+    matches: [match(1)],
   })
 
-  it('marks the most recent licence, which the index stores LAST', () => {
-    const listed =
-      fieldNamed(profileEmbed(data({ licences: [OLDEST, NEWEST] }), NOW), 'Licences') ?? ''
+  it('prints no licence value in the embed, the bans included', () => {
+    const embed = profileEmbed(three, NOW)
+    const whole = [embed.title, embed.description, ...values(embed)].join('\n')
 
-    expect(listed).toContain(`${NEWEST} (current)`)
-    expect(listed).not.toContain(`${OLDEST} (current)`)
+    expect(whole).not.toContain(OLDEST)
+    expect(whole).not.toContain(MIDDLE)
+    expect(whole).not.toContain(NEWEST)
 
-    // Newest first on the page, so the cut below can only ever eat history.
-    expect(listed.indexOf(NEWEST)).toBeLessThan(listed.indexOf(OLDEST))
+    // Not the bare hex either: the guard above would pass on a reply that
+    // printed the licence with its `license:` qualifier stripped off.
+    expect(whole).not.toContain('aaaaaaaa')
+    expect(whole).not.toContain('cccccccc')
   })
 
-  it('does not say "more than one" for exactly one', () => {
-    const embed = profileEmbed(data({ licences: [NEWEST] }), NOW)
+  it('prints no count of them and no sentence about how many there are', () => {
+    const whole = [
+      profileEmbed(three, NOW).description,
+      ...values(profileEmbed(three, NOW)),
+    ].join('\n')
 
-    expect(embed.description).toContain('One licence.')
-    expect(embed.description).not.toContain('more than one')
+    // The three sentences that used to be the description's second line, and
+    // the word itself, in either case.
+    expect(whole).not.toMatch(/licen[cs]e/iu)
+    expect(whole).not.toContain('more than one')
   })
 
-  it('keeps the current licence and states the count when the list is too long', () => {
-    const many = Array.from({ length: 60 }, (_, index) => `license:${String(index % 10).repeat(40)}`)
-    const listed = fieldNamed(profileEmbed(data({ licences: many }), NOW), 'Licences') ?? ''
+  it('has no Licences section left to render one into', () => {
+    const embed = profileEmbed(three, NOW)
 
-    expect(listed.length).toBeLessThanOrEqual(1024)
+    expect(fieldNamed(embed, 'Licences')).toBeUndefined()
+    expect(section(embed, 'Licences')).toBeUndefined()
+  })
 
-    // The one that was dropped is named as a count rather than left silent.
-    const omitted = /\+(\d+) older licences not shown\./u.exec(listed)
-    expect(omitted).not.toBeNull()
+  it('still reports the ban on the OLDEST licence, which is the whole point', () => {
+    // The account's CURRENT licence is clean and an old one is permanently
+    // banned. Reading only the current licence would answer "no ban" here, and
+    // this is the case that says the fan-out survived the owner's cut.
+    expect(section(profileEmbed(three, NOW), 'Bans')).toContain('ban evasion')
+    expect(section(profileEmbed(three, NOW), 'Bans')).not.toContain('No ban')
+  })
 
-    const shown = listed.split('\n').length - 1
-    expect(shown + Number(omitted?.[1])).toBe(60)
+  it('says nothing about the licences the fan-out cap skipped', () => {
+    const embed = profileEmbed(data({ bansSkipped: 7 }), NOW)
 
-    // And the current one survived, because the list is rendered newest first.
-    expect(listed).toContain('(current)')
+    expect(section(embed, 'Bans')).not.toContain('7')
+    expect(embed.description).not.toMatch(/licen[cs]e/iu)
+  })
+
+  it('keeps the console button, which is a route and not a display', () => {
+    // The one place a licence still travels. It is in a url rather than in the
+    // reply's text, and the owner asked for it to stay.
+    const url = consoleRow(NEWEST)
+
+    expect(url).not.toBeNull()
   })
 })
 
-describe('profileEmbed: no record, and no index', () => {
-  it('says there is no record and offers no fields keyed on a licence', () => {
+describe('profileEmbed: no record, and no lookup', () => {
+  it('says there is no record and offers nothing keyed on a licence', () => {
     const embed = profileEmbed(data({ licences: [], current: null, bans: [] }), NOW)
 
     expect(embed.description).toContain('No player record for this Discord account.')
-    expect(fieldNamed(embed, 'Licences')).toBeUndefined()
-    expect(fieldNamed(embed, 'Career')).toBeUndefined()
+    expect(section(embed, 'Bans')).toBeUndefined()
+    expect(section(embed, 'Server record')).toBeUndefined()
+    expect(fieldNamed(embed, 'Level')).toBeUndefined()
   })
 
-  it('says the index could not be read, which is the opposite sentence', () => {
+  it('names the failed read as a lookup rather than as an index of licences', () => {
     const embed = profileEmbed(
       data({
         licences: [],
@@ -737,14 +812,17 @@ describe('profileEmbed: no record, and no index', () => {
         bans: [],
         career: null,
         registry: null,
-        unreached: [{ source: 'licences', why: 'timeout' }],
+        unreached: [{ source: 'lookup', why: 'timeout' }],
       }),
       NOW,
     )
 
+    // The sentence that used to sit in the description here — `The
+    // Discord-to-licence index could not be read` — named the index outright.
+    // What is left says which read failed without saying what it reads.
     expect(embed.description).not.toContain('No player record')
-    expect(embed.description).toContain('could not be read')
-    expect(fieldNamed(embed, 'Could not be read')).toContain('licences: timeout')
+    expect(embed.description).not.toMatch(/licen[cs]e/iu)
+    expect(section(embed, 'Could not be read')).toContain('lookup: timeout')
   })
 })
 
@@ -761,11 +839,39 @@ describe('profileEmbed: bans', () => {
       NOW,
     )
 
-    const bans = fieldNamed(embed, 'Bans') ?? ''
+    const bans = section(embed, 'Bans') ?? ''
 
-    expect(bans).toContain(OLDEST)
+    // The state and the reason, and NOT the licence the row was keyed on.
     expect(bans).toContain('**ACTIVE**, permanent')
     expect(bans).toContain('ban evasion')
+    expect(bans).not.toContain(OLDEST)
+  })
+
+  /**
+   * TWO ROWS THAT DIFFERED ONLY BY THEIR LICENCE NOW READ THE SAME, and that is
+   * a consequence of the owner's cut rather than a rendering fault. Both lines
+   * are kept: collapsing them would hide a second ban, which is the wrong
+   * direction for the section an admin ran this command to read.
+   */
+  it('keeps two identical-looking rows rather than folding them into one', () => {
+    const same = { reason: 'cheating', at: Date.parse('2026-01-01T00:00:00.000Z') }
+
+    const bans =
+      section(
+        profileEmbed(
+          data({
+            licences: [OLDEST, NEWEST],
+            bans: [
+              { licence: OLDEST, ban: ban({ license: OLDEST, ...same }) },
+              { licence: NEWEST, ban: ban({ license: NEWEST, ...same }) },
+            ],
+          }),
+          NOW,
+        ),
+        'Bans',
+      ) ?? ''
+
+    expect(bans.split('\n')).toHaveLength(2)
   })
 
   /**
@@ -793,34 +899,29 @@ describe('profileEmbed: bans', () => {
       NOW,
     )
 
-    const bans = fieldNamed(embed, 'Bans') ?? ''
+    const bans = section(embed, 'Bans') ?? ''
 
-    expect(bans).toContain(`${OLDEST}: lifted <t:${String(lift / 1000)}:R>`)
-    expect(bans).toContain(`${MIDDLE}: expired <t:${String(gone / 1000)}:R>`)
-    expect(bans).toContain(`${NEWEST}: **ACTIVE** until <t:${String(ends / 1000)}:f>`)
+    expect(bans).toContain(`lifted <t:${String(lift / 1000)}:R>`)
+    expect(bans).toContain(`expired <t:${String(gone / 1000)}:R>`)
+    expect(bans).toContain(`**ACTIVE** until <t:${String(ends / 1000)}:f>`)
 
-    // And not one ISO string anywhere in the field, which is what was there
+    // And not one ISO string anywhere in the section, which is what was there
     // before and what a half-done edit would leave behind.
     expect(bans).not.toMatch(/\d{4}-\d{2}-\d{2}T/u)
   })
 
-  it('says so when nothing read carries a ban', () => {
-    expect(fieldNamed(profileEmbed(data(), NOW), 'Bans')).toContain(
-      'No ban on any licence read.',
-    )
+  it('says so when nothing read carries a ban, and says it without the word', () => {
+    const bans = section(profileEmbed(data(), NOW), 'Bans') ?? ''
+
+    expect(bans).toContain('No ban on any record read.')
+    expect(bans).not.toMatch(/licen[cs]e/iu)
   })
 
-  it('states the licences the cap meant were never checked', () => {
-    expect(fieldNamed(profileEmbed(data({ bansSkipped: 4 }), NOW), 'Bans')).toContain(
-      '4 older licences were not checked for bans.',
-    )
-  })
-
-  it('counts what it dropped without borrowing the licence field’s sentence', () => {
+  it('counts the ban lines it dropped, and states the count in the section', () => {
     const licences = Array.from({ length: 10 }, (_, index) => `license:${String(index).repeat(40)}`)
 
     const bans =
-      fieldNamed(
+      section(
         profileEmbed(
           data({
             licences,
@@ -834,13 +935,17 @@ describe('profileEmbed: bans', () => {
         'Bans',
       ) ?? ''
 
+    // THE CAP THAT MATTERS MOVED WITH THE TEXT. This used to be a field with
+    // 1024 units of its own; it is a section of a description now, and
+    // `SECTION_CAP` keeps the same ceiling so that the shape it was truncated
+    // to survived the move.
     expect(bans.length).toBeLessThanOrEqual(1024)
 
     const omitted = /\+(\d+) more not shown\./u.exec(bans)
     expect(omitted).not.toBeNull()
 
-    // Not "older licences not shown": these are bans, and a field that reports
-    // a cut it did not make is the failure this file is written against.
+    // Not "older licences not shown": that string is deleted, and a section
+    // that reports a cut it did not make is what this file is written against.
     expect(bans).not.toContain('older licences not shown')
 
     expect(bans.split('\n').length - 1 + Number(omitted?.[1])).toBe(10)
@@ -849,21 +954,21 @@ describe('profileEmbed: bans', () => {
   it('does not let a newline in a ban reason forge a line', () => {
     const embed = profileEmbed(
       data({
-        bans: [{ licence: NEWEST, ban: ban({ reason: 'first\nlicense:evil: ACTIVE, permanent' }) }],
+        bans: [{ licence: NEWEST, ban: ban({ reason: 'first\nsecond: ACTIVE, permanent' }) }],
       }),
       NOW,
     )
 
-    const bans = fieldNamed(embed, 'Bans') ?? ''
+    const bans = section(embed, 'Bans') ?? ''
 
     expect(bans.split('\n')).toHaveLength(1)
-    expect(bans).toContain('first license:evil')
+    expect(bans).toContain('first second')
   })
 })
 
 describe('profileEmbed: match history', () => {
   it('says nothing was omitted when nothing was', () => {
-    const matches = fieldNamed(
+    const matches = section(
       profileEmbed(data({ matches: [match(0), match(1)], career: career({ matches: 2 }) }), NOW),
       'Recent matches',
     )
@@ -875,7 +980,7 @@ describe('profileEmbed: match history', () => {
   it('states the reader’s cut even when the embed dropped nothing', () => {
     // 3 read out of 300 played: the cut nobody would otherwise see, and it is
     // the larger of the two.
-    const matches = fieldNamed(
+    const matches = section(
       profileEmbed(
         data({ matches: [match(0), match(1), match(2)], career: career({ matches: 300 }) }),
         NOW,
@@ -891,7 +996,7 @@ describe('profileEmbed: match history', () => {
     const read = Array.from({ length: 25 }, (_, index) => match(index))
 
     const matches =
-      fieldNamed(
+      section(
         profileEmbed(data({ matches: read, career: career({ matches: 300 }) }), NOW),
         'Recent matches',
       ) ?? ''
@@ -919,7 +1024,7 @@ describe('profileEmbed: match history', () => {
    */
   it('shows five matches at most and still says how many were played in all', () => {
     const matches =
-      fieldNamed(
+      section(
         profileEmbed(
           data({
             matches: Array.from({ length: 5 }, (unused, index) => match(index)),
@@ -948,7 +1053,7 @@ describe('profileEmbed: match history', () => {
    */
   it('renders five even when the reader hands back more, and says it read more', () => {
     const matches =
-      fieldNamed(
+      section(
         profileEmbed(
           data({
             matches: Array.from({ length: 9 }, (unused, index) => match(index)),
@@ -964,13 +1069,13 @@ describe('profileEmbed: match history', () => {
   })
 
   it('says the history was empty rather than implying there is none', () => {
-    expect(fieldNamed(profileEmbed(data({ matches: [] }), NOW), 'Recent matches')).toBe(
+    expect(section(profileEmbed(data({ matches: [] }), NOW), 'Recent matches')).toBe(
       'No matches read.',
     )
   })
 
   it('falls back to the sort key for a row that carried no timestamp', () => {
-    const matches = fieldNamed(
+    const matches = section(
       profileEmbed(
         data({ matches: [{ sk: 'match#01J0', at: null, placement: null, kills: null }] }),
         NOW,
@@ -993,7 +1098,7 @@ describe('profileEmbed: match history', () => {
     const played = Date.parse('2026-08-30T09:00:00.000Z')
 
     const matches =
-      fieldNamed(
+      section(
         profileEmbed(
           data({ matches: [{ sk: 'match#1', at: played, placement: 3, kills: 4 }] }),
           NOW,
@@ -1053,18 +1158,51 @@ describe('profileEmbed: the numbers read as a table', () => {
   })
 
   /**
-   * AND THE LONG ONES ARE NOT INLINE. A licence list or a ban history in a third
-   * of the width is a ribbon of two-word lines — the layout working exactly as
-   * asked and reading worse than what it replaced.
+   * AND THE LONG ONES ARE NOT FIELDS AT ALL ANY MORE. A ban history in a third
+   * of the width is a ribbon of two-word lines; a ban history in a FIELD cannot
+   * carry a heading, because Discord renders no markdown heading in one. Both
+   * arguments point the same way, and the second is why these are sections of
+   * the description now. The tiles are the only fields left.
    */
-  it('leaves everything that grows at full width', () => {
+  it('leaves nothing that grows in a column, or in a field at all', () => {
     const embed = profileEmbed(
       data({ matches: [match(1)], unreached: [{ source: 'matches', why: 'unavailable' }] }),
       NOW,
     )
 
-    for (const name of ['Licences', 'Bans', 'Server record', 'Could not be read', 'Recent matches']) {
-      expect(fieldAt(embed, name)?.inline).toBeUndefined()
+    for (const name of ['Bans', 'Server record', 'Could not be read', 'Recent matches']) {
+      expect(fieldAt(embed, name)).toBeUndefined()
+      expect(section(embed, name)).toBeDefined()
+    }
+
+    expect(embed.fields.every((entry) => entry.inline === true)).toBe(true)
+  })
+
+  /**
+   * THE HEADINGS ARE `##` AND HAVE TO BE, WHICH IS A PLATFORM FACT AND NOT A
+   * TASTE. The owner asked for larger text rather than bold. Discord renders
+   * `#`/`##`/`###` in an embed DESCRIPTION and renders none of them in a field
+   * name or value (discord/discord-api-docs#7167), so a build that put these
+   * back into fields would ship the two characters `##` to the reader — or, if
+   * it dropped them, go back to the bold the owner asked to replace.
+   */
+  it('writes every section heading as a real markdown heading', () => {
+    const embed = profileEmbed(
+      data({ matches: [match(1)], unreached: [{ source: 'matches', why: 'unavailable' }] }),
+      NOW,
+    )
+
+    expect(headings(embed)).toEqual([
+      'Bans',
+      'Server record',
+      'Could not be read',
+      'Recent matches',
+    ])
+
+    // And no `#` reached a field, where it would arrive as punctuation.
+    for (const entry of embed.fields) {
+      expect(entry.name).not.toContain('#')
+      expect(entry.value).not.toContain('#')
     }
   })
 
@@ -1087,27 +1225,47 @@ describe('profileEmbed: the numbers read as a table', () => {
     const embed = profileEmbed(data(), NOW)
 
     expect(fieldAt(embed, 'Level')?.value).toBe('**7**\n4500 XP')
-    expect(fieldAt(embed, 'Kills')?.value).toBe('**30**\n10 deaths · 14 downs · 3 revives')
+    expect(fieldAt(embed, 'Kills')?.value).toBe('**30**\n10 deaths · 3 revives')
     expect(fieldAt(embed, 'Damage')?.value).toBe('**9001**')
     expect(fieldAt(embed, 'In match')?.value).toBe('**2h 0m**\n4 solo · 8 squad')
   })
 
-  /** Every number `GameProfile` carries is still somewhere, in one field or another. */
+  /**
+   * Every number `GameProfile` carries is still somewhere — except the one the
+   * owner took out. See the case under this one.
+   */
   it('drops none of the career numbers on the way into the columns', () => {
     const shown = rendered({ embeds: [profileEmbed(data(), NOW)] })
 
     for (const number of ['7', '4500', '250', '12', '2 wins', '5 top 10s', '30', '10 deaths',
-      '14 downs', '3 revives', '9001', '2h 0m', '4 solo', '8 squad']) {
+      '3 revives', '9001', '2h 0m', '4 solo', '8 squad']) {
       expect(shown).toContain(number)
     }
   })
 
-  it('still answers with one full-width sentence when there is no career row', () => {
+  /**
+   * "We don't need a mention of downs." The row is still READ — ddb.ts projects
+   * it and `GameProfile` still carries the number — and the kills tile no longer
+   * prints it. The fixture's `downs` is 14 and its `revives` is 3, so a build
+   * that dropped the wrong one of the two fails this rather than passing it.
+   */
+  it('says nothing about downs', () => {
+    const embed = profileEmbed(data({ career: career({ downs: 14, deaths: 10, revives: 3 }) }), NOW)
+    const shown = rendered({ embeds: [embed] })
+
+    expect(shown).not.toContain('downs')
+    expect(shown).not.toContain('14')
+    expect(fieldAt(embed, 'Kills')?.value).toBe('**30**\n10 deaths · 3 revives')
+  })
+
+  it('answers with one sentence under its own heading when there is no career row', () => {
     const embed = profileEmbed(data({ career: null }), NOW)
 
-    expect(fieldAt(embed, 'Career')?.value).toBe('No match record on the game side.')
-    expect(fieldAt(embed, 'Career')?.inline).toBeUndefined()
+    expect(section(embed, 'Career')).toBe('No match record on the game side.')
+
+    // No empty columns beside it: six tiles of nothing is a table of nothing.
     expect(fieldAt(embed, 'Volts')).toBeUndefined()
+    expect(embed.fields).toHaveLength(0)
   })
 })
 
@@ -1122,7 +1280,7 @@ describe('profileEmbed: times are the reader’s own, not UTC', () => {
     const last = Date.parse('2026-08-29T00:00:00.000Z')
 
     const record =
-      fieldNamed(
+      section(
         profileEmbed(data({ registry: registry({ firstSeen: first, lastSeen: last }) }), NOW),
         'Server record',
       ) ?? ''
@@ -1171,7 +1329,7 @@ describe('profileEmbed: times are the reader’s own, not UTC', () => {
    */
   it('says the time is unknown rather than building a stamp out of one that is not', () => {
     const record =
-      fieldNamed(
+      section(
         profileEmbed(
           // Finite, and far outside the range a Date can hold — the case
           // `Number.isFinite` alone does not catch.
@@ -1231,24 +1389,24 @@ describe('profileEmbed: what could not be read', () => {
       NOW,
     )
 
-    const named = fieldNamed(embed, 'Could not be read') ?? ''
+    const named = section(embed, 'Could not be read') ?? ''
 
     expect(named).toContain('career: denied')
     expect(named).toContain('matches: unavailable')
 
     // A partial read still shows what it got.
-    expect(fieldNamed(embed, 'Licences')).toContain(NEWEST)
-    expect(fieldNamed(embed, 'Server record')).toContain('Somebody')
+    expect(section(embed, 'Server record')).toBeDefined()
+    expect(embed.title).toBe('Somebody')
   })
 
   it('says nothing about it when everything was read', () => {
-    expect(fieldNamed(profileEmbed(data({ unreached: [] }), NOW), 'Could not be read')).toBe(
+    expect(section(profileEmbed(data({ unreached: [] }), NOW), 'Could not be read')).toBe(
       undefined,
     )
   })
 
   it('distinguishes a career that is absent from one that was denied', () => {
-    expect(fieldNamed(profileEmbed(data({ career: null }), NOW), 'Career')).toContain(
+    expect(section(profileEmbed(data({ career: null }), NOW), 'Career')).toContain(
       'No match record on the game side.',
     )
   })
@@ -1313,6 +1471,36 @@ describe('profileEmbed: Discord’s limits, measured the way Discord measures th
     }
   })
 
+  /**
+   * AND EVERY SECTION TOO, WHICH IS THE CAP THAT MOVED. These four used to be
+   * fields with 1024 units apiece; they share one 4096-unit description now.
+   * `SECTION_CAP` keeps the old ceiling on each so that nothing was silently
+   * re-truncated to a different shape by the move, and `descriptionOf` clamps
+   * each one again to the room the ones above it left.
+   */
+  it('keeps every description section inside 1024 UTF-16 units', () => {
+    const embed = profileEmbed(monstrous(), NOW)
+
+    for (const heading of headings(embed)) {
+      expect((section(embed, heading) ?? '').length).toBeLessThanOrEqual(1024)
+    }
+  })
+
+  /**
+   * AND EVERY CUT STILL SAYS ITS OWN COUNT. The move into one shared budget is
+   * exactly where a truncation goes quiet: a section squeezed by the sections
+   * above it has no reason of its own to notice. Each of these renders more than
+   * it can hold in `monstrous`, and each has to say so in its own words.
+   */
+  it('states what each squeezed section dropped, in that section', () => {
+    const embed = profileEmbed(monstrous(), NOW)
+
+    expect(section(embed, 'Bans')).toMatch(/\+\d+ more not shown\./u)
+    expect(section(embed, 'Recent matches')).toMatch(
+      /(\d+ of the \d+ read were not shown\.|\d+ matches recorded in all\.)/u,
+    )
+  })
+
   it('keeps the title inside 256 and the description inside 4096', () => {
     const embed = profileEmbed(monstrous(), NOW)
 
@@ -1334,13 +1522,22 @@ describe('profileEmbed: Discord’s limits, measured the way Discord measures th
   })
 
   it('still says which sources went missing when the reply is at its limit', () => {
-    expect(fieldNamed(profileEmbed(monstrous(), NOW), 'Could not be read')).toContain(
+    expect(section(profileEmbed(monstrous(), NOW), 'Could not be read')).toContain(
       'matches: unavailable',
     )
   })
 
-  it('still shows the current licence when the reply is at its limit', () => {
-    expect(fieldNamed(profileEmbed(monstrous(), NOW), 'Licences')).toContain('(current)')
+  /**
+   * THE BANS SURVIVE THE SQUEEZE, WHICH IS WHAT THE SECTION ORDER IS FOR. A
+   * description is squeezed from the end, so the section an admin ran the
+   * command for is the one that cannot be lost — and the reply still names no
+   * licence even when everything in it is at its ceiling.
+   */
+  it('still shows the bans, and still no licence, when the reply is at its limit', () => {
+    const embed = profileEmbed(monstrous(), NOW)
+
+    expect(section(embed, 'Bans')).toBeDefined()
+    expect([embed.title, embed.description, ...values(embed)].join('\n')).not.toContain('license:')
   })
 })
 
@@ -1416,23 +1613,50 @@ describe('the reply is an embed and nothing cuts it twice', () => {
     const reply = await profileCommand(reads(), () => NOW).run(invocation(), {} as never)
 
     expect(typeof reply).not.toBe('string')
-    expect(replyEmbed(reply).fields.length).toBeGreaterThan(0)
+
+    // The sections are the answer now, and the tiles are only there when there
+    // is a career row to fill them — the default fixture has none.
+    expect(headings(replyEmbed(reply)).length).toBeGreaterThan(0)
   })
 
   /**
-   * The case that used to be cut down. Ten sixty-character licences, ten bans
-   * whose reasons are astral text, and twenty-five matches: over a message's
-   * 2000 and inside an embed's 6000, so every section survives now and none of
-   * them did before.
+   * The case that used to be cut down. Ten bans whose reasons are astral text, a
+   * registry row of astral names and five matches whose only identifier is a
+   * long sort key: over a message's 2000 and inside an embed's 6000, so every
+   * section survives now and none of them did before.
+   *
+   * THE FIXTURE HAD TO CHANGE WHEN THE LICENCES WENT. It used to reach 2000 with
+   * ten sixty-character licences in a field of their own; there is no such field
+   * any more, so the weight is where the reply actually carries weight — the
+   * three prose sections that share one description.
    */
   it('sends an answer a message could not have carried, whole', async () => {
+    const licences = Array.from({ length: 10 }, (_, index) => `license:${String(index).repeat(60)}`)
+
     const big = data({
-      licences: Array.from({ length: 10 }, (_, index) => `license:${String(index).repeat(60)}`),
-      bans: Array.from({ length: 10 }, (_, index) => ({
-        licence: `license:${String(index).repeat(60)}`,
-        ban: ban({ reason: ASTRAL.repeat(200) }),
+      licences,
+      current: licences.at(-1) ?? NEWEST,
+
+      bans: licences.map((licence) => ({
+        licence,
+        ban: ban({ license: licence, reason: ASTRAL.repeat(200) }),
       })),
-      matches: Array.from({ length: 25 }, (_, index) => match(index)),
+
+      registry: registry({
+        preferredName: ASTRAL.repeat(200),
+        names: Array.from({ length: 8 }, (unused, index) => ({
+          name: `${ASTRAL.repeat(40)}${String(index)}`,
+          firstSeen: 0,
+          lastSeen: 0,
+        })),
+      }),
+
+      matches: Array.from({ length: 5 }, (unused, index) => ({
+        sk: `match#${'k'.repeat(200)}${String(index)}`,
+        at: null,
+        placement: null,
+        kills: null,
+      })),
     })
 
     const embed = profileEmbed(big, NOW)
@@ -1456,9 +1680,8 @@ describe('the reply is an embed and nothing cuts it twice', () => {
 
     const sent = replyEmbed(await command.run(invocation(), {} as never))
 
-    expect(sent.fields.map((entry) => entry.name)).toEqual(
-      embed.fields.map((entry) => entry.name),
-    )
+    expect(headings(sent)).toEqual(headings(embed))
+    expect(sent.description).toBe(embed.description)
     expect(rendered(await command.run(invocation(), {} as never))).not.toContain('did not fit')
   })
 })
@@ -1517,11 +1740,15 @@ describe('profileCommand', () => {
       () => NOW,
     )
 
-    const text = rendered(await command.run(invocation(), {} as never))
+    const reply = await command.run(invocation(), {} as never)
+    const text = rendered(reply)
 
-    expect(text).toContain('2 licences')
-    expect(text).toContain(OLDEST)
-    expect(text).toContain(NEWEST)
+    // The record it read, and none of what it read it FROM. The button's url
+    // still carries the current licence, which is why `rendered` folds the
+    // components in and this asserts against the embed alone.
+    expect(replyEmbed(reply).title).toBe('Somebody')
+    expect(section(replyEmbed(reply), 'Server record')).toBeDefined()
+    expect(text).not.toContain(OLDEST)
   })
 
   /**
@@ -1571,8 +1798,7 @@ describe('profileCommand', () => {
     const text = rendered(await command.run(invocation(), {} as never))
 
     // `runCommand` turns a throw into a line that names nothing. A named
-    // absence beside the licence that WAS read is a better answer.
-    expect(text).toContain(NEWEST)
+    // absence per source is a better answer.
     expect(text).toContain('bans: timeout')
     expect(text).toContain('career: denied')
     expect(text).toContain('registry: credentials')
@@ -1587,12 +1813,19 @@ describe('profileCommand', () => {
  * THE SELF VIEW.
  *
  * `/profile` with no target answers about the person who ran it, and the whole
- * of what these cases are for is the FIELD THAT MUST NOT BE THERE. The admin
- * view leads with the licence list because more than one licence on one Discord
- * account is the ban-evasion signal and the most interesting thing this bot
- * knows; showing that to the player tells a ban evader exactly how many of
- * their alts the system has already joined up. Ban HISTORY — lifted and expired
- * rows — is a moderation record about them rather than their own data.
+ * of what these cases are for is the THING THAT MUST NOT BE THERE. Neither view
+ * prints a licence any more — the owner asked for that — but the two halves are
+ * kept apart by two different mechanisms and only one of them is a rendering
+ * decision. The admin path READS the list, because more than one licence on one
+ * Discord account is the ban-evasion signal and the ban fan-out is built on it;
+ * the self path cannot read it at all, because `SelfReads` has no `licencesFor`
+ * on it and `tsc` is what enforces that. Ban HISTORY — lifted and expired rows —
+ * is a moderation record about them rather than their own data, and is discarded
+ * at the read for the same reason.
+ *
+ * WHICH IS WHY THESE CASES DID NOT WEAKEN WHEN THE DISPLAY RULE CHANGED. "We do
+ * not show it" and "we cannot reach it" are different guarantees; the first one
+ * now covers both views and the second one still covers only this one.
  *
  * ASSERTED AGAINST THE RENDERED TEXT AND AGAINST THE INJECTED READS, and
  * neither on its own would do. Rendered text is what a player actually sees, so
@@ -1724,20 +1957,31 @@ describe('the self view: a player’s own record, and nothing about their licenc
   /**
    * THE SAME FIXTURE, THE ADMIN VIEW, AND THE OPPOSITE ASSERTIONS. Without this
    * the case above passes just as well against a build whose self view is empty
-   * and against a fixture that never had a licence in it.
+   * and against a fixture that never had a ban in it.
+   *
+   * IT CANNOT ASSERT THE LICENCES ANY MORE, WHICH IS WHY IT ASSERTS THE BAN
+   * HISTORY INSTEAD. Neither view prints a licence now. What still separates the
+   * two is the moderation record: the lifted bans off the OLD licences, which
+   * the admin fan-out reads across the whole list and the self path never sees.
+   * A build that quietly narrowed the admin read to the current licence would
+   * fail here and pass everything else in this file.
    */
-  it('is the same subject the admin view leads with the licence list for', async () => {
+  it('is the same subject the admin view shows the whole ban history for', async () => {
     const seen: string[] = []
     const command = profileCommand(subject(seen), () => NOW)
 
-    const text = rendered(await command.run(invocation({ targetId: DISCORD }), cfg()))
+    const embed = replyEmbed(await command.run(invocation({ targetId: DISCORD }), cfg()))
+    const bans = section(embed, 'Bans') ?? ''
 
-    expect(text).toContain('3 licences')
-    expect(text).toContain(OLDEST)
-    expect(text).toContain(MIDDLE)
-    expect(text).toContain(NEWEST)
-    expect(text).toContain('wrongly banned for desync')
-    expect(text).toContain('evading on an alt')
+    // Both lifted rows, which are on licences that are NOT the current one.
+    expect(bans).toContain('wrongly banned for desync')
+    expect(bans).toContain('evading on an alt')
+    expect(bans).toContain('An Admin')
+
+    // And still not one licence value, in the reply the ADMIN gets either.
+    for (const licence of [OLDEST, MIDDLE, NEWEST, FORGOTTEN]) {
+      expect(embed.description).not.toContain(licence)
+    }
   })
 
   /**
@@ -1900,25 +2144,28 @@ describe('selfEmbed', () => {
   }
 
   /**
-   * THE BAN GOES FIRST, WHICH IS BOTH THE RIGHT ORDER AND THE SAFE ONE:
-   * `trimEmbed` drops fields from the END, so the field a player must not lose
-   * is the one field that cannot be lost.
+   * THE BAN GOES FIRST, WHICH IS BOTH THE RIGHT ORDER AND THE SAFE ONE: a
+   * description is squeezed from the END, so the section a player must not lose
+   * is the one section that cannot be.
    */
   it('leads with an active ban, saying the reason and when it runs out', () => {
     const embed = selfEmbed(
       selfData({ ban: { reason: 'aimbot', expiresAt: Date.parse('2026-09-05T00:00:00.000Z') } }),
     )
 
-    expect(embed.fields.at(0)?.name).toBe('Ban')
-    expect(embed.fields.at(0)?.value).toContain('aimbot')
+    expect(headings(embed).at(0)).toBe('Ban')
+
+    const said = section(embed, 'Ban') ?? ''
+
+    expect(said).toContain('aimbot')
 
     // `f` AND NOT `R`, WHICH IS THE ONE PLACE THE STYLE RULE GOES THE OTHER WAY.
     // An expiry is a deadline a player plans around, so it is the date — in
     // their own timezone, which is exactly what the ISO string here was not.
-    expect(embed.fields.at(0)?.value).toContain(
+    expect(said).toContain(
       `Until **<t:${String(Date.parse('2026-09-05T00:00:00.000Z') / 1000)}:f>**.`,
     )
-    expect(embed.fields.at(0)?.value).not.toContain('2026-09-05T')
+    expect(said).not.toContain('2026-09-05T')
   })
 
   it('says permanent rather than an expiry there is not', () => {
@@ -1935,13 +2182,14 @@ describe('selfEmbed', () => {
   })
 
   /**
-   * NO FIELD AT ALL RATHER THAN A SENTENCE SAYING THERE IS NO BAN. The admin
-   * view says `No ban on any licence read.` because an admin asked that
+   * NO SECTION AT ALL RATHER THAN A SENTENCE SAYING THERE IS NO BAN. The admin
+   * view says `No ban on any record read.` because an admin asked that
    * question; a player did not, and inventing copy to answer a question nobody
    * put is how a reply grows text the owner never wrote.
    */
   it('shows no ban section at all when there is no active ban', () => {
-    expect(selfEmbed(selfData()).fields.map((one) => one.name)).not.toContain('Ban')
+    expect(headings(selfEmbed(selfData()))).not.toContain('Ban')
+    expect(section(selfEmbed(selfData()), 'Ban')).toBeUndefined()
   })
 
   /**
@@ -1978,12 +2226,15 @@ describe('selfEmbed', () => {
    */
   it('shows five matches at most and says how many they have played in all', () => {
     const value =
-      selfEmbed(
-        selfData({
-          matches: Array.from({ length: 5 }, (unused, index) => match(index)),
-          career: career({ matches: 40 }),
-        }),
-      ).fields.find((one) => one.name === 'Recent matches')?.value ?? ''
+      section(
+        selfEmbed(
+          selfData({
+            matches: Array.from({ length: 5 }, (unused, index) => match(index)),
+            career: career({ matches: 40 }),
+          }),
+        ),
+        'Recent matches',
+      ) ?? ''
 
     const lines = value.split('\n')
 
@@ -1997,12 +2248,15 @@ describe('selfEmbed', () => {
 
   it('renders five even when the reader hands back more', () => {
     const value =
-      selfEmbed(
-        selfData({
-          matches: Array.from({ length: 12 }, (unused, index) => match(index)),
-          career: career({ matches: 12 }),
-        }),
-      ).fields.find((one) => one.name === 'Recent matches')?.value ?? ''
+      section(
+        selfEmbed(
+          selfData({
+            matches: Array.from({ length: 12 }, (unused, index) => match(index)),
+            career: career({ matches: 12 }),
+          }),
+        ),
+        'Recent matches',
+      ) ?? ''
 
     expect(value.split('\n')).toHaveLength(6)
     expect(value).toContain('+7 more not shown.')
@@ -2062,6 +2316,241 @@ describe('selfEmbed', () => {
  * player does not have, so a button on their own reply is a dead end that also
  * implies there is a page about them they may open.
  * ------------------------------------------------------------------ */
+
+/**
+ * THE SERVER RECORD, AND THE TWO LINES THE OWNER TOOK OUT OF IT.
+ *
+ * "We don't need their name listed again under Server record." It is the embed's
+ * TITLE, off the same registry row, so the first line under the heading was the
+ * same word twice on one screen.
+ *
+ * "We don't need a mention of Also known as if the name is the same as their
+ * discord display name." Which is the ordinary case — somebody who plays under
+ * the name they use on Discord — and the line then says nothing at all.
+ */
+describe('profileEmbed: the server record', () => {
+  const named = (over: Partial<PlayerRecord> = {}): PlayerRecord =>
+    registry({
+      name: 'Somebody',
+      names: [
+        { name: 'Somebody', firstSeen: 1, lastSeen: 2 },
+        { name: 'Someone Else', firstSeen: 0, lastSeen: 1 },
+      ],
+      ...over,
+    })
+
+  it('does not repeat the in-game name under the heading', () => {
+    // No name history on this row, so the only place the name could appear
+    // under the heading is the line the owner asked to remove.
+    const embed = profileEmbed(data({ registry: named({ names: [] }) }), NOW)
+    const record = section(embed, 'Server record') ?? ''
+
+    // Once, as the title, and nowhere in the section's own lines.
+    expect(embed.title).toBe('Somebody')
+    expect(record).not.toContain('Somebody')
+
+    // And the facts that are not the name are all still there.
+    expect(record).toContain('First seen')
+    expect(record).toContain('**40** sessions')
+  })
+
+  it('drops "Also known as" when the in-game name is their Discord display name', () => {
+    const embed = profileEmbed(data({ registry: named() }), NOW, {
+      avatarUrl: null,
+      displayName: 'Somebody',
+    })
+
+    expect(section(embed, 'Server record')).not.toContain('Also known as')
+    expect(section(embed, 'Server record')).not.toContain('Someone Else')
+  })
+
+  it('keeps it when the two names differ', () => {
+    const embed = profileEmbed(data({ registry: named() }), NOW, {
+      avatarUrl: null,
+      displayName: 'Different On Discord',
+    })
+
+    expect(section(embed, 'Server record')).toContain('Also known as Somebody, Someone Else')
+  })
+
+  /**
+   * AN ABSENT DISPLAY NAME SHOWS THE HISTORY RATHER THAN HIDING IT. `null` means
+   * the invocation carried no user object to read one off, and treating that as
+   * "they match" would delete a moderation signal to make a tidier reply — the
+   * wrong direction for the one section that exists to surface it.
+   */
+  it('shows it when there is no display name to compare against', () => {
+    expect(section(profileEmbed(data({ registry: named() }), NOW), 'Server record')).toContain(
+      'Also known as',
+    )
+  })
+
+  /**
+   * COMPARED THE WAY THE REPLY RENDERS THEM. Both sides go through `oneLine`, so
+   * a name carrying a newline or a run of spaces is not called different from
+   * the one the reader sees. Case is deliberately NOT folded: `Somebody` and
+   * `somebody` are two names a moderator would want side by side.
+   */
+  it('compares the names as they are rendered, and does not fold case', () => {
+    const collapsed = profileEmbed(data({ registry: named({ name: 'Two  Words' }) }), NOW, {
+      avatarUrl: null,
+      displayName: 'Two Words',
+    })
+
+    expect(section(collapsed, 'Server record')).not.toContain('Also known as')
+
+    const cased = profileEmbed(data({ registry: named() }), NOW, {
+      avatarUrl: null,
+      displayName: 'somebody',
+    })
+
+    expect(section(cased, 'Server record')).toContain('Also known as')
+  })
+})
+
+/**
+ * THE AVATAR THUMBNAIL. "On the embed - make the thumbnail URL the user's
+ * profile image."
+ *
+ * IN BOTH VIEWS, and the self one discloses nothing: it is the caller's own
+ * picture, which they are looking at beside their own name in every channel
+ * already.
+ */
+describe('the avatar thumbnail', () => {
+  const AVATAR = 'https://cdn.discordapp.com/avatars/444/abc.png'
+
+  it('is the subject’s avatar on the admin view', () => {
+    const embed = profileEmbed(data(), NOW, { avatarUrl: AVATAR, displayName: 'Somebody' })
+
+    expect(embed.thumbnail).toEqual({ url: AVATAR })
+  })
+
+  it('is the caller’s own avatar on the self view', () => {
+    const embed = selfEmbed(
+      { discordId: DISCORD, known: true, ban: null, career: career(), matches: [], unreached: [] },
+      AVATAR,
+    )
+
+    expect(embed.thumbnail).toEqual({ url: AVATAR })
+  })
+
+  /**
+   * NO KEY AT ALL RATHER THAN AN EMPTY ONE. Discord refuses an embed whose
+   * thumbnail carries an empty `url`, and a refused reply reaches the admin as
+   * `runCommand`'s failure line with no profile in it.
+   */
+  it('is absent, and not empty, when no avatar reached the renderer', () => {
+    expect(profileEmbed(data(), NOW).thumbnail).toBeUndefined()
+    expect('thumbnail' in profileEmbed(data(), NOW)).toBe(false)
+
+    expect(
+      profileEmbed(data(), NOW, { avatarUrl: '', displayName: null }).thumbnail,
+    ).toBeUndefined()
+  })
+
+  /**
+   * NOT IN THE 6000. Discord's embed budget covers the title, the description,
+   * every field name and value, the footer text and the author name — a
+   * thumbnail is a URL it fetches an image from, not text it renders. Counting
+   * one would spend a hundred units of somebody's ban history on nothing.
+   */
+  it('costs nothing against the embed’s text budget', () => {
+    const bare = profileEmbed(data(), NOW)
+    const withOne = profileEmbed(data(), NOW, { avatarUrl: AVATAR, displayName: null })
+
+    expect(embedUnits(withOne)).toBe(embedUnits(bare))
+  })
+
+  /**
+   * AND THE BUDGET GUARD CARRIES IT THROUGH. `trimEmbed` rebuilds the record by
+   * hand, so a key left off that literal is a key silently dropped from every
+   * reply that trips the guard — the same trap the colour was already in.
+   */
+  it('survives the last-resort trim', () => {
+    const trimmed = trimEmbed({
+      title: 'Player profile',
+      description: 'a description',
+      color: 0x5865f2,
+      thumbnail: { url: AVATAR },
+      fields: Array.from({ length: 30 }, (unused, index) => ({
+        name: `f${String(index)}`,
+        value: 'v',
+      })),
+    })
+
+    expect(trimmed.thumbnail).toEqual({ url: AVATAR })
+  })
+
+  /**
+   * THE WIRING, WHICH IS THE HALF A UNIT TEST OF THE RENDERER CANNOT SEE.
+   * `Invocation` carries the caller's avatar and the target's separately, and
+   * `run` picks between them with the same `targetId === null` test that decides
+   * whose profile it is building. A build that resolved "the subject" at the
+   * seam instead would put the caller's picture on an admin's lookup.
+   */
+  it('takes the target’s avatar for a lookup and the caller’s for the self view', async () => {
+    const command = profileCommand(
+      reads({ registry: () => Promise.resolve(ok(registry())) }),
+      () => NOW,
+    )
+
+    const lookedUp = replyEmbed(
+      await command.run(
+        invocation({
+          targetId: DISCORD,
+          targetAvatarUrl: 'https://cdn/target.png',
+          userAvatarUrl: 'https://cdn/caller.png',
+        }),
+        {} as never,
+      ),
+    )
+
+    expect(lookedUp.thumbnail).toEqual({ url: 'https://cdn/target.png' })
+
+    const own = replyEmbed(
+      await command.run(
+        invocation({
+          targetId: null,
+          targetAvatarUrl: 'https://cdn/target.png',
+          userAvatarUrl: 'https://cdn/caller.png',
+        }),
+        {} as never,
+      ),
+    )
+
+    expect(own.thumbnail).toEqual({ url: 'https://cdn/caller.png' })
+  })
+
+  /** And the display name reaches the one comparison that reads it. */
+  it('carries the target’s display name into the name-history decision', async () => {
+    const command = profileCommand(
+      reads({
+        registry: () =>
+          Promise.resolve(
+            ok(
+              registry({
+                name: 'Somebody',
+                names: [{ name: 'Somebody', firstSeen: 1, lastSeen: 2 }],
+              }),
+            ),
+          ),
+      }),
+      () => NOW,
+    )
+
+    const same = replyEmbed(
+      await command.run(invocation({ targetDisplayName: 'Somebody' }), {} as never),
+    )
+
+    expect(section(same, 'Server record')).not.toContain('Also known as')
+
+    const differs = replyEmbed(
+      await command.run(invocation({ targetDisplayName: 'Another Name' }), {} as never),
+    )
+
+    expect(section(differs, 'Server record')).toContain('Also known as Somebody')
+  })
+})
 
 describe('the console button', () => {
   /**

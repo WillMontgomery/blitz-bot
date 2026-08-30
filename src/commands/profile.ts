@@ -30,9 +30,10 @@ import {
  * `/profile @someone` IS THE MODERATION VIEW and is admin-only. `/profile` with
  * no target is the SELF view: anybody may run it and it answers about the
  * person who ran it. "No target means me" is the whole rule, which also means
- * an ADMIN with no target gets the self view — they cannot see their own
- * licence list this way, and that is a decision rather than an oversight. An
- * admin who wants the moderation view of themselves tags themselves.
+ * an ADMIN with no target gets the self view — no ban history, no registry row
+ * and no name history about themselves this way, and that is a decision rather
+ * than an oversight. An admin who wants the moderation view of themselves tags
+ * themselves.
  *
  * THE TWO VIEWS SHARE NO FIELD-ASSEMBLY CODE, AND THAT IS THE POINT.
  * `gatherProfile`/`profileEmbed` build the admin answer; `gatherSelf`/
@@ -45,21 +46,36 @@ import {
  * next one. A flag has to be remembered at every future edit; a separate
  * function cannot be forgotten into.
  *
+ * NO LICENCE IS DISPLAYED IN EITHER VIEW, BY THE OWNER: "We don't need any list
+ * or mention of licences. Not even in the bans section." So there is no licence
+ * value, no count of them and no sentence about how many anywhere in this reply.
+ *
+ * READING THEM AND SHOWING THEM ARE TWO DIFFERENT THINGS AND ONLY THE SECOND
+ * WENT. The admin path still reads the whole list out of the reverse identifier
+ * index and still fans the ban read out across it, because a clean current
+ * licence beside a permanently-banned old one is the thing an admin is running
+ * this command to find — it is now reported as a ban, without naming which
+ * licence it came from. `bansSection` says that again where it happens.
+ *
+ * THE ONE LICENCE THAT SURVIVES IS NOT A DISPLAY OF ONE. `consoleRow` puts the
+ * current licence in a link button's URL, which is a route to the console's page
+ * for that player rather than a thing the reply states.
+ *
  * THE LICENCE LIST IS NEVER FETCHED ON THE SELF PATH, rather than fetched and
  * omitted. `SelfReads` is a NARROWER type than `ProfileReads` and has no
  * `licencesFor` on it at all, so `gatherSelf` calling it is a compile error
- * rather than a review comment. This matters because more than one licence on
- * one Discord account is the ban-evasion signal, and showing a player that
- * count tells a ban evader exactly how many of their alts the system has
- * already joined up. Ban HISTORY — lifted and expired rows — is a moderation
+ * rather than a review comment. That type-level separation is untouched by the
+ * display rule above and stays exactly as it is: "we do not show it" is a
+ * rendering decision that a later edit can undo by accident, and "we cannot
+ * reach it" is not. Ban HISTORY — lifted and expired rows — is a moderation
  * record about the subject rather than the subject's own data, so it is
  * discarded in `gatherSelf` and `SelfData` has no shape that could carry it.
  *
  * ALWAYS EPHEMERAL, WHICHEVER VIEW IT IS. `onlyInvoker` decides who SEES the
  * answer and is fixed at the defer, before the handler has run. The admin view
- * carries a member's ban history, their licence list and their name history;
- * the self view carries somebody's own ban, which is theirs to show and not
- * the channel's to read. `onlyInvoker` is therefore a constant `true`.
+ * carries a member's ban history and every name their account has used; the
+ * self view carries somebody's own ban, which is theirs to show and not the
+ * channel's to read. `onlyInvoker` is therefore a constant `true`.
  *
  * SPLIT IN THREE PER PATH, THE WAY command.ts IS SPLIT. A `gather*` does the
  * reads and produces a record; an `*Embed` turns that record into an embed and
@@ -93,7 +109,7 @@ import {
  * never renders an empty history it cannot vouch for. `unavailable` and a
  * DynamoDB failure are two different sentences and stay two.
  *
- * HOW IT IS PRESENTED, WHICH IS FOUR DECISIONS AND ALL FOUR ARE THE OWNER'S.
+ * HOW IT IS PRESENTED, AND EVERY DECISION HERE IS THE OWNER'S.
  *
  *   TIMES ARE DISCORD TIMESTAMPS, NOT ISO STRINGS. `<t:UNIX:R>` renders as "2
  *   hours ago" and `<t:UNIX:f>` as a date, both in the READER'S OWN timezone
@@ -104,9 +120,30 @@ import {
  *   THE SHORT NUMBERS ARE COLUMNS. Discord lays out up to three `inline: true`
  *   fields per row, so level, Volts, matches, kills, damage and time in match
  *   are six tiles that read as two rows of a table instead of six lines of
- *   `a · b · c`. Everything that grows — the licence list, the bans, the
- *   registry row, the history — stays full width, because a long value in a
- *   third of the width is a column of two-word lines.
+ *   `a · b · c`. Nothing that grows is a column, because a long value in a
+ *   third of the width is a ribbon of two-word lines.
+ *
+ *   THE PROSE IS IN THE DESCRIPTION AND THE NUMBERS ARE FIELDS, WHICH IS A
+ *   HYBRID FORCED BY A PLATFORM LIMIT. The owner asked for section headings in
+ *   larger text rather than bold. Discord does not render `#`, `##` or `###` in
+ *   an embed FIELD name or value — they arrive as the characters that were typed
+ *   — and does render them in the embed DESCRIPTION and in ordinary message
+ *   content (discord/discord-api-docs#7167). Bold is therefore the ceiling
+ *   inside a field, so everything that wanted a heading — bans, the server
+ *   record, recent matches, what could not be read — moved into the description
+ *   under a real `##`, and the six numeric tiles stayed fields, where columns
+ *   are what makes them readable and a heading row would be wasted.
+ *
+ *   WHICH MOVES THE BUDGET AS WELL AS THE TEXT, and that is the half worth
+ *   watching. Those sections used to have 1024 UTF-16 units EACH as fields;
+ *   they now share the description's 4096. `SECTION_CAP` keeps the old
+ *   per-section ceiling, `descriptionOf` clamps each section a second time to
+ *   what the sections before it left, and every cut still states its own count.
+ *
+ *   THE THUMBNAIL IS THE SUBJECT'S OWN DISCORD AVATAR, in both views — in the
+ *   self view it is the caller's own picture and discloses nothing. It is not
+ *   read from DynamoDB and is not in the 6000-unit budget; see `Subject` and
+ *   `embedUnits`.
  *
  *   THE BALANCE IS IN VOLTS, which is what the game calls it:
  *   `BR.Config.Market.currency = 'Volts'` in the gamemode repo. It was labelled
@@ -132,9 +169,9 @@ import {
  * PLACEHOLDER-FREE, DELIBERATELY, AND THAT IS A DIFFERENT CALL FROM command.ts.
  * The strings in `COPY` there are things a MEMBER reads — a refusal, a failure
  * — and the owner supplies those verbatim. Every one of these is either a label
- * on a number or one of the three statements the command exists to make: how
- * many licences there are, how much was cut, and what could not be read. A
- * placeholder in any of those is a command that cannot answer its question.
+ * on a number or one of the two statements the command exists to make: how much
+ * was cut, and what could not be read. A placeholder in either of those is a
+ * command that cannot answer its question.
  *
  * A MEMBER NOW READS SOME OF THESE, which was not true when this record was
  * written: the self view reuses the labels and the two honest-absence
@@ -180,37 +217,26 @@ const COPY = {
   /** Not an error. A Discord account that has never played is a normal answer. */
   noRecord: 'No player record for this Discord account.',
 
-  indexUnreadable:
-    'The Discord-to-licence index could not be read, so nothing else could be looked up.',
-
   /**
-   * THE SENTENCE THIS COMMAND EXISTS FOR. `ringmaster-player-ids` returns a
-   * LIST, and more than one entry means this Discord account has connected
-   * under more than one licence — the identifier-reuse signal the console files
-   * incidents about. Showing the licences without saying this leaves the reader
-   * to notice a count for themselves, which is the same as not saying it.
-   */
-  oneLicence: 'One licence.',
-  manyLicences: (count: number) =>
-    `${count} licences — this Discord account has played under more than one.`,
-
-  licences: 'Licences',
-  licencesOmitted: (count: number) => `+${count} older licences not shown.`,
-
-  /**
-   * What every OTHER field says when its lines did not fit.
+   * What EVERY section says when its lines did not fit.
    *
-   * NOT `licencesOmitted`, WHICH IS THE POINT OF IT BEING A SECOND STRING. The
-   * fields below are packed by the same function, and reusing the licence
-   * wording would have a career field that overflowed report "+2 older licences
-   * not shown" — a sentence about a thing that did not happen, in the one place
-   * this file is trying hardest to be honest.
+   * ONE SENTENCE FOR ALL OF THEM NOW. There used to be a second one — `+N older
+   * licences not shown` — and the record here warned against reusing it, because
+   * a career section that overflowed would then report a thing that did not
+   * happen. The licence list is gone, so the trap is gone with it and this is
+   * the only cut sentence left.
    */
   linesOmitted: (count: number) => `+${count} more not shown.`,
 
   bans: 'Bans',
-  noBans: 'No ban on any licence read.',
-  bansSkipped: (count: number) => `${count} older licences were not checked for bans.`,
+
+  /**
+   * NO LICENCE IN THIS SENTENCE EITHER, which is what "not even in the bans
+   * section" costs it: it used to read `No ban on any licence read.` The ban
+   * fan-out still covers every licence the account has used — see `bansSection`
+   * — so "any record read" is what is actually true and is what it now says.
+   */
+  noBans: 'No ban on any record read.',
 
   /**
    * The one career field that is still a field: the sentence for a player with
@@ -233,19 +259,34 @@ const COPY = {
   damage: 'Damage',
   inMatch: 'In match',
 
-  /** The lines under those headings, where the headline number is bold. */
+  /**
+   * The lines under those headings, where the headline number is bold.
+   *
+   * NO DOWNS, BY THE OWNER: "We don't need a mention of downs." `GameProfile`
+   * still carries the number — ddb.ts projects that row field by field and is
+   * not this file's to edit — and the kills tile no longer prints it. Deaths and
+   * revives are the two that stayed, so the tile still reads as the other side
+   * of the kills it is named for.
+   */
   levelTile: (level: number, xp: number) => `**${level}**\n${xp} XP`,
   voltsTile: (balance: number) => `**${balance}**`,
   matchesTile: (played: number, wins: number, top10s: number, last: string) =>
     `**${played}**\n${wins} wins · ${top10s} top 10s\nLast match ${last}`,
-  killsTile: (kills: number, deaths: number, downs: number, revives: number) =>
-    `**${kills}**\n${deaths} deaths · ${downs} downs · ${revives} revives`,
+  killsTile: (kills: number, deaths: number, revives: number) =>
+    `**${kills}**\n${deaths} deaths · ${revives} revives`,
   damageTile: (dealt: number) => `**${dealt}**`,
   inMatchTile: (played: string, solo: number, squad: number) =>
     `**${played}**\n${solo} solo · ${squad} squad`,
 
   registry: 'Server record',
   noRegistry: 'No row in the server registry.',
+
+  /**
+   * THE NAME HISTORY, AND IT IS NOW CONDITIONAL — see `registrySection`. The
+   * owner asked for no "Also known as" at all when the in-game name is the same
+   * as the subject's Discord display name, because the line then repeats the
+   * embed's own title back at a reader who is looking at both.
+   */
   alsoKnownAs: (names: string, more: number) =>
     more > 0 ? `Also known as ${names} (+${more} more)` : `Also known as ${names}`,
 
@@ -372,6 +413,34 @@ const EMBED_FIELD_VALUE_CAP = 1024
 const EMBED_TOTAL_CAP = 6000
 
 /**
+ * A section heading, as the only markdown Discord will actually enlarge.
+ *
+ * `##` AND NOT `#`, AND NOT BOLD. The owner asked for section headings in larger
+ * text rather than bold. Discord renders `#`/`##`/`###` in an embed DESCRIPTION
+ * and in message content, and does NOT render any of them in an embed field's
+ * name or value — a `##` typed into a field arrives as the two characters
+ * (discord/discord-api-docs#7167). That is why the prose sections live in the
+ * description at all; see the file header. `##` rather than `#` because `#` is
+ * the size of a title and there is already a title above these.
+ */
+const HEADING = '##'
+
+/**
+ * How much one section of the description may hold.
+ *
+ * THE OLD PER-FIELD CEILING, KEPT ON PURPOSE THROUGH THE MOVE. Bans, the server
+ * record, what could not be read and the match history were each a field with
+ * 1024 UTF-16 units of its own; they are now sections of one description with
+ * 4096 between them. Keeping 1024 per section preserves the shape each of those
+ * blocks was written and truncated to, and the arithmetic works out: four
+ * sections, their headings and the subject line come to a little over 4096 in
+ * the worst case, and `descriptionOf` clamps each one a SECOND time to the room
+ * the sections above it actually left. So the last section is squeezed rather
+ * than the description overflowing, and every cut still says its own count.
+ */
+const SECTION_CAP = EMBED_FIELD_VALUE_CAP
+
+/**
  * How much of a line of somebody else's text survives.
  *
  * A PER-LINE CAP SO THAT NO SINGLE LINE CAN EXCEED A FIELD. A ban reason is
@@ -390,12 +459,15 @@ const LINE_CAP = 240
  * GetItem, and they run in parallel, but an unbounded list is an unbounded
  * number of requests on a path with a person at the end of it. Ten is chosen
  * because a Discord account with more than ten licences is already the answer
- * to the question being asked — and the reply says how many were not checked,
- * so the cap is visible rather than silent.
+ * to the question being asked.
  *
  * THE MOST RECENT TEN, because those are the ones the account is using now.
- * The older ones are the more interesting half of a ban-evasion story, which is
- * exactly why the count of skipped ones is stated rather than dropped.
+ *
+ * THE COUNT IT SKIPS IS NO LONGER IN THE REPLY, and that is the one thing the
+ * owner's "not even in the bans section" actually cost this file: `N older
+ * licences were not checked for bans` is a count of licences however it is
+ * phrased. `gatherProfile` still counts them, and says so in the JOURNAL, which
+ * is operator-facing and is where a fan-out that hit its bound belongs.
  */
 const LICENCE_CAP = 10
 
@@ -426,11 +498,17 @@ const RECENT_MATCHES = 5
 const NAME_HISTORY_CAP = 5
 
 /**
- * The floor under the match field. Below this there is no room for a line AND
- * the note that says how much was cut, and a field carrying only a truncation
- * notice is worse than no field.
+ * The floor under the match section. Below this there is no room for a line AND
+ * the note that says how much was cut, and a heading over nothing but a
+ * truncation notice is worse than no section.
+ *
+ * IT CANNOT FIRE AT TODAY'S CAPS, which is the arithmetic `SECTION_CAP` states:
+ * the sections above this one are capped at 1024 each and there are three of
+ * them, so the description always has hundreds of units left when the match
+ * section is reached. It is kept for the reason `trimEmbed` is kept — a guard
+ * that is unreachable today is reachable the day a cap above it changes.
  */
-const MATCH_FIELD_FLOOR = 120
+const MATCH_SECTION_FLOOR = 120
 
 /**
  * The bar down the side of the embed, in the two states this reply has.
@@ -512,8 +590,53 @@ export interface ProfileEmbed {
    */
   readonly color: number
 
+  /**
+   * The subject's Discord avatar, in the corner of the embed.
+   *
+   * OPTIONAL, AND ABSENT RATHER THAN EMPTY WHEN THERE IS NO URL. Discord refuses
+   * an embed carrying `thumbnail: { url: '' }`, and a refused reply reaches the
+   * admin as `runCommand`'s failure line with no profile in it — so an
+   * invocation that arrived without an avatar url gets no `thumbnail` key at
+   * all. `Subject` says when that can happen.
+   *
+   * ASSIGNABLE TO `APIEmbedThumbnail`, which is `{ url, proxy_url?, height?,
+   * width? }`: the three Discord fills in itself are the three left off here.
+   */
+  readonly thumbnail?: { readonly url: string }
+
   readonly fields: APIEmbedField[]
 }
+
+/**
+ * What the INVOCATION knows about the subject that DynamoDB does not.
+ *
+ * A THIRD PARAMETER TO THE RENDERER RATHER THAN TWO MORE FIELDS ON
+ * `ProfileData`, and the split is the same one the rest of this file makes.
+ * `gatherProfile` reads tables; every value on the record it returns came out of
+ * one. These two came off the interaction — see `Invocation` in ./command.ts —
+ * and threading them through the read layer would make `gatherProfile` take an
+ * argument it never uses.
+ *
+ * BOTH NULLABLE, BECAUSE THE SEAM CAN GENUINELY BE EMPTY. `Invocation` carries
+ * ids, and the avatar and display name are read off the interaction's own user
+ * objects in `invocationOf`; a payload that carried no user for the option — and
+ * every fixture written before this existed — has neither. Null means "not
+ * known", and the two consequences are stated where they are read: no
+ * `thumbnail` key, and the name history is SHOWN rather than suppressed.
+ */
+export interface Subject {
+  /** Their Discord avatar, already resolved to a URL. */
+  readonly avatarUrl: string | null
+
+  /**
+   * Their Discord display name, for the one comparison this reply makes: the
+   * name history is not worth a line when the in-game name is already it.
+   */
+  readonly displayName: string | null
+}
+
+/** Neither known. The default, so a caller that has neither says so once. */
+const ANONYMOUS: Subject = { avatarUrl: null, displayName: null }
 
 /**
  * One match, reduced to what a line of history says.
@@ -529,8 +652,17 @@ export interface ProfileEmbed {
  */
 export type MatchSummary = GameMatch
 
-/** The five things a profile is assembled from, named so an absence can be too. */
-export type ProfileSource = 'licences' | 'bans' | 'career' | 'registry' | 'matches'
+/**
+ * The five things a profile is assembled from, named so an absence can be too.
+ *
+ * `lookup` RATHER THAN `licences`, WHICH IS `SelfSource`'S NAME AND ITS REASON
+ * BORROWED. It used to be `licences`, and `licences: denied` in a reply that may
+ * not mention a licence anywhere is exactly the disclosure the owner asked to
+ * remove — a reader learns that a Discord account is indexed to licences and
+ * that the bot went looking. Naming the read for what it was FOR rather than
+ * what it read says the same operational thing without it.
+ */
+export type ProfileSource = 'lookup' | 'bans' | 'career' | 'registry' | 'matches'
 
 /**
  * Why a source is missing.
@@ -551,13 +683,12 @@ export interface Unreached {
  * The sources a SELF profile is assembled from. Three, and none of them is the
  * licence list.
  *
- * `lookup` RATHER THAN `licences`, AND THE NAME IS THE POINT. The admin view
- * says `licences: denied` and, one field up, `The Discord-to-licence index
- * could not be read` — both of which tell the reader that a Discord account is
- * indexed to licences and that the bot went looking. That is exactly the fact
- * the self view is built not to disclose, so the one read the self path makes
- * against that table reports under a name that describes what it was FOR
- * rather than what it read.
+ * `lookup` RATHER THAN `licences`, AND THE NAME IS THE POINT. `licences: denied`
+ * tells the reader that a Discord account is indexed to licences and that the
+ * bot went looking, so the one read the self path makes against that table
+ * reports under a name that describes what it was FOR rather than what it read.
+ * THE ADMIN VIEW NOW BORROWS IT — see `ProfileSource`, which used to say
+ * `licences` and cannot any more.
  *
  * `ban` IS SINGULAR HERE AND `bans` IS PLURAL THERE, for the same reason: the
  * admin path fans out over every licence and the self path reads exactly one.
@@ -609,17 +740,36 @@ export interface ProfileData {
   readonly discordId: string
 
   /**
-   * The licences the index holds, IN STORED ORDER: most recent LAST. Kept in
-   * that order because it is what the table says; the renderer reverses it for
-   * display and says which one is current.
+   * The licences the index holds, IN STORED ORDER: most recent LAST.
+   *
+   * READ, AND NOT RENDERED. Nothing in either builder prints this list, its
+   * length, or anything derived from either — the owner asked for no licence
+   * anywhere in the reply. It is on the record because it is what the ban
+   * fan-out is made from and what `gatherProfile` is reporting on, and because a
+   * gather that quietly stopped reading the whole list would turn the admin
+   * view's one real signal off. See the file header.
    */
   readonly licences: readonly string[]
 
-  /** The licence every read below was made against: the most recent one. */
+  /**
+   * The licence every read below was made against: the most recent one.
+   *
+   * STILL RENDERED, IN EXACTLY ONE PLACE AND NOT AS TEXT: `consoleRow` puts it
+   * in a link button's URL. It is also the "is there anything to show" bit both
+   * builders test, because an account the index has never heard of has nothing
+   * keyed on a licence to render.
+   */
   readonly current: string | null
 
   readonly bans: readonly LicenceBan[]
-  /** Licences the cap meant were never ban-checked. Said in the reply. */
+
+  /**
+   * Licences the cap meant were never ban-checked.
+   *
+   * IN THE JOURNAL, NOT IN THE REPLY. It used to be a sentence in the bans
+   * field; a count of licences is a count of licences however it is worded, so
+   * `gatherProfile` logs it instead. See `LICENCE_CAP`.
+   */
   readonly bansSkipped: number
 
   readonly career: GameProfile | null
@@ -679,9 +829,10 @@ export interface ProfileReads {
    *
    * THE ADMIN PATH'S READ, AND ONLY THE ADMIN PATH'S. It is the reverse
    * identifier index — the thing that answers "how many licences has this
-   * Discord account played under" — and that answer is the ban-evasion signal
-   * the moderation view leads with. `SelfReads` below deliberately does not
-   * include it.
+   * Discord account played under" — and the moderation view fans its ban read
+   * out across every answer it gives. It no longer PRINTS any of them; see the
+   * file header for why reading and showing are two decisions and only the
+   * second one changed. `SelfReads` below deliberately does not include it.
    */
   licencesFor: (discordId: string) => Promise<DdbResult<string[]>>
 
@@ -981,7 +1132,7 @@ function nothing(discordId: string, unreached: readonly Unreached[]): ProfileDat
  *
  * THE INDEX IS READ FIRST AND ALONE, because every other read is keyed on what
  * it returns. A failure there is the one failure that costs the whole answer,
- * and it is reported as itself — `licences: unreachable` — rather than as an
+ * and it is reported as itself — `lookup: unreachable` — rather than as an
  * account with no record, which is the same reply for the opposite reason.
  *
  * THE REST RUN TOGETHER. Four reads against one licence plus one per licence
@@ -1012,7 +1163,7 @@ export async function gatherProfile(
 
     // One entry per source however many reads of it failed: ten denied ban
     // reads are one thing wrong, and ten identical lines in the reply would
-    // push the licences off the bottom of it.
+    // push everything under them off the bottom of it.
     if (!unreached.some((entry) => entry.source === source)) {
       unreached.push({ source, why: failure.kind })
     }
@@ -1021,7 +1172,7 @@ export async function gatherProfile(
   const found = await reads.licencesFor(discordId)
 
   if (!found.ok) {
-    missed('licences', found.failure)
+    missed('lookup', found.failure)
     return nothing(discordId, unreached)
   }
 
@@ -1034,6 +1185,20 @@ export async function gatherProfile(
   if (current === undefined) return nothing(discordId, unreached)
 
   const checked = licences.slice(-LICENCE_CAP)
+
+  // THE REPLY CANNOT SAY THIS ANY MORE, SO THE JOURNAL DOES. `N older licences
+  // were not checked for bans` was a line in the bans field until the owner
+  // asked for no mention of a licence anywhere, and a count of them is still a
+  // count of them. A fan-out that hit its bound is an operational fact either
+  // way: an admin has been shown a ban record that is not the whole one, and the
+  // only place left to say so is the journal, which is operator-facing.
+  if (licences.length > checked.length) {
+    log('info', 'ban fan-out hit its cap, so some licences were not checked', {
+      discord: discordId,
+      checked: checked.length,
+      skipped: licences.length - checked.length,
+    })
+  }
 
   const [banRows, career, registry, matches] = await Promise.all([
     Promise.all(checked.map(async (licence) => ({ licence, read: await reads.ban(licence) }))),
@@ -1095,7 +1260,7 @@ function nobody(discordId: string, unreached: readonly SelfUnreached[]): SelfDat
  * carry one — see `SelfBan`.
  *
  * ONE LICENCE'S BAN, NOT EVERY LICENCE'S, WHICH IS THE OTHER HALF OF THE SAME
- * RULE. `bansField` deliberately reports a ban on ANY licence because an
+ * RULE. `bansBody` deliberately reports a ban on ANY licence because an
  * account whose current licence is clean and whose previous one is banned is
  * the thing the admin view exists to surface. Doing that here would disclose
  * that there IS a previous licence. What this reads is the ban on the licence
@@ -1183,6 +1348,30 @@ function field(name: string, value: string): APIEmbedField {
 }
 
 /**
+ * The subject's avatar as an embed thumbnail, or no thumbnail key at all.
+ *
+ * SPREAD INTO THE EMBED LITERAL, WHICH IS WHY IT RETURNS AN OBJECT AND NOT A
+ * URL. Discord refuses an embed whose thumbnail carries an empty `url`, and a
+ * refused reply is `runCommand`'s failure line with no profile in it — so
+ * "there is no avatar" has to be the ABSENCE of the key rather than a key with
+ * nothing in it.
+ *
+ * NOT LENGTH-CHECKED, UNLIKE THE CONSOLE BUTTON'S URL. `BUTTON_URL_CAP` exists
+ * because that url interpolates a value read out of DynamoDB — another repo's
+ * table, another repo's idea of how long a licence is. This one is built by
+ * discord.js out of the avatar hash Discord itself sent on the interaction, so
+ * there is no foreign value in it to be surprised by.
+ *
+ * SHARED BY BOTH BUILDERS, and it is the one shared thing that touches the
+ * subject at all — which is safe for the reason the file header gives: an
+ * avatar is the account's own picture, so the self view showing it discloses
+ * nothing the caller does not already see beside their own name.
+ */
+function thumbnailOf(avatarUrl: string | null): { thumbnail?: { url: string } } {
+  return avatarUrl === null || avatarUrl === '' ? {} : { thumbnail: { url: avatarUrl } }
+}
+
+/**
  * A column.
  *
  * `inline: true` IS THE WHOLE OF DISCORD'S LAYOUT LANGUAGE, and what it means is
@@ -1194,9 +1383,10 @@ function field(name: string, value: string): APIEmbedField {
  *
  * SHORT VALUES ONLY, WHICH IS NOT A STYLE RULE. A column is a third of the
  * width, so a long value in one is a narrow ribbon of two-word lines that is
- * harder to read than the single line it replaced. The licence list, the bans,
- * the registry row and the history are therefore full-width fields and always
- * will be; what goes in a tile is a number and at most a line under it.
+ * harder to read than the single line it replaced. The bans, the registry row
+ * and the history are therefore not tiles and never will be — they are sections
+ * of the description now, which is full width by construction; what goes in a
+ * tile is a number and at most a line under it.
  *
  * SHARED BY BOTH BUILDERS, like `cut` and `packed` and for the same reason: it
  * is about how Discord draws a field and decides nothing about what one says.
@@ -1279,22 +1469,51 @@ export function consoleRow(licence: string): CommandComponentRow | null {
 }
 
 /**
- * The licences, newest first, with the current one marked.
+ * A description built section by section, each one measured against what the
+ * ones above it left.
  *
- * REVERSED FOR DISPLAY, AND THE REASON IS THE TRUNCATION. The table stores them
- * most-recent-last, so listing them in stored order would put the licence the
- * account is using right now at the bottom — the exact end `packed` drops from
- * when the list is too long for a field. Newest first means the cut can only
- * ever eat history, and the line it leaves behind says how much.
+ * SHARED BY BOTH BUILDERS, like `cut`, `packed` and `tile`, and for the same
+ * reason: it knows how Discord draws a heading and how many units are left, and
+ * it decides nothing about what any section says. Neither builder can reach the
+ * other's wording through it — a section arrives here already rendered.
+ *
+ * A CLOSURE OVER A RUNNING TOTAL RATHER THAN A LIST OF SECTIONS RENDERED AND
+ * THEN TRIMMED, because a section has to know its budget BEFORE it packs itself:
+ * `packed` drops whole lines and states how many it dropped, and it can only do
+ * that against a number. Rendering everything and cutting the result afterwards
+ * is the second cut with a second set of rules that this file deletes wherever
+ * it finds one.
+ *
+ * THE HEADING IS PAID FOR OUT OF THE SECTION'S OWN BUDGET, which is what makes
+ * `room` the honest number to hand `packed`: the separator, the `##`, the
+ * heading text and the newline under it are all charged before the caller is
+ * told what it has.
  */
-function licencesField(data: ProfileData): APIEmbedField {
-  const newestFirst = [...data.licences].reverse()
+function descriptionOf(cap: number, opening: string) {
+  const parts: string[] = [opening]
+  let spent = units(opening)
 
-  const lines = newestFirst.map((licence, index) =>
-    cut(index === 0 ? `${licence} (current)` : licence, LINE_CAP),
-  )
+  // The blank line, the heading and the newline that ends it. Sections are
+  // joined with '\n\n' so that Discord's markdown starts a new block for each.
+  const overhead = (heading: string): number => units(`\n\n${HEADING} ${heading}\n`)
 
-  return field(COPY.licences, packed(lines, COPY.licencesOmitted, EMBED_FIELD_VALUE_CAP))
+  return {
+    /** What is left for a section under this heading, once it is paid for. */
+    room: (heading: string): number => Math.min(SECTION_CAP, cap - spent - overhead(heading)),
+
+    add: (heading: string, body: string): void => {
+      parts.push(`${HEADING} ${heading}\n${body}`)
+      spent += overhead(heading) + units(body)
+    },
+
+    /**
+     * ALWAYS INSIDE `cap`, because every `add` was sized against `room` first.
+     * The final `cut` is the same belt-and-braces `trimEmbed` is: it costs one
+     * comparison and it is the difference between a reply Discord takes and a
+     * reply it refuses outright.
+     */
+    text: (): string => cut(parts.join('\n\n'), cap),
+  }
 }
 
 /**
@@ -1309,8 +1528,14 @@ function licencesField(data: ProfileData): APIEmbedField {
  * and when it expired are all freshness — an admin is asking "recently?" — and
  * the expiry of a ban still in force is the deadline, which is the one that has
  * to be a date. See `when`.
+ *
+ * NO LICENCE IN FRONT OF IT ANY MORE. This line used to begin with the licence
+ * the row was keyed on, and the owner asked for no mention of one anywhere —
+ * "not even in the bans section". So the line takes no licence rather than
+ * taking one and declining to print it: a parameter that is in scope and unused
+ * is one careless edit away from being interpolated back in.
  */
-function banLine(licence: string, ban: Ban, now: number): string {
+function banLine(ban: Ban, now: number): string {
   const state = isBanActive(ban, now)
     ? ban.expiresAt === null
       ? '**ACTIVE**, permanent'
@@ -1321,31 +1546,40 @@ function banLine(licence: string, ban: Ban, now: number): string {
 
   const reason = ban.reason ? ` — ${oneLine(ban.reason)}` : ''
 
-  return cut(
-    `${licence}: ${state}, by ${oneLine(ban.byName)} ${when(ban.at, 'R')}${reason}`,
-    LINE_CAP,
-  )
+  return cut(`${state}, by ${oneLine(ban.byName)} ${when(ban.at, 'R')}${reason}`, LINE_CAP)
 }
 
 /**
- * Every ban on every licence that was read, or the sentence saying there are
- * none.
+ * Every ban read, on every licence, or the sentence saying there are none.
  *
- * ALL OF THEM, NOT THE CURRENT LICENCE'S. An account whose current licence is
- * clean and whose previous one is permanently banned is the whole reason the
- * licence list is worth showing, and a ban field that only looked at the
- * current licence would hide it behind a list the reader has to join by hand.
+ * ALL OF THEM AND NOT THE CURRENT LICENCE'S, WHICH IS THE ONE THING THIS SECTION
+ * MUST KEEP DOING. An account whose current licence is clean and whose previous
+ * one is permanently banned is what an admin runs this command to find, and a
+ * ban read that only looked at the licence the account is on now would answer
+ * "no ban" about exactly that person. `gatherProfile` still fans out over the
+ * whole list; see `LICENCE_CAP`.
+ *
+ * WHAT WENT IS THE NAMING, NOT THE LOOKING, AND THE TWO ARE DIFFERENT THINGS.
+ * Each line used to begin with the licence its row was keyed on. The owner asked
+ * for no licence in this section, so the bans are reported without saying which
+ * one each came from — the fan-out behind them is unchanged.
+ *
+ * WHICH MEANS TWO IDENTICAL LINES ARE POSSIBLE AND ARE NOT A RENDERING FAULT.
+ * The same admin banning two of somebody's licences for the same reason in the
+ * same minute now reads as the same sentence twice, because the one thing that
+ * told them apart was the licence. They are two real rows and they are left as
+ * two: collapsing them would hide a second ban, which is worse than repeating a
+ * line.
  */
-function bansField(data: ProfileData, now: number): APIEmbedField {
+function bansBody(data: ProfileData, now: number, budget: number): string {
   const lines = [...data.bans]
     .reverse()
     .filter((row): row is LicenceBan & { ban: Ban } => row.ban !== null)
-    .map((row) => banLine(row.licence, row.ban, now))
+    .map((row) => banLine(row.ban, now))
 
   if (lines.length === 0) lines.push(COPY.noBans)
-  if (data.bansSkipped > 0) lines.push(COPY.bansSkipped(data.bansSkipped))
 
-  return field(COPY.bans, packed(lines, COPY.linesOmitted, EMBED_FIELD_VALUE_CAP))
+  return packed(lines, COPY.linesOmitted, budget)
 }
 
 /**
@@ -1363,21 +1597,24 @@ function bansField(data: ProfileData, now: number): APIEmbedField {
  * top row — how far along, how rich, how much have they played — and what they
  * do in a match on the bottom.
  *
- * EVERY FIELD OF `GameProfile` IS SOMEWHERE HERE. Wins and top tens sit under
- * the match count they are a fraction of, deaths, downs and revives under the
- * kills they are the other side of, solo and squad under the time. A number
- * dropped for tidiness is a number the reader then cannot get at all.
+ * EVERY FIELD OF `GameProfile` IS SOMEWHERE HERE EXCEPT ONE, AND THE EXCEPTION
+ * IS THE OWNER'S: "We don't need a mention of downs." Wins and top tens sit
+ * under the match count they are a fraction of, deaths and revives under the
+ * kills they are the other side of, solo and squad under the time. Downs is the
+ * one number read out of that row and deliberately not shown; every other one
+ * dropped for tidiness would be a number the reader then cannot get at all.
  *
  * AN ARRAY, SO THE CALLER SPREADS IT. The alternative — one function per tile
  * — is six call sites in a builder that has to keep them in order anyway, and
  * order is what makes them a table.
  *
- * A NULL CAREER IS STILL ONE FIELD SAYING SO. Six empty columns would be a table
- * of nothing; `No match record on the game side.` is a sentence, and a sentence
- * gets the full width.
+ * A NULL CAREER PRODUCES NO TILES AT ALL, and the sentence that replaces them is
+ * the caller's to put in the DESCRIPTION. Six empty columns would be a table of
+ * nothing, and a one-sentence field beside a `##` heading is the shape this
+ * reply stopped using — see `profileEmbed`.
  */
 function careerTiles(career: GameProfile | null): APIEmbedField[] {
-  if (career === null) return [field(COPY.career, COPY.noCareer)]
+  if (career === null) return []
 
   return [
     tile(COPY.level, COPY.levelTile(career.level, career.xp)),
@@ -1392,10 +1629,7 @@ function careerTiles(career: GameProfile | null): APIEmbedField[] {
       ),
     ),
 
-    tile(
-      COPY.kills,
-      COPY.killsTile(career.kills, career.deaths, career.downs, career.revives),
-    ),
+    tile(COPY.kills, COPY.killsTile(career.kills, career.deaths, career.revives)),
     tile(COPY.damage, COPY.damageTile(career.damageDealt)),
     tile(
       COPY.inMatch,
@@ -1408,32 +1642,55 @@ function careerTiles(career: GameProfile | null): APIEmbedField[] {
   ]
 }
 
-/** The console's registry row: who they are and how long they have been here. */
-function registryField(registry: PlayerRecord | null): APIEmbedField {
-  if (registry === null) return field(COPY.registry, COPY.noRegistry)
-
+/**
+ * The console's registry row: how long they have been here, and what else they
+ * have been called.
+ *
+ * THE NAME IS NOT THE FIRST LINE ANY MORE, BY THE OWNER: "We don't need their
+ * name listed again under Server record." It is the embed's TITLE — `profileEmbed`
+ * takes the title straight off this same row — so the line under the heading was
+ * the same word twice on one screen.
+ *
+ * "ALSO KNOWN AS" IS NOW CONDITIONAL, AND THE CONDITION IS THE DISCORD DISPLAY
+ * NAME. The owner asked for no name history when the in-game name is the same as
+ * their Discord display name, which is the ordinary case: somebody who plays
+ * under the name they use on Discord got a line telling them so.
+ *
+ * A DISPLAY NAME WE DO NOT HAVE SHOWS THE HISTORY RATHER THAN HIDING IT. `null`
+ * means the invocation carried no user object to read one off — see `Subject` —
+ * and it must not be treated as "they match". Suppressing a name history on an
+ * absent comparison would delete a moderation signal to make a tidier reply,
+ * which is the wrong direction for the one field that exists to surface it.
+ */
+function registryBody(
+  registry: PlayerRecord,
+  subject: Subject,
+  budget: number,
+): string {
   // `f` for first seen and `R` for last seen, which is the rule in `when`
   // applied to two dates that look alike and are not: the first is when this
   // account started, which is a date somebody quotes, and the second is
   // freshness — "yesterday" is the answer, and the date it fell on is not.
-  // The name is NOT bolded here, though it is the one borrowed value in the
-  // field: it is already the embed's title, and `cut` walks code points to a
-  // budget, so wrapping it would be the one place in this file where a
-  // truncation could land between a `**` and its partner and leave the markup
-  // open. The numbers below are bounded and cannot.
   const lines = [
-    cut(oneLine(registry.name), LINE_CAP),
     `First seen ${when(registry.firstSeen, 'f')} · last seen ${when(registry.lastSeen, 'R')}`,
     `**${registry.sessions}** sessions · **${span(registry.playtimeMs)}** connected`,
   ]
 
   if (registry.preferredName) {
-    lines.splice(1, 0, cut(`Preferred name ${oneLine(registry.preferredName)}`, LINE_CAP))
+    lines.unshift(cut(`Preferred name ${oneLine(registry.preferredName)}`, LINE_CAP))
   }
 
   const history = registry.names ?? []
 
-  if (history.length > 0) {
+  // Compared as the reply shows them: `oneLine` on both sides, because a name
+  // carrying a newline or a run of spaces is collapsed before it is ever
+  // rendered, and comparing the raw value would call two identical names
+  // different. Case is NOT folded: `Somebody` and `somebody` are two names a
+  // moderator would want to see side by side.
+  const known = oneLine(registry.name)
+  const repeats = subject.displayName !== null && oneLine(subject.displayName) === known
+
+  if (history.length > 0 && !repeats) {
     const shown = history.slice(0, NAME_HISTORY_CAP).map((entry) => oneLine(entry.name))
 
     lines.push(
@@ -1441,7 +1698,7 @@ function registryField(registry: PlayerRecord | null): APIEmbedField {
     )
   }
 
-  return field(COPY.registry, packed(lines, COPY.linesOmitted, EMBED_FIELD_VALUE_CAP))
+  return packed(lines, COPY.linesOmitted, budget)
 }
 
 /**
@@ -1503,8 +1760,9 @@ function matchesValue(
     if (units(body) <= budget) return body
   }
 
-  // Unreachable while `budget` is at or above `MATCH_FIELD_FLOOR`: the caller
-  // drops the field entirely below that, and every line is capped at `LINE_CAP`.
+  // Unreachable while `budget` is at or above `MATCH_SECTION_FLOOR`: the caller
+  // drops the section entirely below that, and every line is capped at
+  // `LINE_CAP`.
   return cut(lines[0] ?? COPY.noMatches, budget)
 }
 
@@ -1521,6 +1779,12 @@ function matchesValue(
  * an oversight to be tidied up later: adding it would make every reply measure
  * six units it does not spend, and the first thing to be cut for those six is a
  * line of somebody's ban history.
+ *
+ * NEITHER IS THE THUMBNAIL, AND FOR THE SAME REASON RATHER THAN A SECOND ONE.
+ * Discord's 6000 covers the title, the description, every field name and value,
+ * the footer text and the author name — a thumbnail is a URL Discord fetches an
+ * image from, not text it renders, and counting one would spend a hundred units
+ * of somebody's ban history on a value that is not in the limit at all.
  */
 export function embedUnits(embed: ProfileEmbed): number {
   let total = units(embed.title) + units(embed.description)
@@ -1534,14 +1798,15 @@ export function embedUnits(embed: ProfileEmbed): number {
  * The last-resort trim: drop whole fields until the embed is one Discord will
  * take, and say how many went.
  *
- * NO INPUT `profileEmbed` CAN PRODUCE REACHES IT TODAY. Six fields, each
- * individually capped at 1024, plus a description that cannot grow past a
- * mention and one sentence — the arithmetic tops out well under 6000, and the
- * match field is handed only what is left over rather than competing for it.
- * The alternative to a guard that never fires is a reply Discord rejects
- * outright, and `runCommand` turns that into a failure line naming nothing. It
- * is EXPORTED so that the guard is exercised against an embed built by hand,
- * because a guard nothing can reach is also a guard nothing can test.
+ * NO INPUT EITHER BUILDER CAN PRODUCE REACHES IT TODAY, AND THE ARITHMETIC MOVED
+ * WHEN THE PROSE DID. It used to be six fields at 1024 each over a two-line
+ * description; it is now a description capped at 4096 — and capped a second time
+ * at what the title and the tiles leave of the 6000 — over at most six tiles of
+ * a few dozen units. Both tops out well under the limit. The alternative to a
+ * guard that never fires is a reply Discord rejects outright, and `runCommand`
+ * turns that into a failure line naming nothing. It is EXPORTED so that the
+ * guard is exercised against an embed built by hand, because a guard nothing can
+ * reach is also a guard nothing can test.
  */
 export function trimEmbed(embed: ProfileEmbed): ProfileEmbed {
   if (embed.fields.length <= EMBED_FIELD_CAP && embedUnits(embed) <= EMBED_TOTAL_CAP) return embed
@@ -1568,13 +1833,17 @@ export function trimEmbed(embed: ProfileEmbed): ProfileEmbed {
 
   if (dropped > 0) kept.push(field(COPY.dropped, COPY.fieldsDropped(dropped)))
 
-  // The colour is carried through rather than recomputed. This function knows
-  // nothing about bans and must not learn: it is a budget guard, and the one
-  // thing it may do to a reply is take fields off the end of it.
+  // The colour and the thumbnail are carried through rather than recomputed.
+  // This function knows nothing about bans or about whose avatar that is and
+  // must not learn: it is a budget guard, and the one thing it may do to a reply
+  // is take fields off the end of it. Rebuilding the record by hand is why they
+  // have to be named here at all — a field left off this literal is a field
+  // silently dropped from every reply that trips the guard.
   return {
     title: embed.title,
     description: embed.description,
     color: embed.color,
+    ...(embed.thumbnail === undefined ? {} : { thumbnail: embed.thumbnail }),
     fields: kept,
   }
 }
@@ -1586,91 +1855,130 @@ export function trimEmbed(embed: ProfileEmbed): ProfileEmbed {
  * comparison against the clock, and a renderer that read the clock itself could
  * not be asserted against a ban that expires tomorrow.
  *
- * THE MATCH FIELD IS BUILT LAST AND GETS WHAT IS LEFT. Every other field is a
- * bounded fact about the player; history is the one thing that grows without
- * limit, so it is the one thing that absorbs the budget rather than competing
- * for it. Below `MATCH_FIELD_FLOOR` there is no room for a line and the note
- * saying what was cut, and a field carrying only the notice is dropped instead
- * — the notice is not lost, because `trimEmbed` accounts for it.
+ * PROSE IN THE DESCRIPTION UNDER `##`, NUMBERS AS INLINE FIELDS UNDER IT. That
+ * is the hybrid the file header sets out and it is forced by Discord: a markdown
+ * heading renders in a description and does not render in a field name or value.
+ * So bans, the career sentence, the server record, what could not be read and
+ * the match history are sections of one description, and the six career numbers
+ * stay fields, where three to a row is what makes them a table.
  *
- * THE ORDER IS THE LAYOUT AND IT IS ALSO THE SURVIVAL ORDER. Discord fills a row
- * with consecutive `inline` fields and breaks it at the first full-width one, so
- * "licences, bans, then two rows of three tiles, then the long ones" is a
- * paragraph of moderation record above a table of numbers. It happens to be the
- * same order `trimEmbed` would want anyway: it drops from the END, so the two
- * fields an admin ran this command for are the two that cannot be dropped.
+ * THE TILES ARE BUILT FIRST, WHICH IS ABOUT THE BUDGET AND NOT THE LAYOUT.
+ * Discord renders every field after the whole description whatever order they
+ * were built in; what building them first buys is a description cap that already
+ * knows what the title and the tiles will spend of the 6000.
+ *
+ * THE MATCH SECTION IS BUILT LAST AND GETS WHAT IS LEFT. Every other section is
+ * a bounded fact about the player; history is the one thing that grows without
+ * limit, so it is the one thing that absorbs the budget rather than competing
+ * for it. Below `MATCH_SECTION_FLOOR` there is no room for a line and the note
+ * saying what was cut, and a heading over nothing but a notice is worse than no
+ * section.
+ *
+ * THE ORDER IS THE READING ORDER AND IT IS ALSO THE SURVIVAL ORDER. Bans first,
+ * because that is what an admin ran this for; the record and the honest-absence
+ * section next; history last, because it is the one that shrinks. A section that
+ * is squeezed is squeezed from the end of the description, so the answer to the
+ * question is the part that cannot be.
  */
-export function profileEmbed(data: ProfileData, now: number): ProfileEmbed {
-  const description: string[] = [COPY.subject(data.discordId)]
-  const unreadable = data.unreached.some((entry) => entry.source === 'licences')
-
-  if (unreadable) description.push(COPY.indexUnreadable)
-  else if (data.licences.length === 0) description.push(COPY.noRecord)
-  else if (data.licences.length === 1) description.push(COPY.oneLicence)
-  else description.push(COPY.manyLicences(data.licences.length))
-
+export function profileEmbed(
+  data: ProfileData,
+  now: number,
+  subject: Subject = ANONYMOUS,
+): ProfileEmbed {
   const title = cut(
     data.registry === null ? COPY.title : oneLine(data.registry.name) || COPY.title,
     EMBED_TITLE_CAP,
   )
 
-  // ANY licence, not the current one, which is the same rule `bansField`
+  // ANY licence, not the current one, which is the same rule `bansBody`
   // follows and for the same reason: an account whose current licence is clean
   // and whose previous one is banned is what this command exists to surface,
   // and a colour that only looked at the current licence would say the opposite
-  // of the field under it.
+  // of the section under it.
   const banned = data.bans.some((row) => row.ban !== null && isBanActive(row.ban, now))
 
-  const embed: ProfileEmbed = {
-    title,
-    description: cut(description.join('\n'), EMBED_DESCRIPTION_CAP),
-    color: banned ? COLOUR.banned : COLOUR.normal,
-    fields: [],
+  // No licence means nothing keyed on one to show — the six tiles included. The
+  // description says which of the two reasons that is.
+  const fields = data.current === null ? [] : careerTiles(data.career)
+
+  const opening = [COPY.subject(data.discordId)]
+
+  // "No record" is said only when the lookup actually answered, which is the
+  // rule `selfEmbed` already followed and this half now borrows. It used to say
+  // `The Discord-to-licence index could not be read` on the other branch — a
+  // sentence that names the index, and so a sentence the owner's "no mention of
+  // licences" takes out. The `Could not be read` section names the read as
+  // `lookup` instead, which says the same operational thing.
+  if (data.current === null && !data.unreached.some((entry) => entry.source === 'lookup')) {
+    opening.push(COPY.noRecord)
   }
 
-  // An account with no licences has nothing keyed on one to show. The
-  // description has already said which of the two reasons that is.
-  if (data.licences.length > 0) {
-    embed.fields.push(
-      licencesField(data),
-      bansField(data, now),
-      ...careerTiles(data.career),
-      registryField(data.registry),
+  const spentOnFields = fields.reduce(
+    (total, entry) => total + units(entry.name) + units(entry.value),
+    0,
+  )
+
+  // The description's OWN cap and the share of the whole embed's cap it is
+  // allowed, whichever is smaller. Discord enforces both, and only the second
+  // one moves with the reply.
+  const description = descriptionOf(
+    Math.min(EMBED_DESCRIPTION_CAP, EMBED_TOTAL_CAP - units(title) - spentOnFields),
+    opening.join('\n'),
+  )
+
+  if (data.current !== null) {
+    description.add(COPY.bans, bansBody(data, now, description.room(COPY.bans)))
+
+    // The sentence that replaces the six tiles when there is no career row.
+    // `careerTiles` returns none in that case, so this heading is the only thing
+    // that says the row was absent rather than the numbers being zero.
+    if (data.career === null) description.add(COPY.career, COPY.noCareer)
+
+    description.add(
+      COPY.registry,
+      data.registry === null
+        ? COPY.noRegistry
+        : registryBody(data.registry, subject, description.room(COPY.registry)),
     )
   }
 
   if (data.unreached.length > 0) {
-    embed.fields.push(
-      field(
-        COPY.unreached,
-        packed(
-          data.unreached.map((entry) => COPY.unreachedLine(entry.source, entry.why)),
-          COPY.licencesOmitted,
-          EMBED_FIELD_VALUE_CAP,
-        ),
+    description.add(
+      COPY.unreached,
+      packed(
+        data.unreached.map((entry) => COPY.unreachedLine(entry.source, entry.why)),
+
+        // `linesOmitted` AND NOT THE LICENCE SENTENCE THAT USED TO BE HERE. This
+        // call passed `licencesOmitted`, so a `Could not be read` section that
+        // overflowed reported "+2 older licences not shown" about a list of
+        // failed reads — the exact confusion that string's own record warned
+        // against. It is deleted now, and this is the only note left.
+        COPY.linesOmitted,
+        description.room(COPY.unreached),
       ),
     )
   }
 
-  if (data.licences.length > 0) {
-    const budget = Math.min(
-      EMBED_FIELD_VALUE_CAP,
-      EMBED_TOTAL_CAP - embedUnits(embed) - units(COPY.matches),
-    )
+  if (data.current !== null) {
+    const budget = description.room(COPY.matches)
 
-    if (budget >= MATCH_FIELD_FLOOR) {
-      embed.fields.push(
-        field(
-          COPY.matches,
-          data.matches.length === 0
-            ? COPY.noMatches
-            : matchesValue(data.matches, data.career?.matches ?? null, budget),
-        ),
+    if (budget >= MATCH_SECTION_FLOOR) {
+      description.add(
+        COPY.matches,
+        data.matches.length === 0
+          ? COPY.noMatches
+          : matchesValue(data.matches, data.career?.matches ?? null, budget),
       )
     }
   }
 
-  return trimEmbed(embed)
+  return trimEmbed({
+    title,
+    description: description.text(),
+    color: banned ? COLOUR.banned : COLOUR.normal,
+    ...thumbnailOf(subject.avatarUrl),
+    fields,
+  })
 }
 
 /* ------------------------------------------------------------------ *
@@ -1687,11 +1995,18 @@ export function profileEmbed(data: ProfileData, now: number): ProfileEmbed {
  * where that edit silently changes both.
  *
  * WHAT IS SHARED IS `field`, `tile`, `cut`, `oneLine`, `when`, `span`,
- * `packed`, `units`, `embedUnits` and `trimEmbed`. Every one of those is about
- * Discord's limits, its layout, or turning somebody else's text into one safe
- * line. None of them is handed a licence, a `Ban`, or a decision about who may
- * see what — and `consoleRow`, which IS handed a licence, is on the other side
- * of that line and is called from neither builder.
+ * `packed`, `units`, `embedUnits`, `descriptionOf`, `thumbnailOf` and
+ * `trimEmbed`. Every one of those is about Discord's limits, its layout, or
+ * turning somebody else's text into one safe line. None of them is handed a
+ * licence, a `Ban`, or a decision about who may see what — and `consoleRow`,
+ * which IS handed a licence, is on the other side of that line and is called
+ * from neither builder.
+ *
+ * `descriptionOf` IS SHARED AND THE SECTIONS ARE NOT, which is the same split
+ * one level up: it knows what a `##` costs and how much room is left, and every
+ * section reaches it already rendered by a function that belongs to one builder
+ * alone. `thumbnailOf` is shared because an avatar is the one fact about the
+ * subject that both views may state — see the file header.
  * ------------------------------------------------------------------ */
 
 /**
@@ -1701,20 +2016,30 @@ export function profileEmbed(data: ProfileData, now: number): ProfileEmbed {
  * given, no issuing admin and no lift, so this function could not disclose one
  * if it were rewritten carelessly. See `SelfBan`.
  */
-function selfBanField(ban: SelfBan): APIEmbedField {
+function selfBanBody(ban: SelfBan, budget: number): string {
   const lines: string[] = []
+
+  // THE ONE LINE IN EITHER VIEW THAT BEGINS WITH SOMEBODY ELSE'S TEXT, and that
+  // is worth naming now that these lines live in a description where a leading
+  // `# ` renders as a heading. Every other borrowed value in this file is
+  // preceded by something of ours — a ban line opens with its state, a match
+  // line with its timestamp, a registry line with `First seen` or `Also known
+  // as` — so no PLAYER-chosen value, an in-game name included, can start a line.
+  // What can is this: a ban reason, which a moderator typed. `oneLine` already
+  // stops it forging a second line; a moderator who opens one with `# ` gets a
+  // large first line in the reply, which is theirs to do and nobody else's.
   const reason = oneLine(ban.reason)
 
   // A ban row with an empty reason is a row the console should not have
   // written, but it is not this reply's job to invent one — the expiry line
-  // below is always present, so the field is never empty either way.
+  // below is always present, so the section is never empty either way.
   if (reason) lines.push(cut(reason, LINE_CAP))
 
   lines.push(
     ban.expiresAt === null ? SELF.banPermanent : SELF.banUntil(when(ban.expiresAt, 'f')),
   )
 
-  return field(SELF.ban, packed(lines, COPY.linesOmitted, EMBED_FIELD_VALUE_CAP))
+  return packed(lines, COPY.linesOmitted, budget)
 }
 
 /**
@@ -1729,7 +2054,7 @@ function selfBanField(ban: SelfBan): APIEmbedField {
  * anybody has to remember to keep.
  */
 function selfCareerTiles(career: GameProfile | null): APIEmbedField[] {
-  if (career === null) return [field(COPY.career, COPY.noCareer)]
+  if (career === null) return []
 
   return [
     tile(COPY.level, COPY.levelTile(career.level, career.xp)),
@@ -1744,10 +2069,7 @@ function selfCareerTiles(career: GameProfile | null): APIEmbedField[] {
       ),
     ),
 
-    tile(
-      COPY.kills,
-      COPY.killsTile(career.kills, career.deaths, career.downs, career.revives),
-    ),
+    tile(COPY.kills, COPY.killsTile(career.kills, career.deaths, career.revives)),
     tile(COPY.damage, COPY.damageTile(career.damageDealt)),
     tile(
       COPY.inMatch,
@@ -1788,12 +2110,12 @@ function selfMatchLine(match: MatchSummary): string {
  * exist: "3 of the 5 read were not shown" is bot plumbing, and what a player is
  * owed is the count of their own matches.
  */
-function selfMatchesField(
+function selfMatchesBody(
   matches: readonly MatchSummary[],
   total: number | null,
   budget: number,
-): APIEmbedField {
-  if (matches.length === 0) return field(COPY.matches, COPY.noMatches)
+): string {
+  if (matches.length === 0) return COPY.noMatches
 
   const read = matches.length
   const lines = matches.slice(0, RECENT_MATCHES).map(selfMatchLine)
@@ -1802,13 +2124,14 @@ function selfMatchesField(
     const note = SELF.matchesNote(shown, read, total)
     const body = [...lines.slice(0, shown), ...(note === null ? [] : [note])].join('\n')
 
-    if (units(body) <= budget) return field(COPY.matches, body)
+    if (units(body) <= budget) return body
   }
 
-  // Unreachable while `budget` is at or above `MATCH_FIELD_FLOOR`, exactly as in
-  // `matchesValue`: the caller drops the field below that and every line is
-  // capped at `LINE_CAP`. Never empty, because Discord refuses an empty value.
-  return field(COPY.matches, cut(lines[0] ?? COPY.noMatches, budget))
+  // Unreachable while `budget` is at or above `MATCH_SECTION_FLOOR`, exactly as
+  // in `matchesValue`: the caller drops the section below that and every line is
+  // capped at `LINE_CAP`. Never empty, because a heading over nothing is worse
+  // than a truncated line.
+  return cut(lines[0] ?? COPY.noMatches, budget)
 }
 
 /**
@@ -1819,14 +2142,11 @@ function selfMatchesField(
  * career row is a player told they have never played, which is worse than a
  * word they have to ask about.
  */
-function selfUnreachedField(unreached: readonly SelfUnreached[]): APIEmbedField {
-  return field(
-    COPY.unreached,
-    packed(
-      unreached.map((entry) => COPY.unreachedLine(entry.source, entry.why)),
-      COPY.linesOmitted,
-      EMBED_FIELD_VALUE_CAP,
-    ),
+function selfUnreachedBody(unreached: readonly SelfUnreached[], budget: number): string {
+  return packed(
+    unreached.map((entry) => COPY.unreachedLine(entry.source, entry.why)),
+    COPY.linesOmitted,
+    budget,
   )
 }
 
@@ -1838,11 +2158,17 @@ function selfUnreachedField(unreached: readonly SelfUnreached[]): APIEmbedField 
  * `gatherSelf` has already discarded every ban that is not. That is the same
  * separation stated twice — the clock belongs where the discarding happens.
  *
+ * THE SAME HYBRID THE ADMIN VIEW USES, AND FOR THE SAME PLATFORM REASON. The
+ * ban, what could not be read and the match history are prose and go in the
+ * description under real `##` headings, because Discord renders a markdown
+ * heading there and renders none in a field. The six career numbers stay inline
+ * fields, where three to a row is what makes them a table.
+ *
  * THE BAN GOES FIRST, WHICH IS BOTH THE RIGHT ORDER AND THE SAFE ONE. It is the
- * one thing in this reply a player needs before anything else, and `trimEmbed`
- * drops fields from the END — so the field that must never be lost is the field
- * that cannot be. Match history, the one thing here that grows, goes last and
- * takes what the budget leaves.
+ * one thing in this reply a player needs before anything else, and a squeezed
+ * description is squeezed from the END — so the section that must never be lost
+ * is the section that cannot be. Match history, the one thing here that grows,
+ * goes last and takes what the budget leaves.
  *
  * NO TITLE FROM THE REGISTRY. `profileEmbed` titles itself with the in-game
  * name off the registry row; the self path never reads that row, so the title
@@ -1860,38 +2186,65 @@ function selfUnreachedField(unreached: readonly SelfUnreached[]): APIEmbedField 
  * function could add without first widening the record it is handed. See
  * `consoleRow`.
  */
-export function selfEmbed(data: SelfData): ProfileEmbed {
-  const description: string[] = [COPY.subject(data.discordId)]
+export function selfEmbed(data: SelfData, avatarUrl: string | null = null): ProfileEmbed {
+  const opening = [COPY.subject(data.discordId)]
   const unreadable = data.unreached.some((entry) => entry.source === 'lookup')
 
   // "No record" is said only when the lookup actually answered. When it failed,
-  // the field below names it and the description stays quiet rather than
-  // telling somebody who has played for a year that they have never been here.
-  if (!unreadable && !data.known) description.push(COPY.noRecord)
+  // the section below names it and the opening stays quiet rather than telling
+  // somebody who has played for a year that they have never been here.
+  if (!unreadable && !data.known) opening.push(COPY.noRecord)
 
-  const embed: ProfileEmbed = {
-    title: COPY.title,
-    description: cut(description.join('\n'), EMBED_DESCRIPTION_CAP),
-    color: data.ban === null ? COLOUR.normal : COLOUR.banned,
-    fields: [],
+  // Built before the description for the reason `profileEmbed` gives: what the
+  // tiles and the title spend of the 6000 is what the description may not.
+  const fields = data.known ? selfCareerTiles(data.career) : []
+
+  const spentOnFields = fields.reduce(
+    (total, entry) => total + units(entry.name) + units(entry.value),
+    0,
+  )
+
+  const description = descriptionOf(
+    Math.min(EMBED_DESCRIPTION_CAP, EMBED_TOTAL_CAP - units(COPY.title) - spentOnFields),
+    opening.join('\n'),
+  )
+
+  if (data.ban !== null) {
+    description.add(SELF.ban, selfBanBody(data.ban, description.room(SELF.ban)))
   }
 
-  if (data.ban !== null) embed.fields.push(selfBanField(data.ban))
-  if (data.known) embed.fields.push(...selfCareerTiles(data.career))
-  if (data.unreached.length > 0) embed.fields.push(selfUnreachedField(data.unreached))
+  // The sentence that stands in for the six tiles when there is no career row.
+  if (data.known && data.career === null) description.add(COPY.career, COPY.noCareer)
+
+  if (data.unreached.length > 0) {
+    description.add(
+      COPY.unreached,
+      selfUnreachedBody(data.unreached, description.room(COPY.unreached)),
+    )
+  }
 
   if (data.known) {
-    const budget = Math.min(
-      EMBED_FIELD_VALUE_CAP,
-      EMBED_TOTAL_CAP - embedUnits(embed) - units(COPY.matches),
-    )
+    const budget = description.room(COPY.matches)
 
-    if (budget >= MATCH_FIELD_FLOOR) {
-      embed.fields.push(selfMatchesField(data.matches, data.career?.matches ?? null, budget))
+    if (budget >= MATCH_SECTION_FLOOR) {
+      description.add(
+        COPY.matches,
+        selfMatchesBody(data.matches, data.career?.matches ?? null, budget),
+      )
     }
   }
 
-  return trimEmbed(embed)
+  return trimEmbed({
+    title: COPY.title,
+    description: description.text(),
+    color: data.ban === null ? COLOUR.normal : COLOUR.banned,
+
+    // THE CALLER'S OWN PICTURE, which is the one thing about the subject this
+    // view may show without a second thought: they are looking at it beside
+    // their own name in every channel already.
+    ...thumbnailOf(avatarUrl),
+    fields,
+  })
 }
 
 /* ------------------------------------------------------------------ */
@@ -1938,8 +2291,8 @@ export function profileAdminOnly(invocation: Invocation): boolean {
  *
  * `onlyInvoker` IS A CONSTANT `true` AND MUST STAY ONE. Discord fixes a
  * reply's visibility at the defer. The admin view carries a member's ban
- * history, their licence list and every name they have used; the self view
- * carries somebody's own active ban, which is theirs and not the channel's.
+ * history and every name their account has used; the self view carries
+ * somebody's own active ban, which is theirs and not the channel's.
  * A public copy cannot be taken back — deleting the message does not unsee it.
  * There is no invocation that should make this false.
  *
@@ -1998,20 +2351,37 @@ export function profileCommand(reads: ProfileReads, now: () => number = Date.now
       // `userId` and never `targetId`, so there is no path on which a caller
       // chooses whose self view they get.
       //
+      // THE AVATAR FOLLOWS THAT SAME BRANCH RATHER THAN BEING RESOLVED FOR IT.
+      // `invocationOf` fills in the caller's avatar and the target's separately —
+      // see `Invocation` in ./command.ts — so "whose picture" is decided by the
+      // same `targetId === null` test that decides whose profile, in one place,
+      // instead of the unwrapping half having to know this command's rule.
+      //
       // AN ADMIN LANDS HERE TOO WHEN THEY GIVE NO TARGET, which means an admin
-      // cannot see their own licence list this way. That is deliberate: "no
-      // target means me" is one rule for everybody, and a second reading of it
-      // for admins would be a branch on the caller's role inside the half of
-      // this file that is meant not to know about roles. An admin who wants the
-      // moderation view of their own account tags themselves.
+      // gets no ban history or registry row about themselves this way. That is
+      // deliberate: "no target means me" is one rule for everybody, and a second
+      // reading of it for admins would be a branch on the caller's role inside
+      // the half of this file that is meant not to know about roles. An admin
+      // who wants the moderation view of their own account tags themselves.
       if (invocation.targetId === null) {
+        const self = await gatherSelf(reads, invocation.userId, now())
+
         // NO `components` ON THIS PATH, and nothing here decides that: there is
         // no licence in scope to link to. See `selfEmbed` and `consoleRow`.
-        return { embeds: [selfEmbed(await gatherSelf(reads, invocation.userId, now()))] }
+        return { embeds: [selfEmbed(self, invocation.userAvatarUrl ?? null)] }
       }
 
       const data = await gatherProfile(reads, invocation.targetId)
-      const embed = profileEmbed(data, now())
+
+      // The two things the reply needs that no table holds: whose picture goes
+      // in the corner, and the name to weigh the registry's name history
+      // against. Both are `?? null` because `Invocation` carries them
+      // optionally — an interaction whose option arrived without a user object
+      // has neither, and null is "not known" rather than "not there".
+      const embed = profileEmbed(data, now(), {
+        avatarUrl: invocation.targetAvatarUrl ?? null,
+        displayName: invocation.targetDisplayName ?? null,
+      })
 
       // NO BUTTON WITHOUT A LICENCE TO PUT IN IT. An account the index has never
       // heard of, and an index that could not be read, both arrive here with

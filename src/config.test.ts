@@ -476,6 +476,43 @@ describe('BLITZ_SERVER_IPS', () => {
    * `fivem://connect/` target, so a hostname smuggled in here would be an
    * allowlisted destination rather than a dead line.
    */
+  /**
+   * THE SPELLINGS links.ts CAN NEVER PRODUCE, WHICH USED TO BOOT. The shape
+   * check here was its own regex — one to three digits per octet, no range and
+   * no leading-zero rule — while the matcher has rejected an octet over 255 and
+   * a padded octet since the ShadowPlay clips forced that question. Each of
+   * these therefore parsed, sat in `serverIps`, and exempted nothing: an
+   * allowlist line that looks like protection and is not one. The two are now
+   * one imported regex, so this class cannot come back without deleting the
+   * import.
+   */
+  it.each(['999.1.1.1', '256.1.1.1', '014.22.5.3', '3.130.092.28', '0300.0400.0500.0600'])(
+    'refuses to boot on %s, which no matched address could ever equal',
+    (entry: string) => {
+      let message = ''
+      try {
+        loadConfig({ ...base, BLITZ_SERVER_IPS: entry })
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error)
+      }
+
+      expect(message).toContain('BLITZ_SERVER_IPS')
+      expect(message).toContain(entry)
+    },
+  )
+
+  /**
+   * A SINGLE `0` IS STILL AN OCTET, which is the other half of the leading-zero
+   * rule and is easy to lose while adding the first half. The matcher removes
+   * `0.0.0.0` and `127.0.0.1`, so an operator has to be able to allowlist them.
+   */
+  it.each(['0.0.0.0', '127.0.0.1', '255.255.255.255', '10.0.0.7'])(
+    'still accepts %s, because the matcher can produce it',
+    (entry: string) => {
+      expect(loadConfig({ ...base, BLITZ_SERVER_IPS: entry }).serverIps).toEqual([entry])
+    },
+  )
+
   it.each(['evil.com', '3.130.92', '3.130.92.28.1', '3.130.92.2 8', 'fivem://connect/evil.com'])(
     'refuses to boot on the entry %s',
     (entry: string) => {

@@ -164,10 +164,61 @@ export function roleIdsOf(member: InteractionMember | null): readonly string[] |
   return 'cache' in roles ? [...roles.cache.keys()] : roles
 }
 
+/**
+ * A Discord account as an interaction carries one.
+ *
+ * THREE THINGS OFF A LIVE `User`, AND THE THIRD IS A CALL RATHER THAN A FIELD.
+ * `Invocation` carries ids and strings — see there — so the avatar is resolved
+ * HERE, at the seam, and what crosses into the handlers is a URL. That is what
+ * keeps `User`, which is a live object with a REST handle on it, out of the half
+ * of this foundation that exists to be built in a test.
+ *
+ * `displayAvatarURL` AND NOT `avatarURL`, CHECKED AGAINST THE INSTALLED
+ * TYPINGS. discord.js declares `avatarURL(options?): string | null` and
+ * `displayAvatarURL(options?): string` — the second falls back to the default
+ * avatar Discord assigns every account, so it cannot answer null and there is no
+ * missing-image case anywhere downstream. Declared here as a zero-argument
+ * function, which the real one-optional-argument method satisfies.
+ *
+ * `displayName` IS THE ACCOUNT'S, WHICH IS NOT ALWAYS THE GUILD'S — a member
+ * with a nickname here is shown by that nickname. `displayNameOf` prefers the
+ * nickname and falls back to this; see there.
+ */
+export interface InteractionUser {
+  readonly id: string
+  readonly displayName: string
+  displayAvatarURL: () => string
+}
+
+/**
+ * The invoking guild's member record for a targeted user, in the two shapes an
+ * interaction can carry one.
+ *
+ * TWO SHAPES FOR THE REASON `InteractionMember` HAS TWO. discord.js hands back a
+ * live `GuildMember` when the member is cached and the raw API record when it is
+ * not, and which one arrives depends on nothing this bot controls. The live one
+ * has `displayName` (already the nickname, or the account's name when there is
+ * none); the raw one has `nick`. Both properties are optional here, so both real
+ * types are assignable and neither has to be narrowed at the call site.
+ */
+export interface OptionMember {
+  readonly displayName?: string
+  readonly nick?: string | null
+}
+
 /** One option as it arrived, reduced to what the two options are read out of. */
 export interface SuppliedOption {
   readonly type: number
-  readonly user?: { readonly id: string } | null
+  readonly user?: InteractionUser | null
+
+  /**
+   * The guild member behind a user option, when the payload carried one.
+   *
+   * OPTIONAL AND NULLABLE BOTH, because discord.js types it that way: a user
+   * option for somebody who is not in this guild resolves a user and no member.
+   * `displayNameOf` falls through to the account's own display name for that.
+   */
+  readonly member?: OptionMember | null
 
   /**
    * The option's own value, which is what a string option carries.
@@ -188,9 +239,52 @@ export interface CommandSource {
   /** discord.js types this `Snowflake | null`; `Invocation` carries it as-is. */
   readonly channelId: string | null
 
-  readonly user: { readonly id: string }
+  /**
+   * Who ran it. WIDER THAN THE ID IT USED TO BE, because `/profile` puts the
+   * caller's own avatar on the self view's embed and the avatar is not something
+   * an id can be turned into without asking Discord for it.
+   */
+  readonly user: InteractionUser
+
   readonly member: InteractionMember | null
   readonly options: { get: (name: string) => SuppliedOption | null }
+}
+
+/**
+ * Everything about the tagged member that `Invocation` carries, read off the one
+ * option that has it in hand.
+ *
+ * ONE RECORD OUT OF ONE `options.get`, WHICH IS WHY THE THREE ARE READ TOGETHER.
+ * The id, the avatar and the display name all come off the same resolved user,
+ * and asking for the option three times would be three chances for the two type
+ * checks in `targetOf` to be written differently — and one of those spellings
+ * would be the one that throws. A separate `targetAvatarOf` would have to repeat
+ * both checks to get back to the same object.
+ */
+interface Target {
+  readonly id: string
+  readonly avatarUrl: string
+  readonly displayName: string
+}
+
+/**
+ * What Discord shows this account as in THIS guild.
+ *
+ * THE NICKNAME FIRST, BECAUSE THAT IS WHAT THE READER IS LOOKING AT. `/profile`
+ * uses this for one comparison — is the in-game name already the Discord name on
+ * screen — and the `<@id>` mention it leads with renders as the guild nickname
+ * when there is one. Comparing against the account's global name instead would
+ * decide against a name the reader cannot see, which is the wrong answer in
+ * exactly the case somebody set a nickname to match their in-game name.
+ *
+ * THE TWO MEMBER SHAPES ARE BOTH ASKED, in the order that costs nothing: the
+ * live `GuildMember` resolves `displayName` itself (nickname, else the account's
+ * name), the raw record carries `nick`, and an option with no member at all —
+ * somebody tagged who is not in this guild — falls through to the account's own
+ * display name. See `OptionMember`.
+ */
+function displayNameOf(user: InteractionUser, member: OptionMember | null | undefined): string {
+  return member?.displayName ?? member?.nick ?? user.displayName
 }
 
 /**
@@ -205,12 +299,30 @@ export interface CommandSource {
  * null for an option that is not there and never throws, and comparing the type
  * says what is actually meant: a target is a USER option by this name, and
  * anything else is not a target.
+ *
+ * A RECORD RATHER THAN AN ID, since `/profile` grew a thumbnail. The avatar and
+ * the display name are on the user object Discord already put on this option;
+ * the alternative to reading them here is a REST fetch on a path that has three
+ * seconds to answer, for a picture.
  */
-function targetOf(options: CommandSource['options']): string | null {
+function targetOf(options: CommandSource['options']): Target | null {
   const option = options.get(TARGET_OPTION)
 
   if (option === null || option.type !== ApplicationCommandOptionType.User) return null
-  return option.user?.id ?? null
+
+  // An option of the right kind that resolved no user is not a target, which is
+  // what `option.user?.id ?? null` said before this returned a record. Named as
+  // its own step now, so the three values below are read off one non-null user
+  // rather than three optional chains that could disagree.
+  const user = option.user
+
+  if (user === undefined || user === null) return null
+
+  return {
+    id: user.id,
+    avatarUrl: user.displayAvatarURL(),
+    displayName: displayNameOf(user, option.member),
+  }
 }
 
 /**
@@ -245,16 +357,33 @@ function textOf(options: CommandSource['options']): string | null {
  * what the gate gets to see.
  */
 export function invocationOf(interaction: CommandSource): Invocation {
+  const target = targetOf(interaction.options)
+
   return {
     commandName: interaction.commandName,
     guildId: interaction.guildId,
     channelId: interaction.channelId,
     userId: interaction.user.id,
+
+    // THE ONE PLACE EITHER AVATAR IS RESOLVED. `displayAvatarURL()` is a method
+    // on a live discord.js object, so it is called here — where the live object
+    // is — and every handler downstream is handed a string. The caller's is
+    // always available; the target's exists only when an option resolved a user.
+    userAvatarUrl: interaction.user.displayAvatarURL(),
+
     roleIds: roleIdsOf(interaction.member),
 
     // Null for every command that does not declare an option by that name, so
     // both cost nothing to ask on behalf of a command that never uses them.
-    targetId: targetOf(interaction.options),
+    targetId: target === null ? null : target.id,
+
+    // `undefined` rather than null for these two, which is what "the seam did
+    // not carry one" means on `Invocation` — see there. Nobody was tagged, or
+    // the option resolved no user, and `/profile` renders no thumbnail and keeps
+    // the name history rather than guessing at either.
+    targetAvatarUrl: target?.avatarUrl,
+    targetDisplayName: target?.displayName,
+
     text: textOf(interaction.options),
   }
 }

@@ -1,5 +1,7 @@
 import { z } from 'zod'
 
+import { IPV4_ADDRESS } from './links.ts'
+
 /**
  * Configuration, read from the environment and validated before anything
  * connects.
@@ -234,14 +236,22 @@ const DEFAULT_SERVER_IPS = ['3.130.92.28', '18.222.244.205']
 /**
  * What an entry in `BLITZ_SERVER_IPS` has to look like.
  *
- * EXACTLY WHAT src/links.ts CALLS IPv4-SHAPED, deliberately: one to three digits
- * per octet and four of them, with no range check on top. An entry this accepts
- * that the matcher could never produce would be an allowlist line that silently
- * exempts nothing, and an entry the matcher can produce that this rejects would
- * be an address the operator cannot allowlist. The two notions have to be the
- * same one.
+ * EXACTLY WHAT src/links.ts CALLS IPv4-SHAPED, AND NOW LITERALLY THE SAME
+ * REGEX. An entry this accepts that the matcher could never produce is an
+ * allowlist line that silently exempts nothing, and an entry the matcher can
+ * produce that this rejects is an address the operator cannot allowlist. The two
+ * notions have to be the same one.
+ *
+ * THEY WERE NOT, AND THE COMMENT HERE SAID THEY WERE. This used to be
+ * `/^\d{1,3}(?:\.\d{1,3}){3}$/` — one to three digits per octet with no range
+ * and no leading-zero rule — while links.ts has rejected an octet over 255 and a
+ * padded octet since the ShadowPlay clips forced the question. So
+ * `BLITZ_SERVER_IPS=999.1.1.1` and `BLITZ_SERVER_IPS=014.22.5.3` booted, and
+ * each put a line in the allowlist that no matched address could ever equal:
+ * protection in the config file, nothing at all in the process. Importing the
+ * pattern is the only version of "the same one" that a later edit cannot undo.
  */
-const IPV4_ENTRY = /^\d{1,3}(?:\.\d{1,3}){3}$/
+const IPV4_ENTRY = IPV4_ADDRESS
 
 /**
  * The IP allowlist: a comma-separated list, defaulted and shape-checked.

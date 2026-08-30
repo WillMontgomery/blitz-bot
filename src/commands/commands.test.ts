@@ -34,6 +34,7 @@ import {
   type CommandRegistry,
   type CommandSource,
   type InteractionMember,
+  type InteractionUser,
   type RegistrationGuild,
   type ReplyTarget,
   type SuppliedOption,
@@ -648,12 +649,30 @@ describe('roleIdsOf — Discord ships the roles, in either of two shapes', () =>
 })
 
 describe('invocationOf — a live interaction reduced to a record', () => {
+  /**
+   * A Discord account as an interaction carries one.
+   *
+   * `displayAvatarURL` IS A FUNCTION HERE BECAUSE IT IS A METHOD THERE. The
+   * whole reason `Invocation` carries a URL rather than a user object is that
+   * the real one is a live discord.js `User` — so the fake has to be called,
+   * not read, or this file would be asserting a shape the real thing does not
+   * have. discord.js types it `displayAvatarURL(options?): string`, non-null,
+   * because it falls back to Discord's default avatar.
+   */
+  function account(id: string, name = `display-${id}`): InteractionUser {
+    return {
+      id,
+      displayName: name,
+      displayAvatarURL: () => `https://cdn.discordapp.com/avatars/${id}/abc.png`,
+    }
+  }
+
   function source(over: Partial<CommandSource> = {}): CommandSource {
     return {
       commandName: 'help',
       guildId: GUILD,
       channelId: CHANNEL,
-      user: { id: MEMBER },
+      user: account(MEMBER),
       member: { roles: [OTHER_ROLE] },
       options: { get: () => null },
       ...over,
@@ -671,10 +690,90 @@ describe('invocationOf — a live interaction reduced to a record', () => {
       guildId: GUILD,
       channelId: CHANNEL,
       userId: MEMBER,
+      userAvatarUrl: `https://cdn.discordapp.com/avatars/${MEMBER}/abc.png`,
       roleIds: [OTHER_ROLE],
       targetId: null,
+      targetAvatarUrl: undefined,
+      targetDisplayName: undefined,
       text: null,
     })
+  })
+
+  /**
+   * THE CALLER'S AVATAR IS RESOLVED HERE AND NOWHERE ELSE, which is the seam
+   * `/profile`'s thumbnail is built on. `displayAvatarURL()` is a call on a live
+   * object; making it here means every handler downstream is handed a string and
+   * `Invocation` stays the plain record the gate can be tested against.
+   */
+  it('resolves the caller’s avatar to a url rather than carrying the user', () => {
+    const invocation = invocationOf(source())
+
+    expect(invocation.userAvatarUrl).toBe(
+      `https://cdn.discordapp.com/avatars/${MEMBER}/abc.png`,
+    )
+  })
+
+  /**
+   * AND THE TARGET'S, SEPARATELY. Two fields rather than one resolved "subject",
+   * because "no target means me" is `/profile`'s rule and belongs in `/profile`
+   * — a seam that resolved the subject itself would be a second copy of it in
+   * the half of the code that is meant not to know what any command means.
+   */
+  it('resolves the target’s avatar and display name off the same option', () => {
+    const options = optionNamed(TARGET_OPTION, {
+      type: ApplicationCommandOptionType.User,
+      user: account(TARGET, 'Tagged Person'),
+    })
+
+    const invocation = invocationOf(source({ options }))
+
+    expect(invocation.targetId).toBe(TARGET)
+    expect(invocation.targetAvatarUrl).toBe(
+      `https://cdn.discordapp.com/avatars/${TARGET}/abc.png`,
+    )
+    expect(invocation.targetDisplayName).toBe('Tagged Person')
+  })
+
+  /**
+   * THE GUILD'S NAME FOR THEM WINS, IN BOTH SHAPES DISCORD SENDS ONE.
+   * discord.js hands back a live `GuildMember` when it has one cached — which
+   * resolves `displayName` itself — and the raw API record when it does not,
+   * which carries `nick`. `/profile` compares an in-game name against what the
+   * reader is actually looking at, and the `<@id>` mention beside it renders as
+   * the nickname, so the account's global name is the wrong answer whenever the
+   * two differ.
+   */
+  it('prefers a cached member’s display name over the account’s', () => {
+    const options = optionNamed(TARGET_OPTION, {
+      type: ApplicationCommandOptionType.User,
+      user: account(TARGET, 'Global Name'),
+      member: { displayName: 'Nickname Here' },
+    })
+
+    expect(invocationOf(source({ options })).targetDisplayName).toBe('Nickname Here')
+  })
+
+  it('reads the raw payload’s nick when there is no cached member', () => {
+    const options = optionNamed(TARGET_OPTION, {
+      type: ApplicationCommandOptionType.User,
+      user: account(TARGET, 'Global Name'),
+      member: { nick: 'Raw Nickname' },
+    })
+
+    expect(invocationOf(source({ options })).targetDisplayName).toBe('Raw Nickname')
+  })
+
+  /** A member with no nickname, and somebody tagged who is not in this guild. */
+  it('falls back to the account’s display name', () => {
+    for (const member of [{ nick: null }, undefined, null]) {
+      const options = optionNamed(TARGET_OPTION, {
+        type: ApplicationCommandOptionType.User,
+        user: account(TARGET, 'Global Name'),
+        member,
+      })
+
+      expect(invocationOf(source({ options })).targetDisplayName).toBe('Global Name')
+    }
   })
 
   /**
@@ -692,7 +791,7 @@ describe('invocationOf — a live interaction reduced to a record', () => {
   it('reads the target out of the option both halves agree on', () => {
     const options = optionNamed(TARGET_OPTION, {
       type: ApplicationCommandOptionType.User,
-      user: { id: TARGET },
+      user: account(TARGET),
     })
 
     expect(invocationOf(source({ options })).targetId).toBe(TARGET)
@@ -724,7 +823,14 @@ describe('invocationOf — a live interaction reduced to a record', () => {
       user: null,
     })
 
-    expect(invocationOf(source({ options })).targetId).toBeNull()
+    const invocation = invocationOf(source({ options }))
+
+    expect(invocation.targetId).toBeNull()
+
+    // And nothing to draw a thumbnail from or weigh a name against, which is
+    // what `undefined` means on those two — not "we know there is none".
+    expect(invocation.targetAvatarUrl).toBeUndefined()
+    expect(invocation.targetDisplayName).toBeUndefined()
   })
 
   /**
@@ -749,7 +855,7 @@ describe('invocationOf — a live interaction reduced to a record', () => {
   it('ignores a text-named option of the wrong type, rather than throwing', () => {
     const options = optionNamed(STICKY_TEXT_OPTION, {
       type: ApplicationCommandOptionType.User,
-      user: { id: TARGET },
+      user: account(TARGET),
     })
 
     expect(invocationOf(source({ options })).text).toBeNull()
@@ -1044,7 +1150,13 @@ function fakeInteraction(over: Partial<ReplyTarget> = {}): never {
     isChatInputCommand: () => true,
     commandName: 'help',
     guildId: GUILD,
-    user: { id: MEMBER },
+
+    // `displayAvatarURL` is a METHOD on the real `User`, and `invocationOf`
+    // calls it — so a fake carrying only an id is a fake the seam throws on, in
+    // the one place a throw would escape the listener's own catch. That is
+    // exactly what these cases are about, so it is here rather than asserted.
+    user: { id: MEMBER, displayName: 'A Member', displayAvatarURL: () => 'https://cdn/a.png' },
+
     member: { roles: [OTHER_ROLE] },
     options: { get: () => null },
     deferReply: () => Promise.resolve(null),

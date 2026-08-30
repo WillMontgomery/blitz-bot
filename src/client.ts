@@ -53,10 +53,23 @@ import { installStickies } from './sticky.ts'
  * lines are the only thing that tells those two apart from the outside, which
  * is why they are warnings and not debug.
  *
- * THE BOT NEVER TALKS TO MEMBERS. No DM, no reply, no "your message was
- * removed". A removal is a journal line and, if `BLITZ_LOG_CHANNEL_ID` is set,
- * one factual line in a channel admins read. That is a standing instruction
- * from the owner, not an oversight to be helpfully filled in later.
+ * THE BOT TALKS TO A MEMBER IN EXACTLY ONE CASE: ITS OWN REMOVAL OF THEIR
+ * MESSAGE. This file used to say it never did, and that was the standing
+ * instruction until the owner replaced it. The instruction now is that a poster
+ * is told their message was removed and WHICH RULE removed it — by DM, or, if
+ * the DM bounces, by a line in the channel that tags them and is taken back down
+ * about half a minute later. See `notifier` and `noticeChannel`.
+ *
+ * EVERYTHING ELSE ABOUT THAT RULE IS UNCHANGED. It is still the case that no
+ * removal is announced to the guild at large, that nothing quotes the text that
+ * matched, and that the RECORD of a removal is the journal line plus — if
+ * `BLITZ_LOG_CHANNEL_ID` is set — one factual line in a channel admins read.
+ * The notice is a courtesy to one person; it is not evidence and nothing reads
+ * it back.
+ *
+ * THE WORDS THEMSELVES ARE NOT WRITTEN YET AND ARE A MARKED PLACEHOLDER — see
+ * `NOTICE_PLACEHOLDER`. The owner supplies user-facing wording; this file
+ * supplies everything around it.
  */
 
 /**
@@ -488,6 +501,24 @@ export interface Actions {
 
   remove: () => Promise<void>
   announce: ((line: string) => Promise<void>) | null
+
+  /**
+   * How the poster is told their message was removed, and which rule removed
+   * it.
+   *
+   * REQUIRED AND NOT NULLABLE, unlike `announce`. A missing log channel is a
+   * configured absence — the operator did not set `BLITZ_LOG_CHANNEL_ID` — so
+   * `null` there says something true about the deployment. There is no
+   * corresponding setting here: telling the poster is a standing instruction
+   * and not a feature that can be off, so a nullable field would only ever be a
+   * way for a caller to skip it by accident.
+   *
+   * IT NEVER REJECTS, AND `notifier` IS WHY. Every failure it can have — a
+   * closed DM, a channel the bot cannot post in, a member who left — is handled
+   * where it happens, so the delete path below can await it without a `try`
+   * and without a reader wondering what a rejection here would cost.
+   */
+  notify: (why: DeleteReason) => Promise<void>
 }
 
 /**
@@ -563,6 +594,15 @@ export async function handleMessage(
 
       log('info', `deleted ${CARRIED[verdict.why]}`, { ...where, ...logFields(verdict) })
       await postLine(actions.announce, removedLine(message, verdict))
+
+      // THE POSTER IS TOLD LAST, AND ONLY ON A REMOVAL THAT ACTUALLY HAPPENED.
+      // It is last for the same reason the announce is after the delete: the
+      // record comes before the courtesy, so a member is never told about a
+      // removal the journal has no line for. It is inside this branch and not
+      // shared with `would-delete` because a dry run deletes nothing — a DM
+      // saying a message was removed, sent while the bot is only watching,
+      // would be the bot lying to a member about its own behaviour.
+      await actions.notify(verdict.why)
       return
     }
   }
@@ -792,6 +832,352 @@ async function postLine(
     // The removal already happened and is already in the journal. Losing the
     // channel copy is a nuisance; throwing here would lose the handler.
     log('error', 'could not post to the log channel', { error })
+  }
+}
+
+/**
+ * ============================================================================
+ * WHAT THE POSTER IS TOLD. PLACEHOLDER — THE OWNER SUPPLIES THIS WORDING.
+ * ============================================================================
+ *
+ * NONE OF THESE STRINGS ARE THE FINAL TEXT AND NONE MAY SHIP AS IF THEY WERE.
+ * They are deliberately unmistakable so that one cannot reach a member's DMs
+ * without somebody noticing: no apology, no explanation, no house style,
+ * nothing that reads like a sentence the owner would have written. Everything
+ * AROUND them — which rule fired, how it is delivered, when the fallback is
+ * taken down — is decided and tested; only the words are open.
+ *
+ * ONE RECORD, EXPORTED, AND THAT IS THE POINT RATHER THAN THE TIDINESS.
+ * src/commands/sticky.ts is the worked example of getting this wrong: its tests
+ * asserted FRAGMENTS OF THE PLACEHOLDER PROSE, and nine of them broke the
+ * moment the real wording arrived — so the person pasting the owner's text in
+ * spent the afternoon editing assertions instead of reading them. A test that
+ * says `toContain(COPY['foreign-ip'])` pins WHICH message fired and survives
+ * any rewrite of what it says. A test that says `toContain('shortened link')`
+ * pins the draft, and it is the assertion that gets deleted rather than updated.
+ *
+ * A STRING PER REASON RATHER THAN ONE FOR ALL SIX, WHICH REVERSES WHAT THIS WAS.
+ * It used to be a single placeholder with `(rule: <why>)` appended, on the
+ * argument that a poster is told one thing and six wordings would be six things
+ * to keep in step. But the standing instruction is that a poster is told WHICH
+ * RULE fired, and six rules the owner may well want to word six different ways
+ * — an invite to another Discord is not the same conversation as a shortened
+ * link — is exactly the shape a copy record exists for. The frame is what stops
+ * them drifting: it is one sentence, written once, and every reason goes
+ * through it.
+ *
+ * THE RULE TOKEN SURVIVES ANY REWRITE, AND IT IS THE ONE THING THE FINAL
+ * WORDING MAY NOT DROP. `why` is the same token the journal line and the admin
+ * channel line carry, so a member quoting their notice and an admin reading the
+ * log are looking at the same word rather than at two descriptions. The frame
+ * is where it is put, and the tests hold a rewrite to it.
+ *
+ * NOTHING FROM THE MESSAGE IS QUOTED BACK. Every rule that can fire here
+ * matched a WORKING link — an address, a cfx code, a `fivem://` target, a
+ * shortened url — and the fallback posts into the very channel the message was
+ * removed from, so quoting the match would repost the advert the bot has just
+ * taken down. links.ts does not hand the text back at all, so there is nothing
+ * here to interpolate even if a wording asked for it; these strings name the
+ * reason and never the match, and a rewrite must keep it that way.
+ *
+ * `satisfies` RATHER THAN A TYPE ANNOTATION. A seventh `DeleteReason` is then a
+ * compile error here — the same guarantee `CARRIED` above gets from its
+ * `Record` — while `COPY['foreign-ip']` stays the literal string a test can
+ * compare against instead of widening to `string`.
+ */
+export const COPY = {
+  /**
+   * The sentence wrapped around whichever reason fired, and the ONLY place the
+   * rule token is put. One frame rather than six means a rewrite cannot leave
+   * five notices carrying the token and one not.
+   */
+  frame: (reason: string, why: DeleteReason) =>
+    `Your message was removed. ${reason} If that's wrong, tell an admin. (rule: ${why})`,
+
+  'foreign-invite': 'It contained an invite to another Discord server.',
+  'over-lookup-cap': 'It contained too many invite links to check.',
+  'fivem-connect': 'It contained a connect link to another game server.',
+  'server-listing': 'It contained a link to another FiveM server.',
+  'foreign-ip': 'It contained an IP address. Four numbers separated by dots will trigger this, even in a file name or a version number.',
+  'link-shortener': "It contained a shortened link, which we don't allow because the destination is hidden.",
+} satisfies Record<DeleteReason, string> & {
+  frame: (reason: string, why: DeleteReason) => string
+}
+
+/** The notice for one removal, in whatever words are in force. */
+export function removalNotice(why: DeleteReason): string {
+  return COPY.frame(COPY[why], why)
+}
+
+/**
+ * How long the channel fallback stands before the bot takes it down again.
+ *
+ * ABOUT HALF A MINUTE, WHICH IS THE INSTRUCTION. Long enough that a member who
+ * is looking at the channel — and they are, they just posted in it — sees the
+ * ping; short enough that the channel is not left with a permanent public note
+ * about somebody's deleted message. The fallback is a courtesy, not a record;
+ * the record is the journal line and the admin channel.
+ */
+const NOTICE_TTL_MS = 30_000
+
+/**
+ * The two ways a poster can be reached, as a seam.
+ *
+ * A SEAM RATHER THAN A discord.js CALL INSIDE `handleMessage`, for the reason
+ * `remove` and `announce` are already seams: this file's whole split is that
+ * the decision and the carrying-out are testable without a live guild, and a
+ * notice that DMs a real user on a real gateway is exactly the sort of side
+ * effect that otherwise only gets exercised in production.
+ *
+ * `dm` REJECTS RATHER THAN RETURNING FALSE, and that is not a style choice.
+ * There is no in-band answer to "the DM bounced": discord.js throws a
+ * `DiscordAPIError` with code 50007 when the recipient does not accept DMs from
+ * the server, and throws differently again for a user that cannot be fetched.
+ * Making the seam reject means the fallback is driven by the same event the
+ * real client produces, rather than by a boolean somebody has to remember to
+ * return.
+ *
+ * `fallback` TAKES THE AUTHOR ID AS WELL AS THE TEXT because the mention has to
+ * be allowed at the send — see `noticeChannel`. A function that only saw the
+ * finished string could put `<@id>` in a message and have no way to make it
+ * notify the person it names.
+ */
+export interface NoticeChannel {
+  dm: (userId: string, text: string) => Promise<void>
+  fallback: (channelId: string, userId: string, text: string) => Promise<void>
+}
+
+/**
+ * Whether a failed DM means the poster cannot be DMed AT ALL, rather than the
+ * send having gone wrong this time.
+ *
+ * THE FALLBACK IS SPENT ON A BOUNCE AND ON NOTHING ELSE, AND THAT DISTINCTION IS
+ * THE WHOLE OF THIS FUNCTION. This used to treat every rejection out of `dm` as
+ * a bounce, on the reasoning that a user who cannot be fetched and a user who
+ * will not accept the message are the same outcome for the poster. They are not
+ * the same outcome for the CHANNEL: a 429 or a 500 is a DM that would have
+ * landed a second later, and answering one with a public note about somebody's
+ * deleted message — tagging them, in the channel they posted in — is a cost
+ * paid on Discord having a bad minute. There is no third state to represent,
+ * either; the notice is a courtesy, so a transient failure is simply a courtesy
+ * that did not get done, and the removal is recorded twice over regardless.
+ *
+ * TWO CODES, AND THEY ARE THE SAME ANSWER SPELLED TWICE. 50007 is what Discord
+ * returns when a member has "allow direct messages from server members" off,
+ * which is the common case this fallback was built for. 50278 is the same
+ * sentence for a member the bot shares no guild with — it can arrive when
+ * somebody leaves between the removal and the notice. Both are permanent for
+ * this send: no retry, no later attempt and no other route reaches them, which
+ * is precisely what makes the channel worth spending.
+ *
+ * EVERYTHING ELSE FALLS THE OTHER WAY, INCLUDING WHAT WE HAVE NOT SEEN. An
+ * unrecognised failure is not known to be permanent, and the closed direction
+ * for a public post about a member is not to make it. The cost is one member
+ * occasionally not told; the cost of the other default is the channel filling
+ * with notes every time the API wobbles.
+ */
+function dmsAreShut(error: unknown): boolean {
+  if (!(error instanceof DiscordAPIError)) return false
+
+  return (
+    error.code === RESTJSONErrorCodes.CannotSendMessagesToThisUser ||
+    error.code === RESTJSONErrorCodes.CannotSendMessagesToThisUserDueToHavingNoMutualGuilds
+  )
+}
+
+/**
+ * How long one poster stays told before another removal earns them a second
+ * notice.
+ *
+ * A SPAM WAVE IS ONE PERSON POSTING TWENTY TIMES, AND IT MUST NOT BE TWENTY DM
+ * OPENS. Opening a DM channel is one of the more expensive things this bot can
+ * ask Discord for and it is rate-limited per recipient, so the burst that most
+ * needs the removals to keep landing is exactly the burst that would queue every
+ * delete behind a courtesy note. Worse on the fallback path: twenty pings in the
+ * channel, each standing half a minute, is the bot doing more damage to the
+ * channel than the adverts did.
+ *
+ * A MINUTE, WHICH IS `ROLE_TTL_MS` AND FOR A RELATED REASON — it is long enough
+ * to flatten a raid and short enough that nobody moderated twice in an evening
+ * goes unexplained. A continuing wave still earns a notice once a window rather
+ * than never: the window is not refreshed by a suppressed removal, so somebody
+ * spamming for five minutes is told five times, not silently ignored.
+ *
+ * COALESCED, NOT QUEUED, AND THE FIRST REASON IS THE ONE SENT. The suppressed
+ * removals are still deleted, still logged, and still posted to the admin
+ * channel — the record is unaffected. What is dropped is the second through
+ * twentieth copy of "your message was removed" to somebody who is at that moment
+ * watching their messages disappear.
+ */
+const NOTICE_COOLDOWN_MS = 60_000
+
+/** How many posters the window remembers before the oldest is dropped. */
+const NOTICE_MAX_ENTRIES = 500
+
+/**
+ * Who has been told lately, per `NoticeChannel`.
+ *
+ * KEYED ON THE SEAM RATHER THAN HELD AS ONE MODULE-LEVEL MAP, which is the
+ * `roleCaches` pattern above and is here for both of its reasons. In the process
+ * there is exactly one `NoticeChannel` — `createClient` builds it once — so the
+ * window is process-wide in practice. In a test each fake seam is its own
+ * object, so no case can be made to pass or fail by what an earlier one did to a
+ * shared table, and there is no reset anybody has to remember to call.
+ *
+ * A `WeakMap`, so a seam that goes out of scope takes its table with it, and the
+ * table itself is bounded — the keys are ids a stranger chose by posting, and
+ * unbounded is a memory leak anybody can drive.
+ */
+const noticed = new WeakMap<NoticeChannel, Map<string, number>>()
+
+function noticedVia(notices: NoticeChannel): Map<string, number> {
+  const existing = noticed.get(notices)
+  if (existing !== undefined) return existing
+
+  const created = new Map<string, number>()
+  noticed.set(notices, created)
+  return created
+}
+
+/**
+ * Whether this poster is due a notice, recording the attempt if they are.
+ *
+ * THE ATTEMPT IS WHAT IS RECORDED, NOT THE DELIVERY, because the attempt is what
+ * costs. A DM that bounces has already spent the request, and a bounce is a
+ * SETTING rather than a transient — so the twenty messages after it would each
+ * bounce in turn and each spend a channel post. Marking before the send is what
+ * makes the bound hold on the path that needs it most.
+ */
+function noticeIsDue(notices: NoticeChannel, authorId: string): boolean {
+  const seen = noticedVia(notices)
+  const now = Date.now()
+  const told = seen.get(authorId)
+
+  if (told !== undefined && now - told < NOTICE_COOLDOWN_MS) return false
+
+  // Delete before set so a re-told author moves to the END of the Map's
+  // insertion order, or eviction could drop the entry just written. Same idiom,
+  // same reason, as `remember` below.
+  seen.delete(authorId)
+  seen.set(authorId, now)
+
+  while (seen.size > NOTICE_MAX_ENTRIES) {
+    const oldest = seen.keys().next()
+    // Only reachable on an empty Map, which the loop condition has ruled out.
+    if (oldest.done === true) break
+    seen.delete(oldest.value)
+  }
+
+  return true
+}
+
+/**
+ * Tell one poster their message was removed, and which rule removed it.
+ *
+ * DM FIRST, CHANNEL SECOND, AND THE CHANNEL ONLY WHEN THE DM BOUNCES. A DM is
+ * the version of this that costs nobody else anything: the member finds out,
+ * and the channel they posted in is not given a public note about them. The
+ * fallback exists because a member with DMs closed to server members is the
+ * common case rather than the odd one, and a notice that silently goes nowhere
+ * for those members is the same as no notice at all.
+ *
+ * A DM IS THE ONLY PRIVATE ROUTE THERE IS, which is worth saying because the
+ * obvious alternative does not exist. An ephemeral reply is a property of an
+ * INTERACTION response — a slash command, a button — and a member typing a
+ * message generates no interaction, so there is nothing to answer ephemerally.
+ * The choice is a DM or a public line; it is not a DM or a quiet in-channel one.
+ *
+ * "BOUNCED" MEANS DISCORD SAID THE DM CANNOT LAND, NOT THAT THE SEND FAILED.
+ * See `dmsAreShut`: a rate limit or a 500 is a courtesy that did not get done
+ * this time, and answering it with a public note about somebody's deleted
+ * message would spend the fallback on the API having a bad minute.
+ *
+ * ONE POSTER IS TOLD AT MOST ONCE A WINDOW, whichever route it took. See
+ * `noticeIsDue`: a burst of removals from one person is the case where telling
+ * them each time is both most expensive and least useful.
+ *
+ * THE FALLBACK IS TAKEN DOWN AGAIN, WHICH IS WHAT MAKES IT ACCEPTABLE. See
+ * `NOTICE_TTL_MS`. It is also the only message this bot sends that PINGS
+ * anybody, and it has to: a silent mention in a channel, deleted again half a
+ * minute later, would reach nobody at all — which is the case the fallback
+ * exists for. `noticeChannel` is where that is spelled out and asserted.
+ *
+ * A WEBHOOK IS NOT A POSTER AND IS NOT TOLD. A webhook removal has no member
+ * behind it: there is no account to DM, and `<@webhookId>` renders as
+ * `@unknown-user` and notifies nobody, so the fallback would be a public note
+ * about a deleted message addressed to no one. It is logged instead, so the
+ * absence is visible rather than silent.
+ *
+ * NOTHING IN HERE IS ALLOWED TO THROW PAST `handleMessage`. The message is
+ * already gone and the removal is already recorded; failing to tell somebody
+ * about it is a nuisance, and taking down the message handler over it would be
+ * a bypass anybody could trigger by closing their DMs.
+ */
+export function notifier(
+  notices: NoticeChannel,
+  message: ScannedMessage,
+): (why: DeleteReason) => Promise<void> {
+  return async (why) => {
+    const where = { author: message.authorId, channel: message.channelId }
+
+    if (message.webhookId !== null) {
+      log('info', 'removal was a webhook post, so there is no poster to tell', {
+        ...where,
+        reason: why,
+      })
+      return
+    }
+
+    if (!noticeIsDue(notices, message.authorId)) {
+      // Info rather than a warning: this is the mechanism working. It is
+      // recorded at all because it is the one path where a member is knowingly
+      // not told, and an admin asking "why did they get no DM" needs the line.
+      log('info', 'poster was told about a removal moments ago, not telling them again', {
+        ...where,
+        reason: why,
+      })
+      return
+    }
+
+    const text = removalNotice(why)
+
+    try {
+      await notices.dm(message.authorId, text)
+      return
+    } catch (error) {
+      if (!dmsAreShut(error)) {
+        // NOT A BOUNCE, SO THE FALLBACK IS NOT SPENT. A warning and not an info,
+        // unlike the closed-DM case below: a member's privacy setting is
+        // expected traffic, and the API refusing a send for some other reason is
+        // the bot's own fault to look at.
+        log('warn', 'the DM failed for a reason other than closed DMs, so nothing was posted', {
+          ...where,
+          reason: why,
+          error,
+        })
+        return
+      }
+
+      // Expected traffic, not a fault: a member who does not accept DMs from
+      // this server is the ordinary reason to be here. Recorded at info so that
+      // a bot whose DMs ALL bounce — a token problem, a gateway problem — is
+      // still visible as a pattern in the journal.
+      log('info', 'could not DM the poster, telling them in the channel instead', {
+        ...where,
+        reason: why,
+        error,
+      })
+    }
+
+    try {
+      await notices.fallback(message.channelId, message.authorId, `<@${message.authorId}> ${text}`)
+    } catch (error) {
+      log('error', 'could not tell the poster their message was removed', {
+        ...where,
+        reason: why,
+        error,
+      })
+    }
   }
 }
 
@@ -1150,6 +1536,13 @@ export interface LiveMessage extends ScannableMessage {
 export interface LiveActions {
   resolve: InviteResolver
   announce: ((line: string) => Promise<void>) | null
+
+  /**
+   * The two ways to reach a poster. Built once from the client, like the
+   * resolver and the log channel, because neither of them is bound to a
+   * message — `notifier` is what binds them to one.
+   */
+  notices: NoticeChannel
 }
 
 /**
@@ -1195,11 +1588,17 @@ export async function handleLive(
     return
   }
 
-  await handleMessage(snapshot(full, authorId, selfId), config, {
+  // Built once and used twice: `handleMessage` reads it, and `notifier` needs
+  // the same author and channel the verdict was made about rather than a second
+  // reading of the live message that could disagree with it.
+  const scanned = snapshot(full, authorId, selfId)
+
+  await handleMessage(scanned, config, {
     resolve: actions.resolve,
     fetchRoles: memberRoles(full),
     remove: remover(full, config),
     announce: actions.announce,
+    notify: notifier(actions.notices, scanned),
   })
 }
 
@@ -1394,25 +1793,29 @@ export function createClient(config: Config): Client {
     partials: [Partials.Message],
 
     /**
-     * NOTHING THIS BOT SENDS CAN EVER PING ANYONE. Set on the client so the
-     * guarantee holds for whatever gets added later without depending on
-     * somebody remembering. The log line carries an invite code chosen by a
-     * stranger and, since the author became a mention, `<@id>` on purpose —
-     * this makes the question moot instead of making it a thing to reason
-     * about.
+     * NOTHING THIS BOT SENDS PINGS ANYONE UNLESS THE SEND ITSELF SAYS SO. Set
+     * on the client so the guarantee holds for whatever gets added later
+     * without depending on somebody remembering. The log line carries an invite
+     * code chosen by a stranger and, since the author became a mention, `<@id>`
+     * on purpose — this makes the question moot instead of making it a thing to
+     * reason about.
      *
-     * THE ONE SEND THAT EXISTS TODAY REPEATS IT ANYWAY. This is a default, and
-     * a default is silently replaced by any call that passes `allowedMentions`
-     * of its own; `announcer` states the suppression at its own `send` because
-     * that call deliberately contains a mention, and because a default set here
-     * cannot be asserted on there.
+     * THIS USED TO SAY "CAN EVER PING ANYONE", AND THAT IS NO LONGER TRUE. A
+     * default is silently replaced by any call that passes `allowedMentions` of
+     * its own, so what it really guarantees is the sends that say nothing. Two
+     * now say something: `announcer` repeats the suppression at its own `send`,
+     * because that call deliberately contains a mention and because a default
+     * set here cannot be asserted on there — and `noticeChannel`'s fallback
+     * DELIBERATELY pings, narrowed to the single poster it names, because its
+     * whole job is to reach a member whose DMs are shut. Both state their
+     * option at the send, which is the only place a reader can see it.
      */
     allowedMentions: { parse: [], repliedUser: false },
   })
 
   const resolve = inviteResolver((code) => client.fetchInvite(code))
   const post = config.logChannelId === null ? null : announcer(client, config.logChannelId)
-  const actions: LiveActions = { resolve, announce: post }
+  const actions: LiveActions = { resolve, announce: post, notices: noticeChannel(client) }
 
   client.once(Events.ClientReady, (ready) => {
     // `Events.ClientReady` is `clientReady` in this version; the old `ready`
@@ -1874,10 +2277,19 @@ function snapshot(message: LiveMessage, authorId: string, selfId: string | null)
  * but it is a default: it applies to the sends that say nothing about mentions,
  * it lives four hundred lines from here, and the guarantee it makes is one that
  * a `send` passing its own `allowedMentions` for some other reason silently
- * replaces. This is now the one call in the bot that puts a mention in a
- * message ON PURPOSE, so the suppression belongs next to it, where a reader of
- * this function can see it and a test can assert on the options that were
- * actually handed to `send`.
+ * replaces. This call puts a mention in a message ON PURPOSE, so the
+ * suppression belongs next to it, where a reader of this function can see it
+ * and a test can assert on the options that were actually handed to `send`.
+ *
+ * THE OTHER DELIBERATE MENTION IN THIS FILE SETS THE OPPOSITE OPTION, AND BOTH
+ * ARE RIGHT. `noticeChannel`'s fallback passes `allowedMentions: { users: [id] }`
+ * and DOES notify the person it names. The two are not an inconsistency and
+ * neither is an oversight: this line is a RECORD, read by admins, about a member
+ * — and a removal record that pings the person it is about turns evidence into a
+ * poke. That one is the LAST RESORT of telling that member something, taken only
+ * because the private route already failed, and a mention nobody is notified
+ * about would reach nobody at all. Same markup, opposite jobs, opposite options,
+ * each stated at its own send. Change one and you have not changed the other.
  *
  * EXPORTED SO THAT LAST PART IS POSSIBLE, for the same reason `remover` is. The
  * option is invisible from the front door — every caller above this sees a
@@ -1905,6 +2317,85 @@ export function announcer(client: Client, channelId: string): (line: string) => 
     }
 
     await channel.send({ content: line, allowedMentions: { parse: [] } })
+  }
+}
+
+/**
+ * The two ways this bot reaches a poster, built on the live client.
+ *
+ * `users.fetch` THEN `send` IS THE WHOLE OF THE DM. discord.js opens the DM
+ * channel on the first send by itself, so there is nothing to cache and nothing
+ * to clean up, and a fetch reads its own user cache first. A member who does not
+ * accept DMs from this server makes the SEND reject — not the fetch — with
+ * Discord's 50007.
+ *
+ * THE ERROR IS PASSED UP AS IT CAME, AND THAT IS WHAT LETS `notifier` TELL A
+ * BOUNCE FROM A BAD MINUTE. Nothing here catches, wraps or re-throws: a
+ * `DiscordAPIError` arrives at `dmsAreShut` with its `code` intact, so 50007 can
+ * be separated from a 429 or a 500. An earlier version of this comment argued
+ * the opposite — that a user who cannot be fetched and a user who will not
+ * accept the message are the same outcome, so any rejection should spend the
+ * fallback. They are the same outcome for the POSTER and not for the CHANNEL,
+ * which is the half that pays for it; see `dmsAreShut`.
+ *
+ * THE FALLBACK IS THE ONE MESSAGE THIS BOT SENDS THAT PINGS ANYBODY, and the
+ * option that makes that true is right here so it can be read and asserted.
+ * `createClient` sets `allowedMentions: { parse: [] }` as a client-wide default
+ * and `announcer` repeats it, because the moderation record names a member
+ * without notifying them. This send is the opposite case on purpose: its only
+ * job is to reach a member whose DMs are shut, and a mention that does not
+ * notify — in a message the bot deletes again half a minute later — would reach
+ * nobody at all and the fallback would be theatre.
+ *
+ * IT IS NARROWED TO ONE ID RATHER THAN TURNED ON. `{ users: [userId] }` allows
+ * exactly the poster and nothing else: no `@everyone`, no role ping, and no
+ * second user — so a notice can never be made to ping the guild by anything in
+ * the text, which matters because the text is a template somebody will later
+ * rewrite.
+ *
+ * THE MESSAGE TAKES ITSELF DOWN AGAIN, AND THE TIMER IS `unref`ed. A courtesy
+ * note must not be the reason a restart waits thirty seconds — systemd restarts
+ * this unit on every deploy — so a process that exits inside the window leaves
+ * the line standing rather than holding the event loop open for it. That is the
+ * cheaper of the two failures: one stale line in a channel, against a deploy
+ * that hangs.
+ *
+ * THE DELETE'S OWN FAILURE IS LOGGED AND NOT THROWN. By the time it runs,
+ * `notifier` has long since returned and there is nobody left to hand an error
+ * to; an unhandled rejection out of a bare timer callback would take the
+ * process down over a message somebody had probably already dismissed.
+ */
+export function noticeChannel(client: Client): NoticeChannel {
+  return {
+    dm: async (userId, text) => {
+      const user = await client.users.fetch(userId)
+      await user.send({ content: text, allowedMentions: { parse: [] } })
+    },
+
+    fallback: async (channelId, userId, text) => {
+      const channel = await client.channels.fetch(channelId)
+
+      if (channel === null || !channel.isSendable()) {
+        // The channel the message was posted in, a moment ago. If it cannot be
+        // posted to now, the bot has lost a permission or the channel is gone —
+        // either way the poster cannot be told and somebody should know.
+        throw new Error(`cannot post the removal notice in ${channelId}`)
+      }
+
+      const sent = await channel.send({
+        content: text,
+        allowedMentions: { users: [userId] },
+      })
+
+      setTimeout(() => {
+        void sent.delete().catch((error: unknown) => {
+          log('warn', 'could not take the removal notice back down', {
+            channel: channelId,
+            error,
+          })
+        })
+      }, NOTICE_TTL_MS).unref()
+    },
   }
 }
 

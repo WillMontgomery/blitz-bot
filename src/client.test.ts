@@ -21,6 +21,7 @@ import {
   announcer,
   botManualPath,
   commitFiles,
+  COPY,
   createClient,
   decide,
   docsChannel,
@@ -28,10 +29,13 @@ import {
   handleLive,
   handleMessage,
   inviteResolver,
+  noticeChannel,
+  notifier,
   ours,
   parseManual,
   readManual,
   remover,
+  removalNotice,
   reportDeployedCommit,
   reportedCommitPath,
   scanText,
@@ -43,6 +47,7 @@ import {
   type CommitFiles,
   type AttachmentText,
   type ComponentText,
+  type DeleteReason,
   type DocsChannel,
   type EmbedText,
   type LiveActions,
@@ -51,6 +56,7 @@ import {
   type LiveMessage,
   type ManualEmbed,
   type ManualSection,
+  type NoticeChannel,
   type PollText,
   type PostedSection,
   type RoleLookup,
@@ -691,12 +697,30 @@ describe('decide — the link policy', () => {
  * was attempted and that the failure was handled, and it cannot do the first
  * with a bare function.
  */
-function actions(over: Partial<Actions> = {}): Actions & { remove: Mock<() => Promise<void>> } {
+function actions(over: Partial<Actions> = {}): Actions & {
+  remove: Mock<() => Promise<void>>
+  notify: Mock<(why: DeleteReason) => Promise<void>>
+} {
   const remove = vi.fn<() => Promise<void>>(over.remove ?? (() => Promise.resolve()))
+
+  // A SPY FOR THE SAME REASON `remove` IS ONE. "The poster was told, and told
+  // this reason" is an assertion about a call rather than about a return value,
+  // and the branch that must NOT tell them — a dry run — can only be asserted
+  // against something that records not having been called.
+  const notify = vi.fn<(why: DeleteReason) => Promise<void>>(
+    over.notify ?? (() => Promise.resolve()),
+  )
 
   // The default answers "I could not find out", which is the state that used to
   // skip the message entirely and must now scan it.
-  return { resolve: foreignResolver, fetchRoles: cannotAsk, announce: null, ...over, remove }
+  return {
+    resolve: foreignResolver,
+    fetchRoles: cannotAsk,
+    announce: null,
+    ...over,
+    remove,
+    notify,
+  }
 }
 
 /** A role lookup that never finds out. The fail-closed case, as the default. */
@@ -1074,6 +1098,657 @@ describe('handleMessage — a link removal names its own rule and quotes nothing
 
     expect(acts.remove).not.toHaveBeenCalled()
     expect(posted).toHaveLength(0)
+  })
+})
+
+/**
+ * THE POSTER IS TOLD, AND TOLD WHICH RULE FIRED.
+ *
+ * THIS REVERSES A STANDING INSTRUCTION, WHICH IS WHY IT IS TESTED FROM BOTH
+ * ENDS. The rule used to be that the bot never talks to members at all — the
+ * file header said so and the absence of any such call was the whole
+ * implementation. The rule now is that a removal is explained to the person it
+ * happened to: by DM, or, when the DM bounces, by a line in the channel that
+ * tags them and comes back down about half a minute later.
+ *
+ * THE THREE THINGS THESE CASES HOLD, none of which the wording can move:
+ *
+ *   - A NOTICE FOLLOWS A REMOVAL AND ONLY A REMOVAL. A dry run deletes nothing,
+ *     so a member told their message was removed during one has been lied to
+ *     about the bot's own behaviour, by the exact feature that exists to be
+ *     straight with them.
+ *   - THE RULE TOKEN IS IN IT. It is the same token the journal line and the
+ *     admin channel carry, so a member quoting their notice and an admin
+ *     reading the log are looking at one word rather than two descriptions.
+ *   - A FAILURE TO DELIVER IT COSTS NOTHING ELSE. Closing your DMs is a setting
+ *     anybody has; if that could take down the message handler it would be a
+ *     bypass of the whole bot, available from a user-settings menu.
+ *
+ * THE WORDING ITSELF IS A PLACEHOLDER AND IS DELIBERATELY NOT ASSERTED ON, past
+ * the rule token. The owner supplies user-facing text; a test that pinned this
+ * draft would have to be edited by whoever pastes the real one in, which is the
+ * moment a check gets deleted rather than updated.
+ */
+describe('the poster is told, and told which rule fired', () => {
+  /**
+   * The six reasons a message can be removed over, written out rather than
+   * derived from `COPY`, so that a seventh is a decision somebody makes here as
+   * well as in client.ts. Reading the keys off the record instead would mean a
+   * reason added without copy tests itself against nothing.
+   */
+  const REASONS: DeleteReason[] = [
+    'foreign-invite',
+    'over-lookup-cap',
+    'fivem-connect',
+    'server-listing',
+    'foreign-ip',
+    'link-shortener',
+  ]
+
+  it('tells the poster after a removal, naming the rule', async () => {
+    const acts = actions()
+
+    await handleMessage(msg({ text: 'bit.ly/3xY9k' }), cfg(), acts)
+
+    expect(acts.notify).toHaveBeenCalledTimes(1)
+    expect(acts.notify).toHaveBeenCalledWith('link-shortener')
+  })
+
+  it('names the rule that actually fired, not a fixed one', async () => {
+    const acts = actions()
+
+    await handleMessage(msg({ text: 'come play at 5.6.7.8.' }), cfg(), acts)
+
+    expect(acts.notify).toHaveBeenCalledWith('foreign-ip')
+  })
+
+  it('says nothing to a poster whose message was left alone', async () => {
+    const acts = actions()
+
+    await handleMessage(msg({ text: 'good game everyone' }), cfg(), acts)
+
+    expect(acts.notify).not.toHaveBeenCalled()
+  })
+
+  it('says nothing during a dry run, which removes nothing', async () => {
+    const acts = actions()
+
+    await handleMessage(msg({ text: 'bit.ly/3xY9k' }), cfg({ dryRun: true }), acts)
+
+    expect(acts.remove).not.toHaveBeenCalled()
+    expect(acts.notify).not.toHaveBeenCalled()
+  })
+
+  it('says nothing when the delete itself failed', async () => {
+    // The message is still standing. Telling its author it was removed would be
+    // a false statement they can check by scrolling up.
+    const acts = actions({ remove: () => Promise.reject(new Error('Missing Permissions')) })
+
+    await handleMessage(msg({ text: 'bit.ly/3xY9k' }), cfg(), acts)
+
+    expect(acts.notify).not.toHaveBeenCalled()
+  })
+
+  it('says nothing about a message it never scanned', async () => {
+    const acts = actions()
+
+    await handleMessage(msg({ text: 'bit.ly/3xY9k' }), cfg({ exemptChannelIds: [CHANNEL] }), acts)
+
+    expect(acts.notify).not.toHaveBeenCalled()
+  })
+
+  it('carries the notice out by DM when the DM lands', async () => {
+    const seam = notices()
+
+    await notifier(seam, msg())('link-shortener')
+
+    expect(seam.dm).toHaveBeenCalledTimes(1)
+    expect(seam.dm).toHaveBeenCalledWith(AUTHOR, expect.stringContaining('link-shortener'))
+    expect(seam.fallback).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the channel, tagging them, when the DM bounces', async () => {
+    const seam = dmsClosed()
+
+    await notifier(seam, msg())('foreign-ip')
+
+    expect(seam.fallback).toHaveBeenCalledTimes(1)
+    expect(seam.fallback).toHaveBeenCalledWith(
+      CHANNEL,
+      AUTHOR,
+      expect.stringContaining(`<@${AUTHOR}>`),
+    )
+    expect(seam.fallback).toHaveBeenCalledWith(
+      CHANNEL,
+      AUTHOR,
+      expect.stringContaining('foreign-ip'),
+    )
+  })
+
+  it('does not post in the channel when the DM landed', async () => {
+    // The fallback is a public note about somebody's deleted message. It is
+    // taken every time the DM fails and never when it did not.
+    const seam = notices()
+
+    await notifier(seam, msg())('server-listing')
+
+    expect(seam.fallback).not.toHaveBeenCalled()
+  })
+
+  it('never throws, whichever half of the delivery broke', async () => {
+    const bothBroken = notices({
+      dm: () =>
+        Promise.reject(
+          dmFailure(
+            RESTJSONErrorCodes.CannotSendMessagesToThisUser,
+            'Cannot send messages to this user',
+          ),
+        ),
+      fallback: () => Promise.reject(new Error('Missing Permissions')),
+    })
+
+    await expect(notifier(bothBroken, msg())('fivem-connect')).resolves.toBeUndefined()
+  })
+
+  it('does not take the message handler down when the poster cannot be reached', async () => {
+    // The path the case above proves in isolation, proven again through the
+    // front door: a member with DMs closed in a channel the bot cannot post in
+    // must not be able to stop a removal from completing.
+    const acts = actions({
+      notify: notifier(
+        notices({
+          dm: () =>
+            Promise.reject(
+              dmFailure(
+                RESTJSONErrorCodes.CannotSendMessagesToThisUser,
+                'Cannot send messages to this user',
+              ),
+            ),
+          fallback: () => Promise.reject(new Error('Missing Permissions')),
+        }),
+        msg(),
+      ),
+    })
+
+    await expect(handleMessage(msg({ text: 'bit.ly/3xY9k' }), cfg(), acts)).resolves.toBeUndefined()
+    expect(acts.remove).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * A WEBHOOK IS NOT A POSTER. There is no account behind one to DM, and
+   * `<@webhookId>` renders as `@unknown-user` and notifies nobody — so the
+   * fallback would be a public note about a deleted message addressed to
+   * nobody, standing in the channel for half a minute. The removal itself is
+   * unaffected: a webhook advert is exactly what `decide` refuses to exempt.
+   */
+  it('does not try to DM a webhook, which has nobody behind it', async () => {
+    const seam = notices()
+
+    await notifier(seam, msg({ webhookId: '777777777777777777' }))('server-listing')
+
+    expect(seam.dm).not.toHaveBeenCalled()
+    expect(seam.fallback).not.toHaveBeenCalled()
+  })
+
+  it('puts the rule token in the notice, whatever the wording becomes', () => {
+    // THE ONE THING A REWRITE MAY NOT DROP. Everything else about this string is
+    // the owner's to choose; the token is what ties a member's copy to the
+    // journal line and the admin channel line about the same removal.
+    for (const why of REASONS) expect(removalNotice(why)).toContain(why)
+  })
+
+  /**
+   * WHICH MESSAGE FIRED, PINNED THROUGH `COPY` RATHER THAN THROUGH ITS PROSE.
+   * This is the whole reason the record is exported. src/commands/sticky.ts
+   * asserted fragments of its placeholder text and nine cases broke the day the
+   * real wording landed; comparing against `COPY[why]` asks the only question
+   * worth asking — did the notice for THIS reason go out — and keeps asking it
+   * after somebody rewrites every string in the record.
+   */
+  it('sends the copy belonging to the rule that fired', () => {
+    for (const why of REASONS) expect(removalNotice(why)).toContain(COPY[why])
+  })
+
+  it('does not send some other reason as well', async () => {
+    const seam = notices()
+
+    await notifier(seam, msg())('foreign-ip')
+
+    const [, sent] = seam.dm.mock.calls[0] ?? []
+    expect(sent).toContain(COPY['foreign-ip'])
+    for (const why of REASONS.filter((other) => other !== 'foreign-ip')) {
+      expect(sent).not.toContain(COPY[why])
+    }
+  })
+
+  it('carries real wording for every reason, and no drafts', () => {
+    // THIS CASE HAS BEEN INVERTED, AND THE OLD ONE DID ITS JOB. It used to
+    // assert every string still said PLACEHOLDER, so that supplying wording
+    // would fail loudly rather than let a draft reach a member's DMs. The owner
+    // supplied it, this failed, and here is what the failure was for.
+    //
+    // It now guards the opposite and more useful thing: a reason added later
+    // with no wording written for it. That is the same mistake in the other
+    // direction, and it is the one nobody would notice, because the notice
+    // would go out reading like a bug report to whoever posted the message.
+    for (const [key, draft] of Object.entries(COPY)) {
+      if (typeof draft !== 'string') continue
+      expect(draft, key).not.toContain('PLACEHOLDER')
+      expect(draft.trim(), key).not.toBe('')
+    }
+
+    // Every reason the matcher can return has a sentence, derived from the
+    // reason list rather than typed out, so a new DeleteReason fails here.
+    for (const why of REASONS) {
+      const notice = removalNotice(why)
+      expect(notice, why).not.toContain('PLACEHOLDER')
+      expect(notice, why).toContain(COPY[why])
+      expect(notice, why).toContain(`(rule: ${why})`)
+    }
+  })
+
+  /**
+   * THE NOTICE NEVER REPEATS WHAT WAS REMOVED, AND THAT IS A SAFETY PROPERTY.
+   * Every rule that can fire here matched a WORKING link, and the fallback posts
+   * into the very channel the message was taken out of — so a notice that quoted
+   * the match would repost the advert. The verdict does not carry the text (see
+   * links.ts), which is what makes this true; this case is what would notice a
+   * later wording reaching for it anyway.
+   */
+  it('names the reason and never the thing that matched', async () => {
+    const seam = dmsClosed()
+    const advert = 'join us at 5.6.7.8'
+
+    await notifier(seam, msg({ text: advert }))('foreign-ip')
+
+    const [, , posted] = seam.fallback.mock.calls[0] ?? []
+    expect(posted).not.toContain('5.6.7.8')
+    expect(posted).toContain('foreign-ip')
+  })
+})
+
+/**
+ * A BOUNCE IS NOT THE SAME AS A BAD MINUTE, AND ONLY ONE OF THEM BUYS A PUBLIC
+ * POST.
+ *
+ * The fallback tags a member, in the channel they posted in, about a message of
+ * theirs that was deleted. That is worth doing when the private route can NEVER
+ * work — DMs from server members are off — and is not worth doing because
+ * Discord returned a 429 or a 500 on one request. The two arrive at the same
+ * seam as a rejection and are told apart only by the error's `code`, which is
+ * why every case here throws a real `DiscordAPIError`.
+ */
+describe('a DM that bounced, and a DM that merely failed', () => {
+  it('spends the fallback when the recipient has DMs closed', async () => {
+    const seam = notices({
+      dm: () =>
+        Promise.reject(
+          dmFailure(
+            RESTJSONErrorCodes.CannotSendMessagesToThisUser,
+            'Cannot send messages to this user',
+          ),
+        ),
+    })
+
+    await notifier(seam, msg())('foreign-ip')
+
+    expect(seam.fallback).toHaveBeenCalledTimes(1)
+  })
+
+  it('spends it for a recipient there is no mutual guild with', async () => {
+    // The same sentence under a second code — a member who left between the
+    // removal and the notice. Permanent for this send either way, and permanence
+    // is what the fallback is paid for.
+    const seam = notices({
+      dm: () =>
+        Promise.reject(
+          dmFailure(
+            RESTJSONErrorCodes.CannotSendMessagesToThisUserDueToHavingNoMutualGuilds,
+            'Cannot send messages to this user',
+          ),
+        ),
+    })
+
+    await notifier(seam, msg())('foreign-ip')
+
+    expect(seam.fallback).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not post in the channel when the DM hit a rate limit', async () => {
+    const seam = notices({
+      dm: () => Promise.reject(dmFailure(0, 'You are being rate limited.', 429)),
+    })
+
+    await notifier(seam, msg())('link-shortener')
+
+    expect(seam.fallback).not.toHaveBeenCalled()
+  })
+
+  it('does not post in the channel when the DM hit a server error', async () => {
+    const seam = notices({
+      dm: () => Promise.reject(dmFailure(0, 'Internal Server Error', 500)),
+    })
+
+    await notifier(seam, msg())('link-shortener')
+
+    expect(seam.fallback).not.toHaveBeenCalled()
+  })
+
+  it('does not post in the channel when the DM failed for no Discord reason at all', async () => {
+    // A socket hang-up, a bug in the seam, anything that is not a
+    // `DiscordAPIError`. Not known to be permanent, so it does not buy a post.
+    const seam = notices({ dm: () => Promise.reject(new Error('socket hang up')) })
+
+    await notifier(seam, msg())('server-listing')
+
+    expect(seam.fallback).not.toHaveBeenCalled()
+  })
+
+  it('says in the journal that it did not fall back, and why', async () => {
+    const seam = notices({
+      dm: () => Promise.reject(dmFailure(0, 'Internal Server Error', 500)),
+    })
+
+    await notifier(seam, msg())('link-shortener')
+
+    expect(stderr.join('')).toContain('other than closed DMs')
+  })
+})
+
+/**
+ * A BURST OF REMOVALS FROM ONE PERSON IS ONE NOTICE, NOT TWENTY.
+ *
+ * Opening a DM channel is rate-limited per recipient and is one of the more
+ * expensive requests this bot makes, so the wave that most needs the DELETES to
+ * keep landing is exactly the wave that would queue them behind a courtesy note.
+ * The fallback path is worse again: twenty pings in the channel, each standing
+ * half a minute, is the bot doing more to the channel than the adverts did.
+ *
+ * NOTHING ABOUT THE RECORD IS COALESCED — every one of those messages is still
+ * deleted, still logged, and still posted to the admin channel. What is bounded
+ * is how many times one person is told the same thing while they watch it
+ * happen.
+ */
+describe('a burst of removals is not a burst of DMs', () => {
+  it('tells one poster once, however many of their messages go', async () => {
+    const seam = notices()
+    const tell = notifier(seam, msg())
+
+    for (let i = 0; i < 20; i += 1) await tell('link-shortener')
+
+    expect(seam.dm).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not turn a burst into a wall of pings either', async () => {
+    const seam = dmsClosed()
+    const tell = notifier(seam, msg())
+
+    for (let i = 0; i < 20; i += 1) await tell('foreign-ip')
+
+    expect(seam.dm).toHaveBeenCalledTimes(1)
+    expect(seam.fallback).toHaveBeenCalledTimes(1)
+  })
+
+  it('still tells everybody else in the same wave', async () => {
+    // The bound is per poster, not per bot. A raid is several accounts, and
+    // suppressing the second one because the first was just told would be a
+    // notice that stops working exactly when it is most needed.
+    const seam = notices()
+    const other = '222222222222222222'
+
+    await notifier(seam, msg())('link-shortener')
+    await notifier(seam, msg({ authorId: other }))('link-shortener')
+
+    expect(seam.dm).toHaveBeenCalledTimes(2)
+    expect(seam.dm).toHaveBeenCalledWith(AUTHOR, expect.any(String))
+    expect(seam.dm).toHaveBeenCalledWith(other, expect.any(String))
+  })
+
+  it('tells them again once the window has passed', async () => {
+    // Bounded, not silenced. Somebody who is still posting adverts five minutes
+    // later is still told; they are not told once per message.
+    vi.useFakeTimers()
+
+    try {
+      const seam = notices()
+      const tell = notifier(seam, msg())
+
+      await tell('link-shortener')
+      vi.setSystemTime(Date.now() + 61_000)
+      await tell('foreign-ip')
+
+      expect(seam.dm).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('leaves the removals themselves untouched', async () => {
+    // The coalescing is about the courtesy and nothing else. Two messages, two
+    // deletes, two log lines, one DM.
+    const seam = notices()
+    const first = actions({ notify: notifier(seam, msg()) })
+    const second = actions({ notify: notifier(seam, msg()) })
+
+    await handleMessage(msg({ text: 'bit.ly/3xY9k' }), cfg(), first)
+    await handleMessage(msg({ text: 'bit.ly/3xY9k' }), cfg(), second)
+
+    expect(first.remove).toHaveBeenCalledTimes(1)
+    expect(second.remove).toHaveBeenCalledTimes(1)
+    expect(seam.dm).toHaveBeenCalledTimes(1)
+  })
+
+  it('says in the journal that somebody was deliberately not told', async () => {
+    const seam = notices()
+    const tell = notifier(seam, msg())
+
+    await tell('link-shortener')
+    await tell('link-shortener')
+
+    // Info, so stdout: a member deliberately not told is the mechanism working
+    // rather than a fault, and it is recorded so an admin asking "why did they
+    // get no DM" has the line.
+    expect(stdout.join('')).toContain('not telling them again')
+  })
+})
+
+/**
+ * THE FALLBACK IS A MESSAGE IN A MODERATED CHANNEL, AND THE BOT MUST NOT MODERATE
+ * IT.
+ *
+ * This is the loop the feature creates and it did not exist before: until now
+ * the only thing the bot posted into a member-facing channel was nothing at all.
+ * The fallback goes into the very channel the removal happened in, so it arrives
+ * back through `messageCreate` like any other message — and it carries `<@id>`,
+ * and the wording is a placeholder somebody will later replace with a sentence
+ * that may well contain a link. If the bot scanned it, a notice about a removal
+ * could be removed, which would post a notice about THAT.
+ *
+ * `fromSelf` IS WHAT STOPS IT, AND IT IS CHECKED ON THE TEXT ACTUALLY SENT
+ * rather than on a string written here. A case that fed a hand-written line back
+ * through would keep passing after a rewrite made the real one match a rule.
+ *
+ * THE OTHER LISTENER THAT SEES IT IS THE STICKY ENGINE, and it ignores the bot's
+ * own posts for its own reasons — `saw(channelId, fromSelf)` in sticky.ts, tested
+ * there. The delete of the fallback reaches nothing at all: this bot registers no
+ * `messageDelete` listener.
+ */
+describe('the notice the bot posts is not itself moderated', () => {
+  it('skips the fallback line it posted a moment ago', async () => {
+    const seam = dmsClosed()
+
+    await notifier(seam, msg())('foreign-ip')
+
+    const posted = seam.fallback.mock.calls[0]?.[2] ?? ''
+    expect(posted).not.toBe('')
+
+    const own = live({ content: posted })
+    const onward = notices()
+
+    // `selfId` is this message's author, which is what the live path computes
+    // for anything this bot sent.
+    await handleLive(own, AUTHOR, cfg(), liveActions({ notices: onward }))
+
+    expect(own.delete).not.toHaveBeenCalled()
+    expect(onward.dm).not.toHaveBeenCalled()
+    expect(onward.fallback).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * THE DELIVERY, AGAINST THE OPTIONS ACTUALLY HANDED TO DISCORD.
+ *
+ * THE FALLBACK IS THE ONE MESSAGE THIS BOT SENDS THAT PINGS ANYBODY, and
+ * nothing about the STRING says whether it will. `<@id>` renders as the account
+ * either way; only `allowedMentions` on the request decides whether a
+ * notification is delivered. The client-wide default suppresses every mention,
+ * so a fallback that forgot to override it would look correct in the channel,
+ * read correctly in a test that checked the text, and reach nobody — which is
+ * the entire failure this fallback exists to avoid.
+ *
+ * IT IS NARROWED TO ONE ID RATHER THAN TURNED ON, and that half matters more
+ * every time the wording is edited: `{ users: [id] }` means no `@everyone` and
+ * no role ping can be produced by anything a future draft puts in the text.
+ */
+describe('noticeChannel — the DM, and the ping that only the fallback carries', () => {
+  function clientNoticing(
+    dmSend: Mock<(payload: unknown) => Promise<unknown>>,
+    channelSend: Mock<(payload: unknown) => Promise<unknown>>,
+    over: { sendable?: boolean; fetchUserRejects?: unknown } = {},
+  ): Client {
+    return {
+      users: {
+        fetch: () =>
+          over.fetchUserRejects === undefined
+            ? Promise.resolve({ send: dmSend })
+            : Promise.reject(over.fetchUserRejects),
+      },
+      channels: {
+        fetch: () =>
+          Promise.resolve({ isSendable: () => over.sendable !== false, send: channelSend }),
+      },
+    } as unknown as Client
+  }
+
+  const sendSpy = (): Mock<(payload: unknown) => Promise<unknown>> =>
+    vi.fn<(payload: unknown) => Promise<unknown>>(() =>
+      Promise.resolve({ delete: () => Promise.resolve() }),
+    )
+
+  it('sends the DM with every mention suppressed', async () => {
+    const dmSend = sendSpy()
+    const channelSend = sendSpy()
+
+    await noticeChannel(clientNoticing(dmSend, channelSend)).dm(AUTHOR, 'a notice')
+
+    expect(dmSend).toHaveBeenCalledWith({ content: 'a notice', allowedMentions: { parse: [] } })
+    expect(channelSend).not.toHaveBeenCalled()
+  })
+
+  it('pings exactly the poster on the channel fallback and nobody else', async () => {
+    const dmSend = sendSpy()
+    const channelSend = sendSpy()
+
+    await noticeChannel(clientNoticing(dmSend, channelSend)).fallback(
+      CHANNEL,
+      AUTHOR,
+      `<@${AUTHOR}> a notice`,
+    )
+
+    expect(channelSend).toHaveBeenCalledWith({
+      content: `<@${AUTHOR}> a notice`,
+      allowedMentions: { users: [AUTHOR] },
+    })
+  })
+
+  it('rejects rather than posting when the channel cannot be posted in', async () => {
+    // The channel the message was in a moment ago. `notifier` turns this into
+    // one error line; swallowing it here would make a bot that can tell nobody
+    // anything look exactly like a bot with nothing to say.
+    const dmSend = sendSpy()
+    const channelSend = sendSpy()
+    const seam = noticeChannel(clientNoticing(dmSend, channelSend, { sendable: false }))
+
+    await expect(seam.fallback(CHANNEL, AUTHOR, 'a notice')).rejects.toThrow(CHANNEL)
+    expect(channelSend).not.toHaveBeenCalled()
+  })
+
+  it('treats a user it cannot even fetch as a bounced DM', async () => {
+    // A member who left between the removal and the notice. `notifier` reads
+    // any rejection from `dm` as "tell them in the channel instead", so the two
+    // failures do not need telling apart.
+    const dmSend = sendSpy()
+    const channelSend = sendSpy()
+    const seam = noticeChannel(
+      clientNoticing(dmSend, channelSend, { fetchUserRejects: new Error('Unknown User') }),
+    )
+
+    await expect(seam.dm(AUTHOR, 'a notice')).rejects.toThrow('Unknown User')
+  })
+
+  it('takes the fallback back down again, and does not hold the process open', async () => {
+    /**
+     * BOTH HALVES OF THE CLEANUP IN ONE CASE, because each is invisible on its
+     * own. A timer that never fires leaves a permanent public note about a
+     * member's deleted message; a timer that is not `unref`ed makes every deploy
+     * wait half a minute for a courtesy nobody is reading. Fake timers are what
+     * make the first assertable without the test taking thirty seconds.
+     */
+    vi.useFakeTimers()
+
+    try {
+      const remove = vi.fn(() => Promise.resolve())
+      const channelSend = vi.fn<(payload: unknown) => Promise<unknown>>(() =>
+        Promise.resolve({ delete: remove }),
+      )
+
+      await noticeChannel(clientNoticing(sendSpy(), channelSend)).fallback(
+        CHANNEL,
+        AUTHOR,
+        'a notice',
+      )
+
+      expect(remove).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      expect(remove).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('survives the take-down failing, which happens once a message is gone', async () => {
+    // AN UNHANDLED REJECTION OUT OF A BARE TIMER CALLBACK TAKES THE PROCESS
+    // DOWN, and by the time this runs `notifier` has long since returned and
+    // there is nobody left to hand an error to. The warning is the evidence
+    // that the rejection was caught rather than merely not observed here.
+    vi.useFakeTimers()
+
+    const seen: string[] = []
+    setSink((level, message) => {
+      seen.push(`${level} ${message}`)
+      return Promise.resolve()
+    })
+
+    try {
+      const channelSend = vi.fn<(payload: unknown) => Promise<unknown>>(() =>
+        Promise.resolve({ delete: () => Promise.reject(new Error('Unknown Message')) }),
+      )
+
+      await noticeChannel(clientNoticing(sendSpy(), channelSend)).fallback(
+        CHANNEL,
+        AUTHOR,
+        'a notice',
+      )
+
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      expect(seen).toContainEqual(expect.stringContaining('could not take the removal notice'))
+    } finally {
+      setSink(null)
+      vi.useRealTimers()
+    }
   })
 })
 
@@ -1701,7 +2376,57 @@ function live(over: Partial<LiveMessage> = {}): LiveMessage & {
 }
 
 function liveActions(over: Partial<LiveActions> = {}): LiveActions {
-  return { resolve: foreignResolver, announce: null, ...over }
+  return { resolve: foreignResolver, announce: null, notices: notices(), ...over }
+}
+
+/**
+ * The two ways to reach a poster, as spies that reach nobody.
+ *
+ * THE DM SUCCEEDS BY DEFAULT, so the fallback is only exercised by a case that
+ * asks for it. A seam whose default is the failure path would make every
+ * unrelated test post in a channel, and the cases about the fallback would then
+ * be indistinguishable from the ones that merely did not care.
+ */
+function notices(over: Partial<NoticeChannel> = {}): NoticeChannel & {
+  dm: Mock<NoticeChannel['dm']>
+  fallback: Mock<NoticeChannel['fallback']>
+} {
+  return {
+    dm: vi.fn<NoticeChannel['dm']>(over.dm ?? (() => Promise.resolve())),
+    fallback: vi.fn<NoticeChannel['fallback']>(over.fallback ?? (() => Promise.resolve())),
+  }
+}
+
+/**
+ * A DM failure exactly as discord.js raises it.
+ *
+ * A REAL `DiscordAPIError` AND NOT A PLAIN `Error`, WHICH IS NOW LOAD-BEARING.
+ * `dmsAreShut` separates a bounce from a bad minute by reading `code` off a
+ * `DiscordAPIError`, so a fake that threw `new Error('Cannot send messages to
+ * this user')` would exercise the NOT-a-bounce branch while reading like the
+ * bounce case — a test that passes for the wrong reason and would keep passing
+ * if the discrimination were deleted.
+ */
+function dmFailure(code: number, message: string, status = 403): DiscordAPIError {
+  return new DiscordAPIError({ code, message }, code, status, 'POST', DM_URL, {})
+}
+
+const DM_URL = 'https://discord.com/api/v10/channels/1/messages'
+
+/** A DM seam that always bounces, which is a member with DMs closed. */
+function dmsClosed(): NoticeChannel & {
+  dm: Mock<NoticeChannel['dm']>
+  fallback: Mock<NoticeChannel['fallback']>
+} {
+  return notices({
+    dm: () =>
+      Promise.reject(
+        dmFailure(
+          RESTJSONErrorCodes.CannotSendMessagesToThisUser,
+          'Cannot send messages to this user',
+        ),
+      ),
+  })
 }
 
 /**
@@ -1733,7 +2458,19 @@ describe('the link policy reads the same flattened text the invite scan does', (
     // A filename cannot hold a slash, so the form that shows up here is the bare
     // address — which is exactly why the policy does not need a `fivem://`
     // wrapper to see one.
-    ['an attachment name', scannable({ attachments: attached(attachment({ name: 'join-us-at-5.6.7.8.png' })) })],
+    //
+    // THE PORT IS IN THE NAME FOR A REASON AND THE CASE IS WEAKER WITHOUT IT.
+    // This row used to read `join-us-at-5.6.7.8.png`, and links.ts no longer
+    // removes that: an address sitting immediately before a file extension is
+    // read as part of the filename, because that is the only way to stop the bot
+    // deleting ShadowPlay clips, whose default name ends in a four-field clock.
+    // See the ShadowPlay rows in links.test.ts for the full trade. What this
+    // case is here to prove is that the attachment SURFACE is read at all, so it
+    // uses a name where the address is unambiguously an address.
+    [
+      'an attachment name',
+      scannable({ attachments: attached(attachment({ name: 'join_us_at_5.6.7.8_30120.png' })) }),
+    ],
     ['a poll question', scannable({ poll: poll('who is moving to 5.6.7.8?') })],
     [
       'a forwarded message',
@@ -1788,6 +2525,31 @@ describe('handleLive — from a gateway message to a removal', () => {
     await handleLive(message, AUTHOR, cfg(), liveActions())
 
     expect(message.delete).not.toHaveBeenCalled()
+  })
+
+  /**
+   * THE NOTICE, THROUGH THE FRONT DOOR. `notifier` is proven on its own above;
+   * this is the wiring — that `handleLive` builds one at all, and builds it
+   * against the SAME author and channel the verdict was made about rather than
+   * a second reading of the live message that could disagree with it.
+   */
+  it('tells the poster which rule removed their message', async () => {
+    const seam = notices()
+    const message = live({ content: 'come play at 5.6.7.8.' })
+
+    await handleLive(message, null, cfg(), liveActions({ notices: seam }))
+
+    expect(message.delete).toHaveBeenCalledTimes(1)
+    expect(seam.dm).toHaveBeenCalledWith(AUTHOR, expect.stringContaining('foreign-ip'))
+  })
+
+  it('tells nobody anything when nothing was removed', async () => {
+    const seam = notices()
+
+    await handleLive(live({ content: 'good game everyone' }), null, cfg(), liveActions({ notices: seam }))
+
+    expect(seam.dm).not.toHaveBeenCalled()
+    expect(seam.fallback).not.toHaveBeenCalled()
   })
 
   /**
@@ -2780,7 +3542,7 @@ describe('a guild id the bot is not in is fatal to moderation', () => {
     expect(acts.remove).not.toHaveBeenCalled()
 
     const message = live()
-    await mod.handleLive(message, null, cfg(), { resolve, announce: null })
+    await mod.handleLive(message, null, cfg(), liveActions({ resolve }))
 
     expect(message.delete).not.toHaveBeenCalled()
     expect(resolve).not.toHaveBeenCalled()
@@ -2802,7 +3564,7 @@ describe('a guild id the bot is not in is fatal to moderation', () => {
       fetch: () => Promise.resolve(live({ content: 'now with discord.gg/sneaky in it' })),
     })
 
-    await mod.handleLive(partial, null, cfg(), { resolve, announce: null })
+    await mod.handleLive(partial, null, cfg(), liveActions({ resolve }))
 
     expect(partial.fetch).not.toHaveBeenCalled()
     expect(partial.delete).not.toHaveBeenCalled()
@@ -2839,6 +3601,22 @@ describe('the file header', () => {
     expect(header).toMatch(/login/i)
     expect(header).toMatch(/restart loop/i)
     expect(header).not.toContain('is indistinguishable from a bot whose regex is')
+  })
+
+  /**
+   * A HEADER THAT DESCRIBES THE OPPOSITE OF WHAT THE FILE DOES IS WORSE THAN NO
+   * HEADER. This one said "THE BOT NEVER TALKS TO MEMBERS. No DM, no reply" and
+   * called it a standing instruction from the owner — which it was, until he
+   * replaced it. Anybody reading the file to find out whether a notice was
+   * deliberate would have been told, in capitals, that it could not exist.
+   */
+  it('no longer claims the bot never talks to members', async () => {
+    const source = await readFile(new URL('./client.ts', import.meta.url), 'utf8')
+    const header = source.slice(0, source.indexOf('export interface ScannedMessage'))
+
+    expect(header).not.toContain('THE BOT NEVER TALKS TO MEMBERS')
+    expect(header).toMatch(/which rule/i)
+    expect(header).toContain('PLACEHOLDER')
   })
 })
 

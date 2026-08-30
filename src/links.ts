@@ -33,9 +33,10 @@
  * that comes back unresolved and nothing is ever deleted on it, so the pattern
  * can afford to be loose. Here there is no confirmation step: a match IS the
  * removal. A rule that is too loose deletes a member's message about nothing,
- * with no way for them to tell why. So the patterns below are anchored on BOTH
- * sides, the allowlist exception is anchored the same way the match is, and an
- * octet is at most three digits because a four-digit group is not an address.
+ * with no way for them to tell why — and the member is a real person who now
+ * distrusts the bot, while the bypass that gets away costs one advert standing
+ * for an hour. When those two pull in opposite directions below, the false
+ * positive is the one that decides.
  *
  * WHAT IS DELIBERATELY NOT CARRIED OUT OF HERE: THE TEXT THAT MATCHED. A verdict
  * is a reason and nothing else. Every rule here matches a WORKING LINK, and the
@@ -73,11 +74,22 @@
  * host is resolved, so `cfx。re/join/x` is not a lookalike of the real link;
  * after mapping it IS the real link. A closed set of three, spelled as escapes
  * because three dots that differ only in width are indistinguishable in a diff.
+ * `fold` below folds two of the three away before any pattern runs; U+3002 is
+ * the one NFKC leaves alone, which is measured and is why this class stays.
  *
  * `SLASHES` — `//` is not a typo to a URL parser and `\` folds to `/` for
  * special schemes. A character class rather than the alternation `(?:\\?/|\\)+`
  * that says the same thing, because that form gives a run of k separators 2^k
  * parses and is the catastrophic backtracking the timed test guards.
+ *
+ * `MAYBE_SLASHES` — the same class with `*` rather than `+`, and it exists for
+ * exactly one place: the gap between a scheme's colon and its path. `fivem:` is
+ * a URI scheme, and a URI scheme's colon may be followed by an OPAQUE path with
+ * no separators at all — `fivem:connect/x` is the same request to the same
+ * handler as `fivem://connect/x`. Written as `[\\/]*` and NOT as `${SLASHES}?`,
+ * which is a different pattern with the same reading: appending `?` to `+`
+ * yields the LAZY `+?`, which still demands one separator. The star is one
+ * character class with one parse, so it keeps the property `SLASHES` exists for.
  *
  * `AFTER_HOST` — everything a URL legally allows between a host and a path: the
  * FQDN root dot, an optional `:port` whose digits may be absent, then the
@@ -91,6 +103,7 @@
 const ESC = '\\\\?'
 const DOT = `${ESC}[.\\u3002\\uFF0E\\uFF61]`
 const SLASHES = `[\\\\/]+`
+const MAYBE_SLASHES = `[\\\\/]*`
 const AFTER_HOST = `(?:${DOT})?(?:${ESC}:\\d*)?${SLASHES}`
 
 /**
@@ -100,7 +113,8 @@ const AFTER_HOST = `(?:${DOT})?(?:${ESC}:\\d*)?${SLASHES}`
  * `mybit.ly/x` and `notcfx.re/join/x` are other people's domains, and a label
  * ends at a dot, so a preceding letter, digit or hyphen means this is the tail
  * of a longer label. A preceding dot is fine — that is a subdomain, and a
- * subdomain of a shortener belongs to the shortener.
+ * subdomain of a shortener USUALLY belongs to the shortener; `SHORTENER_HOSTS`
+ * below is where the word "usually" is paid for.
  *
  * `_` IS NOT IN IT, for the reason invites.ts gives: `_bit.ly/x_` is how
  * Discord's markdown writes italics, it renders as a working link, and treating
@@ -147,6 +161,30 @@ export type LinkReason = 'fivem-connect' | 'server-listing' | 'foreign-ip' | 'li
  * tweet's author pointed it, which may be a FiveM server. It fails the rule, so
  * it is in.
  *
+ * `linktr.ee` WAS PUT TO THE RULE AND CAME BACK OUT, AND THAT IS THE SECOND
+ * WORKED EXAMPLE OF THE LINE. It is the domain a poacher reaches for after the
+ * plain shorteners stop working, so leaving it out is a real cost and is stated
+ * as one. But it does not REDIRECT: `linktr.ee/<name>` lands on a Linktree page
+ * and stays there, which is the `youtu.be` answer word for word — the domain
+ * says exactly where you are going, and reaching a server from it takes a second
+ * click on a page the reader is already looking at. `t.co` is in because it
+ * carries the reader to the advertiser's URL without stopping; Linktree stops.
+ * The same reading keeps out every other link-in-bio page for the same reason,
+ * and it is why `linktr.ee` has a test of its own rather than only an absence:
+ * this is the entry somebody adds by taste on a bad afternoon, and the rule has
+ * to be what says no rather than whoever reviews that diff. If the owner would
+ * rather delete Linktree posts, that is a decision about this guild and not a
+ * reading of this rule, and the line to add is one line.
+ *
+ * THE SEVEN ADDED AFTER THE FIRST SWEEP — `bl.ink`, `clck.ru`, `lnk.to`,
+ * `short.gy`, `surl.li`, `tiny.one`, `urlz.fr` — were each asked the same
+ * question and each answered it the same way: every one of them is a generic
+ * redirector whose path is an opaque slug, so the domain says nothing about the
+ * destination and the bot would have to fetch it to find out. They are not a
+ * new class; they are the class this list already names, spelled seven more
+ * ways, and they were missing because the list was assembled from the ones
+ * anybody could remember.
+ *
  * THE DISCORD REDIRECTORS ARE WHY THIS RULE EXISTS AT ALL. `dsc.gg/<name>`
  * redirects to a Discord invite, and invites.ts cannot see it: nothing in the
  * message says "discord", there is no invite code to extract, and no lookup
@@ -164,7 +202,9 @@ export type LinkReason = 'fivem-connect' | 'server-listing' | 'foreign-ip' | 'li
 export const SHORTENERS: readonly string[] = [
   'bit.ly',
   'bitly.com',
+  'bl.ink',
   'buff.ly',
+  'clck.ru',
   'cutt.ly',
   'discord.link',
   'dsc.gg',
@@ -172,17 +212,50 @@ export const SHORTENERS: readonly string[] = [
   'goo.gl',
   'invite.gg',
   'is.gd',
+  'lnk.to',
   'ow.ly',
   'rb.gy',
   'rebrand.ly',
+  'short.gy',
   'shorturl.at',
   'shrtco.de',
+  'surl.li',
   't.co',
   't.ly',
   'tiny.cc',
+  'tiny.one',
   'tinyurl.com',
+  'urlz.fr',
   'v.gd',
 ]
+
+/**
+ * The hosts UNDER a shortener domain that are not shorteners.
+ *
+ * "A SUBDOMAIN OF A SHORTENER BELONGS TO THE SHORTENER" IS TRUE OF `goo.gl` AND
+ * FALSE OF `app.goo.gl`, AND THAT COST A MEMBER THEIR MESSAGE. `goo.gl/<id>`
+ * is Google's dead URL shortener and says nothing about where it lands.
+ * `maps.app.goo.gl/<id>` is the link the Google Maps share sheet produces and
+ * `photos.app.goo.gl/<id>` is the one Google Photos produces; each can only
+ * reach the product it is named after. That is the SHORTENERS rule above,
+ * applied without an exception for the fact that the host happens to end in one
+ * of the twenty — exactly the reading that keeps `youtu.be` out of the list.
+ *
+ * SO THIS IS NOT A CARVE-OUT, IT IS THE SAME TEST ASKED OF THE WHOLE HOST rather
+ * than of its last two labels. The unit a reader judges is the host they can
+ * see, and the host they can see here says Maps or Photos.
+ *
+ * IT DOES NOT GENERALISE TO `app.goo.gl` ITSELF, WHICH IS THE INTERESTING PART.
+ * A bare `<name>.app.goo.gl` is a Firebase Dynamic Link, and where one of those
+ * lands is chosen by whoever registered the app — so it fails the rule and stays
+ * matched. Only the two hosts Google itself runs are named, and the reason a
+ * third would be added is the same reason: the host names its destination.
+ *
+ * MATCHED AS A SUFFIX ON A LABEL BOUNDARY, so `x.maps.app.goo.gl` is exempt (it
+ * is under a host only Google controls) and `evilmaps.app.goo.gl` is not (it is
+ * a different label, and it is somebody's Firebase link).
+ */
+export const SHORTENER_HOSTS: readonly string[] = ['maps.app.goo.gl', 'photos.app.goo.gl']
 
 /**
  * A shortened link: one of the domains above, a host boundary, and at least one
@@ -197,11 +270,16 @@ export const SHORTENERS: readonly string[] = [
  * shortener's slug is not compared against anything here, so there is no reason
  * to be strict about its case and one good reason not to be: `BIT.LY/3XY9K`
  * loads the same page.
+ *
+ * THE DOMAIN IS CAPTURED AND THE PATTERN IS GLOBAL because `shortener` has to
+ * look at the host each match sits in — see `SHORTENER_HOSTS`. `matchAll` builds
+ * its own regex from this one and leaves this constant's `lastIndex` alone,
+ * which is what keeps the statelessness cases green.
  */
 const SHORTENER = new RegExp(
-  `${NOT_A_LABEL_TAIL}(?:${SHORTENERS.map((host) => host.split('.').join(DOT)).join('|')})` +
+  `${NOT_A_LABEL_TAIL}(${SHORTENERS.map((host) => host.split('.').join(DOT)).join('|')})` +
     `${AFTER_HOST}[A-Za-z0-9]`,
-  'i',
+  'gi',
 )
 
 /**
@@ -267,13 +345,21 @@ const FIVEM_DETAIL = new RegExp(
  * `3.130.92.28.evil.com` and not the allowlisted prefix of it. Greedy is the
  * whole of that: there is nothing left for the exception to match.
  *
+ * ONE OR MORE, NOT ZERO OR MORE, AND THE DIFFERENCE WAS A LIVE FALSE POSITIVE.
+ * With `*` the target could be the empty string, `isOurs('')` was false, and so
+ * the bare text `fivem://connect/` — which is what somebody types when they are
+ * EXPLAINING how to connect, with the address on the next line or in a
+ * screenshot — was removed as a connect link to another server. A connect link
+ * to nowhere is not a link to anywhere; see `fivemConnect`, which also drops a
+ * target that normalises away to nothing.
+ *
  * TWO DISJOINT ALTERNATIVES, WHICH IS NOT AN ACCIDENT. `${LABEL}` cannot begin
  * with a backslash or a dot and `${DOT}` cannot begin with anything else, so no
  * string has two parses and a run of k of them cannot be walked 2^k ways. This
  * is the property `SLASHES` exists to preserve, in a second place; see the
  * timed test.
  */
-const FIVEM_TARGET = `(?:${LABEL}|${DOT})*`
+const FIVEM_TARGET = `(?:${LABEL}|${DOT})+`
 
 /**
  * `fivem://connect/<target>`.
@@ -297,50 +383,170 @@ const FIVEM_TARGET = `(?:${LABEL}|${DOT})*`
  * backslash before punctuation, so `fivem\://connect/x` renders as the link and
  * arrives here with the backslash still on it. A rule applied to one delimiter
  * out of three is the same bug in a new place.
+ *
+ * THE SEPARATORS AFTER THE COLON ARE OPTIONAL, AND THE `+` THERE WAS A BYPASS
+ * COSTING TWO KEYSTROKES. `fivem:///connect/x` fired and `fivem://connect/x`
+ * fired, but `fivem:connect/x` — one colon, no slashes — did not, and that form
+ * is not a typo: RFC 3986 calls it the opaque path, every scheme has one, and
+ * the protocol handler this scheme is registered to receives the identical
+ * string either way. There was no rule behind the `+`; it was the shape of the
+ * two spellings somebody happened to write down. See `MAYBE_SLASHES` for why
+ * this is a `*` rather than a `?` hung off `SLASHES`.
+ *
+ * THE SEPARATOR BEFORE THE TARGET STAYS MANDATORY, WHICH IS NOT THE SAME
+ * QUESTION. `connect` there is a path segment and not a scheme, so what follows
+ * it has to be a segment boundary — without one, `fivem:connectplay.evil.com`
+ * would read `connect` as a prefix of a word and pull `play.evil.com` out of the
+ * middle of it.
  */
 const FIVEM_CONNECT = new RegExp(
-  `${NOT_A_LABEL_TAIL}fivem${ESC}:${SLASHES}connect${SLASHES}(${FIVEM_TARGET})`,
+  `${NOT_A_LABEL_TAIL}fivem${ESC}:${MAYBE_SLASHES}connect${SLASHES}(${FIVEM_TARGET})`,
   'gi',
 )
 
 /**
- * Anything shaped like an IPv4 address.
+ * One octet: a number from 0 to 255 with no leading zero.
+ *
+ * THE RANGE AND THE LEADING ZERO ARE ONE RULE AND THEY ARE HERE FOR ONE CASE.
+ * NVIDIA ShadowPlay — the capture button every GTA player already has bound —
+ * names its clips `Grand Theft Auto V 2026.08.30 - 14.22.05.03.mp4`. The tail of
+ * that filename is `14.22.05.03`: four groups, each one to three digits, each
+ * under 255. The old pattern read it as an address and the bot deleted the clip,
+ * on a GTA server, where clips are most of what gets posted. An attachment's
+ * filename is a scanned surface — client.ts reads it deliberately, because
+ * `discord.gg-x3.png` is an advert that never appears in `content` — so there is
+ * no fixing this by looking somewhere else.
+ *
+ * `05` AND `03` ARE WHAT MAKE IT NOT AN ADDRESS. A leading zero is not
+ * canonical dotted-quad: nobody pastes `14.22.05.03` to be connected to, every
+ * client that renders an address renders `14.22.5.3`, and the WHATWG URL parser
+ * has rejected leading zeros outright since 2021 — measured, `new URL` throws on
+ * `http://0300.0400.0500.0600/`. A zero-padded field is a CLOCK, and that is
+ * what ShadowPlay is writing there.
+ *
+ * A SINGLE `0` IS STILL AN OCTET, so `0.0.0.0` and `127.0.0.1` are untouched by
+ * this and are still removed. The rule is about a zero that PADS, not about the
+ * digit.
+ *
+ * THE RANGE CHECK RIDES ALONG BECAUSE THE ALTERNATION THAT REJECTS `05` IS THE
+ * SAME ONE THAT REJECTS `999`, and the file used to argue against it — "a
+ * carve-out is a bypass with a justification attached". That argument was about
+ * carving out addresses that WORK (loopback, the private ranges), and it still
+ * stands for those. `999.1.1.1` is not an address anyone can connect to in any
+ * spelling, so refusing it removes no reachable destination; what it removes is
+ * a class of version string and score line that a member can now post.
+ */
+const OCTET = `(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)`
+
+/**
+ * Anything shaped like an IPv4 address a person could actually connect to.
  *
  * ANY SUCH STRING IS REMOVED UNLESS IT IS ONE OF OURS, AND THERE ARE NO CARVE
- * OUTS. Not for the private ranges, not for loopback, not for anything that
- * could be read as a version number: `127.0.0.1`, `192.168.1.1` and `1.0.0.1`
- * were each asked about and each answered the same way, because those
- * discussions do not happen in this guild. This is a game community, not a
- * support forum, and the only reason four dotted numbers appear in it is to tell
- * somebody where to connect.
+ * OUTS FOR WHAT AN ADDRESS MEANS. Not for the private ranges, not for loopback,
+ * not for anything that could be read as a version number: `127.0.0.1`,
+ * `192.168.1.1` and `1.0.0.1` were each asked about and each answered the same
+ * way, because those discussions do not happen in this guild. This is a game
+ * community, not a support forum, and the only reason four dotted numbers appear
+ * in it is to tell somebody where to connect.
  *
  * NO `fivem://` WRAPPER IS NEEDED. A bare address in prose is the form people
  * actually post — the scheme is a convenience, not the advert.
  *
- * AN OCTET IS ONE TO THREE DIGITS AND THE MATCH IS FENCED BY `(?<!\d)` AND
- * `(?!\d)`, WHICH IS THE ONE PLACE THIS FILE IS STRICT RATHER THAN LOOSE. Those
- * two fences are what stop `1.2.3.4567` matching as `1.2.3.456` and
- * `2024.10.5.1` matching as `024.10.5.1` — neither is an address anybody can
- * connect to, and a match here is a deletion with no confirmation step behind
- * it. There is no range check on top of that: `999.1.1.1` is not a real address
- * either, but rejecting it would be a carve-out, and a carve-out is a bypass
- * with a justification attached.
+ * THE FENCES ARE THE WHOLE OF "FOUR GROUPS, NOT FOUR OF SEVEN", AND THE OLD ONES
+ * WERE HALF THE RULE. `(?<!\d)` and `(?!\d)` stop `1.2.3.4567` matching as
+ * `1.2.3.456`, and they always did. What they never stopped is a quad found
+ * INSIDE a longer dotted run: `rule 1.2.3.4.5` matched at `1.2.3.4`,
+ * `laps: 1.02.3.99` matched, and `stamp 2026.08.30.14.22.05` matched at
+ * `08.30.14.22` — four numbers that are four fields of something else. A digit
+ * fence cannot see that, because the character in the way is a DOT. So there are
+ * four fences now, one pair per side: no digit adjacent, and no
+ * digit-then-separator adjacent either. `(?<!\d${DOT})` is what says "the dot to
+ * my left continues a number, so I am in the middle of something".
+ *
+ * A VARIABLE-LENGTH LOOKBEHIND, WHICH JAVASCRIPT ALLOWS AND MOST FLAVOURS DO
+ * NOT. `${DOT}` carries `ESC`'s optional backslash, so the assertion is two or
+ * three characters wide. V8 has supported this since 2018 and node 24 is the
+ * only engine this runs on; the alternative is spelling the same fence twice.
  *
  * THE VALUES ARE NOT CHECKED AGAINST THE ALLOWLIST HERE. The pattern's job is to
- * find every candidate; whether one is exempt is a question about the characters
- * on either side of it, which a regex alternative would have to encode twice.
- * See `foreignIp`.
+ * find every candidate; whether one is exempt — and whether it is an address at
+ * all rather than the middle of a filename — is a question about the characters
+ * on either side of it. See `foreignIp`.
  *
  * GLOBAL, AND ITERATED WITH `matchAll` RATHER THAN `test`. A global regex
  * carries `lastIndex` between calls, so `test` on a module-level constant
  * answers differently on the second call with the same input — the classic form
  * of that bug scans every other message, and there is a case pinning it.
- * `FIVEM_CONNECT` is global for the same reason, because it too has to hand back
- * something. The three that are NOT global — the shortener and the two
- * listings — are the three that are only ever asked whether they match at all,
- * so they hold no state that could survive the question.
+ * `FIVEM_CONNECT` and `SHORTENER` are global for the same reason, because they
+ * too have to hand something back. The two that are NOT global — the listings —
+ * are the two that are only ever asked whether they match at all, so they hold
+ * no state that could survive the question.
  */
-const IPV4 = new RegExp(`(?<!\\d)\\d{1,3}(?:${DOT}\\d{1,3}){3}(?!\\d)`, 'g')
+const IPV4 = new RegExp(
+  `(?<!\\d)(?<!\\d${DOT})${OCTET}(?:${DOT}${OCTET}){3}(?!\\d)(?!${DOT}\\d)`,
+  'g',
+)
+
+/**
+ * ONE IPv4 ADDRESS AND NOTHING ELSE, in exactly the spelling `IPV4` can produce.
+ *
+ * EXPORTED FOR config.ts, WHICH IS THE ONLY WAY THE TWO STAY THE SAME NOTION.
+ * `BLITZ_SERVER_IPS` is checked for shape at boot so that a typo stops the
+ * process instead of quietly becoming an allowlist line that exempts nothing,
+ * and that check used to be its own regex over there: one to three digits per
+ * octet, no range, no leading-zero rule. It therefore ACCEPTED `999.1.1.1` and
+ * `014.22.5.3` — two spellings this matcher can never produce, so both would
+ * have sat in the config looking like protection and exempting nothing. A
+ * comment claiming the two notions were the same one is not the same one. This
+ * is.
+ *
+ * PLAIN `\.` AND NOT `DOT`, BECAUSE AN ALLOWLIST ENTRY IS NOT A MESSAGE. The
+ * unicode separators and the markdown escape are things a poster writes; an
+ * operator writes this into a systemd unit, and `plainIp` has already folded a
+ * matched address to this spelling before either is compared.
+ */
+export const IPV4_ADDRESS = new RegExp(`^${OCTET}(?:\\.${OCTET}){3}$`)
+
+/**
+ * IPv6 IS NOT MATCHED, AND THIS IS THE DECISION RATHER THAN THE ABSENCE OF ONE.
+ *
+ * WRITTEN DOWN BECAUSE AN UNSTATED GAP IS THE ONE NOBODY REVISITS. `connect to
+ * 2001:db8::1` and `fivem://connect/[2001:db8::1]:30120` are both kept today,
+ * and until this paragraph existed the only way to find that out was to try it.
+ *
+ * IT IS NOT THE SAME SHAPE AS THE DECIMAL AND HEX SPELLINGS, WHICH ARE ALSO
+ * DELIBERATELY NOT CAUGHT — see the rows for them in the tests. Those are left
+ * because the FiveM client will not take them: an advert written as
+ * `http://84281096/` cannot be acted on without a browser and a conversion, so
+ * the rule would delete crash dumps and player ids every day to close a hole
+ * nobody can walk through. That argument does NOT transfer. Cfx.re staff state
+ * on the forum that `connect [::1]:30120` in the client console works, so an
+ * IPv6 advert is actionable in a way a decimal one is not. This gap is real.
+ *
+ * IT IS LEFT OPEN ANYWAY, ON THREE COUNTS, AND ANY ONE OF THEM CHANGING IS
+ * GROUNDS TO REOPEN IT:
+ *
+ *   1. THE ALLOWLIST CANNOT HOLD ONE. `BLITZ_SERVER_IPS` is shape-checked as
+ *      IPv4 by `IPV4_ADDRESS` above, so a rule that removed IPv6 addresses would
+ *      have no way to spell an exemption for OURS. The first time this guild's
+ *      server answered on IPv6 the bot would delete the message naming it, and
+ *      the only fix would be a code change — which is the exact failure the
+ *      allowlist is configuration to avoid.
+ *   2. COMPARING TWO OF THEM IS NOT STRING EQUALITY. `2001:db8::1`,
+ *      `2001:0db8:0000:0000:0000:0000:0000:0001` and `::FFFF:1.2.3.4` are one
+ *      address in three spellings, so an exemption needs a canonicaliser, not a
+ *      `.includes`. That is a real piece of code with its own edges, and every
+ *      one of its bugs is a deleted message.
+ *   3. THE FORM BARELY EXISTS IN THE FIELD. The server browser does not resolve
+ *      IPv6, FXServer has open bugs against IPv6-only setups, and a FiveM server
+ *      being advertised into this guild is behind an IPv4 address or a cfx code.
+ *      The benefit today is close to nothing.
+ *
+ * WHAT WOULD BE BUILT IF IT WERE BUILT: a strict pattern only — eight groups, or
+ * the `::` compression — never a loose colon run, because `14:22:35` is a
+ * timestamp and `00:1A:2B:3C:4D:5E` is a MAC address, and both are six or fewer
+ * groups with no `::`, which strict IPv6 rejects and a loose rule would not.
+ */
 
 /** One character that can appear inside a hostname label. */
 const LABEL_CHAR = /[A-Za-z0-9-]/
@@ -350,19 +556,28 @@ const LABEL_CHAR = /[A-Za-z0-9-]/
  *
  * SPELLED AS ESCAPES, like `DOT` and for the same reason: three dots that differ
  * only in width are three characters nobody can tell apart in a diff, and the
- * fences below decide whether the owner's own server is exempt.
+ * boundary work below decides whether the owner's own server is exempt.
  */
 const DOT_CHARS = '.\u3002\uFF0E\uFF61'
 
 /**
- * A well-formed percent escape. Global because `percentDecode` replaces every
- * one of them; `String.prototype.replace` resets `lastIndex` on a global regex
- * itself, so this constant carries no state between calls.
+ * A run of percent escapes. Global because `percentDecode` replaces every one of
+ * them; `String.prototype.replace` resets `lastIndex` on a global regex itself,
+ * so this constant carries no state between calls.
+ *
+ * A RUN AND NOT A SINGLE ESCAPE, WHICH IS THE WHOLE OF THE UTF-8 FIX. One
+ * character outside ASCII is two to four escapes that only mean anything
+ * together: `%E3%80%82` is U+3002, and decoding it a byte at a time produces
+ * three characters of mojibake that no pattern here matches. See `percentDecode`.
  */
-const PERCENT_ESCAPE = /%([0-9A-Fa-f]{2})/g
+const PERCENT_RUN = /(?:%[0-9A-Fa-f]{2})+/g
+
+/** One decoder for the whole module; it holds no state between calls. */
+const UTF8 = new TextDecoder()
 
 /**
- * The message as a URL parser would read it: ONE pass of percent-decoding.
+ * The message as a URL parser would read it: ONE pass of percent-decoding, and
+ * the bytes read as UTF-8.
  *
  * THE SAME BYPASS THAT invites.ts CLOSES, IN FOUR MORE PLACES. `bit%2Ely/x`,
  * `cfx%2Ere/join/x` and `%31%32%37.0.0.1` are the host dot and the digits
@@ -371,41 +586,254 @@ const PERCENT_ESCAPE = /%([0-9A-Fa-f]{2})/g
  * Discord's host. Teaching each pattern about `%` instead would mean four
  * character classes that each match a string no client can load.
  *
+ * DECODED AS UTF-8 AND NOT ONE BYTE AT A TIME, WHICH WAS A WORKING BYPASS.
+ * `String.fromCharCode` per escape turns `cfx%E3%80%82re` into three Latin-1
+ * characters — mojibake that matches nothing — while `new URL` resolves the same
+ * text to the host `cfx.re`, measured. Every non-ASCII separator this file
+ * already knows about has a percent spelling, so the byte-wise decode was a
+ * three-escape way around the rule that exists to catch them.
+ *
  * ONCE, NOT TO A FIXED POINT, because a browser decodes a path once. `%2561` is
  * the literal text `%61` to every client that will ever load it.
  *
- * BYTE-WISE AND DELIBERATELY NOT `decodeURIComponent`, which throws on the whole
- * string for one malformed escape — so `100% sure, bit.ly/x` would take the pass
- * down with it, a bypass costing four characters of prose.
+ * STILL NOT `decodeURIComponent`, which throws on the whole string for one
+ * malformed escape — so `100% sure, bit.ly/x` would take the pass down with it,
+ * a bypass costing four characters of prose. This decodes each well-formed RUN
+ * and leaves everything else exactly as posted; a run whose bytes are not valid
+ * UTF-8 comes back as U+FFFD, which matches nothing here and is no worse than
+ * the mojibake it replaces.
  */
 function percentDecode(content: string): string {
   if (!content.includes('%')) return content
 
-  return content.replace(PERCENT_ESCAPE, (_escape, hex: string) =>
-    String.fromCharCode(Number.parseInt(hex, 16)),
-  )
+  return content.replace(PERCENT_RUN, (run: string) => {
+    const bytes = new Uint8Array(run.length / 3)
+
+    for (let i = 0; i < bytes.length; i += 1) {
+      bytes[i] = Number.parseInt(run.slice(i * 3 + 1, i * 3 + 3), 16)
+    }
+
+    return UTF8.decode(bytes)
+  })
 }
 
 /**
- * A matched address reduced to the form the allowlist is written in.
+ * The characters that render as NOTHING between two letters of a host.
  *
- * ONLY THE MATCH IS NORMALISED, NEVER THE MESSAGE. Rewriting the whole message
- * before matching would be a second reading of every post and would move the
- * escape and unicode-dot rules out of the patterns that document them. The
- * allowlist is a COMPARISON rather than a search, so normalising the few
- * characters being compared is enough.
+ * A SOFT HYPHEN IN THE MIDDLE OF A HOST DEFEATED EVERY RULE IN THIS FILE FOR ONE
+ * KEYSTROKE. `b<U+00AD>it.ly/3xY9k` renders in Discord as `bit.ly/3xY9k`, is
+ * clicked as `bit.ly/3xY9k`, and measured, `new URL` resolves it to exactly
+ * that host — UTS #46 maps the character to nothing before the name is looked
+ * up. The zero-width space, the two zero-width joiners, the word joiner and the
+ * byte-order mark are the same character class and the same measurement.
+ *
+ * THIS USED TO BE THOSE SIX SPELLED OUT, AND THE COMMENT CLAIMED THE SET WAS
+ * CLOSED. IT WAS NOT. Measured the same way, `new URL` resolves `b<U+034F>it.ly`
+ * and `b<U+FE0F>it.ly` to the host `bit.ly` as well — the combining grapheme
+ * joiner and the emoji variation selector, neither of which is a FORMAT
+ * character and neither of which NFKC removes, so nothing else in this file
+ * touched them. U+3164 and U+180E are two more, measured the same way. A
+ * hand-written list of invisible characters is a list somebody has to keep
+ * finishing, and this one was six items into a class of several hundred.
+ *
+ * SO THE CLASS IS NAMED RATHER THAN ENUMERATED. `Default_Ignorable_Code_Point`
+ * is Unicode's own name for "renders as nothing and is meant to be skipped",
+ * which is what all four of those measurements have in common; `Cf` is the
+ * format characters, which overlaps it heavily and carries the few separator
+ * controls sitting outside it. Both are asked of the engine's Unicode tables,
+ * so the answer grows with Node rather than with whoever next reads a bug
+ * report — and the `u` flag is what makes the property escapes legal and what
+ * makes an astral one a single character rather than two surrogates.
+ *
+ * STRIPPING THEM CANNOT INVENT A MATCH OUT OF ORDINARY TEXT, which is the
+ * question to ask of anything that rewrites a message before matching it. Every
+ * one of them is invisible where it matters here — between two label characters
+ * — so no member has ever typed one there between two characters they meant to
+ * keep apart. The only strings this changes are strings that already render as
+ * the joined form.
+ *
+ * WHAT NAMING THE CLASS STILL DOES NOT GET, because a rule that names a class
+ * invites being read as complete:
+ *
+ *   - IT IS NOT UTS #46'S IGNORED SET, AND THE TWO DISAGREE IN BOTH DIRECTIONS.
+ *     Measured: U+00AD, U+034F, U+FE0F, U+3164 and U+180E are dropped and the
+ *     host resolves, so those are the bypass this closes. U+061C, U+202E, U+0600
+ *     and U+E0001 are in this class as well, and `new URL` THROWS on a host
+ *     containing any of them — so stripping those builds a match out of a string
+ *     that no client can open. This rule matches MORE than a resolver would,
+ *     never less: the safe direction for a bypass and the wrong one for a false
+ *     positive. Nobody types a bidi override inside `bit.ly`, so that half is
+ *     paid in theory rather than in posts, and splitting the class by hand would
+ *     be the hand-written list this replaced.
+ *   - IT IS THE ENGINE'S TABLES AND NOT UNICODE'S LATEST. A character that
+ *     becomes default-ignorable in a release newer than the Node this runs on is
+ *     not in the class until that Node is upgraded. "Closed" is a claim about
+ *     today's build, which is the claim the six-character list should have made.
+ *   - IT IS ABOUT CHARACTERS THAT VANISH, NOT CHARACTERS THAT CHANGE. A
+ *     lookalike that RESOLVES SOMEWHERE ELSE is a different problem with a
+ *     different answer, and `fold` writes the Cyrillic case out.
+ */
+const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\p{Cf}]/gu
+
+/**
+ * Is there anything here that `fold` could possibly change?
+ *
+ * A SURROGATE IS IN THE RANGE, WHICH IS WHAT MAKES THIS GATE SAFE FOR AN ASTRAL
+ * CHARACTER. `INVISIBLE` reaches U+E0001 and NFKC reaches the mathematical
+ * alphabets, and both are written as a pair from U+D800\u2013U+DFFF \u2014 inside the
+ * range this class tests \u2014 so a message whose only non-ASCII content is astral
+ * still reaches the fold rather than being skipped as plain ASCII.
+ */
+const NON_ASCII = /[\u0080-\uFFFF]/
+
+/**
+ * The message as the reader's client will render and resolve it.
+ *
+ * FINDINGS 6, 7 AND 8 WERE ONE FINDING: THE RULES MATCHED RAW TEXT WHILE WHAT
+ * DECIDES WHERE A CLICK LANDS IS WHAT A URL PARSER RESOLVES TO. A soft hyphen, a
+ * fullwidth letter and a UTF-8 percent escape are three spellings of "this is
+ * not the host you are matching against, but it is the host that will be
+ * opened". Patching three patterns for three spellings leaves the fourth open;
+ * normalising once, before any rule runs, means every rule below is matching
+ * something closer to what the client will actually load.
+ *
+ * NFKC IS THE FOLD BECAUSE IT IS THE ONE UTS #46 USES. Fullwidth `ｃｆｘ.re`,
+ * mathematical bold `𝐜𝐟𝐱.re` and circled `ⓒⓕⓧ.re` all resolve to the host
+ * `cfx.re` — measured with `new URL`, all three — and all three are NFKC-mapped
+ * to ASCII `cfx`. The file already argued this case for the three unicode dots;
+ * this is the same argument applied to the rest of the alphabet instead of
+ * stopping at the separator.
+ *
+ * WHAT THIS CANNOT DO, AND IT IS WORTH BEING PLAIN ABOUT IT:
+ *
+ *   - NORMALISATION MAKES THE HOMOGLYPH CLASSES FINITE, NOT EMPTY. Cyrillic
+ *     `с` (U+0441) is NOT NFKC-mapped to ASCII `c`, so `сfx.re/join/x` still
+ *     walks past every rule here. It is a weaker bypass than the ones above, and
+ *     that is the honest reason it is left: measured, `new URL` resolves it to
+ *     the punycode host `xn--fx-9lc.re`, which is NOT cfx.re — the lookalike
+ *     goes somewhere else, or nowhere. Catching it would mean a confusable-skeleton
+ *     table, which is a large dependency for a class of link that does not reach
+ *     the advertiser's server.
+ *   - A RULE THAT RESOLVES IS STILL NOT A RULE THAT FETCHES. This file's whole
+ *     premise is that it never follows anything, so a shortener domain that is
+ *     not in the list above, or a redirect from a domain that is not, is
+ *     invisible however well the text is normalised.
+ *   - THE THREE UNICODE DOTS STAY IN `DOT` REGARDLESS. Measured: NFKC maps
+ *     U+FF0E to `.` and U+FF61 to U+3002, and leaves U+3002 exactly as it is. A
+ *     fold that handled two separators out of three would be worse than no fold
+ *     at all, because it would read as having handled them.
+ *
+ * SKIPPED OUTRIGHT FOR AN ALL-ASCII MESSAGE, which is nearly every message. The
+ * test is one pass that finds nothing, against a `normalize` call that would
+ * copy the string.
+ */
+function fold(content: string): string {
+  if (!NON_ASCII.test(content)) return content
+
+  return content.replace(INVISIBLE, '').normalize('NFKC')
+}
+
+/**
+ * A host reduced to the form the allowlist is written in: backslashes gone, the
+ * unicode separators folded to `.`.
  *
  * THE ONLY BACKSLASHES A MATCH CAN CONTAIN ARE `ESC`'s, so removing all of them
  * cannot damage anything else. The three unicode separators fold to `.` because
- * a resolver folds them. A single TRAILING dot is dropped because `3.130.92.28.`
- * is the FQDN root form of the identical host — the same rule `AFTER_HOST`
- * encodes for the boundary after a hostname.
+ * a resolver folds them — `fold` above has already dealt with two of the three,
+ * and U+3002 survives NFKC, so this is not redundant.
+ */
+function plainHost(text: string): string {
+  return text.replace(/\\/g, '').replace(/[\u3002\uFF0E\uFF61]/g, '.')
+}
+
+/**
+ * The same thing, with every trailing dot dropped.
+ *
+ * ONE ROOT DOT IS A HOST; THREE ARE AN ELLIPSIS; NEITHER IS PART OF THE ADDRESS.
+ * `3.130.92.28.` is the FQDN root form of the identical host — the same rule
+ * `AFTER_HOST` encodes for the boundary after a hostname. Stripping exactly one
+ * was a live false positive: `fivem://connect/3.130.92.28... see you` left
+ * `3.130.92.28..`, which matched no allowlist entry, and the owner's own connect
+ * link was deleted for ending a sentence.
  */
 function plainIp(text: string): string {
-  return text
-    .replace(/\\/g, '')
-    .replace(/[\u3002\uFF0E\uFF61]/g, '.')
-    .replace(/\.$/, '')
+  return plainHost(text).replace(/\.+$/, '')
+}
+
+/**
+ * How many hostname labels a trailing run of host characters actually contains.
+ *
+ * A HYPHEN COUNTS AS A SEPARATOR HERE EVEN THOUGH DNS SAYS IT IS NOT, and that
+ * is deliberate rather than sloppy. The question being asked is "does a DOMAIN
+ * follow this address", and `3.130.92.28-evil.com` answers it exactly as
+ * `3.130.92.28.evil.com` does: `evil.com` is a registrable name somebody owns
+ * and can point at a server. Counting the hyphen as a break is what makes those
+ * two one case instead of two.
+ */
+function segments(tail: string): number {
+  return plainHost(tail).split(/[.-]+/).filter((part) => part !== '').length
+}
+
+/**
+ * Does this trailing run turn the address in front of it into a LONGER HOST?
+ *
+ * TWO OR MORE LABELS IS A REGISTRABLE DOMAIN — `3.130.92.28.evil.com` — and that
+ * is a host somebody else controls that merely begins with an address. The line
+ * is drawn at two because `com`, `net` and `re` are public suffixes while `mp4`,
+ * `png` and `See` are not, and counting labels is the only way to say that
+ * without carrying a list of every TLD and every file extension in the world.
+ * Both lists change weekly; the shape does not.
+ *
+ * A HYPHEN IS A BREAK HERE, VIA `segments`, so `3.130.92.28-evil.com` is the
+ * same case as `3.130.92.28.evil.com` rather than a second one.
+ *
+ * THE COST IS A FILENAME WITH TWO EXTENSIONS, AND IT IS PAID EVEN FOR OUR OWN
+ * ADDRESS. `blitz-backup-3.130.92.28.tar.gz` and `3.130.92.28.crt.pem` have two
+ * labels after the quad, so they read as a domain and are removed — and there is
+ * no shape that separates `.tar.gz` from `.evil.com`, because the only real
+ * difference between them is that `com` is a public suffix and `gz` is not.
+ * Keeping both would mean carrying the list this rule exists to avoid. The
+ * owner has been shown these two by name; see the tables, where they sit as
+ * removals with this paragraph's reason attached.
+ */
+function addsADomain(tail: string): boolean {
+  return segments(tail) >= 2
+}
+
+/**
+ * Is this trailing run a full stop and a word, or a file extension — rather than
+ * an address at all?
+ *
+ * THIS IS THE ONE JUDGEMENT THAT DECIDES THE WORST FALSE POSITIVE, and it is a
+ * judgement rather than a fact, so it is written down once. After a dotted quad,
+ * a dot and EXACTLY ONE label is
+ *
+ *   - a sentence: `we are back up on 3.130.92.28.See you there`, which is a full
+ *     stop somebody did not put a space after;
+ *   - or a file extension: `14.22.35.13.mp4`, the ShadowPlay clip whose clock
+ *     happens to have no zero-padded field in it, and `ping-3.130.92.28.png`.
+ *
+ * EXACTLY ONE, AND `<= 1` HERE WAS THE REGRESSION. A trailing run of `.` with
+ * nothing after it counts ZERO labels, so `<= 1` answered yes to it — and the
+ * question this asks is "is there a word after the dot", not "is there a dot".
+ * The effect was that `come play at 5.6.7.8.` and
+ * `New server, join us at 45.87.154.22.` stopped firing: an address at the end
+ * of a sentence, which is how an advert is actually written, went invisible
+ * because it had been punctuated. A full stop is where the address ENDS; it is
+ * not evidence about whose address it is.
+ *
+ * WHAT THIS COSTS, BECAUSE A JUDGEMENT WITH NO COST IS A JUDGEMENT NOBODY
+ * CHECKED. `1.2.3.4.x` and `1.2.3.4.join` survive: a foreign address with one
+ * junk label stuck on the end is readable to a human and invisible to this rule.
+ * That is the price of the ShadowPlay clip and it is the right way round — this
+ * bypass costs an advert the reader has to hand-edit before it connects, and the
+ * false positive cost a member their clip, on a GTA server, where clips are most
+ * of what gets posted.
+ */
+function endsTheAddress(tail: string): boolean {
+  const plain = plainHost(tail)
+
+  return plain.startsWith('.') && segments(plain) === 1
 }
 
 /** Is this matched text one of the addresses this deployment is allowed to name? */
@@ -414,62 +842,116 @@ function isOurs(text: string, ourIps: readonly string[]): boolean {
 }
 
 /**
- * Is the character before the match part of a hostname that continues leftwards?
+ * Does this host name one of our addresses and nothing else?
  *
- * THIS AND `gluedRight` ARE THE WHOLE OF THE ALLOWLIST BOUNDARY, AND THE
- * BOUNDARY IS THE SUBTLE PART OF THIS FILE. Excepting the literal string
- * `3.130.92.28` — a substring test, or a match with no fences on it — hands out
- * two bypasses immediately: `3.130.92.28.evil.com` is a host somebody else
- * controls that merely BEGINS with our address, and `13.130.92.28` is a
- * different address that merely CONTAINS it. Both would be exempted, and both
- * are somebody else's server.
+ * THE EXCEPTION IS ANCHORED AGAINST WHERE A URL ENDS, NOT AGAINST A LIST OF
+ * NEIGHBOURING CHARACTERS. The old boundary asked "is the next character a
+ * label character or a dot", which is a question about punctuation, and it
+ * answered wrongly for every ordinary way of writing a sentence: an ellipsis, a
+ * full stop with no space after it, a hyphen before a port, a `.png`. Deleting a
+ * message that names the OWNER'S OWN server is the most embarrassing thing this
+ * bot can do, and it was doing it five different ways.
  *
- * SO THE EXCEPTION IS ANCHORED THE SAME WAY THE HOST PATTERN IS: it applies only
- * when the match is a whole host on its own. A label character or a dot
- * immediately to the left means more hostname is attached and this is not our
- * address; `/`, `:`, a space, a bracket, an underscore or the start of the
- * message all mean it stands alone.
+ * SO THE QUESTION IS ASKED OF THE WHOLE HOST INSTEAD: our address, then a
+ * trailing run that does not add a domain to it. Anything that does —
+ * `3.130.92.28.evil.com`, `3.130.92.28-evil.com` — is a different host, and it
+ * is not ours.
+ *
+ * THE REMAINDER IS TESTED WITH `addsADomain` AND NOT WITH `endsTheAddress`, and
+ * the difference is a port. `fivem://connect/3.130.92.28-30120` and
+ * `fivem://connect/3.130.92.28:30120` are the same address twice, but only the
+ * second one's separator stops `FIVEM_TARGET`, so the first arrives here with
+ * `-30120` still attached — a remainder that is not punctuation, not a domain,
+ * and not a reason to delete the owner's own connect link. Asking the negative
+ * question is what makes the port, the ellipsis, the extension and the next
+ * word of a sentence one case rather than four.
  */
-function gluedLeft(content: string, start: number): boolean {
-  const before = content[start - 1]
-  if (before === undefined) return false
+function namesOurs(host: string, ourIps: readonly string[]): boolean {
+  for (const ip of ourIps) {
+    if (host === ip) return true
+    if (host.startsWith(ip) && !addsADomain(host.slice(ip.length))) return true
+  }
 
-  return LABEL_CHAR.test(before) || DOT_CHARS.includes(before)
+  return false
 }
 
 /**
- * The same question on the right, where a dot is ambiguous and has to be read
- * one character further.
+ * Everything to the RIGHT of an index that a resolver would still read as part
+ * of the same hostname.
  *
- * A LABEL CHARACTER GLUES OUTRIGHT. A DOT ONLY GLUES WHEN A LABEL FOLLOWS IT:
- * `3.130.92.28.evil.com` continues the host and is not ours, while
- * `connect to 3.130.92.28.` is our address at the end of a sentence and the
- * full stop is punctuation. Reading only the next character would have to choose
- * one of those and be wrong about the other.
- *
- * THE OPTIONAL BACKSLASH IS `ESC` AGAIN, in the one place a fence rather than a
- * pattern has to know about it: `3.130.92.28\.evil.com` renders as the glued
- * host, so the escape must not be what makes the exception apply.
+ * READ FORWARD AS FAR AS THE HOST GOES rather than one or two characters, so the
+ * caller can ask a question about the host instead of about the next character.
+ * A backslash is included because `ESC` puts one in front of any dot Discord
+ * would otherwise eat, and `3.130.92.28\.evil.com` renders as the glued host.
  */
-function gluedRight(content: string, end: number): boolean {
-  const next = content[end]
-  if (next === undefined) return false
-  if (LABEL_CHAR.test(next)) return true
+function hostTail(content: string, end: number): string {
+  let at = end
 
-  const offset = next === '\\' ? 1 : 0
-  const dot = content[end + offset]
-  const after = content[end + offset + 1]
+  while (at < content.length) {
+    const char = content[at]
 
-  return (
-    dot !== undefined &&
-    DOT_CHARS.includes(dot) &&
-    after !== undefined &&
-    LABEL_CHAR.test(after)
-  )
+    if (char === undefined) break
+    if (!LABEL_CHAR.test(char) && !DOT_CHARS.includes(char) && char !== '\\') break
+
+    at += 1
+  }
+
+  return content.slice(end, at)
+}
+
+/** The same, to the LEFT: the subdomain labels a matched host sits under. */
+function hostHead(content: string, start: number): string {
+  let at = start
+
+  while (at > 0) {
+    const char = content[at - 1]
+
+    if (char === undefined) break
+    if (!LABEL_CHAR.test(char) && !DOT_CHARS.includes(char) && char !== '\\') break
+
+    at -= 1
+  }
+
+  return content.slice(at, start)
 }
 
 /**
  * Does the message name an address that is not one of ours?
+ *
+ * THREE QUESTIONS, ASKED IN THIS ORDER, AND THE ORDER IS THE WHOLE FIX. A dotted
+ * quad in a message is one of:
+ *
+ *   1. A LONGER HOST — a real domain follows, so the string names somewhere that
+ *      is not an address at all and cannot be on an allowlist of addresses.
+ *      Removed. `3.130.92.28.evil.com` is the shape this exists for, and it is
+ *      asked FIRST because it is the one answer the allowlist must not overrule.
+ *   2. OUR ADDRESS — kept, whatever punctuation ends it. This is the exemption,
+ *      and it is the only place the allowlist is consulted.
+ *   3. NOT AN ADDRESS AT ALL — a dot and one more label follows, so it is a
+ *      filename's extension or the first word of the next sentence. Nothing
+ *      fires, for anybody's address: `14.22.35.13.mp4` is a clip and
+ *      `1.2.3.4.mp4` is also a clip. See `endsTheAddress` for what that costs.
+ *
+ * Anything else is somebody else's address, and it is removed.
+ *
+ * QUESTION 2 IS ASKED OF THE ADDRESS AND NOT OF THE PUNCTUATION, WHICH IS THE
+ * BUG THIS ORDER FIXES. The exemption used to be reached through the tail test:
+ * a trailing run that looked like the end of a sentence skipped the candidate
+ * outright, before anybody asked WHOSE address it was. That is true of the
+ * owner's address followed by a full stop, and it is equally true of a poacher's
+ * — so `come play at 5.6.7.8.` stopped firing, and an advert is a sentence with
+ * an address at the end of it. Our address is exempt because it is OURS. A full
+ * stop only says where it stopped.
+ *
+ * NOTHING IS ASKED ABOUT THE CHARACTERS TO THE LEFT ANY MORE, AND THAT IS A
+ * DELIBERATE LOSS. `gluedLeft` used to fire on a preceding letter or hyphen,
+ * which deleted `server3.130.92.28 is ours` and `ping-3.130.92.28.png` — the
+ * owner's own address, in his own sentences. The prefix it was defending against
+ * cannot make a working destination: `x3.130.92.28` is not an address, because
+ * of the `x`, and not a host, because its last label is `28` and there is no
+ * such TLD. A different address that CONTAINS ours needs no left-hand rule at
+ * all — `13.130.92.28` is matched whole by the pattern, compared whole, and
+ * removed.
  *
  * EVERY CANDIDATE IS EXAMINED, NOT JUST THE FIRST. A message that names our
  * server and then somebody else's is the ordinary shape of a poach — "we used to
@@ -486,10 +968,13 @@ function foreignIp(content: string, ourIps: readonly string[]): boolean {
     // process where "it must be there" is worth not asserting.
     if (text === undefined || at === undefined) continue
 
-    const exempt =
-      isOurs(text, ourIps) && !gluedLeft(content, at) && !gluedRight(content, at + text.length)
+    const tail = hostTail(content, at + text.length)
 
-    if (!exempt) return true
+    if (addsADomain(tail)) return true
+    if (isOurs(text, ourIps)) continue
+    if (endsTheAddress(tail)) continue
+
+    return true
   }
 
   return false
@@ -504,19 +989,32 @@ function foreignIp(content: string, ourIps: readonly string[]): boolean {
  * that is not shaped like an IPv4 address, so `evil.com` cannot be sitting in
  * `ourIps` waiting for `fivem://connect/evil.com` to walk through. Checking it
  * again here would be a second place for the two notions of "IPv4-shaped" to
- * drift apart.
+ * drift apart — and they DID drift, back when config.ts spelled the shape out
+ * in a regex of its own; `IPV4_ADDRESS` above is now the single one both use.
  *
- * NO BOUNDARY CHECK IS NEEDED AROUND THE TARGET, unlike the bare address above,
- * because `FIVEM_TARGET` is greedy over dots and label characters: anything glued
- * to our address is already inside the captured string and has already failed the
- * comparison.
+ * A TARGET THAT NORMALISES TO NOTHING IS NOT A LINK TO ANYWHERE.
+ * `fivem://connect/` is what a person types while EXPLAINING how to connect, and
+ * `fivem://connect/...` is that with an ellipsis; both used to be removed. This
+ * is the same measured rule that keeps `cfx.re/join/` — a listing link with no
+ * code — out of the listing rule: removing a message over a URL that goes
+ * nowhere is removing it over nothing.
+ *
+ * NO SEPARATE BOUNDARY CHECK IS NEEDED AROUND THE TARGET, unlike the bare
+ * address above, because `FIVEM_TARGET` is greedy over dots and label
+ * characters: anything glued to our address is already inside the captured
+ * string, and `namesOurs` is what decides whether it is punctuation or a domain.
  */
 function fivemConnect(content: string, ourIps: readonly string[]): boolean {
   for (const match of content.matchAll(FIVEM_CONNECT)) {
     const target = match[1]
     if (target === undefined) continue
 
-    if (!isOurs(target, ourIps)) return true
+    const host = plainIp(target)
+
+    if (host === '') continue
+    if (namesOurs(host, ourIps)) continue
+
+    return true
   }
 
   return false
@@ -527,9 +1025,30 @@ function serverListing(content: string): boolean {
   return CFX_JOIN.test(content) || FIVEM_DETAIL.test(content)
 }
 
-/** A link whose destination the bot cannot read and will not fetch. */
+/**
+ * A link whose destination the bot cannot read and will not fetch.
+ *
+ * THE MATCH IS ONLY THE LAST TWO LABELS, SO THE HOST IS REBUILT BEFORE JUDGING
+ * IT. `goo.gl` matches inside `maps.app.goo.gl`, and the lookbehind lets it,
+ * because a preceding dot is a subdomain and a subdomain of a shortener usually
+ * belongs to the shortener. `SHORTENER_HOSTS` is the list of hosts where that
+ * "usually" is false, and it can only be checked against the whole host — which
+ * is what `hostHead` reads back.
+ */
 function shortener(content: string): boolean {
-  return SHORTENER.test(content)
+  for (const match of content.matchAll(SHORTENER)) {
+    const domain = match[1]
+    const at = match.index
+
+    if (domain === undefined || at === undefined) continue
+
+    const host = plainHost(hostHead(content, at) + domain).toLowerCase()
+    const named = SHORTENER_HOSTS.some((known) => host === known || host.endsWith(`.${known}`))
+
+    if (!named) return true
+  }
+
+  return false
 }
 
 /**
@@ -589,23 +1108,31 @@ const RULES: readonly Rule[] = [
  * second list of message surfaces to keep in step, and the history of that file
  * is four separate bypasses that all came from a surface somebody forgot.
  *
+ * THE FOLD RUNS ONCE, HERE, AND EVERY RULE BELOW SEES ONLY ITS OUTPUT. That is
+ * the point of it being one pass at the top rather than a change to four
+ * patterns — see `fold`. The normalisation is NOT done in `scanText`, even
+ * though that is where the string is built, because invites.ts reads the same
+ * string and a change to what IT matches is not this change's to make.
+ *
  * READ TWICE, ONCE AS POSTED AND ONCE PERCENT-DECODED, and per rule rather than
  * per pass. Doing all four rules on the raw text and only then falling back to
  * the decoded text would let a low-priority rule matching the raw text outrank a
  * high-priority rule that only the decoded text shows — the message would be
  * removed either way, but the reason printed would be the less informative one.
  * The decode is skipped outright when the message has no `%` in it, which is
- * nearly every message.
+ * nearly every message, and the folded pair are compared so an unchanged decode
+ * costs no second scan.
  *
  * FIRST HIT WINS AND NOTHING KEEPS LOOKING. One removal needs one reason, and
  * every rule below the one that fired would be describing the same deletion.
  */
 export function scanLinks(content: string, ourIps: readonly string[]): LinkReason | null {
-  const decoded = percentDecode(content)
+  const folded = fold(content)
+  const decoded = fold(percentDecode(content))
 
   for (const rule of RULES) {
-    if (rule.fires(content, ourIps)) return rule.why
-    if (decoded !== content && rule.fires(decoded, ourIps)) return rule.why
+    if (rule.fires(folded, ourIps)) return rule.why
+    if (decoded !== folded && rule.fires(decoded, ourIps)) return rule.why
   }
 
   return null

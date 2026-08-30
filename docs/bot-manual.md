@@ -150,30 +150,35 @@ does.
 `/profile` takes an OPTIONAL user, and its reply is always ephemeral.
 
 Naming somebody is admin-only, and that half is the one this rule exists for. It
-carries a member's ban history, every licence the account has played under and
-every name it has used, and a copy in the channel cannot be taken back. It
-reports the licences that Discord account has connected under, the bans on the
-ten most recent of those, the game's career numbers, the server registry row and
-the last five matches, and it carries a button that opens that player's page in
-the Ringmaster console.
+carries a member's ban history and every name their account has used, and a copy
+in the channel cannot be taken back. It reports the bans, the game's career
+numbers, the server registry row and the last five matches, and it carries a
+button that opens that player's page in the Ringmaster console.
+
+The bans cover every game identity that account has played under, up to the ten
+most recent, so a ban is not hidden by a clean current one. No identity is named
+in the reply.
 
 Naming nobody is open to anyone and shows you your own progression and match
-record, plus a ban if one is in force right now. It cannot show you the licence
-list or any lifted ban: those are what a moderator uses to join up alternate
-accounts, and the bot never reads them for this half at all. No console button
-either: the console is behind a sign-in players do not have.
+record, plus a ban if one is in force right now. It cannot show you any lifted
+ban or anything about other accounts: those are what a moderator uses to join up
+alternate accounts, and the bot never reads them for this half at all. No console
+button either: the console is behind a sign-in players do not have.
 
 Whatever could not be read is named in the reply rather than left out, because
 "no record" and "the table would not answer" are opposite answers to the same
 question.
 
-Both halves read the same way. The short numbers — level, Volts, matches, kills,
-damage, time in match — are laid out as columns, and anything that can grow is
-full width. Every time in it is a Discord timestamp, so it renders in your own
-timezone rather than as UTC. The balance is in Volts, which is what the game
-calls it. The bar down the side is red while the subject is under a ban that is
-in force. Five matches are listed with the number played in all beside them, so a
-short list never reads as a whole career. Whoever it is about is tagged, and
+Both halves read the same way. Bans, server record, recent matches and what could
+not be read are headings in the body; the short numbers — level, Volts, matches,
+kills, damage, time in match — are columns underneath, because Discord renders no
+heading inside a column. Every time in it is a Discord timestamp, so it renders in
+your own timezone rather than as UTC. The balance is in Volts, which is what the
+game calls it. The bar down the side is red while the subject is under a ban in
+force, and the picture in the corner is that account's Discord avatar. Five
+matches are listed with the number played in all beside them, so a short list
+never reads as a whole career. Past names are listed only when the in-game name
+is not already the name Discord shows them by. Whoever it is about is tagged, and
 their Discord id is printed nowhere — the tag already carries it.
 
 `/sticky` takes the text of a message, is admin-only, and its reply is
