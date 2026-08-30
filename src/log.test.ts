@@ -335,18 +335,223 @@ const LOGIN_FAILED = capture(
   'the failed-login log call in src/index.ts',
 )
 
-/** The two lines the bot posts to BLITZ_LOG_CHANNEL_ID, up to their first field. */
-const CHANNEL_REMOVED = capture(
+/**
+ * The two lines the bot posts to BLITZ_LOG_CHANNEL_ID, WHOLE.
+ *
+ * THESE USED TO BE THE FIRST FEW WORDS AND NOTHING ELSE. `capture` took the
+ * literal prefix off each template — `Removed a message. ` and `Dry run,
+ * nothing removed. ` — and every assertion below asked deploy.md to contain
+ * that much. Then `authorRef` changed how the author is named, from a bare
+ * snowflake to a mention plus the username in a code span; both quoted examples
+ * in §8 and §9 went stale; and both assertions stayed green, because a prefix
+ * cannot see a changed tail and the tail is the whole content of the line. That
+ * is the THIRD time this document has drifted from the code, and the second
+ * time a check that looked like it covered the case did not.
+ *
+ * SO THE WHOLE LINE IS REBUILT HERE, out of the same five builders, and the
+ * document has to quote the result character for character. Any change to any
+ * part of it lands here: the mention markup, the parenthetical username and its
+ * code span, the channel link, the reason token, the codes, and every comma and
+ * space between them.
+ *
+ * BY READING THE SOURCE RATHER THAN CALLING THE BUILDERS, because `removedLine`,
+ * `dryRunLine`, `attribution`, `authorRef` and `statedGrounds` are all private
+ * to src/client.ts and none of them should be exported to satisfy a test — the
+ * one function in that family that IS exported, `announcer`, is exported for a
+ * promise a test cannot otherwise see. So each builder's `return` expression is
+ * read out of the file and its template literals are expanded against the
+ * placeholder ids this document uses. Same bargain as the log lines above: the
+ * string is derived from the thing that emits it, never typed out twice.
+ */
+
+/**
+ * The placeholder values deploy.md fills these lines with.
+ *
+ * ONE SET, SHARED BY THE CHANNEL LINE AND THE JOURNAL LINE, because §8 shows
+ * both about the same removal and an operator reads them as a pair. Eighteen
+ * zeros for a snowflake and `XXXXXXX` for an invite code are the document's own
+ * convention. The username is a placeholder in the same spirit and reads as the
+ * operator's own, because in §8 and §9 the message being removed is one he
+ * posted himself — and it is spelled with characters Discord's username charset
+ * actually allows, so it is not an example of a name that cannot exist.
+ */
+const AUTHOR_ID = '000000000000000000'
+const CHANNEL_ID = '000000000000000000'
+const INVITE_CODE = 'XXXXXXX'
+const USERNAME = 'your_username'
+
+/**
+ * The reason token a confirmed-foreign removal carries.
+ *
+ * ANCHORED ON THE BRANCH THAT PRODUCES IT rather than typed out, so renaming the
+ * token changes the value the document must contain instead of leaving
+ * `foreign-invite` correct in this file and wrong on the operator's screen. It
+ * is the same token the channel line prints and the journal puts in `reason=`,
+ * which is the whole reason the two can be matched up with one `grep`.
+ */
+const FOREIGN_INVITE = capture(
   clientSource,
-  /function removedLine[\s\S]*?return `([^$`]+)\$\{/,
-  'removedLine in src/client.ts',
+  /result\.foreign\.length > 0\) return removal\('([^']+)'/,
+  'the reason a confirmed-foreign removal carries in src/client.ts',
 )
 
-const CHANNEL_DRY_RUN = capture(
-  clientSource,
-  /function dryRunLine[\s\S]*?return `([^$`]+)\$\{/,
-  'dryRunLine in src/client.ts',
-)
+/**
+ * The `return` expression of one private builder, as source text.
+ *
+ * ANCHORED ON `function <name>(` AND ON THE CLOSING BRACE AT COLUMN 0, so a
+ * builder that is renamed, inlined or reshaped into something with more than
+ * one `return` throws by way of `capture` instead of quietly matching less.
+ * Starting at the `return` also steps over the doc comment and any body comment
+ * above it, which is what keeps a backtick in prose from being mistaken for the
+ * start of a template.
+ */
+const returnExpression = (name: string): string =>
+  capture(
+    clientSource,
+    new RegExp(`^function ${name}\\([\\s\\S]*?\\n {2}return ([\\s\\S]*?)\\n\\}`, 'm'),
+    `the return expression of ${name}() in src/client.ts`,
+  )
+
+/** Every template literal in one expression, `\`` escapes and all. */
+const templateLiterals = (expression: string, what: string): string[] =>
+  captureAll(expression, /`((?:[^`\\]|\\.)*)`/g, `a template literal in ${what}`)
+
+/** The one template a single-expression builder returns, or a loud failure. */
+function onlyTemplate(name: string): string {
+  const found = templateLiterals(returnExpression(name), `${name}()`)
+  const [single] = found
+
+  if (single === undefined || found.length !== 1) {
+    throw new Error(`${name}() no longer returns exactly one template literal`)
+  }
+  return single
+}
+
+/**
+ * One branch of a builder that returns a ternary, chosen by something in it.
+ *
+ * `authorRef` and `statedGrounds` each have two shapes and the document quotes
+ * one of each: the author WITH a username on him, and the grounds for a removal
+ * that confirmed a foreign invite. Selecting by a marker rather than by position
+ * means swapping the branches over does not silently change which line the
+ * document is being held to.
+ */
+function branchTemplate(name: string, marker: string): string {
+  const found = templateLiterals(returnExpression(name), `${name}()`).filter((template) =>
+    template.includes(marker),
+  )
+  const [single] = found
+
+  if (single === undefined || found.length !== 1) {
+    throw new Error(`${name}() no longer has exactly one branch containing ${marker}`)
+  }
+  return single
+}
+
+/**
+ * One template literal, filled in the way the running bot fills it.
+ *
+ * AN UNKNOWN `${...}` IS A FAILURE, NOT AN EMPTY STRING. A builder that starts
+ * interpolating something new — a guild id, a timestamp, a message link — must
+ * be given a placeholder here and shown in the document, and the alternative is
+ * a pin that quietly drops the new part and keeps passing.
+ *
+ * `\`` BECOMES A BACKTICK because that is what it is by the time the line
+ * reaches Discord: the code span `authorRef` wraps the username in, which is the
+ * thing that stops a hostile username reformatting our moderation log.
+ */
+function expand(template: string, values: Readonly<Record<string, string>>): string {
+  return template.replace(/\\`/gu, '`').replace(/\$\{([^}]*)\}/gu, (_match, expression: string) => {
+    const value = values[expression.trim()]
+    if (value === undefined) {
+      throw new Error(`no placeholder for \${${expression}} in a channel-line template`)
+    }
+    return value
+  })
+}
+
+const CHANNEL_AUTHOR = expand(branchTemplate('authorRef', '${name}'), {
+  'message.authorId': AUTHOR_ID,
+  name: USERNAME,
+})
+
+const CHANNEL_ATTRIBUTION = expand(onlyTemplate('attribution'), {
+  'authorRef(message)': CHANNEL_AUTHOR,
+  'message.channelId': CHANNEL_ID,
+})
+
+const CHANNEL_GROUNDS = expand(branchTemplate('statedGrounds', 'verdict.foreign'), {
+  'verdict.why': FOREIGN_INVITE,
+  "verdict.foreign.join(', ')": INVITE_CODE,
+})
+
+const CHANNEL_HALVES = {
+  'attribution(message)': CHANNEL_ATTRIBUTION,
+  'statedGrounds(verdict)': CHANNEL_GROUNDS,
+}
+
+const CHANNEL_REMOVED = expand(onlyTemplate('removedLine'), CHANNEL_HALVES)
+const CHANNEL_DRY_RUN = expand(onlyTemplate('dryRunLine'), CHANNEL_HALVES)
+
+/**
+ * The fields a verdict-carrying journal line puts after `msg=`, in order.
+ *
+ * THE SAME WEAKNESS AS THE CHANNEL LINE, ONE COLUMN OVER. §8, §9 and §12.2 each
+ * quote a full journal record — `author=`, `channel=`, `reason=`, `found=`,
+ * `codes=` — and until now only the `msg="..."` part of each was derived from
+ * the source. Rename a field in `logFields`, add one, or reorder `where`, and
+ * all three quoted records go stale while every assertion about them stays
+ * green, which is precisely how the channel line drifted.
+ *
+ * READ FROM BOTH HALVES OF THE SPREAD, in the order `handleMessage` spreads
+ * them, because the order is part of what an operator compares against his
+ * screen.
+ */
+const VERDICT_FIELDS = [
+  ...captureAll(
+    capture(clientSource, /const where = \{([^}]*)\}/, 'the `where` fields in handleMessage'),
+    /(\w+):/g,
+    'a field name in `where`',
+  ),
+  ...captureAll(
+    capture(
+      clientSource,
+      /function logFields[\s\S]*?return \{([^}]*)\}/,
+      "logFields' fields in src/client.ts",
+    ),
+    /(\w+):/g,
+    'a field name in logFields',
+  ),
+]
+
+/**
+ * What each of those fields holds in the document's worked example: the same
+ * placeholder ids the channel line uses, and one invite code, because §8 says
+ * to post exactly one link.
+ */
+const VERDICT_VALUES: Readonly<Record<string, unknown>> = {
+  author: AUTHOR_ID,
+  channel: CHANNEL_ID,
+  reason: FOREIGN_INVITE,
+  found: 1,
+  codes: INVITE_CODE,
+}
+
+/** The fields of one quoted removal record, plus anything the call site adds. */
+function verdictFields(extra?: Record<string, unknown>): Record<string, unknown> {
+  const fields: Record<string, unknown> = {}
+
+  for (const key of VERDICT_FIELDS) {
+    // A new field with no placeholder is a decision about what the document
+    // shows, not something to fill in with a blank and forget.
+    if (!(key in VERDICT_VALUES)) {
+      throw new Error(`no placeholder for the ${key}= field of a removal line`)
+    }
+    fields[key] = VERDICT_VALUES[key]
+  }
+
+  return { ...fields, ...extra }
+}
 
 /**
  * The configuration failure, which is the one thing this process writes WITHOUT
@@ -414,6 +619,19 @@ function emit(level: Level, message: string, fields?: Record<string, unknown>): 
 /** One `key="value"` token off an emitted line. */
 const field = (line: string, key: string): string =>
   capture(line, new RegExp(`(${key}="[^"]*")`), `the ${key} field of an emitted line`)
+
+/**
+ * One whole quoted record, from `level=` to the end — everything but the
+ * timestamp, which is the only part of a real line the document cannot predict.
+ *
+ * THE POINT IS THE TAIL. `field(..., 'msg')` proves the sentence is the one the
+ * code writes and says nothing at all about the five `key=value` pairs after it,
+ * which are the half an operator reads to find out WHICH channel to go and fix.
+ */
+function journalRecord(level: Level, message: string, fields?: Record<string, unknown>): string {
+  const line = emit(level, message, fields)
+  return line.slice(line.indexOf('level=')).trimEnd()
+}
 
 describe('.github/workflows/ci.yml — the first push must not fail on a mode bit', () => {
   const workflow = repoFile('.github/workflows/ci.yml')
@@ -743,10 +961,58 @@ describe('docs/deploy.md — every quoted log line, re-derived from the source',
    * The two lines that reach the admin channel, which are the only output the
    * owner sees without an SSH session — and therefore the only thing the smoke
    * test in §8 can be read against.
+   *
+   * WHOLE LINES, NOT OPENINGS. The tail is where the author, the channel, the
+   * reason and the codes are; an assertion that stops after `Removed a message. `
+   * is an assertion about the one part of the line nobody has to look up.
    */
-  it('quotes both channel lines the bot posts to BLITZ_LOG_CHANNEL_ID', () => {
+  it('quotes both channel lines the bot posts to BLITZ_LOG_CHANNEL_ID, whole', () => {
     expect(deployDoc).toContain(CHANNEL_DRY_RUN)
     expect(deployDoc).toContain(CHANNEL_REMOVED)
+  })
+
+  /**
+   * EVERY COPY, NOT THE TWO WE KNOW ABOUT. The two examples were corrected by
+   * hand once already and a third description of the same line elsewhere in the
+   * file would have been missed — §12 and §14 both discuss what the channel
+   * shows. So: find every line in the document that names an author the way the
+   * channel line does, and require all of them to carry the current shape.
+   *
+   * The journal's own `author="..."` field is untouched by this and is meant to
+   * be: it is a bare id there, deliberately, and `Author ` with a capital A and
+   * a space is the channel line's spelling and nothing else's.
+   */
+  it('describes the author the same way everywhere the channel line appears', () => {
+    // The literal text the attribution opens with, taken from the template
+    // ahead of its first `${`, so it is the word the OLD shape and the new one
+    // have in common rather than anything about how the author is spelled now.
+    const opening = capture(
+      onlyTemplate('attribution'),
+      /^([^$`]+)\$\{/,
+      "the literal opening of attribution() in src/client.ts",
+    )
+
+    const attributed = deployDoc.split('\n').filter((line) => line.includes(opening))
+
+    expect(attributed).not.toHaveLength(0)
+    for (const line of attributed) expect(line, line).toContain(CHANNEL_ATTRIBUTION)
+  })
+
+  /**
+   * THE SAME PIN, ON THE JOURNAL SIDE. Three records in this document carry a
+   * verdict's fields — §8's dry run, §9's removal and §12.2's failed delete —
+   * and each was previously held only to its `msg="..."`. `author=` and
+   * `channel=` are the two an operator acts on, and §12.2 says in so many words
+   * to go and fix the channel named on the line.
+   */
+  it('quotes every field on the three journal records a removal writes', () => {
+    expect(deployDoc).toContain(journalRecord('warn', WOULD_DELETE, verdictFields()))
+    expect(deployDoc).toContain(journalRecord('info', DELETED, verdictFields()))
+
+    const code = RESTJSONErrorCodes.MissingPermissions
+    const error = new DiscordAPIError({ code, message: 'Missing Permissions' }, code, 403, 'DELETE', 'https://discord.com/api/v10/channels/0/messages/0', {})
+
+    expect(deployDoc).toContain(journalRecord('error', DELETE_FAILED, verdictFields({ error })))
   })
 
   /**

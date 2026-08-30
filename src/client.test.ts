@@ -13,6 +13,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 
 import {
+  announcer,
   createClient,
   decide,
   handleLive,
@@ -63,6 +64,15 @@ const OURS = '111111111111111111'
 const THEIRS = '222222222222222222'
 const ADMIN_ROLE = '333333333333333333'
 const AUTHOR = '444444444444444444'
+
+/**
+ * The author's username, and it carries an underscore on purpose: `_` is
+ * markdown to Discord and an ordinary character in a real username, so it is
+ * the case that says whether the name is neutralised by mangling it or by
+ * putting it somewhere markdown is not read.
+ */
+const AUTHOR_NAME = 'spammer_99'
+
 const CHANNEL = '555555555555555555'
 const LOG_CHANNEL = '666666666666666666'
 const WEBHOOK = '777777777777777777'
@@ -85,6 +95,7 @@ function msg(over: Partial<ScannedMessage> = {}): ScannedMessage {
   return {
     text: 'join us at discord.gg/abc123',
     authorId: AUTHOR,
+    authorUsername: AUTHOR_NAME,
     channelId: CHANNEL,
     guildId: OURS,
     webhookId: null,
@@ -562,15 +573,22 @@ describe('handleMessage — carrying the verdict out', () => {
     expect(posted.join('')).not.toContain('discord.com/invite')
   })
 
-  it('does not talk to the poster and does not mention anyone', async () => {
-    // The owner's standing rule, as an assertion: no mention markup, so nothing
-    // this bot writes can put a notification in front of a member.
+  it('does not talk to the poster, and writes no mass ping', async () => {
+    // The owner's standing rule is that nothing this bot sends puts a
+    // notification in front of a member. It used to be kept by leaving the
+    // mention markup out of the line altogether; the author is now `<@id>` on
+    // purpose, so the rule is kept by the send instead — `allowedMentions` on
+    // `announcer`'s `send`, asserted where that option is actually passed.
+    //
+    // WHAT DOES NOT MOVE is `@everyone` and `@here`: those are not addressed to
+    // an author, no part of this line builds one, and no username can smuggle
+    // one in because `plainName` drops the `@`.
     const posted: string[] = []
     const acts = actions({ announce: collect(posted) })
 
     await handleMessage(msg(), cfg({ logChannelId: LOG_CHANNEL }), acts)
 
-    expect(posted.join('')).not.toContain(`<@${AUTHOR}>`)
+    expect(posted.join('')).toContain(`<@${AUTHOR}>`)
     expect(posted.join('')).not.toContain('@everyone')
     expect(posted.join('')).not.toContain('@here')
   })
@@ -771,6 +789,246 @@ describe('handleMessage — an over-cap removal is never mistaken for an ordinar
     expect(stderr.join('')).toContain('dry run: would have deleted')
     expect(posted[0] ?? '').toContain('Dry run')
     expect(posted[0] ?? '').toContain('over-lookup-cap')
+  })
+})
+
+/**
+ * WHO A REMOVAL WAS ABOUT, IN A FORM A HUMAN CAN READ.
+ *
+ * The line went out with the CHANNEL as `<#id>` — which Discord renders as a
+ * link — and the AUTHOR as a bare eighteen-digit snowflake. One line, two
+ * conventions, and the half that identifies a person was the unreadable one:
+ * the owner's report was that it "only shows the account ID and doesn't tag the
+ * user". The author is now `<@id>` with the username in plain text beside it.
+ *
+ * THE PLAIN-TEXT NAME IS NOT DECORATION. `<@id>` is resolved by the reader's
+ * client against the guild's member list, so it renders as `@unknown-user` the
+ * moment that account leaves or is banned — which is the moment somebody
+ * scrolls back to find out who a removal was about. Every case here therefore
+ * asserts both halves, and the ones below assert that neither half can be
+ * chosen by the person being moderated.
+ */
+describe('the channel line names the author', () => {
+  /**
+   * The removal line and the dry-run line for the same message and the same
+   * grounds, in that order.
+   *
+   * BOTH, EVERY TIME, BECAUSE THE TWO ARE ALLOWED TO DIFFER IN ONE SENTENCE AND
+   * NOTHING ELSE. The dry-run line is the only thing the owner reads while
+   * deciding whether to let this bot delete anything, so a case that proved the
+   * removal line and left the dry-run line untested would be testing the line
+   * that ships and not the line that decision is made on.
+   */
+  async function bothLines(over: Partial<ScannedMessage> = {}): Promise<[string, string]> {
+    const removed: string[] = []
+    const dry: string[] = []
+
+    await handleMessage(
+      msg(over),
+      cfg({ logChannelId: LOG_CHANNEL }),
+      actions({ announce: collect(removed) }),
+    )
+    await handleMessage(
+      msg(over),
+      cfg({ dryRun: true, logChannelId: LOG_CHANNEL }),
+      actions({ announce: collect(dry) }),
+    )
+
+    return [removed[0] ?? '', dry[0] ?? '']
+  }
+
+  /** What the line put inside the code span, or `''` when there is no span. */
+  function spanOf(line: string): string {
+    return /\(`([^`]*)`\)/u.exec(line)?.[1] ?? ''
+  }
+
+  /** The who-and-where half of a line, up to the grounds. */
+  function whoAndWhere(line: string): string {
+    return /Author [\s\S]*?(?=, reason:)/u.exec(line)?.[0] ?? ''
+  }
+
+  it('renders the author as a mention and keeps the username as plain text', async () => {
+    for (const line of await bothLines()) {
+      expect(line).toContain(`<@${AUTHOR}>`)
+      expect(spanOf(line)).toBe(AUTHOR_NAME)
+    }
+  })
+
+  it('leaves the raw id recoverable, because the mention markup contains it', async () => {
+    // The id is what the journal, `grep` and Discord's own audit log agree on;
+    // a rendered name that cannot be turned back into one is a dead end.
+    for (const line of await bothLines()) expect(line).toContain(AUTHOR)
+  })
+
+  it('says who and where in exactly the same words on both lines', async () => {
+    // The drift check. Both builders take the attribution from one function, so
+    // this fails the moment somebody edits one of them alone.
+    const [removed, dry] = await bothLines()
+
+    expect(whoAndWhere(removed)).not.toHaveLength(0)
+    expect(whoAndWhere(removed)).toBe(whoAndWhere(dry))
+  })
+
+  it('still carries the channel link, the grounds and the codes on both lines', async () => {
+    // Everything the line said before the author changed, still said.
+    const [removed, dry] = await bothLines()
+
+    expect(removed).toContain(`channel <#${CHANNEL}>`)
+    expect(removed).toContain('reason: foreign-invite')
+    expect(removed).toContain('invite codes: abc123')
+
+    expect(dry).toContain('Dry run, nothing removed.')
+    expect(dry).toContain(`channel <#${CHANNEL}>`)
+    expect(dry).toContain('reason: foreign-invite')
+    expect(dry).toContain('invite codes: abc123')
+  })
+
+  /**
+   * A USERNAME IS TEXT THE PERSON BEING MODERATED CHOSE, and it is displayed
+   * next to every message they have ever sent, so it is a surface they can
+   * prepare long before the bot ever reads it. Interpolating one into a channel
+   * post unescaped lets the offender write part of our moderation log.
+   */
+  it('cannot let a username break the line, forge markup or write a mass ping', async () => {
+    const nasty = '@everyone <@&999> `**x**`\n||y||'
+
+    for (const line of await bothLines({ authorUsername: nasty })) {
+      // ONE LINE. A newline would push the channel and the grounds onto a line
+      // that no longer says who they are about, and would let a poster produce
+      // something that reads like a second entry in the log.
+      expect(line).not.toContain('\n')
+
+      // Exactly the two delimiters of the code span the name sits in: nothing
+      // in the name can close it and get out as markup.
+      expect(line.match(/`/gu) ?? []).toHaveLength(2)
+
+      // The only `@` and the only `<`s left in the line are the bot's own
+      // mention markup — one `<@`, one `<#` — so the name cannot have forged a
+      // mention of a role or of anybody else.
+      expect(line.match(/@/gu) ?? []).toHaveLength(1)
+      expect(line.match(/</gu) ?? []).toHaveLength(2)
+      expect(line).not.toContain('@everyone')
+      expect(line).not.toContain('<@&')
+
+      // What is left is the name, verbatim and inert: `**x**` is rendered as
+      // asterisks by Discord inside a code span rather than as bold, so it is
+      // kept rather than mangled. That matters for the characters a REAL
+      // username contains — `_` and `.` are both markdown and both ordinary.
+      expect(spanOf(line)).toBe('everyone &999> **x** ||y||')
+
+      // And the record still says what it is for.
+      expect(line).toContain(`channel <#${CHANNEL}>`)
+      expect(line).toContain('reason: foreign-invite')
+    }
+  })
+
+  it('caps the name, so one poster cannot choose how long the record is', async () => {
+    // A webhook name runs to eighty characters and a webhook post is exactly
+    // what this bot removes. The line also has a 2000-character budget to stay
+    // inside, and the name is context rather than the evidence.
+    for (const line of await bothLines({ authorUsername: 'w'.repeat(80) })) {
+      expect(spanOf(line)).toBe(`${'w'.repeat(32)}…`)
+      expect(line).toContain('reason: foreign-invite')
+    }
+  })
+
+  it('still produces a usable line when there is no username to carry', async () => {
+    // Null is a payload that did not bring one; the rest are names that are
+    // nothing but the characters the sanitiser removes. All four have to leave
+    // a record an admin can act on rather than an empty `()` or a stray span.
+    for (const authorUsername of [null, '', '   ', '@@@']) {
+      for (const line of await bothLines({ authorUsername })) {
+        expect(line).toContain(`Author <@${AUTHOR}>,`)
+        expect(line).toContain(`channel <#${CHANNEL}>`)
+        expect(line).toContain('reason: foreign-invite')
+        expect(line).toContain('invite codes: abc123')
+        expect(line).not.toContain('()')
+        expect(line).not.toContain('`')
+      }
+    }
+  })
+})
+
+/**
+ * A client that hands back one channel, and remembers what was sent to it.
+ *
+ * `as unknown as Client` FOR THE SAME REASON `readyPayload` DOES IT: a real
+ * `Client` needs a token and a REST handle, and `announcer` reads two things
+ * off it. Everything this fake answers is a thing the function under test
+ * actually calls.
+ */
+function clientSending(
+  send: Mock<(payload: unknown) => Promise<unknown>>,
+  sendable = true,
+): Client {
+  return {
+    channels: { fetch: () => Promise.resolve({ isSendable: () => sendable, send }) },
+  } as unknown as Client
+}
+
+/**
+ * THE MENTION RENDERS AND NOTIFIES NOBODY, AND ONLY THIS PROVES THE SECOND HALF.
+ *
+ * A mention in a message body pings by default. Nothing about the STRING says
+ * whether it will: the only thing that turns the notification off is
+ * `allowedMentions` on the request, so a test that reads the posted text cannot
+ * tell a suppressed mention from one that pings the member whose message was
+ * just deleted. These assert on the options actually handed to `send`.
+ *
+ * The log channel is admin-only in the guild this runs in, which is why a ping
+ * would usually land nowhere — but that is one server's permission overwrites,
+ * changeable by anybody with Manage Roles and without this file being touched.
+ */
+describe('announcer — the mention renders and notifies nobody', () => {
+  const sendSpy = (): Mock<(payload: unknown) => Promise<unknown>> =>
+    vi.fn<(payload: unknown) => Promise<unknown>>(() => Promise.resolve({}))
+
+  it('suppresses every mention on the send itself', async () => {
+    const send = sendSpy()
+
+    await announcer(clientSending(send), LOG_CHANNEL)(`Author <@${AUTHOR}>`)
+
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(send).toHaveBeenCalledWith({
+      content: `Author <@${AUTHOR}>`,
+      allowedMentions: { parse: [] },
+    })
+  })
+
+  it('carries the option on the line a real removal produces', async () => {
+    // Through `handleMessage`, so the builder and the send are proven to be
+    // wired to each other rather than each proven on its own — which is the way
+    // an option can reach the string and never reach the request.
+    const send = sendSpy()
+    const acts = actions({ announce: announcer(clientSending(send), LOG_CHANNEL) })
+
+    await handleMessage(msg(), cfg({ logChannelId: LOG_CHANNEL }), acts)
+
+    expect(send).toHaveBeenCalledWith({
+      content: expect.stringContaining(`<@${AUTHOR}>`) as unknown as string,
+      allowedMentions: { parse: [] },
+    })
+  })
+
+  it('does the same for the dry-run line, which is the one the owner watches', async () => {
+    const send = sendSpy()
+    const acts = actions({ announce: announcer(clientSending(send), LOG_CHANNEL) })
+
+    await handleMessage(msg(), cfg({ dryRun: true, logChannelId: LOG_CHANNEL }), acts)
+
+    expect(send).toHaveBeenCalledWith({
+      content: expect.stringContaining('Dry run') as unknown as string,
+      allowedMentions: { parse: [] },
+    })
+  })
+
+  it('sends nothing, and says which half is broken, when the channel is unusable', async () => {
+    const send = sendSpy()
+
+    await announcer(clientSending(send, false), LOG_CHANNEL)('anything')
+
+    expect(send).not.toHaveBeenCalled()
+    expect(stderr.join('')).toContain('log channel is missing or cannot be posted to')
   })
 })
 
@@ -1119,6 +1377,18 @@ function memberWith(...roleIds: string[]): LiveMember {
   return { roles: { cache: new Map(roleIds.map((id) => [id, {}])) } }
 }
 
+/**
+ * The author as a payload carries one: an id and a username.
+ *
+ * A HELPER RATHER THAN AN OBJECT LITERAL PER CASE, so the cases that only care
+ * which id is being asked about — the role-cache ones below — do not have to
+ * say anything about the name, and adding a third field to the author is one
+ * edit here rather than one per test.
+ */
+function authorOf(id: string, username: string | null = AUTHOR_NAME): { id: string; username: string | null } {
+  return { id, username }
+}
+
 /** A live message, with spies on the two things that reach Discord. */
 function live(over: Partial<LiveMessage> = {}): LiveMessage & {
   delete: Mock<() => Promise<unknown>>
@@ -1133,7 +1403,7 @@ function live(over: Partial<LiveMessage> = {}): LiveMessage & {
     ...parts({ content: 'join us at discord.gg/abc123' }),
     partial: false,
     messageSnapshots: new Map<string, ScannableParts>(),
-    author: { id: AUTHOR },
+    author: authorOf(AUTHOR),
     member: memberWith(),
     guild: guildWhere(() => Promise.reject(new Error('no such member'))),
     channelId: CHANNEL,
@@ -1242,6 +1512,44 @@ describe('handleLive — from a gateway message to a removal', () => {
 
     expect(posted).toHaveLength(1)
     expect(posted[0] ?? '').toContain(AUTHOR)
+  })
+
+  /**
+   * THE WIRING, WHICH NO ASSERTION ABOUT THE LINE ITSELF CAN REACH. Every case
+   * above that reads the posted text builds the record by hand, so `snapshot`
+   * could stop reading `message.author.username` altogether and all of them
+   * would still pass with the mention in place and the name silently gone —
+   * which is the failure that only shows up weeks later, in the log entry about
+   * somebody who has since left the guild.
+   */
+  it('carries the username off the payload and into the log channel', async () => {
+    const posted: string[] = []
+    const message = live({ author: authorOf(AUTHOR, 'webhook_advert') })
+
+    await handleLive(
+      message,
+      null,
+      cfg({ logChannelId: LOG_CHANNEL }),
+      liveActions({ announce: collect(posted) }),
+    )
+
+    expect(posted[0] ?? '').toContain(`<@${AUTHOR}>`)
+    expect(posted[0] ?? '').toContain('webhook_advert')
+  })
+
+  it('still names the author when the payload brought no username', async () => {
+    const posted: string[] = []
+    const message = live({ author: authorOf(AUTHOR, null) })
+
+    await handleLive(
+      message,
+      null,
+      cfg({ logChannelId: LOG_CHANNEL }),
+      liveActions({ announce: collect(posted) }),
+    )
+
+    expect(posted[0] ?? '').toContain(`Author <@${AUTHOR}>,`)
+    expect(posted[0] ?? '').toContain('reason: foreign-invite')
   })
 
   it('deletes nothing in a dry run', async () => {
@@ -1481,7 +1789,7 @@ describe('handleLive — fetching the member the payload did not bring', () => {
 
     await handleLive(live({ member: null, guild }), null, exempting, liveActions())
     await handleLive(
-      live({ member: null, guild, author: { id: '123456789012345678' } }),
+      live({ member: null, guild, author: authorOf('123456789012345678') }),
       null,
       exempting,
       liveActions(),
@@ -1533,12 +1841,12 @@ describe('handleLive — fetching the member the payload did not bring', () => {
     // with somebody else's hand on the tap. Eviction is proved from the
     // outside: the author pushed out has to be asked about a second time.
     const guild = guildWhere(() => Promise.resolve(memberWith()))
-    const first = { id: '100000000000000001' }
+    const first = authorOf('100000000000000001')
 
     await handleLive(live({ member: null, guild, author: first }), null, exempting, liveActions())
 
     for (let i = 0; i < 500; i++) {
-      const author = { id: `2${String(i).padStart(17, '0')}` }
+      const author = authorOf(`2${String(i).padStart(17, '0')}`)
       await handleLive(live({ member: null, guild, author }), null, exempting, liveActions())
     }
 

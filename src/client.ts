@@ -101,6 +101,27 @@ export interface ScannedMessage {
   readonly text: string
 
   readonly authorId: string
+
+  /**
+   * The author's Discord username, or null when the payload did not carry one.
+   *
+   * `username` AND NOT `globalName`, `displayName` OR `tag`. discord.js 14.27
+   * offers all four and they are not equally good in a record that is read
+   * weeks later. `globalName` is a vanity string its owner can change between
+   * posting the advert and anyone reading about it, and it is not unique — two
+   * accounts can carry the same one, which is how an impersonator ends up
+   * named in a moderation log as somebody else. `displayName` is
+   * `globalName ?? username`, so it inherits that. `tag` is `username` for
+   * every migrated account and `username#1234` only for the legacy ones, so it
+   * is the same string as `username` most of the time and a differently shaped
+   * one the rest of the time. `username` is the unique handle: stable, one per
+   * account, and the thing an admin can actually type into Discord's search.
+   *
+   * WHY IT IS CARRIED AT ALL, when `authorId` is already here: see
+   * `authorRef`. A mention is not a durable record.
+   */
+  readonly authorUsername: string | null
+
   readonly channelId: string
 
   /** Null in a DM. The one signal that says this did not happen in a guild. */
@@ -516,18 +537,12 @@ function logFields(verdict: Removal): Record<string, unknown> {
  * message about a member's behaviour, so there is no advice in it, no emoji and
  * nothing addressed to the poster.
  *
- * THE AUTHOR IS A BARE ID, NOT `<@id>`. A mention renders as a name, which
- * would read better — and notifies the person mentioned whenever they can see
- * the channel. That is the bot talking to a member, which it does not do. If
- * the log channel is admin-only the ping never lands, but that is a property of
- * one server's permissions and not something this file can promise.
- *
  * THE CODES ARE BARE, NEVER `discord.gg/x`. Reposting a working invite into the
  * guild in order to report that it was removed from the guild would be an
  * unusually direct way to defeat the whole bot.
  */
 function removedLine(message: ScannedMessage, verdict: Removal): string {
-  return `Removed a message. Author ${message.authorId}, channel <#${message.channelId}>, ${statedGrounds(verdict)}`
+  return `Removed a message. ${attribution(message)}, ${statedGrounds(verdict)}`
 }
 
 function dryRunLine(message: ScannedMessage, verdict: Removal): string {
@@ -535,7 +550,116 @@ function dryRunLine(message: ScannedMessage, verdict: Removal): string {
   // the owner can watch what the bot WOULD do before letting it do anything; a
   // dry run that only writes to the journal makes that watching an SSH session
   // instead of a channel they are already in.
-  return `Dry run, nothing removed. Author ${message.authorId}, channel <#${message.channelId}>, ${statedGrounds(verdict)}`
+  return `Dry run, nothing removed. ${attribution(message)}, ${statedGrounds(verdict)}`
+}
+
+/**
+ * The who-and-where half of both channel lines, built once.
+ *
+ * ONE FUNCTION FOR THE SAME REASON `statedGrounds` IS ONE FUNCTION. The two
+ * lines above are the same record with a different first sentence, and the
+ * removal line and the dry-run line drifting apart is not a cosmetic problem:
+ * the dry-run line is the ONLY thing the owner reads while deciding whether to
+ * let this bot delete anything, so a field that is right on one of them and
+ * missing on the other is a decision made about a line that is not the line
+ * that will ship. Anything added to the attribution is added to both by
+ * construction, and neither builder can be edited alone.
+ */
+function attribution(message: ScannedMessage): string {
+  return `Author ${authorRef(message)}, channel <#${message.channelId}>`
+}
+
+/**
+ * How the author is named: a mention, and the username in plain text after it.
+ *
+ * THE CHANNEL WAS ALREADY `<#id>` AND THE AUTHOR WAS A BARE SNOWFLAKE — one
+ * line, two conventions, and the half a human actually needs was the unreadable
+ * one. `<@id>` renders as the account's name, so the line can be read without
+ * anybody pasting an eighteen-digit number into a lookup.
+ *
+ * A MENTION IS NOT A DURABLE RECORD, WHICH IS WHY THE NAME IS HERE TOO. `<@id>`
+ * is resolved by the reader's Discord client against the guild's member list,
+ * so the moment that account leaves or is banned the mention renders as
+ * `@unknown-user` — which is exactly when someone scrolls back to find out who
+ * a removal was about. The plain-text username is the copy that survives that,
+ * and it is the copy `grep` and Discord's own search can find. The raw id stays
+ * recoverable either way: it is the digits inside the mention markup.
+ *
+ * THE NAME IS WRAPPED IN A CODE SPAN, AND THAT IS THE NEUTRALISER. A username
+ * is text a stranger chose, interpolated into a message this bot posts, so
+ * without something it is the poster who decides how our moderation log reads:
+ * `**` `_` `~~` `|| ||` reformat the line, and a name is displayed next to
+ * every message they have ever sent, so it is a surface they can prepare in
+ * advance. Inside `` ` ` `` Discord renders every one of those literally and
+ * linkifies nothing — so the name comes out EXACTLY as it was registered rather
+ * than escaped or gutted, which matters because `_` and `.` are ordinary
+ * characters in a real Discord username and stripping them would leave admins
+ * searching for an account that does not exist. `plainName` removes the one
+ * character that could close the span, and three others; see there.
+ *
+ * NOTHING HERE IS THE ANTI-PING MECHANISM. The mention is suppressed at the
+ * send — `announcer` — because that is the only place that can make a promise
+ * about notifications.
+ */
+function authorRef(message: ScannedMessage): string {
+  const name = plainName(message.authorUsername)
+
+  // No name, no parenthetical. An empty `()` would be one more thing in a line
+  // that is read in a hurry, and it says nothing that the mention does not.
+  return name === null ? `<@${message.authorId}>` : `<@${message.authorId}> (\`${name}\`)`
+}
+
+/**
+ * How much of a username the record carries. Discord's own username limit.
+ *
+ * A CAP BECAUSE THE AUTHOR OF THIS STRING IS THE PERSON BEING MODERATED. A
+ * webhook name may be eighty characters and a webhook post is precisely what
+ * this bot exists to remove, so without a cap the offender chooses how much of
+ * every one of our log lines is their text. The channel line has a 2000
+ * character budget it must stay inside — see `statedGrounds` — and the name is
+ * context, not the evidence.
+ */
+const NAME_CAP = 32
+
+/**
+ * A username reduced to something that cannot restructure the line it goes in.
+ *
+ * ONE LINE, ALWAYS. Every run of whitespace becomes a single space, because a
+ * newline in the name does not merely look untidy: it moves the channel and the
+ * grounds onto a second line that no longer says who they are about, and it
+ * lets a poster produce something that reads like a whole second entry in the
+ * moderation log.
+ *
+ * FOUR CHARACTERS ARE REMOVED, AND NONE OF THEM CAN OCCUR IN A REAL DISCORD
+ * USERNAME (the charset is letters, digits, `_` and `.`), so this mangles
+ * nothing legitimate — it is aimed at the names that are not usernames, chiefly
+ * a webhook's, which is free text chosen by anybody holding Manage Webhooks.
+ * A backtick would close the code span `authorRef` puts around the name and let
+ * the rest of it out as markup. `@` is `@everyone` and `@here`. `<` opens every
+ * piece of Discord entity markup there is — `<@id>`, `<@&role>`, `<#channel>` —
+ * so without it a name can forge a mention of somebody who had nothing to do
+ * with the message. `\p{C}` is everything invisible: control codes, zero-width
+ * joiners, and the bidi overrides that reorder what a human reads without
+ * changing a byte of what was stored.
+ *
+ * The suppression at the send makes the ping half of that moot, and this makes
+ * it moot a second time, in the text itself, where it holds no matter what any
+ * later caller does with the string.
+ *
+ * EMPTY IS THE SAME ANSWER AS ABSENT. A name that is nothing but the characters
+ * above leaves an empty string, and printing `` (``) `` would be worse than
+ * printing nothing at all.
+ */
+function plainName(username: string | null): string | null {
+  if (username === null) return null
+
+  const flattened = username.replace(/\s+/gu, ' ').replace(/[`@<\p{C}]/gu, '').trim()
+  if (flattened === '') return null
+
+  // Cut by code point, not by `slice`: a UTF-16 cut can land in the middle of a
+  // surrogate pair and leave half a character in the record.
+  const points = [...flattened]
+  return points.length > NAME_CAP ? `${points.slice(0, NAME_CAP).join('')}…` : flattened
 }
 
 /**
@@ -892,7 +1016,20 @@ export interface LiveGuild {
 
 export interface LiveMessage extends ScannableMessage {
   readonly partial: boolean
-  readonly author: { readonly id: string } | null
+
+  /**
+   * `username` IS NAMED HERE SO THE COMPILER HOLDS discord.js TO IT, the same
+   * way `ScannableParts` names the text surfaces. discord.js's `User` carries
+   * `username`, `globalName`, `displayName` and `tag`; naming the one this file
+   * uses means a rename in a future release is a compile error rather than a
+   * log line that quietly stops saying who a removal was about.
+   *
+   * NULLABLE, THOUGH `User.username` IS NOT. A username the payload did not
+   * bring must not be the difference between a record and no record, and the
+   * line is built to survive its absence — see `authorRef`.
+   */
+  readonly author: { readonly id: string; readonly username: string | null } | null
+
   readonly member: LiveMember | null
 
   /**
@@ -1160,12 +1297,18 @@ export function createClient(config: Config): Client {
     partials: [Partials.Message],
 
     /**
-     * NOTHING THIS BOT SENDS CAN EVER PING ANYONE. Set on the client rather
-     * than at the one call site, because the guarantee should hold for whatever
-     * gets added later without depending on somebody remembering. The log line
-     * contains an invite code chosen by a stranger, and while the code
-     * character class cannot produce an `@`, this makes the question moot
-     * instead of making it a thing to reason about.
+     * NOTHING THIS BOT SENDS CAN EVER PING ANYONE. Set on the client so the
+     * guarantee holds for whatever gets added later without depending on
+     * somebody remembering. The log line carries an invite code chosen by a
+     * stranger and, since the author became a mention, `<@id>` on purpose —
+     * this makes the question moot instead of making it a thing to reason
+     * about.
+     *
+     * THE ONE SEND THAT EXISTS TODAY REPEATS IT ANYWAY. This is a default, and
+     * a default is silently replaced by any call that passes `allowedMentions`
+     * of its own; `announcer` states the suppression at its own `send` because
+     * that call deliberately contains a mention, and because a default set here
+     * cannot be asserted on there.
      */
     allowedMentions: { parse: [], repliedUser: false },
   })
@@ -1332,6 +1475,12 @@ function snapshot(message: LiveMessage, authorId: string, selfId: string | null)
   return {
     text: scanText(message),
     authorId,
+
+    // Read here rather than threaded through `handleLive` alongside `authorId`:
+    // the id is load-bearing for the decision and has to be established before
+    // the message is scanned at all, and the name is only ever a record.
+    authorUsername: message.author?.username ?? null,
+
     channelId: message.channelId,
     guildId: message.guildId,
     webhookId: message.webhookId,
@@ -1355,8 +1504,37 @@ function snapshot(message: LiveMessage, authorId: string, selfId: string | null)
  * channel being recreated, and it fails per-removal instead of leaving the bot
  * permanently unable to report anything because it started before the guild
  * finished loading.
+ *
+ * THE MENTION RENDERS AND NOTIFIES NOBODY, AND THIS IS THE HALF THAT DECIDES
+ * THAT. `allowedMentions: { parse: [] }` tells Discord to resolve no mention in
+ * this message: `<@id>` is still displayed as the account's name, and no
+ * notification is delivered to anybody. Nothing the string builder does can
+ * achieve that — a mention in a message body pings by default, and the only
+ * thing that turns it off is an option on the request.
+ *
+ * IT IS SET HERE AS WELL AS ON THE CLIENT, DELIBERATELY. `createClient` sets
+ * the same option as a client-wide default and that default is worth keeping,
+ * but it is a default: it applies to the sends that say nothing about mentions,
+ * it lives four hundred lines from here, and the guarantee it makes is one that
+ * a `send` passing its own `allowedMentions` for some other reason silently
+ * replaces. This is now the one call in the bot that puts a mention in a
+ * message ON PURPOSE, so the suppression belongs next to it, where a reader of
+ * this function can see it and a test can assert on the options that were
+ * actually handed to `send`.
+ *
+ * EXPORTED SO THAT LAST PART IS POSSIBLE, for the same reason `remover` is. The
+ * option is invisible from the front door — every caller above this sees a
+ * `(line: string) => Promise<void>` and a string that reads correctly whether
+ * or not the send suppresses anything — so a test coming in through
+ * `handleMessage` cannot tell a suppressed mention from one that pings the
+ * member the bot just deleted a message from.
+ *
+ * The channel this posts to is admin-only in the guild it runs in, which is why
+ * a ping would usually land nowhere. That is a property of one server's
+ * permission overwrites, changeable by anybody with Manage Roles and without
+ * anybody touching this file, so it is not the thing the promise rests on.
  */
-function announcer(client: Client, channelId: string): (line: string) => Promise<void> {
+export function announcer(client: Client, channelId: string): (line: string) => Promise<void> {
   return async (line) => {
     const channel = await client.channels.fetch(channelId)
 
@@ -1369,6 +1547,6 @@ function announcer(client: Client, channelId: string): (line: string) => Promise
       return
     }
 
-    await channel.send(line)
+    await channel.send({ content: line, allowedMentions: { parse: [] } })
   }
 }

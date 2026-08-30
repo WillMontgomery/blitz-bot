@@ -689,8 +689,16 @@ can see.
 **Two:** a line appears in `#bot-status`, within a second or two:
 
 ```
-Dry run, nothing removed. Author 000000000000000000, channel <#000000000000000000>, reason: foreign-invite, invite codes: XXXXXXX
+Dry run, nothing removed. Author <@000000000000000000> (`your_username`), channel <#000000000000000000>, reason: foreign-invite, invite codes: XXXXXXX
 ```
+
+That is the text the bot posts. Discord displays `<@id>` as the account's name
+and `<#id>` as a channel link, and renders the username between the backticks as
+a code span, so what you actually see reads with names where the ids are. The
+mention notifies nobody — the bot suppresses that on the send. The username is
+posted alongside it because a mention of an account that has since left or been
+banned renders as `@unknown-user`, which is exactly when someone scrolls back to
+find out who a removal was about.
 
 **Three:** the journal carries the matching record:
 
@@ -760,7 +768,7 @@ above again.
 **Two:** `#bot-status` says so:
 
 ```
-Removed a message. Author 000000000000000000, channel <#000000000000000000>, reason: foreign-invite, invite codes: XXXXXXX
+Removed a message. Author <@000000000000000000> (`your_username`), channel <#000000000000000000>, reason: foreign-invite, invite codes: XXXXXXX
 ```
 
 **Three:** the journal agrees:
