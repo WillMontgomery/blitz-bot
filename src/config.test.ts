@@ -46,6 +46,7 @@ const schemaVariables = [
   'DISCORD_ADMIN_ROLE_ID',
   'BLITZ_LOG_CHANNEL_ID',
   'BLITZ_STATUS_CHANNEL_ID',
+  'BLITZ_DOCS_CHANNEL_ID',
   'BLITZ_EXEMPT_CHANNEL_IDS',
   'BLITZ_EXEMPT_ADMINS',
   'BLITZ_DRY_RUN',
@@ -254,6 +255,62 @@ describe('BLITZ_STATUS_CHANNEL_ID', () => {
 
     expect(config.logChannelId).toBe('111')
     expect(config.statusChannelId).toBe('222')
+  })
+})
+
+/**
+ * The channel the bot keeps its own manual posted in.
+ *
+ * OPTIONAL FOR THE SAME REASON THE STATUS CHANNEL IS, and one more: unset does
+ * not mean "publish nowhere", it means the feature does not exist. Nothing is
+ * read off disk and nothing is posted. The bot is live today with no such
+ * channel and has to keep booting exactly as it does now.
+ */
+describe('BLITZ_DOCS_CHANNEL_ID', () => {
+  it('is null when it is not set, so the bot boots with no manual at all', () => {
+    const config = loadConfig({ DISCORD_BOT_TOKEN: 'token', DISCORD_GUILD_ID: 'guild' })
+
+    expect(config.docsChannelId).toBeNull()
+  })
+
+  /**
+   * THE THREE OPTIONAL CHANNEL IDS ARE THREE DIFFERENT FIELDS. This one names a
+   * channel the bot EDITS AND DELETES MESSAGES IN; the other two hold records of
+   * things that happened. Crossing them would put the bot's own edits into a
+   * channel of evidence, so a test that could not tell them apart is not enough.
+   */
+  it('is carried through, and is neither of the other two channels', () => {
+    const config = loadConfig({
+      DISCORD_BOT_TOKEN: 'token',
+      DISCORD_GUILD_ID: 'guild',
+      BLITZ_LOG_CHANNEL_ID: '111',
+      BLITZ_STATUS_CHANNEL_ID: '222',
+      BLITZ_DOCS_CHANNEL_ID: '333',
+    })
+
+    expect(config.logChannelId).toBe('111')
+    expect(config.statusChannelId).toBe('222')
+    expect(config.docsChannelId).toBe('333')
+  })
+
+  /** Blank is absent, like every other optional id: a copied-but-unedited
+   * `.env` must turn the feature off rather than name a channel called "". */
+  it('reads a blank line as unset', () => {
+    const config = loadConfig({
+      DISCORD_BOT_TOKEN: 'token',
+      DISCORD_GUILD_ID: 'guild',
+      BLITZ_DOCS_CHANNEL_ID: '   ',
+    })
+
+    expect(config.docsChannelId).toBeNull()
+  })
+
+  /**
+   * `.env.example` IS THE DOCUMENT OPERATORS ACTUALLY COPY, and a variable the
+   * code reads but the template does not mention is a feature nobody can find.
+   */
+  it('is in the template operators copy', () => {
+    expect(repoFile('.env.example')).toContain('BLITZ_DOCS_CHANNEL_ID=')
   })
 })
 

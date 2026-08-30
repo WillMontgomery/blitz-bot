@@ -68,8 +68,85 @@ step() {
   "$@" || fail "$label" $?
 }
 
+# The files in deploy/ are not TypeScript and nothing above looks at them: two
+# POSIX shell scripts and three systemd units, which land on the box as
+# /usr/local/bin/blitz-bot-update and /etc/systemd/system/*. Until they were
+# extracted out of docs/deploy.md they were text inside a markdown fence, so the
+# first parse of the updater happened when a unit ran it at 3am and the first
+# parse of a unit happened at `systemctl start`. Both are cheap here.
+#
+# WHAT THIS IS NOT. It does not run either script and it does not install
+# anything: `sh -n` parses without executing, and `systemd-analyze verify` reads
+# unit files. Nothing in this step touches /etc, /usr/local or systemd's state,
+# which is what makes it safe on a laptop.
+deploy() {
+  status=0
+
+  # `sh -n` AND NOT `bash -n`, because both files say `#!/bin/sh` and the
+  # parser that matters is the one that will actually run them. On the CI runner
+  # /bin/sh is dash, so this rejects a bashism -- an array, a `[[`, a `local` --
+  # that `bash -n` would accept here and that /bin/sh on the box would then
+  # refuse at the worst moment. In Git Bash `sh` is bash in POSIX mode and
+  # catches less; CI is where this one earns its keep.
+  for script in deploy/blitz-bot-update deploy/install.sh; do
+    sh -n "$script" || {
+      printf 'deploy: %s does not parse as POSIX sh\n' "$script" >&2
+      status=1
+    }
+  done
+
+  # `systemd-analyze verify` reads a unit the way systemd will: a misspelled
+  # directive, a section that is not a section, a value it cannot parse. None of
+  # that is visible to any other check in this repo, and all of it is a unit
+  # that fails at `systemctl start` on a box nobody is watching.
+  #
+  # SKIPPED LOUDLY WHERE IT IS NOT INSTALLED. CI is ubuntu-latest and has it; a
+  # Windows laptop does not. A check that could not run has to say so, or a skip
+  # reads as a tick and the repo believes for a year that something is verified.
+  #
+  # ITS OUTPUT IS THE VERDICT AND ITS EXIT STATUS IS NOT, which is forced rather
+  # than chosen. It also checks that every path a unit names exists and is
+  # executable, and here none of them do: /opt/node24/bin/node and
+  # /usr/local/bin/blitz-bot-update are on the box and nowhere else, so it exits
+  # non-zero on every machine this file runs on. Complaints about a missing path
+  # are therefore dropped -- that class and no other -- and anything else it
+  # prints fails this step. deploy/install.sh runs the same command ON the box,
+  # after putting those paths there, and uses its status as it comes.
+  if command -v systemd-analyze > /dev/null 2>&1; then
+    complaints=$(
+      systemd-analyze verify \
+        deploy/blitz-bot.service \
+        deploy/blitz-bot-update.service \
+        deploy/blitz-bot-update.timer 2>&1 |
+        grep -v 'No such file or directory'
+    )
+
+    if [ -n "$complaints" ]; then
+      printf '%s\n' "$complaints" >&2
+      printf 'deploy: systemd-analyze rejected a unit file, above\n' >&2
+      status=1
+    else
+      printf 'deploy: systemd-analyze accepts the three unit files\n'
+    fi
+  else
+    printf 'deploy: no systemd-analyze here, so the three unit files were NOT checked\n'
+    printf 'deploy: CI runs on ubuntu-latest, where it exists, and does check them\n'
+  fi
+
+  return "$status"
+}
+
 step 'npm run typecheck' npm run typecheck
 step 'npm run lint' npm run lint
 step 'npm test' npm test
 
-printf '\nverify: typecheck, lint and test all passed\n'
+# LAST, AND THE ORDER ABOVE IT IS THE REASON. Those three are ordered against
+# each other because a `tsc` failure makes the next two into noise. This one has
+# no such relationship with any of them -- it reads shell and ini files, not the
+# TypeScript program -- so it goes where it cannot displace a compile error as
+# the first thing reported. It is also the only step that can half-run, and its
+# "NOT checked" line belongs at the end as a note rather than at the top as a
+# headline.
+step 'deploy/ -- shell syntax and unit files' deploy
+
+printf '\nverify: typecheck, lint, test and deploy/ all passed\n'

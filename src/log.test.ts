@@ -256,6 +256,65 @@ const configSource = repoFile('src/config.ts')
 const indexSource = repoFile('src/index.ts')
 
 /**
+ * The four files that go on the box, and the script that puts them there.
+ *
+ * THEY USED TO BE HEREDOCS IN docs/deploy.md AND EVERY ASSERTION BELOW READ
+ * THEM OUT OF IT. A `sudo tee /usr/local/bin/blitz-bot-update <<'EOF'` block
+ * was the only copy of the updater under version control: nothing could parse
+ * it without running it, nothing could diff it against the box, and installing
+ * it meant pasting nearly four hundred lines into an SSH session. They are real
+ * files now, `verify.sh` parses the two scripts and runs `systemd-analyze
+ * verify` over the three units, and everything here reads the file that is
+ * actually installed rather than a fenced copy of it.
+ *
+ * THE RISK IN THAT MOVE IS THIS FILE, WHICH IS WHY IT IS NAMED HERE. Repointing
+ * a pin at a path that does not exist, or at a file whose shape has changed,
+ * leaves an assertion that matches nothing and passes — thirty green checks
+ * pinning nothing at all. `repoFile` throws on a missing file, `capture` and
+ * `captureAll` throw when their pattern stops matching, and each of these was
+ * confirmed by mutating the file it reads and watching the suite go red.
+ */
+const updateScript = repoFile('deploy/blitz-bot-update')
+const installScript = repoFile('deploy/install.sh')
+const botUnit = repoFile('deploy/blitz-bot.service')
+const updateUnit = repoFile('deploy/blitz-bot-update.service')
+const timerUnit = repoFile('deploy/blitz-bot-update.timer')
+
+/** The two directories deploy/install.sh writes into, as it declares them. */
+const installDirs = new Map([
+  ['BIN', capture(installScript, /^BIN=(\S+)$/m, "the bin directory install.sh declares")],
+  ['SYSTEMD', capture(installScript, /^SYSTEMD=(\S+)$/m, "the unit directory install.sh declares")],
+])
+
+/**
+ * What deploy/install.sh actually puts on the box, in the order it puts it
+ * there: source name, absolute destination, mode.
+ *
+ * READ OUT OF THE SCRIPT RATHER THAN RESTATED. Four destinations and four modes
+ * typed out here would be a second copy of the thing being checked, and the
+ * copy that is never wrong is the one nobody maintains. `captureAll` refuses to
+ * return nothing, so a `place` line that changed shape fails loudly here rather
+ * than quietly reducing every assertion below to a loop over an empty list.
+ */
+const installs = captureAll(
+  installScript,
+  /^place (\S+ +"\$\w+\/[^"]+" +\d+)$/gm,
+  'the place lines in deploy/install.sh',
+).map((line) => {
+  const [src = '', quoted = '', mode = ''] = line.split(/\s+/)
+
+  return {
+    src,
+    mode,
+    dest: quoted.slice(1, -1).replace(/^\$(\w+)/, (_, name: string) => {
+      const directory = installDirs.get(name)
+      if (directory === undefined) throw new Error(`install.sh installs into $${name}, unset`)
+      return directory
+    }),
+  }
+})
+
+/**
  * Every message string deploy.md quotes, pulled out of the file that emits it.
  *
  * THE WHOLE POINT IS THAT NOTHING HERE IS TYPED OUT TWICE. deploy.md has now
@@ -1519,9 +1578,11 @@ describe('docs/deploy.md — the steps that cannot be left out', () => {
    */
   it('runs every npm through the node binary, never through a shebang', () => {
     // The runtime, taken from the unit that has to be right about it rather
-    // than typed out a second time here.
+    // than typed out a second time here. It comes from deploy/blitz-bot.service
+    // now instead of from the heredoc that unit used to be pasted out of; the
+    // value and the argument for it are unchanged.
     const node = capture(
-      deployDoc,
+      botUnit,
       /^ExecStart=(\S+) --disable-warning/m,
       "the bot unit's node binary",
     )
@@ -1540,7 +1601,19 @@ describe('docs/deploy.md — the steps that cannot be left out', () => {
      */
     const NPM = /(?:^|[\s;&|`"'(])((?:[^\s;&|`"'()]*\/)?npm(?:-cli\.js)?)(?=[\s;&|`"')]|$)/g
 
-    const lines = captureAll(deployDoc, /^```bash\n([\s\S]*?)^```/gm, 'a bash block in deploy.md')
+    /**
+     * EVERY PLACE AN `npm` CAN BE RUN, WHICH IS NO LONGER ONLY THE DOCUMENT.
+     * The update's own `npm ci` used to sit in a heredoc in deploy.md and was
+     * scanned along with everything else in a ```bash fence. It is
+     * deploy/blitz-bot-update now, so the two shell scripts are read as well —
+     * without them this check would quietly stop covering the one invocation
+     * that runs unattended, four times an hour, on the box.
+     */
+    const lines = [
+      ...captureAll(deployDoc, /^```bash\n([\s\S]*?)^```/gm, 'a bash block in deploy.md'),
+      updateScript,
+      installScript,
+    ]
       .flatMap((block) => block.split('\n'))
       .filter((line) => !/^\s*#/.test(line))
 
@@ -1566,12 +1639,15 @@ describe('docs/deploy.md — the steps that cannot be left out', () => {
     // document installs still installs.
     expect(invocations).toBeGreaterThanOrEqual(4)
 
-    for (const [what, heading] of [
-      ['the first install', /^## \d+\. The code/m],
-      ['the update script', /^## \d+\. The units/m],
-      ['deploying by hand', /^## \d+\. Deploying an update/m],
+    // The three places that install, named individually so that losing one of
+    // them is a failure rather than a count that is still four because
+    // something else grew a second `npm ci`.
+    for (const [what, source] of [
+      ['the first install', section(deployDoc, /^## \d+\. The code/m)],
+      ['the update script', updateScript],
+      ['deploying by hand', section(deployDoc, /^## \d+\. Deploying an update/m)],
     ] as const) {
-      expect(section(deployDoc, heading), what).toContain(cli)
+      expect(source, what).toContain(cli)
     }
   })
 
@@ -1847,21 +1923,73 @@ describe('docs/deploy.md — the steps that cannot be left out', () => {
       "the experimental-warning flag in package.json's start script",
     )
 
-    expect(deployDoc).toContain(
+    // In the unit, which is deploy/blitz-bot.service rather than a heredoc in
+    // §6.4 — the file that gets installed, not a copy of it in a document.
+    expect(botUnit).toContain(
       `ExecStart=/opt/node24/bin/node ${warning} /opt/blitz-bot/src/index.ts`,
     )
 
+    // Neither the unit nor the runbook may put the bot on the console's Node,
+    // and neither may propose moving the console.
+    expect(botUnit).not.toMatch(/ExecStart=\/usr\/bin\/node/)
     expect(deployDoc).not.toMatch(/ExecStart=\/usr\/bin\/node/)
     expect(deployDoc).not.toMatch(/nodesource/i)
     expect(deployDoc).not.toMatch(/systemctl restart ringmaster/)
   })
 
-  it('writes the unit file in one block and checks it before enabling it', () => {
+  /**
+   * INSTALLED FROM A FILE, AND CHECKED BEFORE ANYTHING IS ENABLED.
+   *
+   * This used to assert that §6 wrote the unit in one `sudo tee` block rather
+   * than telling anybody to open an editor, because a fifty-line paste into
+   * `nano` is where a stray character gets in. There is no paste left: the unit
+   * is deploy/blitz-bot.service and deploy/install.sh copies it. What survives
+   * of that argument is the half that still bites — nothing sends the operator
+   * to edit a unit in place under /etc, and the check happens before a single
+   * `systemctl enable`, because a typo in an enabled unit is a boot-time
+   * failure on a box nobody is watching.
+   */
+  it('installs the units from files and checks them before enabling them', () => {
     const unit = section(deployDoc, /^## \d+\. The unit/m)
 
-    expect(unit).toMatch(/sudo tee \/etc\/systemd\/system\/blitz-bot\.service[^\n]*<<'EOF'/)
     expect(unit).not.toMatch(/nano \/etc\/systemd/)
-    expect(unit).toContain('systemd-analyze verify /etc/systemd/system/blitz-bot.service')
+
+    /**
+     * NO HEREDOC MAY PUT ANY OF THE FOUR BACK INTO THE DOCUMENT. A unit quoted
+     * in the runbook beside the unit in deploy/ is two units, and the one that
+     * gets edited is whichever the next person happened to be reading. Three
+     * drifts in this project have started exactly there.
+     */
+    for (const file of installs) {
+      expect(deployDoc, file.dest).not.toContain(`sudo tee ${file.dest}`)
+    }
+
+    /**
+     * The check is in the installer, over what it just wrote, and it is reached
+     * before the runbook enables anything.
+     *
+     * ON THE CALL AND NOT ON THE STRING. `toContain('systemd-analyze verify')`
+     * was the first version of this and a mutation pass walked straight through
+     * it: install.sh names the command in a comment two paragraphs above, so
+     * replacing the actual invocation with `true` left the string in the file
+     * and the assertion green. The arguments are captured instead, which cannot
+     * be satisfied by prose.
+     */
+    const analyze = capture(
+      installScript,
+      /^systemd-analyze verify((?: *\\\n *"[^"]+")+)/m,
+      'the systemd-analyze call in deploy/install.sh',
+    )
+
+    // Handed the installed paths rather than the repo copies, so the check
+    // covers the copy itself and the ExecStart targets that only exist there.
+    for (const file of installs.filter((each) => /\.(service|timer)$/.test(each.src))) {
+      expect(analyze, file.dest).toContain(`"$SYSTEMD/${file.src}"`)
+    }
+
+    expect(installScript.indexOf('systemd-analyze verify \\')).toBeLessThan(
+      installScript.indexOf('systemctl daemon-reload'),
+    )
     expect(deployDoc.indexOf('systemd-analyze verify')).toBeLessThan(
       deployDoc.indexOf('systemctl enable --now blitz-bot'),
     )
@@ -1921,11 +2049,18 @@ describe('docs/deploy.md — the steps that cannot be left out', () => {
  * The bot no longer updates itself, a timer does, and every part of that is a
  * fact about five files on a box nobody looks at.
  *
- * NONE OF THOSE FIVE IS SOMETHING A PUSH CAN DEPLOY. Two units, a timer, a
- * shell script and a sudoers drop-in, all outside the repo — so the runbook
- * heredocs are the only copy of them under version control, and an edit that
- * drops a line from one of them changes what the next box does while reviewing
- * as a documentation tweak.
+ * FOUR OF THE FIVE ARE IN THE REPOSITORY NOW, in deploy/, and this block used
+ * to read them out of heredocs in docs/deploy.md instead. Nothing about what is
+ * asserted changed with them; what changed is that the thing asserted on is the
+ * file that gets installed rather than a copy of it inside a fenced block. The
+ * fifth, the sudoers drop-in, is still written by hand in §6.3 and is still
+ * read out of its heredoc below.
+ *
+ * A PUSH STILL DEPLOYS NONE OF THEM. `deploy/install.sh` copies them, by hand,
+ * and an update brings a new one only as far as /opt/blitz-bot/deploy/ — so an
+ * edit that drops a line from one of them still changes what the next box does.
+ * What is different is that the edit is now a diff over a shell script and
+ * three unit files, which CI parses, rather than a diff over a document.
  *
  * THE LAST ROUND'S DESIGN WAS REJECTED, AND THESE TESTS ARE MOSTLY HERE TO
  * KEEP IT REJECTED. An `ExecStartPre` on the bot's own unit meant three things
@@ -1956,20 +2091,26 @@ describe('docs/deploy.md — the steps that cannot be left out', () => {
  *     drops its gateway connection four times an hour to arrive at the commit
  *     it was already on.
  *
- * SO THE TESTS READ THE HEREDOCS AND ASSERT ON DIRECTIVES, and where a value
+ * SO THE TESTS READ THE FILES AND ASSERT ON DIRECTIVES, and where a value
  * appears in two places — the script's path, the off switch, the sudo grant,
  * the commit file, the line number in .gitignore — one side is derived from the
  * other rather than typed out twice, for the reason the rest of this file
  * gives.
  */
-describe('docs/deploy.md — the timer that updates, and the unit that no longer does', () => {
+describe('deploy/ — the timer that updates, and the unit that no longer does', () => {
   const UNITS = /^## \d+\. The units/m
   const UPDATE = /^## \d+\. Deploying an update/m
   const RESTART_LOOP = /^## \d+\. When it will not start/m
 
   const flat = (text: string): string => text.replace(/\s+/g, ' ')
 
-  /** One heredoc the runbook writes, exactly as the thing that reads it will. */
+  /**
+   * The one heredoc left in the runbook, exactly as the thing that reads it
+   * will. §6.3 stages the sudoers drop-in in /tmp and checks it with `visudo
+   * -c` before it goes anywhere near /etc/sudoers.d, because a file there that
+   * does not parse stops `sudo` working at all — so it stays a deliberate
+   * by-hand sequence rather than a fifth line in install.sh.
+   */
   const heredoc = (path: string): string =>
     capture(
       deployDoc,
@@ -1977,10 +2118,6 @@ describe('docs/deploy.md — the timer that updates, and the unit that no longer
       `the ${path} heredoc in deploy.md`,
     )
 
-  const botUnit = heredoc('/etc/systemd/system/blitz-bot.service')
-  const updateUnit = heredoc('/etc/systemd/system/blitz-bot-update.service')
-  const timerUnit = heredoc('/etc/systemd/system/blitz-bot-update.timer')
-  const updateScript = heredoc('/usr/local/bin/blitz-bot-update')
   const sudoers = heredoc('/tmp/blitz-bot-update.sudoers')
 
   /** A unit's settings, with its prose and its section headers dropped. */
@@ -2231,16 +2368,23 @@ describe('docs/deploy.md — the timer that updates, and the unit that no longer
       expect(directive, directive).not.toMatch(/^Restart=/)
     }
 
-    // Installed under the path the unit runs, executable, and written before
-    // the unit that names it — the other order leaves a window in which a run
-    // finds nothing there.
+    /**
+     * Installed under the path the unit runs, executable, and installed before
+     * the units that name it — the other order leaves a window in which
+     * blitz-bot-update.service exists and its ExecStart does not, on a box
+     * whose timer may already be running.
+     *
+     * THE `chmod 755` THIS REPLACES WAS A SEPARATE STEP IN THE RUNBOOK, because
+     * `tee` does not set a mode and somebody had to remember to. install.sh
+     * writes the file and the mode in one `install` call, so the assertion is
+     * on the mode it installs rather than on a command being present two blocks
+     * further down the page.
+     */
     const script = setting(updateUnit, 'ExecStart', "the update unit's ExecStart")
-    const units = section(deployDoc, UNITS)
+    const first = installs[0]
 
-    expect(units).toContain(`sudo chmod 755 ${script}`)
-    expect(deployDoc.indexOf(`sudo tee ${script}`)).toBeLessThan(
-      deployDoc.indexOf('sudo tee /etc/systemd/system/blitz-bot-update.service'),
-    )
+    expect(first?.dest, 'the update script is not the first thing install.sh installs').toBe(script)
+    expect(first?.mode, 'the update script is not installed executable').toBe('755')
 
     // It runs as the user that owns the tree. As root, git refuses an
     // ubuntu-owned repository outright and the install leaves a tree the
@@ -2258,6 +2402,122 @@ describe('docs/deploy.md — the timer that updates, and the unit that no longer
     )
 
     expect(startTimeout).toBeGreaterThan(fetch + install)
+  })
+
+  /**
+   * EVERY FILE install.sh CLAIMS TO INSTALL HAS TO BE THERE TO INSTALL.
+   *
+   * It copies four files by name out of its own directory. Rename one in the
+   * repository and not in the script and the run stops halfway: two units in
+   * /etc/systemd/system, the third missing, and the `systemd-analyze verify`
+   * that would have said so never reached — because the script died in front of
+   * it. On the box that reads as an install that "half worked", which is the
+   * one outcome an installer exists to make impossible.
+   *
+   * AND THE FOURTH FILE IS THE POINT OF THE OTHER HALF OF THIS. `deploy/` is
+   * where the units live now, and a destination that does not correspond to a
+   * file in it is a unit installed from nowhere.
+   */
+  it('installs four files, all of which are in deploy/', () => {
+    expect(installs).toHaveLength(4)
+
+    // In deploy/, readable, under the name the script asks for. repoFile throws
+    // on a missing file, so this is the check and not a description of one.
+    for (const file of installs) {
+      expect(() => repoFile(`deploy/${file.src}`), file.src).not.toThrow()
+    }
+
+    // Installed under the same basename it has in the repository, so
+    // `diff deploy/blitz-bot.service /etc/systemd/system/blitz-bot.service` is
+    // both the obvious thing to type and the right one. That comparison is the
+    // whole reason these files stopped being heredocs.
+    for (const file of installs) {
+      expect(file.dest.endsWith(`/${file.src}`), `${file.src} -> ${file.dest}`).toBe(true)
+    }
+
+    // The three units go where systemd reads units, at 644: a unit file is read
+    // by systemd and never executed by anything.
+    const units = installs.filter((file) => /\.(service|timer)$/.test(file.src))
+
+    for (const unit of units) {
+      expect(unit.dest, unit.src).toBe(`${installDirs.get('SYSTEMD') ?? '?'}/${unit.src}`)
+      expect(unit.mode, unit.dest).toBe('644')
+    }
+
+    /**
+     * AND EVERY DESTINATION IS A PATH §6 ALREADY NAMES. This is the one
+     * assertion here that is not derived from install.sh, and it is the only
+     * reason the two directories at the top of that file mean anything: an
+     * installer retargeted at /etc/systemd/user is internally consistent, and
+     * everything above stays green while the box gains three units systemd
+     * never loads and a runbook that describes a different machine.
+     */
+    for (const file of installs) {
+      expect(section(deployDoc, UNITS), file.dest).toContain(file.dest)
+    }
+
+    /**
+     * AND THE FILES IT INSTALLS ARE THE FILES THIS BLOCK PINS. Compared by
+     * content rather than by name, so a fourth unit dropped into deploy/ and
+     * added to install.sh — installed on the box, asserted on by nothing —
+     * fails here instead of arriving unreviewed.
+     */
+    const pinned = [botUnit, updateUnit, timerUnit]
+
+    expect(units).toHaveLength(pinned.length)
+    for (const unit of units) expect(pinned, unit.src).toContain(repoFile(`deploy/${unit.src}`))
+
+    // The one that is not a unit is the update script, likewise by content.
+    expect(repoFile(`deploy/${installs[0]?.src ?? ''}`)).toBe(updateScript)
+
+    /**
+     * AND IT INSTALLS WITHOUT STARTING, which is the decision the runbook is
+     * built on: §7 starts the bot, reads the journal, and turns the timer on
+     * last, one step at a time. `enable` folded in here would mean a reboot
+     * deploys, and `start` would mean an install starts a bot into a live guild
+     * before anybody has looked at `.env`.
+     *
+     * ON THE COMMANDS AND NOT THE TEXT, because the script's own comments name
+     * `systemctl start blitz-bot-update` in order to explain what the
+     * daemon-reload is for.
+     */
+    for (const line of installScript.split('\n')) {
+      if (/^\s*#/.test(line)) continue
+      expect(line, line).not.toMatch(/systemctl (enable|start|restart)\b/)
+    }
+
+    expect(installScript).toContain('systemctl daemon-reload')
+  })
+
+  /**
+   * THE COMMAND THE RUNBOOK HANDS OVER HAS TO NAME A FILE THAT EXISTS.
+   *
+   * §6.1 is now one line to paste and it is the entire install, so a renamed or
+   * moved installer turns that line into `No such file or directory` at the one
+   * moment the operator has nothing else to try — and he is not a programmer,
+   * so "work out where it went" is not a step. Both halves are derived: the
+   * repo-relative half by reading the file at all, and the box-absolute prefix
+   * out of the directory install.sh refuses to run without.
+   */
+  it('hands over an install command that names the installer that exists', () => {
+    const repo = capture(installScript, /^REPO=(\S+)$/m, 'the directory install.sh insists on')
+    const command = `sudo sh ${repo}/deploy/install.sh`
+
+    expect(section(deployDoc, UNITS)).toContain(command)
+
+    /**
+     * THROUGH AN INTERPRETER AND NOT AS `./install.sh`, for the reason ci.yml
+     * gives about verify.sh: this repo is developed on Windows with
+     * `core.filemode=false`, and an executable bit that did not survive is
+     * "Permission denied", exit 126, out of a command that looks exactly right.
+     * Naming `sh` does not consult the mode bit at all.
+     */
+    expect(deployDoc).not.toMatch(/sudo \S*\/deploy\/install\.sh/)
+    expect(deployDoc).not.toMatch(/\.\/deploy\/install\.sh/)
+
+    // §16 sends him back to the same command rather than to a second one, which
+    // is the rule the whole "one script, one unit, one path" argument runs on.
+    expect(section(deployDoc, UPDATE)).toContain(command)
   })
 
   /**
@@ -2583,7 +2843,20 @@ describe('docs/deploy.md — the timer that updates, and the unit that no longer
     expect(updateScript).toContain('git fetch --quiet origin')
     expect(updateScript).toContain('git reset --hard --quiet origin/main')
 
-    for (const block of captureAll(deployDoc, /^```bash\n([\s\S]*?)^```/gm, 'a bash block in deploy.md')) {
+    /**
+     * THE SCRIPT ITSELF IS IN THIS SCAN AND USED TO BE IN IT BY ACCIDENT. While
+     * the updater lived in a heredoc, "every ```bash block in deploy.md" swept
+     * it up along with the runbook's own commands. It is deploy/blitz-bot-update
+     * now, and the file has to be named — a mutation pass proved the point by
+     * dropping a `git clean -xdf` into the script and watching this stay green.
+     * install.sh is here for the same reason and one more: it is the other file
+     * that runs `git`-adjacent commands as root on that box.
+     */
+    for (const block of [
+      ...captureAll(deployDoc, /^```bash\n([\s\S]*?)^```/gm, 'a bash block in deploy.md'),
+      updateScript,
+      installScript,
+    ]) {
       for (const line of block.split('\n')) {
         if (/^\s*#/.test(line)) continue
         expect(line, line).not.toMatch(/git pull/)

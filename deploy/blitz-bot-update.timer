@@ -1,0 +1,37 @@
+[Unit]
+Description=Check origin/main for a new blitz-bot commit every fifteen minutes
+Documentation=https://github.com/WillMontgomery/blitz-bot
+
+[Timer]
+# FIFTEEN MINUTES, AND THE NUMBER IS A TRADE BETWEEN TWO THINGS THE OWNER CAN
+# FEEL. It is the longest a push can sit on main without arriving, so it is how
+# long "I fixed it" takes to become true. It is also the shortest possible gap
+# between pushing something wrong and the box restarting onto it. Shorter, and
+# an evening's work is a restart every few minutes; longer, and somebody opens
+# an SSH session, which is the habit this timer exists to remove. Ninety-six
+# fetches a day against a public repository is nothing to anybody.
+#
+# A CALENDAR EXPRESSION AND NOT OnUnitActiveSec=, FOR ONE CONCRETE REASON:
+# Persistent= below has an effect only on OnCalendar= timers. Written as a
+# monotonic interval, that line would be accepted and would silently do
+# nothing.
+OnCalendar=*:0/15
+
+# systemd records when this timer last ran, on disk. A box that was off -- a
+# stopped instance, a reboot that took a while -- comes back, sees that it
+# missed a window, and runs the update ONCE, straight away, rather than sitting
+# on last week's code until the next quarter hour. Once, and not once per
+# missed window: it is a catch-up, not a backlog.
+Persistent=true
+
+# WITHOUT THIS THE BOX FETCHES AT :00, :15, :30 AND :45 FOR EVER, on the same
+# second as every other thing anybody ever scheduled on the quarter hour --
+# including this box's own catch-up after a reboot. Five minutes of spread
+# costs nothing when the interval is already an approximation.
+RandomizedDelaySec=300
+
+# NO Unit= LINE. A timer starts the service with the same name, and naming it
+# again is a second place for the name to be wrong.
+
+[Install]
+WantedBy=timers.target

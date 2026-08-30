@@ -16,3 +16,11 @@
 *.png binary
 *.jpg binary
 *.ico binary
+
+# The updater has no extension, so `*.sh` above does not reach it. It is the
+# most safety-critical shell script in the repo -- it runs as root's guest on
+# the box, resets the tree and restarts the service -- and a CRLF in it fails
+# as `bad interpreter: /bin/sh^M`, the exact error this file exists to prevent.
+# `* text=auto eol=lf` already covers it; this says so out loud so a future
+# tidy-up of the general rule cannot quietly uncover it.
+deploy/blitz-bot-update text eol=lf

@@ -1,0 +1,268 @@
+#!/bin/sh
+#
+# Bring /opt/blitz-bot to exactly origin/main, install dependencies if the
+# lockfile moved, and restart the bot ONLY if the commit it is running is not
+# the commit now on disk.
+#
+# blitz-bot-update.service runs this, as ubuntu. blitz-bot-update.timer starts
+# that unit every fifteen minutes, and `sudo systemctl start blitz-bot-update`
+# starts the same unit by hand. THE TIMER AND THE COMMAND ARE ONE PATH, which
+# is the point of both: there is no second implementation of a deploy on this
+# box for one of them to drift away from.
+#
+# IT IS NO LONGER AN ExecStartPre OF blitz-bot.service, AND THAT IS THE WHOLE
+# POINT OF THIS ROUND. When the bot's own start ran it, three things were true
+# and all three are gone:
+#
+#   - Restart=always made every crash a deploy. A bot that died at 3am came
+#     back on whatever happened to be on main at 3am.
+#   - `npm ci` deletes node_modules BEFORE it installs, so an install that did
+#     not finish left no dependencies at all -- on a box that was trying to
+#     start the bot again five seconds later, into exactly that tree.
+#   - `reset --hard` inside a crash loop overwrote the last-known-good tree
+#     with nothing holding a reference to it.
+#
+# Now nothing restarts the bot except the last line of this script; that line
+# is reached only after an install that succeeded; and the commit the box was
+# on is tagged before the reset, so it is still reachable afterwards.
+#
+# FAILURES ARE LOUD, WHICH THEY COULD NOT BE BEFORE. Every path in the old
+# version exited 0, because a non-zero exit would have stopped the bot
+# starting. Nothing waits on this script any more, so it reports failure
+# honestly: `systemctl status blitz-bot-update` goes red, `journalctl -p
+# warning` finds the reason, the timer tries again at the next tick, and the
+# bot is untouched throughout.
+#
+# IT IS A FILE AND NOT A LONG `sh -c` IN THE UNIT, for a reason worth keeping:
+# systemd expands `%` in unit lines. `%3N` below is a date format, and inline
+# it would have to be written `%%` -- a trap every future editor gets to
+# rediscover, and one that fails quietly rather than loudly. Out here there is
+# no `%` expansion at all, and these comments fit.
+#
+# It is not in the repo, so it never updates itself. An updater that rewrites
+# itself while it is running is a failure nobody needs to own.
+
+set -u
+
+REPO=/opt/blitz-bot
+STATE=/var/lib/blitz-bot         # StateDirectory=, owned by ubuntu, survives a reboot
+INSTALLED=$STATE/installed-lock  # the lockfile the last good install used
+COMMIT=$REPO/.deployed-commit    # the commit the bot reads at startup -- section 6.2
+PREVIOUS=blitz-bot-previous      # a local git tag: the way back, with no network
+OFF_SWITCH=/etc/blitz-bot-no-update
+
+# $STATE IS SHARED WITH THE BOT, AND THAT IS DELIBERATE. blitz-bot.service
+# declares the same StateDirectory=blitz-bot (section 6.4), so systemd creates
+# /var/lib/blitz-bot once, owns it to ubuntu, and both units -- both running as
+# ubuntu -- can write it. Sharing the DIRECTORY is not sharing a file: nothing
+# this script writes in there is read by the bot, and nothing the bot writes in
+# there is read by this script. $INSTALLED is a copy of a lockfile that only
+# this script ever compares against.
+#
+# AND THIS SCRIPT MUST NEVER WRITE $STATE/reported-commit. That file is the
+# bot's own memory of the last commit it ANNOUNCED in #bot-status, it has
+# exactly one writer, and the writer is the bot (section 6.2). Write the NEW
+# sha there from here and the bot comes up already believing it has announced
+# this deploy, so the notice never fires again. Write the OLD one and it fires
+# on every restart for ever. Those are the two failures the whole comparison
+# exists to prevent, and neither of them is an error anywhere -- they are a
+# channel that went quiet, or a channel that will not shut up.
+
+# npm reads its config and its cache from $HOME, and ProtectHome=true leaves
+# this service no home directory to read. Both of these are directories systemd
+# creates for the unit -- StateDirectory= and CacheDirectory= in section 6.5 --
+# so they exist, they belong to ubuntu, and the cache survives between runs
+# instead of being downloaded again every quarter of an hour.
+#
+# SET HERE AND NOT IN THE UNIT, so that one file says where npm puts things and
+# an Environment= line cannot quietly disagree with it.
+HOME=$STATE
+npm_config_cache=/var/cache/blitz-bot
+
+# Never block on a prompt. The repo is public and needs no credentials, but a
+# URL that starts answering 404 makes git ask for a username, and an update
+# hung on a question nobody can answer never finishes and never fails.
+GIT_TERMINAL_PROMPT=0
+
+export HOME npm_config_cache GIT_TERMINAL_PROMPT
+
+# Timestamped like the bot's own lines so the two journals read as one stream,
+# and prefixed <6>/<4> for the same reason src/log.ts does it: journald reads
+# the priority off the front, strips it, and `journalctl -p warning` then finds
+# a failed update without anyone parsing text (section 13).
+#
+# Deliberately NOT the msg= shape the bot uses. These lines are not the bot's,
+# and every grep in that document which hunts for the bot's messages has to go
+# on missing them.
+stamped() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
+say() { printf '<6>%s blitz-bot-update: %s\n' "$(stamped)" "$1"; }
+warn() { printf '<4>%s blitz-bot-update: %s\n' "$(stamped)" "$1" >&2; }
+
+# THE ONLY WAY OUT OF THIS SCRIPT THAT IS NOT SUCCESS, so there is one place
+# that decides what a failed update does. It says why at <4>, and it exits
+# non-zero so the unit goes red instead of green.
+#
+# AND IT NEVER RESTARTS THE BOT. Reaching this line means the tree, the
+# dependencies or the network is in a state nobody has checked, and a restart
+# into that is the outage. The bot goes on running what it is already running,
+# which is code that was working a minute ago.
+die() { warn "$1"; exit 1; }
+
+cd "$REPO" || die "no $REPO -- nothing to update"
+
+# THE OFF SWITCH, READ FIRST so that it still works when everything below it is
+# broken. main is bad and the box has to be left alone: one `sudo touch`, and
+# no tick of the timer and no run of the command deploys anything until the
+# file is removed (section 16).
+if [ -e "$OFF_SWITCH" ]; then
+  say "skipped: $OFF_SWITCH exists"
+  exit 0
+fi
+
+# WHAT THE RUNNING BOT IS ON, which is the question the restart turns on. This
+# file is written by this script immediately before it restarts the bot, and
+# read by the bot at startup, so it is one fact with one writer.
+#
+# MISSING OR EMPTY MEANS UNKNOWN, AND UNKNOWN MEANS RESTART. A first install
+# has no file; neither has a box somebody rolled back by hand. In neither case
+# can "the bot is already on this commit" be claimed, so neither case claims it.
+deployed=$(cat "$COMMIT" 2>/dev/null || true)
+
+# ---- 1. what origin has --------------------------------------------------
+before=$(git rev-parse --short HEAD) || die "cannot read HEAD -- is $REPO still a git repository?"
+
+timeout 60 git fetch --quiet origin || die 'fetch failed -- nothing was changed'
+
+# ---- 2. the way back, written before anything is overwritten -------------
+#
+# THIS IS THE LINE THE REVIEW ASKED FOR. `reset --hard` moves the branch and
+# leaves the commit the box was on unreferenced -- reachable only through a
+# reflog that expires, in a repository that runs `gc` on its own. A tag is a
+# reference. After this line the old commit has a name, on this disk, and
+# rolling back is one command that never touches github.com:
+#
+#     git reset --hard blitz-bot-previous
+#
+# LIGHTWEIGHT (`git tag -f NAME SHA`) AND NOT ANNOTATED. An annotated tag is an
+# object with an author, an author needs a user.name and a user.email, and
+# ProtectHome=true leaves no home directory to read a .gitconfig from -- so the
+# annotated form is the one that fails here, and it would fail at the exact
+# moment it was most needed.
+#
+# -f, because this is "the commit before this update" and not a history.
+git tag -f "$PREVIOUS" "$before" >/dev/null 2>&1 ||
+  warn "cannot tag $before -- rolling back will need that sha"
+
+# ---- 3. the code, before the dependencies --------------------------------
+#
+# NOT `git pull`, for three things this box will actually hit: pull refuses
+# outright when a tracked file has been edited in place, pull can leave a merge
+# commit so the box is no longer at a commit that exists on main, and a merge
+# commit wants an identity that ProtectHome=true leaves no home directory to
+# read.
+#
+# `reset --hard origin/main` lands on exactly origin/main, stays on the main
+# branch, and DISCARDS local edits to tracked files -- intended on this box,
+# and said plainly in section 16 where the operator will read it. Untracked and
+# ignored files are not touched, which is what keeps /opt/blitz-bot/.env and
+# /opt/blitz-bot/.deployed-commit. There is deliberately no `git clean` anywhere
+# here: `git clean -x` is the one command that would delete .env,
+# .deployed-commit and node_modules in a single go.
+#
+# IT RUNS EVEN WHEN THE COMMIT DID NOT MOVE, so a tracked file edited on the
+# box is put back at the next tick rather than surviving until the next push.
+git reset --hard --quiet origin/main || die "reset failed -- still on $before"
+
+current=$(git rev-parse --short HEAD) || die 'cannot read HEAD after the reset'
+
+if [ "$current" != "$before" ]; then
+  say "updated $before -> $current"
+else
+  say "already on $current"
+fi
+
+# ---- 4. the dependencies, and the reason this is not an ExecStartPre -----
+#
+# `npm ci` DELETES node_modules AND REBUILDS IT FROM NOTHING every time it
+# runs. That is the failure the last review found: for the minute it is
+# running, and for as long as it stays failed afterwards, /opt/blitz-bot holds
+# code and no dependencies.
+#
+# THE ANSWER IS THIS ORDER -- INSTALL FIRST, RESTART AFTERWARDS, AND ONLY IF
+# THE INSTALL SUCCEEDED. Nothing is trying to start the bot during that
+# minute: a timer is not a restart trigger, which is exactly what an
+# ExecStartPre was. The process that is running already holds its dependencies
+# in memory and does not care that the directory underneath it is being
+# rebuilt, and a new process is only ever started against a tree that finished
+# installing.
+#
+# THE OTHER ANSWER WAS A SECOND TREE AND A SYMLINK SWAP, installing beside the
+# running copy and pointing /opt/blitz-bot at it only once the install had
+# worked. It closes the last of the window, and it costs a second copy of the
+# repository, a symlink in the middle of every path in every unit and in this
+# document, and an operator who can no longer be told "the bot is in
+# /opt/blitz-bot". Too much machinery for a window nothing is restarting into.
+#
+# IT INSTALLS WHEN THE LOCKFILE MOVED, AND WHENEVER IT CANNOT TELL. Missing
+# stamp, unreadable stamp, missing lockfile, missing node_modules -- all of
+# them take the install branch, because `cmp` exits non-zero on a file it
+# cannot read exactly as it does on a difference. Installing when it was not
+# needed costs a minute; skipping when it was needed is a bot that cannot
+# start.
+#
+# IT NAMES THE node BINARY AND HANDS IT npm's SCRIPT, WHICH IS NOT THE SAME
+# THING AS AN ABSOLUTE PATH TO npm. /opt/node24/bin/npm is a symlink to
+# npm-cli.js, whose shebang is `#!/usr/bin/env node`, and env searches PATH --
+# which does not carry /opt/node24/bin, on purpose. Run that way this line
+# installed the bot's dependencies on the CONSOLE's Node 22, every quarter of
+# an hour, silently. Section 3 has the proof and the retraction.
+if [ -d node_modules ] && cmp -s package-lock.json "$INSTALLED"; then
+  say 'dependencies unchanged'
+elif timeout 300 /opt/node24/bin/node /opt/node24/lib/node_modules/npm/bin/npm-cli.js ci --no-audit --no-fund; then
+  # Recorded only on success, so a failed install is retried at the next tick
+  # instead of being remembered as done.
+  cp package-lock.json "$INSTALLED" || warn "cannot write $INSTALLED -- the next run will install again"
+  say 'dependencies installed'
+else
+  die "install failed -- $current is on disk and the bot was NOT restarted"
+fi
+
+# ---- 5. the restart, and only when there is something to restart onto ----
+#
+# NO CHANGE MEANS NO RESTART. The bot's whole job is to hold a websocket open.
+# Dropping it every fifteen minutes to arrive back at the same commit is a
+# disconnect, a reconnect and a `ready` line, four times an hour, for nothing --
+# and it would leave the one log line that means "something was deployed"
+# indistinguishable from the noise around it.
+#
+# THE TEST IS "IS THE BOT ON THIS COMMIT", NOT "DID THIS RUN CHANGE ANYTHING",
+# and the difference shows up in exactly one case: a previous run fetched a new
+# commit and then failed its install, so it did not restart, so the bot is
+# still on the old code while the disk is on the new. The next tick changes no
+# commit, installs successfully, and this comparison still says restart -- where
+# "did the commit move during this run" would have said no, and left the bot on
+# the old code until somebody happened to push again.
+if [ "$current" = "$deployed" ]; then
+  say "no restart: blitz-bot is already on $current"
+  exit 0
+fi
+
+# WRITTEN BEFORE THE RESTART, because the bot reads it at startup. The other
+# order hands the new process the old commit, every single time.
+printf '%s\n' "$current" > "$COMMIT" || die "cannot write $COMMIT"
+
+# `try-restart` AND NOT `restart`: it restarts the bot if it is running and
+# does nothing at all if it is not. A bot somebody stopped on purpose -- to
+# read the journal without sixty lines a minute landing in it (section 14) --
+# stays stopped, and the file above still tells the truth about what it will
+# come up on.
+#
+# `sudo -n` FOR THE ONE PRIVILEGED THING THIS SCRIPT DOES. It runs as ubuntu
+# because ubuntu owns the tree; restarting a system unit is root's. Section 6.3
+# grants exactly this command and nothing else, and the two have to be spelled
+# identically -- sudoers matches the arguments literally, so `blitz-bot` here
+# against `blitz-bot.service` there would simply be denied.
+sudo -n /usr/bin/systemctl try-restart blitz-bot.service ||
+  die "restart failed -- $current is installed but blitz-bot did not come back"
+
+say "deployed $current"

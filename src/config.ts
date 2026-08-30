@@ -92,6 +92,24 @@ export interface Config {
    */
   statusChannelId: string | null
 
+  /**
+   * Where the bot keeps its own manual posted, or null for "do not".
+   *
+   * UNSET TURNS THE WHOLE FEATURE OFF, and that is the only reason it is
+   * optional. The bot is live today with no such channel, and a variable that
+   * had to be set would mean the next deploy refuses to boot until somebody
+   * SSHes into the box — the interaction every other optional id here exists to
+   * avoid. Null is not a degraded mode: nothing is read, nothing is posted, and
+   * docs/bot-manual.md is never opened.
+   *
+   * A THIRD CHANNEL RATHER THAN A REUSE OF EITHER OTHER ONE. `logChannelId`
+   * carries the moderation record and `statusChannelId` carries faults; both are
+   * append-only records of things that happened. This one holds a document the
+   * bot EDITS IN PLACE, so pointing it at either of the others would mean the
+   * bot reaching into a channel of evidence and changing messages in it.
+   */
+  docsChannelId: string | null
+
   exemptChannelIds: string[]
   exemptAdmins: boolean
   dryRun: boolean
@@ -177,6 +195,7 @@ const schema = z.object({
   DISCORD_ADMIN_ROLE_ID: optionalId,
   BLITZ_LOG_CHANNEL_ID: optionalId,
   BLITZ_STATUS_CHANNEL_ID: optionalId,
+  BLITZ_DOCS_CHANNEL_ID: optionalId,
   BLITZ_EXEMPT_CHANNEL_IDS: idList,
   BLITZ_EXEMPT_ADMINS: flag(true),
   BLITZ_DRY_RUN: flag(false),
@@ -200,6 +219,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     adminRoleId: parsedEnv.DISCORD_ADMIN_ROLE_ID,
     logChannelId: parsedEnv.BLITZ_LOG_CHANNEL_ID,
     statusChannelId: parsedEnv.BLITZ_STATUS_CHANNEL_ID,
+    docsChannelId: parsedEnv.BLITZ_DOCS_CHANNEL_ID,
     exemptChannelIds: parsedEnv.BLITZ_EXEMPT_CHANNEL_IDS,
     exemptAdmins: parsedEnv.BLITZ_EXEMPT_ADMINS,
     dryRun: parsedEnv.BLITZ_DRY_RUN,

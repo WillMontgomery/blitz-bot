@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vite
 import {
   announceDeployedCommit,
   announcer,
+  botManualPath,
   commitFiles,
   createClient,
   decide,
@@ -25,22 +26,31 @@ import {
   handleLive,
   handleMessage,
   inviteResolver,
+  ours,
+  parseManual,
+  readManual,
   remover,
   reportDeployedCommit,
   reportedCommitPath,
   scanText,
   statusPoster,
   statusReporter,
+  syncDocsChannel,
+  syncManual,
   type Actions,
   type CommitFiles,
   type AttachmentText,
   type ComponentText,
+  type DocsChannel,
   type EmbedText,
   type LiveActions,
   type LiveGuild,
   type LiveMember,
   type LiveMessage,
+  type ManualEmbed,
+  type ManualSection,
   type PollText,
+  type PostedSection,
   type RoleLookup,
   type ScannableMessage,
   type ScannableParts,
@@ -97,6 +107,7 @@ function cfg(over: Partial<Config> = {}): Config {
     adminRoleId: null,
     logChannelId: null,
     statusChannelId: null,
+    docsChannelId: null,
     exemptChannelIds: [],
     exemptAdmins: true,
     dryRun: false,
@@ -3322,5 +3333,1004 @@ describe('the deploy notice — the two files it reads', () => {
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
+  })
+})
+
+/**
+ * The manual: docs/bot-manual.md, rendered into a channel and kept there.
+ *
+ * THE FEATURE IS "THE DOCS CANNOT DRIFT FROM THE CODE WITHOUT IT BEING
+ * VISIBLE", so the cases that matter are the ones where the channel and the
+ * file disagree in an awkward way: a message somebody deleted by hand, a run
+ * that got half way, two sections under one heading, a section that grew past
+ * what an embed will hold. Every one of those is a state a real channel reaches
+ * on its own, and none of them can be arranged in a live guild without
+ * vandalising it.
+ *
+ * THE QUIET RESTART IS THE FIRST TEST AND THE MOST IMPORTANT ONE. This process
+ * restarts on every deploy and every crash. A channel that stirs each time is a
+ * channel nobody reads, and the whole value of this one is that a message in it
+ * means the documentation changed.
+ *
+ * NOTHING HERE TOUCHES DISCORD. `syncManual` takes the channel as four injected
+ * functions, so the reconciliation is exercised against an array.
+ */
+const DOCS_CHANNEL = '101010101010101010'
+
+/**
+ * A manual, written the way the file is: `# heading`, a blank line, a body.
+ *
+ * BUILT AND THEN PARSED RATHER THAN HANDED TO `syncManual` AS SECTIONS. The
+ * split is half of what can go wrong — a `##` read as a top-level heading, a
+ * `#` inside a code fence, whitespace that makes an unchanged section look
+ * changed — so the cases below go in through the same door the bot does.
+ */
+const manual = (...sections: (readonly [string, string])[]): string =>
+  sections.map(([heading, body]) => `# ${heading}\n\n${body}\n`).join('\n')
+
+/**
+ * The channel as an array, and a record of everything asked of it.
+ *
+ * `messages` ARE GIVEN IDS IN CHANNEL ORDER — m1, m2, m3 — because the port
+ * promises oldest first and several assertions below are about which message
+ * was edited rather than merely that one was.
+ *
+ * `rejects` IS ASKED ABOUT EVERY CALL BY NAME, so a case can fail exactly one
+ * write and leave the rest working, which is what a partial failure is.
+ *
+ * `peak` IS HOW MANY CALLS WERE IN FLIGHT AT ONCE. Ten posts fired together are
+ * a burst into Discord's per-channel limit at the moment the bot has just
+ * started, and a serialised loop and a concurrent one are otherwise
+ * indistinguishable from their results.
+ */
+function docsHarness(
+  options: {
+    messages?: readonly { title: string; description: string }[]
+    rejects?: (call: string) => unknown
+  } = {},
+): {
+  channel: DocsChannel
+  calls: string[]
+  written: ManualEmbed[]
+  messages: () => PostedSection[]
+  peak: () => number
+  pause: () => Promise<void>
+  pauses: () => number
+} {
+  const state: PostedSection[] = (options.messages ?? []).map((message, index) => ({
+    id: `m${index + 1}`,
+    ...message,
+  }))
+
+  const calls: string[] = []
+  const written: ManualEmbed[] = []
+
+  let live = 0
+  let high = 0
+  let pauses = 0
+  let ids = state.length
+
+  async function call<T>(name: string, act: () => T): Promise<T> {
+    calls.push(name)
+    live += 1
+    high = Math.max(high, live)
+
+    try {
+      // A turn of the loop before anything happens, so two writes fired without
+      // waiting for each other are seen here as two at once.
+      await Promise.resolve()
+
+      const failure = options.rejects?.(name)
+      if (failure !== undefined) throw failure
+
+      return act()
+    } finally {
+      live -= 1
+    }
+  }
+
+  function replace(id: string, next: PostedSection): void {
+    const at = state.findIndex((message) => message.id === id)
+    if (at < 0) throw new Error(`no message ${id} in the channel`)
+    state[at] = next
+  }
+
+  return {
+    calls,
+    written,
+    messages: () => state.map((message) => ({ ...message })),
+    peak: () => high,
+    pauses: () => pauses,
+
+    pause: () => {
+      pauses += 1
+      return Promise.resolve()
+    },
+
+    channel: {
+      read: () => call('read', () => state.map((message) => ({ ...message }))),
+
+      post: (embed) =>
+        call(`post ${embed.title}`, () => {
+          written.push(embed)
+          ids += 1
+          state.push({ id: `m${ids}`, title: embed.title, description: embed.description })
+        }),
+
+      edit: (id, embed) =>
+        call(`edit ${id}`, () => {
+          written.push(embed)
+          replace(id, { id, title: embed.title, description: embed.description })
+        }),
+
+      remove: (id) =>
+        call(`remove ${id}`, () => {
+          const at = state.findIndex((message) => message.id === id)
+          if (at < 0) throw new Error(`no message ${id} in the channel`)
+          state.splice(at, 1)
+        }),
+    },
+  }
+}
+
+/** How many times a line was written, so "exactly one" can be asserted. */
+const said = (needle: string): number => (stderr.join('') + stdout.join('')).split(needle).length - 1
+
+/** A client that does nothing but hold a `clientReady` listener. No network. */
+function docsClient(): { client: Client; ready: () => void } {
+  const waiting: (() => void)[] = []
+
+  const client = {
+    once: (event: unknown, handler: () => void) => {
+      if (event === Events.ClientReady) waiting.push(handler)
+    },
+  } as unknown as Client
+
+  return {
+    client,
+    ready: () => {
+      for (const handler of waiting.splice(0, waiting.length)) handler()
+    },
+  }
+}
+
+describe('the manual — a restart that changes nothing says nothing', () => {
+  /**
+   * THE CASE THE WHOLE FEATURE IS SHAPED BY, and the same argument the deploy
+   * notice is built around. `Restart=always` starts this process again five
+   * seconds after every crash. If a matching manual cost even one edit, the
+   * documentation channel would be the noisiest channel on the server.
+   */
+  it('writes nothing and logs nothing at info when the channel already matches', async () => {
+    const docs = docsHarness({
+      messages: [
+        { title: 'One', description: 'first' },
+        { title: 'Two', description: 'second' },
+      ],
+    })
+
+    await syncManual(
+      parseManual(manual(['One', 'first'], ['Two', 'second'])),
+      docs.channel,
+      docs.pause,
+    )
+
+    // The read is unavoidable — the channel is the state — and it is the only
+    // request that happens.
+    expect(docs.calls).toEqual(['read'])
+    expect(stdout.join('')).toBe('')
+    expect(stderr.join('')).toBe('')
+  })
+
+  /**
+   * THE COMPARISON IS A PLAIN STRING EQUALITY AGAINST THE STORED DESCRIPTION.
+   * A body full of markdown is the case that would break a comparison made
+   * against anything rendered: what Discord shows for this section is not the
+   * string that was sent, and diffing the shown version would rewrite the
+   * channel on every start forever.
+   */
+  it('compares the stored description, not what Discord renders it as', async () => {
+    const body = ['**bold**, `code`, <@1234> and a list:', '', '- one', '- two'].join('\n')
+    const docs = docsHarness({ messages: [{ title: 'One', description: body }] })
+
+    await syncManual(parseManual(manual(['One', body])), docs.channel, docs.pause)
+
+    expect(docs.calls).toEqual(['read'])
+  })
+
+  /**
+   * Reformatting the blank lines around a section is not a change to it. Without
+   * the trim in the parser, adding a second blank line under a heading would
+   * rewrite that section's message and stamp it with today's date.
+   */
+  it('is not disturbed by the blank lines around a section', async () => {
+    const docs = docsHarness({ messages: [{ title: 'One', description: 'first' }] })
+
+    await syncManual(parseManual('# One\n\n\n\nfirst\n\n\n'), docs.channel, docs.pause)
+
+    expect(docs.calls).toEqual(['read'])
+  })
+})
+
+describe('the manual — one section changes, one message changes', () => {
+  /**
+   * THE POINT OF MATCHING BY HEADING. Section two growing must not touch
+   * sections one and three; under positional matching a change anywhere is a
+   * change to everything below it.
+   */
+  it('edits only the section whose body moved', async () => {
+    const docs = docsHarness({
+      messages: [
+        { title: 'One', description: 'first' },
+        { title: 'Two', description: 'second' },
+        { title: 'Three', description: 'third' },
+      ],
+    })
+
+    await syncManual(
+      parseManual(manual(['One', 'first'], ['Two', 'second, and more'], ['Three', 'third'])),
+      docs.channel,
+      docs.pause,
+    )
+
+    expect(docs.calls).toEqual(['read', 'edit m2'])
+    expect(docs.messages().map((message) => message.description)).toEqual([
+      'first',
+      'second, and more',
+      'third',
+    ])
+  })
+
+  /**
+   * A HEADING IS THE KEY, SO ITS MESSAGE IS FOUND WHEREVER IT SITS. The channel
+   * below is in a different order from the file — which is what a channel looks
+   * like after a section was inserted once — and the edit still lands on the
+   * right message rather than on whatever is third.
+   */
+  it('finds a section wherever in the channel it happens to be', async () => {
+    const docs = docsHarness({
+      messages: [
+        { title: 'Three', description: 'third' },
+        { title: 'One', description: 'first' },
+        { title: 'Two', description: 'second' },
+      ],
+    })
+
+    await syncManual(
+      parseManual(manual(['One', 'first'], ['Two', 'changed'], ['Three', 'third'])),
+      docs.channel,
+      docs.pause,
+    )
+
+    expect(docs.calls).toEqual(['read', 'edit m3'])
+  })
+
+  /**
+   * LAST-CHANGED, NOT LAST-CHECKED. The footer goes out only on a write, so an
+   * unchanged section keeps the date of the edit that really happened — which
+   * is the only reading of a timestamp on a document that is worth anything.
+   * It is also deliberately not part of the comparison: a footer rebuilt every
+   * start and then compared would differ every start.
+   */
+  it('stamps only the section it wrote', async () => {
+    const docs = docsHarness({
+      messages: [
+        { title: 'One', description: 'first' },
+        { title: 'Two', description: 'second' },
+      ],
+    })
+
+    await syncManual(
+      parseManual(manual(['One', 'first'], ['Two', 'moved'])),
+      docs.channel,
+      docs.pause,
+    )
+
+    expect(docs.written).toHaveLength(1)
+    expect(at(docs.written.map((embed) => embed.footer), 0)).toMatch(
+      /^updated \d{4}-\d{2}-\d{2}T[\d:.]+Z$/u,
+    )
+  })
+})
+
+describe('the manual — sections added and removed', () => {
+  /**
+   * ONE POST, AND THE CHANNEL IS NOT REWRITTEN TO MAKE ROOM FOR IT. A message
+   * cannot be moved in Discord, so a section inserted into the middle of the
+   * file lands at the bottom of the channel. The alternative is deleting and
+   * reposting everything below the insertion, which in a project this careful
+   * about audit trails reads as the bot rewriting its own history.
+   */
+  it('posts a new section and touches nothing else, wherever it was inserted', async () => {
+    const docs = docsHarness({
+      messages: [
+        { title: 'One', description: 'first' },
+        { title: 'Three', description: 'third' },
+      ],
+    })
+
+    await syncManual(
+      parseManual(manual(['One', 'first'], ['Two', 'second'], ['Three', 'third'])),
+      docs.channel,
+      docs.pause,
+    )
+
+    expect(docs.calls).toEqual(['read', 'post Two'])
+  })
+
+  /** A first run against an empty channel posts the file in file order. */
+  it('posts the whole manual in file order the first time', async () => {
+    const docs = docsHarness()
+
+    await syncManual(
+      parseManual(manual(['One', 'first'], ['Two', 'second'], ['Three', 'third'])),
+      docs.channel,
+      docs.pause,
+    )
+
+    expect(docs.calls).toEqual(['read', 'post One', 'post Two', 'post Three'])
+  })
+
+  /**
+   * A SECTION REMOVED FROM THE FILE HAS ITS MESSAGE DELETED, not edited into a
+   * tombstone. "This section was removed" is text nobody asked for, nothing
+   * ever clears it, and after a year the channel is mostly tombstones. What the
+   * docs used to say is in the file's history.
+   */
+  it('deletes the message for a section that is no longer in the file', async () => {
+    const docs = docsHarness({
+      messages: [
+        { title: 'One', description: 'first' },
+        { title: 'Two', description: 'second' },
+        { title: 'Three', description: 'third' },
+      ],
+    })
+
+    await syncManual(
+      parseManual(manual(['One', 'first'], ['Three', 'third'])),
+      docs.channel,
+      docs.pause,
+    )
+
+    expect(docs.calls).toEqual(['read', 'remove m2'])
+    expect(docs.written).toEqual([])
+    expect(docs.messages().map((message) => message.title)).toEqual(['One', 'Three'])
+  })
+
+  /** Deletions come last, so a run that fails part way leaves an extra rather
+   * than a hole — the extra is removed on the next start, where a hole would
+   * have to be reposted and would come back at the bottom of the channel. */
+  it('adds before it removes', async () => {
+    const docs = docsHarness({ messages: [{ title: 'Gone', description: 'old' }] })
+
+    await syncManual(parseManual(manual(['New', 'new'])), docs.channel, docs.pause)
+
+    expect(docs.calls).toEqual(['read', 'post New', 'remove m1'])
+  })
+})
+
+/**
+ * THE CHANNEL IS NOT A DATABASE. Any admin can delete a message with a
+ * right-click, and a bot that kept its own record of "section four is message
+ * 123" would believe that record and never post section four again. Every start
+ * derives the whole of its state from the channel, so the repair is automatic
+ * and needs no cleanup command that nobody would know to run.
+ */
+describe('the manual — the channel is read back, never remembered', () => {
+  it('reposts a section whose message was deleted by hand', async () => {
+    const docs = docsHarness({
+      messages: [
+        { title: 'One', description: 'first' },
+        { title: 'Three', description: 'third' },
+      ],
+    })
+
+    await syncManual(
+      parseManual(manual(['One', 'first'], ['Two', 'second'], ['Three', 'third'])),
+      docs.channel,
+      docs.pause,
+    )
+
+    expect(docs.calls).toEqual(['read', 'post Two'])
+    expect(docs.messages().map((message) => message.title)).toEqual(['One', 'Three', 'Two'])
+  })
+
+  /**
+   * PARTIAL FAILURE, AND THEN THE RESTART THAT HAS TO CLEAN IT UP. Section two
+   * fails to post; one and three are already up. Nothing is written down about
+   * any of that, and the next start still has to finish the job without posting
+   * a second copy of anything.
+   */
+  it('finishes a half-done run on the next start, and duplicates nothing', async () => {
+    const first = docsHarness({
+      rejects: (call) => (call === 'post Two' ? new Error('503 Service Unavailable') : undefined),
+    })
+
+    const sections = parseManual(manual(['One', 'first'], ['Two', 'second'], ['Three', 'third']))
+
+    await syncManual(sections, first.channel, first.pause)
+
+    expect(first.calls).toEqual(['read', 'post One', 'post Two', 'post Three'])
+    expect(first.messages().map((message) => message.title)).toEqual(['One', 'Three'])
+    expect(stderr.join('')).toContain('could not post a manual section')
+
+    // The process died here. A new one comes up with no memory of any of it,
+    // and the channel is the only thing that carried over.
+    const second = docsHarness({
+      messages: first.messages().map(({ title, description }) => ({ title, description })),
+    })
+
+    await syncManual(sections, second.channel, second.pause)
+
+    expect(second.calls).toEqual(['read', 'post Two'])
+    expect(second.messages().map((message) => message.title)).toEqual(['One', 'Three', 'Two'])
+  })
+
+  /**
+   * AND THE OTHER HALF OF THAT: a duplicate that did get posted — a send that
+   * succeeded and whose answer was lost — is not left in the channel forever.
+   * A second message under a title no second section claims is unmatched, and
+   * unmatched is deleted.
+   */
+  it('clears a duplicate copy of a section left behind by an earlier run', async () => {
+    const docs = docsHarness({
+      messages: [
+        { title: 'One', description: 'first' },
+        { title: 'One', description: 'first' },
+      ],
+    })
+
+    await syncManual(parseManual(manual(['One', 'first'])), docs.channel, docs.pause)
+
+    expect(docs.calls).toEqual(['read', 'remove m2'])
+    expect(docs.messages()).toHaveLength(1)
+  })
+})
+
+/**
+ * TWO SECTIONS UNDER ONE HEADING. The key is the heading, so a repeated heading
+ * is an ambiguous key — and the two failures worth avoiding are silent ones:
+ * both sections editing the same message forever, or one of them being posted
+ * again on every start because nothing ever matched it.
+ */
+describe('the manual — a heading that appears twice', () => {
+  const twice = (second: string): ManualSection[] =>
+    parseManual(manual(['One', 'first'], ['One', second], ['Two', 'other']))
+
+  it('gives each copy its own message and says the key is ambiguous', async () => {
+    const docs = docsHarness({ messages: [{ title: 'Two', description: 'other' }] })
+
+    await syncManual(twice('second'), docs.channel, docs.pause)
+
+    expect(docs.calls).toEqual(['read', 'post One', 'post One'])
+    expect(docs.messages().map((message) => message.description)).toEqual([
+      'other',
+      'first',
+      'second',
+    ])
+
+    expect(stderr.join('')).toContain('more than one section under this heading')
+    // Once for the heading, however many copies there are of it.
+    expect(said('more than one section under this heading')).toBe(1)
+  })
+
+  /**
+   * Within the ambiguous group, and only within it, the match is positional —
+   * first copy to the first message under that title in channel order. It is
+   * the only thing left to go on, and it is why the warning above exists.
+   */
+  it('matches the second copy to the second message, and edits only that one', async () => {
+    const docs = docsHarness({
+      messages: [
+        { title: 'One', description: 'first' },
+        { title: 'One', description: 'second' },
+        { title: 'Two', description: 'other' },
+      ],
+    })
+
+    await syncManual(twice('second, rewritten'), docs.channel, docs.pause)
+
+    expect(docs.calls).toEqual(['read', 'edit m2'])
+    expect(docs.messages().map((message) => message.description)).toEqual([
+      'first',
+      'second, rewritten',
+      'other',
+    ])
+  })
+
+  /** A heading that appears once is never warned about. */
+  it('says nothing when every heading is its own', async () => {
+    const docs = docsHarness()
+
+    await syncManual(parseManual(manual(['One', 'a'], ['Two', 'b'])), docs.channel, docs.pause)
+
+    expect(stderr.join('')).toBe('')
+  })
+})
+
+/**
+ * DISCORD'S LIMITS, AND THE RULE THAT A SECTION IS NEVER SILENTLY SHORTENED.
+ * This channel's whole claim is that it says the same thing the file says. A
+ * truncated section reads like the whole of it, so the drift would be invisible
+ * and the bot would have caused it. It is refused and said at error instead,
+ * which reaches the status channel and therefore the owner.
+ */
+describe('the manual — a section that will not fit', () => {
+  const long = 'x'.repeat(4097)
+
+  it('refuses a section over the description limit rather than cutting it', async () => {
+    const docs = docsHarness({ messages: [{ title: 'One', description: 'short' }] })
+
+    await syncManual(parseManual(manual(['One', long])), docs.channel, docs.pause)
+
+    expect(docs.written).toEqual([])
+    expect(docs.calls).toEqual(['read'])
+
+    // The message that is up stays as it was: honest about the last version
+    // that fitted, rather than a shortened copy of the one that does not.
+    expect(docs.messages().map((message) => message.description)).toEqual(['short'])
+
+    expect(stderr.join('')).toContain('too long for one embed')
+    expect(stderr.join('')).toContain('length=4097')
+    expect(stderr.join('')).toContain('cap=4096')
+  })
+
+  it('refuses a heading over the title limit', async () => {
+    const docs = docsHarness()
+
+    await syncManual(parseManual(manual(['H'.repeat(257), 'body'])), docs.channel, docs.pause)
+
+    expect(docs.calls).toEqual(['read'])
+    expect(stderr.join('')).toContain('too long for an embed title')
+  })
+
+  /** The refusal is per section: everything that fits still goes out. */
+  it('posts the sections that do fit', async () => {
+    const docs = docsHarness()
+
+    await syncManual(
+      parseManual(manual(['One', 'first'], ['Big', long], ['Three', 'third'])),
+      docs.channel,
+      docs.pause,
+    )
+
+    expect(docs.calls).toEqual(['read', 'post One', 'post Three'])
+  })
+
+  /**
+   * MEASURED IN CODE POINTS, not UTF-16 units. Counting the wrong one refuses a
+   * section Discord would have accepted, in a feature whose failure mode is a
+   * document that stops being published.
+   */
+  it('counts a section the way Discord counts it', async () => {
+    const docs = docsHarness()
+    // 4096 astral characters: 8192 UTF-16 units, and exactly at the limit.
+    await syncManual(parseManual(manual(['One', '𝄞'.repeat(4096)])), docs.channel, docs.pause)
+
+    expect(docs.calls).toEqual(['read', 'post One'])
+    expect(stderr.join('')).toBe('')
+  })
+})
+
+/**
+ * RATE LIMITS. A first run on a ten-section manual is ten posts and a rewritten
+ * one is ten edits, arriving in the first second after a restart. Serialised is
+ * the floor; spaced out is what keeps it well under Discord's per-channel
+ * allowance without anybody having to reason about the exact number.
+ */
+describe('the manual — what it costs Discord', () => {
+  const ten = parseManual(
+    manual(...Array.from({ length: 10 }, (_, i) => [`H${String(i)}`, `body ${String(i)}`] as const)),
+  )
+
+  it('never has two requests in flight at once', async () => {
+    const docs = docsHarness()
+
+    await syncManual(ten, docs.channel, docs.pause)
+
+    expect(docs.calls).toHaveLength(11)
+    expect(docs.peak()).toBe(1)
+  })
+
+  /** Between writes and never before the first, so a one-section change waits
+   * for nothing at all. */
+  it('waits between writes and not before the first one', async () => {
+    const docs = docsHarness()
+
+    await syncManual(ten, docs.channel, docs.pause)
+    expect(docs.pauses()).toBe(9)
+
+    const one = docsHarness({ messages: [{ title: 'One', description: 'old' }] })
+    await syncManual(parseManual(manual(['One', 'new'])), one.channel, one.pause)
+    expect(one.pauses()).toBe(0)
+  })
+
+  /**
+   * THE PACING IS THE DEFAULT AND NOT SOMETHING A CALLER HAS TO REMEMBER. Every
+   * other case here injects an instant pause, so without this one the argument
+   * could default to nothing at all and every test would still pass.
+   */
+  it('spaces its writes out on its own, with nobody passing a pause', async () => {
+    vi.useFakeTimers()
+
+    try {
+      const docs = docsHarness()
+      const done = syncManual(parseManual(manual(['One', 'a'], ['Two', 'b'])), docs.channel)
+
+      await vi.advanceTimersByTimeAsync(0)
+      expect(docs.calls).toEqual(['read', 'post One'])
+
+      await vi.advanceTimersByTimeAsync(1000)
+      await done
+
+      expect(docs.calls).toEqual(['read', 'post One', 'post Two'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+/**
+ * A CHANNEL THAT CANNOT BE USED LATCHES OFF AFTER ONE LINE, the way
+ * `statusReporter` does and for the same reason: a wrong id, a deleted channel
+ * or a missing permission does not get better by being retried, and retrying it
+ * costs a journal line and a failed request per section.
+ */
+describe('the manual — a channel the bot cannot use', () => {
+  const refused = new DiscordAPIError(
+    { code: RESTJSONErrorCodes.MissingPermissions, message: 'Missing Permissions' },
+    RESTJSONErrorCodes.MissingPermissions,
+    403,
+    'POST',
+    'https://discord.com/api/v10/channels/0/messages',
+    {},
+  )
+
+  it('says so once and writes nothing when the channel cannot be read', async () => {
+    const docs = docsHarness({ rejects: (call) => (call === 'read' ? refused : undefined) })
+
+    await syncManual(parseManual(manual(['One', 'a'], ['Two', 'b'])), docs.channel, docs.pause)
+
+    expect(docs.calls).toEqual(['read'])
+    expect(said('docs channel unusable')).toBe(1)
+  })
+
+  it('stops after the first write that proves the channel is unusable', async () => {
+    const docs = docsHarness({ rejects: (call) => (call.startsWith('post') ? refused : undefined) })
+
+    await syncManual(
+      parseManual(manual(['One', 'a'], ['Two', 'b'], ['Three', 'c'])),
+      docs.channel,
+      docs.pause,
+    )
+
+    // One attempt, not one per section.
+    expect(docs.calls).toEqual(['read', 'post One'])
+    expect(said('docs channel unusable')).toBe(1)
+  })
+
+  /**
+   * A TRANSIENT FAILURE IS NOT A LATCH. A rate limit or a 500 in the middle of a
+   * run must not stop the rest of the manual going out, and the next start
+   * reconciles whatever this one missed.
+   */
+  it('carries on past a failure that might work next time', async () => {
+    const docs = docsHarness({
+      rejects: (call) => (call === 'post Two' ? new Error('429 Too Many Requests') : undefined),
+    })
+
+    await syncManual(
+      parseManual(manual(['One', 'a'], ['Two', 'b'], ['Three', 'c'])),
+      docs.channel,
+      docs.pause,
+    )
+
+    expect(docs.calls).toEqual(['read', 'post One', 'post Two', 'post Three'])
+    expect(said('docs channel unusable')).toBe(0)
+    expect(stderr.join('')).toContain('could not post a manual section')
+  })
+})
+
+/**
+ * SPLITTING THE FILE. The parser decides what a section IS, so everything above
+ * rests on it: a heading it invents becomes a message nobody wrote, and a
+ * heading it misses silently welds two sections into one.
+ */
+describe('the manual — splitting the file into sections', () => {
+  it('splits on top-level headings and keeps them in file order', () => {
+    expect(parseManual('# One\n\nfirst\n\n# Two\n\nsecond\n')).toEqual([
+      { heading: 'One', body: 'first' },
+      { heading: 'Two', body: 'second' },
+    ])
+  })
+
+  /** `##` is part of the body. One embed per TOP-level heading was the owner's
+   * decision, and a parser that split on every heading would post a message per
+   * paragraph. */
+  it('treats a sub-heading as body', () => {
+    expect(parseManual('# One\n\n## Detail\n\nfirst\n')).toEqual([
+      { heading: 'One', body: '## Detail\n\nfirst' },
+    ])
+  })
+
+  /**
+   * A `#` INSIDE A CODE FENCE IS NOT A HEADING. A shell example carries comment
+   * lines, and a parser that did not track fences would cut the section in half
+   * at one and post a section called "set the token".
+   */
+  it('does not split on a comment inside a fenced block', () => {
+    const source = ['# One', '', '```sh', '# set the token', 'export X=1', '```', ''].join('\n')
+
+    expect(parseManual(source)).toEqual([
+      { heading: 'One', body: '```sh\n# set the token\nexport X=1\n```' },
+    ])
+  })
+
+  /**
+   * TEXT ABOVE THE FIRST HEADING IS IN NO SECTION AND IS NOT POSTED, and the
+   * warning is what stops that being drift the bot caused. A document whose
+   * first paragraph vanished quietly is the exact failure this feature exists to
+   * prevent.
+   */
+  it('warns about a preamble rather than dropping it silently', () => {
+    expect(parseManual('a note to the reader\n\n# One\n\nfirst\n')).toEqual([
+      { heading: 'One', body: 'first' },
+    ])
+
+    expect(stderr.join('')).toContain('text above its first heading')
+    expect(stderr.join('')).toContain('lines=1')
+  })
+
+  it('reads a file written with Windows line endings', () => {
+    expect(parseManual('# One\r\n\r\nfirst\r\n')).toEqual([{ heading: 'One', body: 'first' }])
+  })
+
+  it('has nothing to say about an empty file', () => {
+    expect(parseManual('')).toEqual([])
+    expect(stderr.join('')).toBe('')
+  })
+})
+
+/**
+ * WHICH MESSAGES ARE THE BOT'S TO EDIT AND DELETE. Everything this lets through
+ * is a message the reconciler may remove, so a mistake here is the bot deleting
+ * somebody else's post out of a channel it was given for its own documentation.
+ */
+describe('the manual — whose messages are read back', () => {
+  const SELF = '121212121212121212'
+
+  const message = (
+    over: Partial<{
+      id: string
+      author: { id: string }
+      embeds: { title: string | null; description: string | null }[]
+      createdTimestamp: number
+    }> = {},
+  ): {
+    id: string
+    author: { id: string }
+    embeds: { title: string | null; description: string | null }[]
+    createdTimestamp: number
+  } => ({
+    id: 'a',
+    author: { id: SELF },
+    embeds: [{ title: 'One', description: 'first' }],
+    createdTimestamp: 1,
+    ...over,
+  })
+
+  it('takes its own single-embed messages and nothing else', () => {
+    expect(
+      ours(
+        [
+          message({ id: 'mine' }),
+          message({ id: 'someone else', author: { id: AUTHOR } }),
+          message({ id: 'no embed', embeds: [] }),
+          message({
+            id: 'two embeds',
+            embeds: [
+              { title: 'One', description: 'first' },
+              { title: 'Two', description: 'second' },
+            ],
+          }),
+          message({ id: 'no title', embeds: [{ title: null, description: 'first' }] }),
+        ],
+        SELF,
+      ).map((section) => section.id),
+    ).toEqual(['mine'])
+  })
+
+  /**
+   * OLDEST FIRST, because `messages.fetch` answers newest first and the order is
+   * what pairs two sections sharing a heading with the right two messages.
+   */
+  it('puts the channel back in the order it reads', () => {
+    expect(
+      ours(
+        [
+          message({ id: 'c', createdTimestamp: 3 }),
+          message({ id: 'a', createdTimestamp: 1 }),
+          message({ id: 'b', createdTimestamp: 2 }),
+        ],
+        SELF,
+      ).map((section) => section.id),
+    ).toEqual(['a', 'b', 'c'])
+  })
+
+  /** An embed with no description and a section with an empty body have to
+   * become the same value, or the comparison is never equal and the section is
+   * rewritten on every start. */
+  it('reads a missing description as an empty one', () => {
+    expect(ours([message({ embeds: [{ title: 'One', description: null }] })], SELF)).toEqual([
+      { id: 'a', title: 'One', description: '' },
+    ])
+  })
+})
+
+/**
+ * THE FILE ON DISK, AND THE ONE RULE THAT OUTRANKS THIS WHOLE FEATURE:
+ * moderation is never blocked by documentation.
+ */
+describe('the manual — the file, and the bot carrying on without it', () => {
+  it('is read from the root of whichever checkout is running', () => {
+    // Derived from the module's own location like `deployedCommitPath`, so a
+    // bot run out of a checkout reads that checkout's manual.
+    expect(botManualPath()).toBe(
+      join(fileURLToPath(new URL('..', import.meta.url)), 'docs', 'bot-manual.md'),
+    )
+  })
+
+  it('answers null and warns once when there is no manual', async () => {
+    await expect(readManual(join(tmpdir(), 'blitz-bot-no-such-manual.md'))).resolves.toBeNull()
+
+    expect(said('no bot manual on disk')).toBe(1)
+    expect(stderr.join('')).toContain('level=warn')
+  })
+
+  /**
+   * A MISSING MANUAL TOUCHES THE CHANNEL AT ALL, and in particular does not read
+   * it as "the manual is now empty" and delete every section in it. That would
+   * be the worst possible reading of a file that is simply not there — a
+   * checkout of an older commit, a botched deploy.
+   */
+  it('leaves the channel alone entirely when the file is missing', async () => {
+    const docs = docsHarness({ messages: [{ title: 'One', description: 'first' }] })
+    const { client, ready } = docsClient()
+
+    syncDocsChannel(
+      client,
+      DOCS_CHANNEL,
+      () => readManual(join(tmpdir(), 'blitz-bot-no-such-manual.md')),
+      () => docs.channel,
+    )
+
+    ready()
+    await settle()
+
+    expect(docs.calls).toEqual([])
+    expect(docs.messages()).toHaveLength(1)
+  })
+
+  /**
+   * AND THE BOT GOES ON MODERATING. Documentation is the least important thing
+   * this process does, and a manual that could not be published is not a reason
+   * for the scanner to be off.
+   */
+  it('leaves the message listeners armed when the manual cannot be published', async () => {
+    const client = createClient(cfg({ docsChannelId: DOCS_CHANNEL }))
+
+    expect(client.listenerCount(Events.MessageCreate)).toBe(1)
+    expect(client.listenerCount(Events.MessageUpdate)).toBe(1)
+
+    await client.destroy()
+  })
+
+  /** Every failure below `syncDocsChannel` ends there. Nothing it does may
+   * reach the process as an unhandled rejection. */
+  it('swallows a read that blows up in some way nobody expected', async () => {
+    const { client, ready } = docsClient()
+
+    syncDocsChannel(
+      client,
+      DOCS_CHANNEL,
+      () => Promise.reject(new Error('disk on fire')),
+      () => docsHarness().channel,
+    )
+
+    ready()
+    await settle()
+
+    expect(stderr.join('')).toContain('the bot manual could not be synchronised')
+  })
+
+  it('registers nothing at all when no docs channel is configured', async () => {
+    const quiet = createClient(cfg())
+    expect(quiet.listenerCount(Events.ClientReady)).toBe(1)
+    await quiet.destroy()
+
+    const wired = createClient(cfg({ docsChannelId: DOCS_CHANNEL }))
+    expect(wired.listenerCount(Events.ClientReady)).toBe(2)
+    await wired.destroy()
+  })
+
+  it('is wired to the docs channel id and to no other', async () => {
+    // A source assertion because all three optional ids are strings: a fake
+    // client cannot tell which of `config`'s fields was handed over, and getting
+    // it wrong points the bot at a channel of evidence it would then edit.
+    const source = await readFile(new URL('./client.ts', import.meta.url), 'utf8')
+
+    expect(source).toContain('syncDocsChannel(client, config.docsChannelId)')
+    expect(source).not.toMatch(/syncDocsChannel\([^)]*(?:logChannelId|statusChannelId)/u)
+  })
+})
+
+/**
+ * THE MANUAL THIS REPO SHIPS, checked against the channel it has to fit in and
+ * against the bot it claims to describe.
+ *
+ * WHY A TEST AND NOT A PROOFREAD. The document is posted by a live bot to a
+ * channel admins read, so a section that is too long stops being published and
+ * a heading used twice weakens the matching — and both of those are edits
+ * anybody could make to a markdown file without ever running the bot.
+ */
+describe('docs/bot-manual.md — the document that actually ships', () => {
+  const shipped = async (): Promise<string> => {
+    const markdown = await readManual()
+    if (markdown === null) throw new Error('docs/bot-manual.md is missing from this repo')
+    return markdown
+  }
+
+  it('fits the channel, section by section', async () => {
+    const sections = parseManual(await shipped())
+
+    expect(sections.length).toBeGreaterThan(0)
+
+    for (const section of sections) {
+      expect([...section.heading].length, section.heading).toBeLessThanOrEqual(256)
+      expect([...section.body].length, section.heading).toBeLessThanOrEqual(4096)
+      expect(section.body, section.heading).not.toBe('')
+    }
+
+    // No repeated heading — so the key is unique — and no preamble above the
+    // first one. Both would have written a warning while parsing.
+    expect(new Set(sections.map((section) => section.heading)).size).toBe(sections.length)
+    expect(stderr.join('')).toBe('')
+  })
+
+  /**
+   * IT DESCRIBES THE BOT AS IT IS TODAY. Each of these is a thing the code
+   * really does and a thing an admin would otherwise have to read src/ to find
+   * out — the surfaces the scan reads being the least obvious of them.
+   */
+  it('describes what the bot really does', async () => {
+    const markdown = (await shipped()).toLowerCase()
+
+    for (const subject of [
+      'embed',
+      'forward',
+      'component',
+      'edit',
+      'dry run',
+      'exempt',
+      'webhook',
+      'blitz_log_channel_id',
+      'blitz_status_channel_id',
+      'blitz_docs_channel_id',
+      'running commit',
+    ]) {
+      expect(markdown, subject).toContain(subject)
+    }
+  })
+
+  /**
+   * AND IT DOES NOT DESCRIBE A COMMAND THAT DOES NOT EXIST. There is no
+   * interaction listener anywhere in this bot; a manual that implied otherwise
+   * would have admins typing at a channel that answers nothing.
+   */
+  it('does not invent a command the bot does not have', async () => {
+    const source = await readFile(new URL('./client.ts', import.meta.url), 'utf8')
+
+    expect(source).not.toContain('InteractionCreate')
+    expect(await shipped()).toContain('No slash commands')
   })
 })

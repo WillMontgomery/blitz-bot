@@ -1,0 +1,125 @@
+[Unit]
+Description=Blitz Royale Discord bot
+Documentation=https://github.com/WillMontgomery/blitz-bot
+After=network-online.target
+Wants=network-online.target
+
+# systemd gives up after five restarts in ten seconds by default. For a process
+# whose whole job is to hold a websocket open, that default turns a ten-minute
+# Discord outage into an indefinite outage of our own that nobody is paged
+# about. It should keep trying.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/blitz-bot
+
+# The token and the guild id. systemd reads this at start, so an edit here
+# needs a `systemctl restart`, not a `daemon-reload`.
+EnvironmentFile=/opt/blitz-bot/.env
+
+# THIS UNIT DOES NOT UPDATE ANYTHING, AND IT USED TO. The version before this
+# one carried an ExecStartPre that ran /usr/local/bin/blitz-bot-update before
+# every start, including the automatic ones. That was reviewed and rejected:
+# with Restart=always it made every crash a deploy, and an `npm ci` that did
+# not finish left a tree with no dependencies on a box that was starting the
+# bot again five seconds later.
+#
+# The update is blitz-bot-update.service now, on a timer, and it restarts this
+# unit rather than being run by it (sections 6.5 and 16).
+#
+# REMOVED ALONGSIDE IT, ALL FOR THE SAME REASON -- this process runs no
+# install, so it is given nothing an install would need: TimeoutStartSec=
+# (there is no install inside this start any more, so the default 90 seconds is
+# generous again for something that execs node), ReadWritePaths=/opt/blitz-bot,
+# CacheDirectory=, and the two Environment= lines that gave npm a home to work
+# in. If you are about to add one of them back, read section 16 first.
+#
+# StateDirectory= IS NOT ON THAT LIST, AND IT IS NOT A LEFTOVER. It is below,
+# it is one line, and it is here for a reason this design has and the rejected
+# one did not. Read its own comment before removing it.
+
+# The bot's own Node 24, by absolute path. NOT /usr/bin/node, which is the
+# console's runtime: this is the line that keeps the two services independent.
+#
+# Node directly rather than `npm start`, for two reasons. npm adds a process
+# whose entire job is to exec node, and it reads its config and cache from the
+# home directory that `ProtectHome=true` below hides -- a combination that
+# produces confusing errors at boot which have nothing to do with this bot.
+#
+# `--disable-warning=ExperimentalWarning` because Node prints an experimental
+# warning for type stripping on every single boot, and a healthy service that
+# logs a warning every time it starts is a service whose warnings nobody reads.
+ExecStart=/opt/node24/bin/node --disable-warning=ExperimentalWarning /opt/blitz-bot/src/index.ts
+
+# `always`, not `on-failure`. A Discord bot that exits 0 is still an outage:
+# the gateway can close in a way discord.js does not treat as fatal, and the
+# process ends with nothing wrong as far as systemd is concerned. Any exit is a
+# bot that has stopped moderating.
+#
+# AND IT IS NO LONGER A DEPLOYMENT MECHANISM. Every restart this line produces
+# relaunches the code already in /opt/blitz-bot. It fetches nothing, installs
+# nothing and changes no commit -- so a bot crash-looping at 3am loops on the
+# same commit it was on at bedtime.
+Restart=always
+
+# Five seconds, because that is a sensible wait before a gateway reconnect, and
+# for no other reason now. It used to have to be defended against the update it
+# triggered twelve times a minute; there is no update in this start to trigger.
+RestartSec=5
+
+# THE HARDENING, WITH ONE DIRECTORY OPEN IN IT AND THE SOURCE TREE SHUT. The
+# version that updated itself had to open /opt/blitz-bot for writing and hand
+# npm a HOME and a cache -- so the running bot could rewrite its own source and
+# its own token file. All of that has gone back where it was.
+#
+# ProtectSystem=strict makes the whole filesystem read-only to this process,
+# apart from the one directory StateDirectory= opens below. It still READS
+# /opt/blitz-bot: its own source, and /opt/blitz-bot/.deployed-commit, which is
+# why that file is there and not somewhere this unit cannot see (section 6.2).
+# Read-only is not invisible.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+# THE ONE WRITABLE DIRECTORY, AND IT IS THE DEPLOY NOTICE'S MEMORY.
+#
+# THIS IS WHY IT IS HERE NOW, AND IT IS NOT WHY IT WAS HERE BEFORE. The
+# rejected design had a StateDirectory= to give npm somewhere to work during an
+# install inside this unit's own start; that install is gone and so is that
+# reason. This line came back for one thing only: the bot writes
+# $STATE_DIRECTORY/reported-commit, the sha of the last deploy it announced in
+# #bot-status, and compares it at the next start (section 6.2).
+#
+# REMOVE IT AND THE NOTICE REPEATS ON EVERY CRASH RESTART. With
+# ProtectSystem=strict and no writable path, that write fails, the bot logs a
+# warning nobody is watching for, and Restart=always then posts the same
+# "running commit <sha>" line into #bot-status every five seconds for as long
+# as the crash loop lasts -- on top of the faults explaining the crash, in the
+# one channel that has to stay readable while it is happening. So: not scenery.
+# If you are tidying this sandbox, this is the line to leave alone.
+#
+# systemd CREATES IT AND OWNS IT TO User=, and it exports STATE_DIRECTORY, which
+# is what the bot reads -- so this line and the code cannot drift apart about
+# where the directory is. It survives a restart and a reboot, which a file under
+# /tmp would not.
+#
+# IT DOES NOT WEAKEN THE SANDBOX IN THE WAY THE REJECTED DESIGN DID.
+# StateDirectory= opens one directory that systemd created for this unit.
+# ReadWritePaths=/opt/blitz-bot would open the bot's own source and its own
+# token file, and that is the line that must stay out.
+#
+# blitz-bot-update.service declares the same StateDirectory=blitz-bot and the
+# two share /var/lib/blitz-bot on purpose -- same user, no shared file, and
+# nothing but this bot ever writes reported-commit (sections 6.1 and 6.5).
+StateDirectory=blitz-bot
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=blitz-bot
+
+[Install]
+WantedBy=multi-user.target

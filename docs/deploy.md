@@ -256,8 +256,9 @@ v22.23.2
 should be able to pick up Node 24 by accident, and equally nothing should be
 able to pick up Node 22 by accident: everything in this document that needs
 either one names **the `node` binary itself** by absolute path — the unit
-file's `ExecStart` in §6, and every `npm` in §3, §6.1 and §16, each of which
-runs `/opt/node24/bin/node` and hands it npm's own script as an argument.
+file's `ExecStart` in §6, and every `npm` in §3, in `deploy/blitz-bot-update`
+and in §16, each of which runs `/opt/node24/bin/node` and hands it npm's own
+script as an argument.
 
 **Naming `npm` by absolute path does not do that**, which this document used to
 claim it did. §3 has the retraction and the proof.
@@ -579,10 +580,10 @@ is not the commit on disk**. §16 is what that means for deploying.
 The one sentence to carry out of this section: **a crash restarts the bot on
 the code already on the box, and deploys nothing.**
 
-Six files. Four of them are written here, in this order, because each is
-needed by the one after it; the other two are written at runtime — one by the
-update, one by the bot — and are described together, where the difference
-between them is easiest to see:
+Seven files, in six rows. Five of them are put on the box in this section —
+four out of `deploy/` with one command, and the sudoers drop-in by hand — and
+the other two are written at runtime, one by the update and one by the bot. Those
+two are described together, where the difference between them is easiest to see:
 
 | Written in | File | What it is |
 |---|---|---|
@@ -593,317 +594,138 @@ between them is easiest to see:
 | §6.4 | `/etc/systemd/system/blitz-bot.service` | the bot, which now does nothing but run |
 | §6.5 | `/etc/systemd/system/blitz-bot-update.service` and `.timer` | the update, and what starts it |
 
-**Nothing in that table is tracked in the repo**, so a push to `main` cannot
-deploy a change to any of it. Changing the script, either unit, the timer or
-the sudoers file is something somebody does here, by hand, and §16 says which
-of them need what afterwards.
+**The script and the three unit files are tracked in the repository**, in
+`deploy/`, and `deploy/install.sh` installs all four (§6.1). They used to be
+four `sudo tee <<'EOF'` blocks in this document — nearly four hundred lines to
+paste into an SSH session, and a shell script that exists only inside a markdown
+fence is not code. It cannot be parsed without running it, it cannot be diffed
+against what is on the box, and CI has no way to look at it at all. They are
+ordinary files now: `bash verify.sh` parses both shell scripts and runs
+`systemd-analyze verify` over the three units on every push.
 
-### 6.1 The update script
+**Their contents are no longer in this document, deliberately.** §6.1, §6.4 and
+§6.5 say what each file is and why it is that way; the file itself is the file,
+and its own comments are longer than anything here. A unit copied into a runbook
+is a unit that drifts away from the one on the box, and this project has been
+bitten by that three times.
 
-```bash
-sudo tee /usr/local/bin/blitz-bot-update > /dev/null <<'EOF'
-#!/bin/sh
-#
-# Bring /opt/blitz-bot to exactly origin/main, install dependencies if the
-# lockfile moved, and restart the bot ONLY if the commit it is running is not
-# the commit now on disk.
-#
-# blitz-bot-update.service runs this, as ubuntu. blitz-bot-update.timer starts
-# that unit every fifteen minutes, and `sudo systemctl start blitz-bot-update`
-# starts the same unit by hand. THE TIMER AND THE COMMAND ARE ONE PATH, which
-# is the point of both: there is no second implementation of a deploy on this
-# box for one of them to drift away from.
-#
-# IT IS NO LONGER AN ExecStartPre OF blitz-bot.service, AND THAT IS THE WHOLE
-# POINT OF THIS ROUND. When the bot's own start ran it, three things were true
-# and all three are gone:
-#
-#   - Restart=always made every crash a deploy. A bot that died at 3am came
-#     back on whatever happened to be on main at 3am.
-#   - `npm ci` deletes node_modules BEFORE it installs, so an install that did
-#     not finish left no dependencies at all -- on a box that was trying to
-#     start the bot again five seconds later, into exactly that tree.
-#   - `reset --hard` inside a crash loop overwrote the last-known-good tree
-#     with nothing holding a reference to it.
-#
-# Now nothing restarts the bot except the last line of this script; that line
-# is reached only after an install that succeeded; and the commit the box was
-# on is tagged before the reset, so it is still reachable afterwards.
-#
-# FAILURES ARE LOUD, WHICH THEY COULD NOT BE BEFORE. Every path in the old
-# version exited 0, because a non-zero exit would have stopped the bot
-# starting. Nothing waits on this script any more, so it reports failure
-# honestly: `systemctl status blitz-bot-update` goes red, `journalctl -p
-# warning` finds the reason, the timer tries again at the next tick, and the
-# bot is untouched throughout.
-#
-# IT IS A FILE AND NOT A LONG `sh -c` IN THE UNIT, for a reason worth keeping:
-# systemd expands `%` in unit lines. `%3N` below is a date format, and inline
-# it would have to be written `%%` -- a trap every future editor gets to
-# rediscover, and one that fails quietly rather than loudly. Out here there is
-# no `%` expansion at all, and these comments fit.
-#
-# It is not in the repo, so it never updates itself. An updater that rewrites
-# itself while it is running is a failure nobody needs to own.
+**Tracked is not deployed.** An update hard-resets `/opt/blitz-bot` onto
+`origin/main`, so a push does change `/opt/blitz-bot/deploy/` on the box — and
+changes nothing whatever in `/usr/local/bin` or `/etc/systemd/system`, because
+nothing copies files there except `deploy/install.sh`, run by hand. §16 says
+what each of them needs afterwards. What being tracked buys is the question that
+could not be asked before at all: **is what is installed the same as what the
+repository says should be installed?**
 
-set -u
+**The sudoers drop-in (§6.3) is still written by hand, and stays that way.** A
+file in `/etc/sudoers.d` that does not parse stops `sudo` working *at all*, on a
+box whose only privileged path is `sudo` over SSH — so it is staged in `/tmp`,
+checked there with `visudo -c`, and only then installed. That sequence is the
+whole point of it, and it does not belong folded into a script that copies four
+files.
 
-REPO=/opt/blitz-bot
-STATE=/var/lib/blitz-bot         # StateDirectory=, owned by ubuntu, survives a reboot
-INSTALLED=$STATE/installed-lock  # the lockfile the last good install used
-COMMIT=$REPO/.deployed-commit    # the commit the bot reads at startup -- section 6.2
-PREVIOUS=blitz-bot-previous      # a local git tag: the way back, with no network
-OFF_SWITCH=/etc/blitz-bot-no-update
+### 6.1 The four files, and the one command that installs them
 
-# $STATE IS SHARED WITH THE BOT, AND THAT IS DELIBERATE. blitz-bot.service
-# declares the same StateDirectory=blitz-bot (section 6.4), so systemd creates
-# /var/lib/blitz-bot once, owns it to ubuntu, and both units -- both running as
-# ubuntu -- can write it. Sharing the DIRECTORY is not sharing a file: nothing
-# this script writes in there is read by the bot, and nothing the bot writes in
-# there is read by this script. $INSTALLED is a copy of a lockfile that only
-# this script ever compares against.
-#
-# AND THIS SCRIPT MUST NEVER WRITE $STATE/reported-commit. That file is the
-# bot's own memory of the last commit it ANNOUNCED in #bot-status, it has
-# exactly one writer, and the writer is the bot (section 6.2). Write the NEW
-# sha there from here and the bot comes up already believing it has announced
-# this deploy, so the notice never fires again. Write the OLD one and it fires
-# on every restart for ever. Those are the two failures the whole comparison
-# exists to prevent, and neither of them is an error anywhere -- they are a
-# channel that went quiet, or a channel that will not shut up.
+§3 cloned the repository, so all four are already on the box, in
+`/opt/blitz-bot/deploy`:
 
-# npm reads its config and its cache from $HOME, and ProtectHome=true leaves
-# this service no home directory to read. Both of these are directories systemd
-# creates for the unit -- StateDirectory= and CacheDirectory= in section 6.5 --
-# so they exist, they belong to ubuntu, and the cache survives between runs
-# instead of being downloaded again every quarter of an hour.
-#
-# SET HERE AND NOT IN THE UNIT, so that one file says where npm puts things and
-# an Environment= line cannot quietly disagree with it.
-HOME=$STATE
-npm_config_cache=/var/cache/blitz-bot
+| In `deploy/` | Installed as | Mode |
+|---|---|---|
+| `blitz-bot-update` | `/usr/local/bin/blitz-bot-update` | 755 |
+| `blitz-bot.service` | `/etc/systemd/system/blitz-bot.service` | 644 |
+| `blitz-bot-update.service` | `/etc/systemd/system/blitz-bot-update.service` | 644 |
+| `blitz-bot-update.timer` | `/etc/systemd/system/blitz-bot-update.timer` | 644 |
 
-# Never block on a prompt. The repo is public and needs no credentials, but a
-# URL that starts answering 404 makes git ask for a username, and an update
-# hung on a question nobody can answer never finishes and never fails.
-GIT_TERMINAL_PROMPT=0
+**`blitz-bot-update` is the update, and the only implementation of one.** It
+brings `/opt/blitz-bot` to exactly `origin/main`, installs dependencies if the
+lockfile moved, and restarts the bot **only if the commit it is running is not
+the commit now on disk**. `blitz-bot-update.service` runs it;
+`blitz-bot-update.timer` starts that unit every fifteen minutes; and
+`sudo systemctl start blitz-bot-update` starts the same unit by hand — one
+script, one unit, one path, with no second implementation of a deploy on this
+box for either of them to drift away from. It tags the commit it is leaving
+before it overwrites it, it never restarts the bot after an install that failed,
+and it has an off switch that is read before anything else (§16). Every one of
+those decisions is argued for in its own comments, in the file, which is the
+first thing to read before changing it. §6.4 covers the bot's unit and §6.5 the
+update's unit and the timer.
 
-export HOME npm_config_cache GIT_TERMINAL_PROMPT
-
-# Timestamped like the bot's own lines so the two journals read as one stream,
-# and prefixed <6>/<4> for the same reason src/log.ts does it: journald reads
-# the priority off the front, strips it, and `journalctl -p warning` then finds
-# a failed update without anyone parsing text (section 13).
-#
-# Deliberately NOT the msg= shape the bot uses. These lines are not the bot's,
-# and every grep in that document which hunts for the bot's messages has to go
-# on missing them.
-stamped() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
-say() { printf '<6>%s blitz-bot-update: %s\n' "$(stamped)" "$1"; }
-warn() { printf '<4>%s blitz-bot-update: %s\n' "$(stamped)" "$1" >&2; }
-
-# THE ONLY WAY OUT OF THIS SCRIPT THAT IS NOT SUCCESS, so there is one place
-# that decides what a failed update does. It says why at <4>, and it exits
-# non-zero so the unit goes red instead of green.
-#
-# AND IT NEVER RESTARTS THE BOT. Reaching this line means the tree, the
-# dependencies or the network is in a state nobody has checked, and a restart
-# into that is the outage. The bot goes on running what it is already running,
-# which is code that was working a minute ago.
-die() { warn "$1"; exit 1; }
-
-cd "$REPO" || die "no $REPO -- nothing to update"
-
-# THE OFF SWITCH, READ FIRST so that it still works when everything below it is
-# broken. main is bad and the box has to be left alone: one `sudo touch`, and
-# no tick of the timer and no run of the command deploys anything until the
-# file is removed (section 16).
-if [ -e "$OFF_SWITCH" ]; then
-  say "skipped: $OFF_SWITCH exists"
-  exit 0
-fi
-
-# WHAT THE RUNNING BOT IS ON, which is the question the restart turns on. This
-# file is written by this script immediately before it restarts the bot, and
-# read by the bot at startup, so it is one fact with one writer.
-#
-# MISSING OR EMPTY MEANS UNKNOWN, AND UNKNOWN MEANS RESTART. A first install
-# has no file; neither has a box somebody rolled back by hand. In neither case
-# can "the bot is already on this commit" be claimed, so neither case claims it.
-deployed=$(cat "$COMMIT" 2>/dev/null || true)
-
-# ---- 1. what origin has --------------------------------------------------
-before=$(git rev-parse --short HEAD) || die "cannot read HEAD -- is $REPO still a git repository?"
-
-timeout 60 git fetch --quiet origin || die 'fetch failed -- nothing was changed'
-
-# ---- 2. the way back, written before anything is overwritten -------------
-#
-# THIS IS THE LINE THE REVIEW ASKED FOR. `reset --hard` moves the branch and
-# leaves the commit the box was on unreferenced -- reachable only through a
-# reflog that expires, in a repository that runs `gc` on its own. A tag is a
-# reference. After this line the old commit has a name, on this disk, and
-# rolling back is one command that never touches github.com:
-#
-#     git reset --hard blitz-bot-previous
-#
-# LIGHTWEIGHT (`git tag -f NAME SHA`) AND NOT ANNOTATED. An annotated tag is an
-# object with an author, an author needs a user.name and a user.email, and
-# ProtectHome=true leaves no home directory to read a .gitconfig from -- so the
-# annotated form is the one that fails here, and it would fail at the exact
-# moment it was most needed.
-#
-# -f, because this is "the commit before this update" and not a history.
-git tag -f "$PREVIOUS" "$before" >/dev/null 2>&1 ||
-  warn "cannot tag $before -- rolling back will need that sha"
-
-# ---- 3. the code, before the dependencies --------------------------------
-#
-# NOT `git pull`, for three things this box will actually hit: pull refuses
-# outright when a tracked file has been edited in place, pull can leave a merge
-# commit so the box is no longer at a commit that exists on main, and a merge
-# commit wants an identity that ProtectHome=true leaves no home directory to
-# read.
-#
-# `reset --hard origin/main` lands on exactly origin/main, stays on the main
-# branch, and DISCARDS local edits to tracked files -- intended on this box,
-# and said plainly in section 16 where the operator will read it. Untracked and
-# ignored files are not touched, which is what keeps /opt/blitz-bot/.env and
-# /opt/blitz-bot/.deployed-commit. There is deliberately no `git clean` anywhere
-# here: `git clean -x` is the one command that would delete .env,
-# .deployed-commit and node_modules in a single go.
-#
-# IT RUNS EVEN WHEN THE COMMIT DID NOT MOVE, so a tracked file edited on the
-# box is put back at the next tick rather than surviving until the next push.
-git reset --hard --quiet origin/main || die "reset failed -- still on $before"
-
-current=$(git rev-parse --short HEAD) || die 'cannot read HEAD after the reset'
-
-if [ "$current" != "$before" ]; then
-  say "updated $before -> $current"
-else
-  say "already on $current"
-fi
-
-# ---- 4. the dependencies, and the reason this is not an ExecStartPre -----
-#
-# `npm ci` DELETES node_modules AND REBUILDS IT FROM NOTHING every time it
-# runs. That is the failure the last review found: for the minute it is
-# running, and for as long as it stays failed afterwards, /opt/blitz-bot holds
-# code and no dependencies.
-#
-# THE ANSWER IS THIS ORDER -- INSTALL FIRST, RESTART AFTERWARDS, AND ONLY IF
-# THE INSTALL SUCCEEDED. Nothing is trying to start the bot during that
-# minute: a timer is not a restart trigger, which is exactly what an
-# ExecStartPre was. The process that is running already holds its dependencies
-# in memory and does not care that the directory underneath it is being
-# rebuilt, and a new process is only ever started against a tree that finished
-# installing.
-#
-# THE OTHER ANSWER WAS A SECOND TREE AND A SYMLINK SWAP, installing beside the
-# running copy and pointing /opt/blitz-bot at it only once the install had
-# worked. It closes the last of the window, and it costs a second copy of the
-# repository, a symlink in the middle of every path in every unit and in this
-# document, and an operator who can no longer be told "the bot is in
-# /opt/blitz-bot". Too much machinery for a window nothing is restarting into.
-#
-# IT INSTALLS WHEN THE LOCKFILE MOVED, AND WHENEVER IT CANNOT TELL. Missing
-# stamp, unreadable stamp, missing lockfile, missing node_modules -- all of
-# them take the install branch, because `cmp` exits non-zero on a file it
-# cannot read exactly as it does on a difference. Installing when it was not
-# needed costs a minute; skipping when it was needed is a bot that cannot
-# start.
-#
-# IT NAMES THE node BINARY AND HANDS IT npm's SCRIPT, WHICH IS NOT THE SAME
-# THING AS AN ABSOLUTE PATH TO npm. /opt/node24/bin/npm is a symlink to
-# npm-cli.js, whose shebang is `#!/usr/bin/env node`, and env searches PATH --
-# which does not carry /opt/node24/bin, on purpose. Run that way this line
-# installed the bot's dependencies on the CONSOLE's Node 22, every quarter of
-# an hour, silently. Section 3 has the proof and the retraction.
-if [ -d node_modules ] && cmp -s package-lock.json "$INSTALLED"; then
-  say 'dependencies unchanged'
-elif timeout 300 /opt/node24/bin/node /opt/node24/lib/node_modules/npm/bin/npm-cli.js ci --no-audit --no-fund; then
-  # Recorded only on success, so a failed install is retried at the next tick
-  # instead of being remembered as done.
-  cp package-lock.json "$INSTALLED" || warn "cannot write $INSTALLED -- the next run will install again"
-  say 'dependencies installed'
-else
-  die "install failed -- $current is on disk and the bot was NOT restarted"
-fi
-
-# ---- 5. the restart, and only when there is something to restart onto ----
-#
-# NO CHANGE MEANS NO RESTART. The bot's whole job is to hold a websocket open.
-# Dropping it every fifteen minutes to arrive back at the same commit is a
-# disconnect, a reconnect and a `ready` line, four times an hour, for nothing --
-# and it would leave the one log line that means "something was deployed"
-# indistinguishable from the noise around it.
-#
-# THE TEST IS "IS THE BOT ON THIS COMMIT", NOT "DID THIS RUN CHANGE ANYTHING",
-# and the difference shows up in exactly one case: a previous run fetched a new
-# commit and then failed its install, so it did not restart, so the bot is
-# still on the old code while the disk is on the new. The next tick changes no
-# commit, installs successfully, and this comparison still says restart -- where
-# "did the commit move during this run" would have said no, and left the bot on
-# the old code until somebody happened to push again.
-if [ "$current" = "$deployed" ]; then
-  say "no restart: blitz-bot is already on $current"
-  exit 0
-fi
-
-# WRITTEN BEFORE THE RESTART, because the bot reads it at startup. The other
-# order hands the new process the old commit, every single time.
-printf '%s\n' "$current" > "$COMMIT" || die "cannot write $COMMIT"
-
-# `try-restart` AND NOT `restart`: it restarts the bot if it is running and
-# does nothing at all if it is not. A bot somebody stopped on purpose -- to
-# read the journal without sixty lines a minute landing in it (section 14) --
-# stays stopped, and the file above still tells the truth about what it will
-# come up on.
-#
-# `sudo -n` FOR THE ONE PRIVILEGED THING THIS SCRIPT DOES. It runs as ubuntu
-# because ubuntu owns the tree; restarting a system unit is root's. Section 6.3
-# grants exactly this command and nothing else, and the two have to be spelled
-# identically -- sudoers matches the arguments literally, so `blitz-bot` here
-# against `blitz-bot.service` there would simply be denied.
-sudo -n /usr/bin/systemctl try-restart blitz-bot.service ||
-  die "restart failed -- $current is installed but blitz-bot did not come back"
-
-say "deployed $current"
-EOF
-```
-
-It has to be executable, or every run of the unit fails with a permission
-error:
+Read them before you install them. This is what the four heredocs used to be and
+nothing has been retyped, so what is on the screen is what goes on the box — the
+three unit files sit alongside it in the same directory:
 
 ```bash
-sudo chmod 755 /usr/local/bin/blitz-bot-update
+less /opt/blitz-bot/deploy/blitz-bot-update
 ```
 
-Check it before anything depends on it:
+**Then install all four:**
 
 ```bash
-ls -l /usr/local/bin/blitz-bot-update ; sh -n /usr/local/bin/blitz-bot-update && echo "update script parses"
+sudo sh /opt/blitz-bot/deploy/install.sh
 ```
 
-Expected — the mode line, then the word:
+Expected, on a box where none of them are in place yet:
 
 ```
--rwxr-xr-x 1 root root 8104 Aug 29 18:02 /usr/local/bin/blitz-bot-update
-update script parses
+install: from /opt/blitz-bot/deploy
+
+  installed  /usr/local/bin/blitz-bot-update
+  installed  /etc/systemd/system/blitz-bot.service
+  installed  /etc/systemd/system/blitz-bot-update.service
+  installed  /etc/systemd/system/blitz-bot-update.timer
+
+  verified   all three unit files parse, and their ExecStart paths exist
+  reloaded   systemd now knows about the three units
+
+install: done. NOTHING WAS ENABLED AND NOTHING WAS STARTED.
 ```
 
-The size and the date are yours. The two things to read are `-rwxr-xr-x` at the
-front and `update script parses` at the end.
+**Read the four verbs, one per file.** A second run says `unchanged` four times
+and copies nothing, which makes the same command the answer to "is this box
+actually on this commit's units?". `updated` means the file on the box was not
+the file in the repository — worth knowing, and not askable at all while the
+units lived in a document.
 
-`sh -n` parses the file without running it. It is the closest thing this half
-of the install has to the `systemd-analyze verify` in §6.5, and it catches the
-one mistake a long paste actually makes. **Do not run the script by hand to
-test it.** By hand it runs outside the unit's sandbox, with a different `HOME`
-and no `/var/lib/blitz-bot` — so it would prove something about a situation
-that never happens, and would drop a package cache in your home directory on
-the way past. §7 runs it for real, through its unit, and reads the result out
-of the journal.
+**`verified` is `systemd-analyze verify`**, run against what was just installed,
+where it was installed. It reads the three units the way systemd will and
+refuses a misspelled directive, a section that is not a section, or a value it
+cannot parse — none of which any other check in this repo can see. It also
+checks that the paths in `ExecStart=` exist and are executable, which is why the
+script is copied before the units that name it. **Any output from it is a
+problem to fix before going on**, and the installer stops there, with the files
+on disk and nothing enabled.
+
+**`reloaded` is `systemctl daemon-reload`.** Without it, `systemctl start
+blitz-bot-update` in §7 answers `Unit blitz-bot-update.service not found` over a
+file that is plainly sitting in `/etc/systemd/system`.
+
+**There is no `sh -n` step here any more, and no `chmod` to remember.** Both
+existed because this section used to be a paste: `sh -n` caught the one mistake
+a four-hundred-line paste actually makes, and the mode had to be set afterwards
+because `tee` does not set it. The script arrives through `git clone` now,
+`bash verify.sh` parsed it before it could reach `main`, and `install.sh` writes
+each file with its mode already on it.
+
+**Nothing was enabled and nothing was started, and that is deliberate.**
+Installing and starting are separate decisions: files on a disk are reversible
+and dull, and a bot about to delete messages in a live guild is neither. §7
+starts the bot, reads the journal after it, and turns the timer on last.
+
+**If it refuses, it refuses before writing anything.** Two ways:
+
+- `no /opt/blitz-bot on this machine` — it is being run on a laptop rather than
+  on the box, and it will not scatter root-owned files outside a checkout. §3 is
+  what creates that directory.
+- `not root, so nothing was installed` — it needs `sudo` for `/usr/local/bin`
+  and `/etc/systemd/system`. It prints the exact line to run rather than
+  re-launching itself, so a password prompt never appears out of a command you
+  did not put `sudo` in front of.
+
+**Do not run `blitz-bot-update` by hand to test it.** By hand it runs outside the
+unit's sandbox, with a different `HOME` and no `/var/lib/blitz-bot` — so it
+would prove something about a situation that never happens, and would drop a
+package cache in your home directory on the way past. §7 runs it for real,
+through its unit, and reads the result out of the journal.
 
 ### 6.2 `/opt/blitz-bot/.deployed-commit` — the commit the bot reports
 
@@ -1030,144 +852,37 @@ paste that went wrong is a file nothing reads. If the line above stops at
 `parsed OK` and goes no further, nothing was installed and nothing is broken:
 fix the heredoc and paste both blocks again.
 
-**The grant is proved at the end of §6.5**, and not here — the command it
-grants names a unit that does not exist yet.
+**The grant is proved at the end of §6.5**, and not here. It could be tried
+now — §6.1 has already installed `blitz-bot.service`, and `sudo` reads
+`/etc/sudoers.d` per call rather than caching it — but it is the last thing
+checked before §7 runs the update for the first time, and the line it proves is
+the line that update ends on.
 
 ### 6.4 The bot's unit
 
-Write the unit file in one block. Do not open an editor for this — a fifty-line
-paste into `nano` is where a stray character gets in, and the error it produces
-names a line number rather than the mistake.
+`deploy/blitz-bot.service`, installed by §6.1 as
+`/etc/systemd/system/blitz-bot.service`. **It does nothing but run the bot.**
 
-```bash
-sudo tee /etc/systemd/system/blitz-bot.service > /dev/null <<'EOF'
-[Unit]
-Description=Blitz Royale Discord bot
-Documentation=https://github.com/WillMontgomery/blitz-bot
-After=network-online.target
-Wants=network-online.target
-
-# systemd gives up after five restarts in ten seconds by default. For a process
-# whose whole job is to hold a websocket open, that default turns a ten-minute
-# Discord outage into an indefinite outage of our own that nobody is paged
-# about. It should keep trying.
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/opt/blitz-bot
-
-# The token and the guild id. systemd reads this at start, so an edit here
-# needs a `systemctl restart`, not a `daemon-reload`.
-EnvironmentFile=/opt/blitz-bot/.env
-
-# THIS UNIT DOES NOT UPDATE ANYTHING, AND IT USED TO. The version before this
-# one carried an ExecStartPre that ran /usr/local/bin/blitz-bot-update before
-# every start, including the automatic ones. That was reviewed and rejected:
-# with Restart=always it made every crash a deploy, and an `npm ci` that did
-# not finish left a tree with no dependencies on a box that was starting the
-# bot again five seconds later.
-#
-# The update is blitz-bot-update.service now, on a timer, and it restarts this
-# unit rather than being run by it (sections 6.5 and 16).
-#
-# REMOVED ALONGSIDE IT, ALL FOR THE SAME REASON -- this process runs no
-# install, so it is given nothing an install would need: TimeoutStartSec=
-# (there is no install inside this start any more, so the default 90 seconds is
-# generous again for something that execs node), ReadWritePaths=/opt/blitz-bot,
-# CacheDirectory=, and the two Environment= lines that gave npm a home to work
-# in. If you are about to add one of them back, read section 16 first.
-#
-# StateDirectory= IS NOT ON THAT LIST, AND IT IS NOT A LEFTOVER. It is below,
-# it is one line, and it is here for a reason this design has and the rejected
-# one did not. Read its own comment before removing it.
-
-# The bot's own Node 24, by absolute path. NOT /usr/bin/node, which is the
-# console's runtime: this is the line that keeps the two services independent.
-#
-# Node directly rather than `npm start`, for two reasons. npm adds a process
-# whose entire job is to exec node, and it reads its config and cache from the
-# home directory that `ProtectHome=true` below hides -- a combination that
-# produces confusing errors at boot which have nothing to do with this bot.
-#
-# `--disable-warning=ExperimentalWarning` because Node prints an experimental
-# warning for type stripping on every single boot, and a healthy service that
-# logs a warning every time it starts is a service whose warnings nobody reads.
-ExecStart=/opt/node24/bin/node --disable-warning=ExperimentalWarning /opt/blitz-bot/src/index.ts
-
-# `always`, not `on-failure`. A Discord bot that exits 0 is still an outage:
-# the gateway can close in a way discord.js does not treat as fatal, and the
-# process ends with nothing wrong as far as systemd is concerned. Any exit is a
-# bot that has stopped moderating.
-#
-# AND IT IS NO LONGER A DEPLOYMENT MECHANISM. Every restart this line produces
-# relaunches the code already in /opt/blitz-bot. It fetches nothing, installs
-# nothing and changes no commit -- so a bot crash-looping at 3am loops on the
-# same commit it was on at bedtime.
-Restart=always
-
-# Five seconds, because that is a sensible wait before a gateway reconnect, and
-# for no other reason now. It used to have to be defended against the update it
-# triggered twelve times a minute; there is no update in this start to trigger.
-RestartSec=5
-
-# THE HARDENING, WITH ONE DIRECTORY OPEN IN IT AND THE SOURCE TREE SHUT. The
-# version that updated itself had to open /opt/blitz-bot for writing and hand
-# npm a HOME and a cache -- so the running bot could rewrite its own source and
-# its own token file. All of that has gone back where it was.
-#
-# ProtectSystem=strict makes the whole filesystem read-only to this process,
-# apart from the one directory StateDirectory= opens below. It still READS
-# /opt/blitz-bot: its own source, and /opt/blitz-bot/.deployed-commit, which is
-# why that file is there and not somewhere this unit cannot see (section 6.2).
-# Read-only is not invisible.
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-
-# THE ONE WRITABLE DIRECTORY, AND IT IS THE DEPLOY NOTICE'S MEMORY.
-#
-# THIS IS WHY IT IS HERE NOW, AND IT IS NOT WHY IT WAS HERE BEFORE. The
-# rejected design had a StateDirectory= to give npm somewhere to work during an
-# install inside this unit's own start; that install is gone and so is that
-# reason. This line came back for one thing only: the bot writes
-# $STATE_DIRECTORY/reported-commit, the sha of the last deploy it announced in
-# #bot-status, and compares it at the next start (section 6.2).
-#
-# REMOVE IT AND THE NOTICE REPEATS ON EVERY CRASH RESTART. With
-# ProtectSystem=strict and no writable path, that write fails, the bot logs a
-# warning nobody is watching for, and Restart=always then posts the same
-# "running commit <sha>" line into #bot-status every five seconds for as long
-# as the crash loop lasts -- on top of the faults explaining the crash, in the
-# one channel that has to stay readable while it is happening. So: not scenery.
-# If you are tidying this sandbox, this is the line to leave alone.
-#
-# systemd CREATES IT AND OWNS IT TO User=, and it exports STATE_DIRECTORY, which
-# is what the bot reads -- so this line and the code cannot drift apart about
-# where the directory is. It survives a restart and a reboot, which a file under
-# /tmp would not.
-#
-# IT DOES NOT WEAKEN THE SANDBOX IN THE WAY THE REJECTED DESIGN DID.
-# StateDirectory= opens one directory that systemd created for this unit.
-# ReadWritePaths=/opt/blitz-bot would open the bot's own source and its own
-# token file, and that is the line that must stay out.
-#
-# blitz-bot-update.service declares the same StateDirectory=blitz-bot and the
-# two share /var/lib/blitz-bot on purpose -- same user, no shared file, and
-# nothing but this bot ever writes reported-commit (sections 6.1 and 6.5).
-StateDirectory=blitz-bot
-
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=blitz-bot
-
-[Install]
-WantedBy=multi-user.target
-EOF
-```
+- **`ExecStart` is `/opt/node24/bin/node` and the source file, and nothing
+  else** — no `ExecStartPre`, no `sh -c` smuggling an update in ahead of it. The
+  version of this unit that ran the update before every start was reviewed and
+  rejected; the three reasons are in the unit's own comments, where somebody
+  about to put the line back is standing, and at length at the end of §16.
+- **`Restart=always`, `RestartSec=5`, and no start limit.** It is what carries
+  the bot through a Discord outage, and it is only safe because the start it
+  produces fetches nothing. **A crash restarts the bot on the code already on
+  the box and deploys nothing** (§14).
+- **A sandbox: `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`,
+  `ProtectHome`.** `/opt/blitz-bot` is readable and not writable, which is why
+  `.deployed-commit` lives there (§6.2) and why there is no `ReadWritePaths=`
+  line anywhere in it — that one directive would hand the running bot its own
+  source and its own token file.
+- **`StateDirectory=blitz-bot`**, the one writable directory it has:
+  `/var/lib/blitz-bot`, where it remembers the last commit it announced (§6.2).
+  Both units declare it, both run as `ubuntu`, and they write different files in
+  it.
+- **`EnvironmentFile=/opt/blitz-bot/.env`** — §5's file, read once at start,
+  which is why an edit to it needs a restart rather than a deploy (§16).
 
 `User=ubuntu` matches the console rather than improving on it. A dedicated
 unprivileged user would stop the bot from being able to read
@@ -1178,159 +893,51 @@ how the bot is deployed.
 
 ### 6.5 The update's unit, and the timer that starts it
 
-```bash
-sudo tee /etc/systemd/system/blitz-bot-update.service > /dev/null <<'EOF'
-[Unit]
-Description=Update blitz-bot to origin/main and restart it if the commit changed
-Documentation=https://github.com/WillMontgomery/blitz-bot
+`deploy/blitz-bot-update.service` and `deploy/blitz-bot-update.timer`, installed
+by §6.1 into `/etc/systemd/system`.
 
-# NOTHING HERE NAMES blitz-bot.service. No Requires=, no BindsTo=, no After=,
-# not even a Wants=. This unit restarts the bot by asking systemd to, in its
-# last line; a dependency would additionally mean that stopping or failing one
-# of them acts on the other, and an ordering dependency between a unit and a
-# unit it restarts is the classic way to wedge a boot.
-After=network-online.target
-Wants=network-online.target
+**The unit:**
 
-[Service]
-# oneshot: it runs, it finishes, and `systemctl status` shows the result of the
-# last run rather than a process. Type=simple would report success the instant
-# the script was exec'd, which is the one thing nobody wants to know.
-Type=oneshot
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/opt/blitz-bot
-ExecStart=/usr/local/bin/blitz-bot-update
+- **`Type=oneshot`, `ExecStart=/usr/local/bin/blitz-bot-update`, running as
+  `ubuntu`** — the user that owns the tree. `systemctl status` then shows the
+  result of the last run rather than a process that is still going.
+- **Its failures are allowed to be failures.** No leading `-` on the
+  `ExecStart`, and no `Restart=` at all: a oneshot that restarts itself on
+  failure is the fetch loop this design exists to remove. Retrying is the
+  timer's job, once, in fifteen minutes.
+- **Nothing in it names `blitz-bot.service`** — no `Requires=`, no `BindsTo=`,
+  no `After=`, not even a `Wants=`. It restarts the bot by asking systemd to, in
+  the script's last line, and an ordering dependency between a unit and a unit
+  it restarts is the classic way to wedge a boot.
+- **`TimeoutStartSec=600`**, above the sum of the two network steps the script
+  bounds itself with, so what gives up is the step that hung, with a line naming
+  it.
+- **`StateDirectory=blitz-bot` and `CacheDirectory=blitz-bot`**, because
+  `ProtectHome=true` leaves npm no home directory to read its config and cache
+  from. The cache survives between runs instead of being downloaded again every
+  quarter of an hour.
+- **No `NoNewPrivileges=`**, and it is the one sandbox line this unit cannot
+  have: the last thing the script does is `sudo -n`, and `NoNewPrivileges` is
+  exactly what stops `sudo` working. The bot's unit keeps it; this one says so
+  out loud in its own comments.
 
-# NO LEADING `-` ON THAT LINE, WHICH IS THE INVERSE OF THE UNIT THIS REPLACED.
-# There, a failed update had to be ignored or the bot would not have started.
-# Here nothing is waiting, so a failed update is allowed to be a failed unit:
-# red in `systemctl status blitz-bot-update`, and found by
-# `journalctl -u blitz-bot-update -p warning`.
-#
-# NO Restart= EITHER. A oneshot that restarts itself on failure is the fetch
-# loop this whole design exists to remove. The timer is what retries, once, in
-# fifteen minutes.
+**The timer:**
 
-# The script bounds its own two network steps at 60s and 300s. This is above
-# their sum, so what gives up is the step that hung, with a line in the journal
-# naming it, rather than systemd killing the run and saying only that it timed
-# out.
-TimeoutStartSec=600
+- **`OnCalendar=*:0/15`** — every fifteen minutes. That is the longest a push
+  can sit on `main` without arriving, and also the shortest gap between pushing
+  something wrong and the box restarting onto it.
+- **`Persistent=true`**, which has an effect *only* on `OnCalendar=` timers: a
+  box that was switched off comes back, sees it missed a window, and catches up
+  once. Written as `OnUnitActiveSec=15min` the schedule would read identically
+  and that line would be accepted and silently do nothing.
+- **`RandomizedDelaySec=300`**, or this box fetches on the same second as every
+  other thing anybody ever scheduled on the quarter hour — including its own
+  catch-up after a reboot.
 
-# systemd creates /var/lib/blitz-bot and /var/cache/blitz-bot, owns them to
-# User= and makes them writable. The first holds the lockfile stamp, the second
-# is the package cache -- worth keeping between runs, because the alternative
-# is downloading every dependency again on every update.
-#
-# THE BOT'S UNIT DECLARES THE SAME StateDirectory=blitz-bot, DELIBERATELY. Both
-# units get /var/lib/blitz-bot; systemd creates it once and owns it to ubuntu,
-# and both units run as ubuntu, so this is one directory two processes can
-# write rather than two directories or a conflict. They share no FILE in it:
-# this unit writes installed-lock and reads nothing the bot wrote, and the bot
-# writes reported-commit and reads nothing this unit wrote.
-#
-# THIS UNIT MUST NEVER WRITE reported-commit. It is the bot's memory of
-# the last deploy it announced, the bot is its only writer, and a second writer
-# makes the notice either fire on every restart or never fire again. The script
-# says the same thing at the line that sets $STATE (section 6.1).
-#
-# CacheDirectory= IS THIS UNIT'S ALONE, and stays that way: the bot runs no
-# install, so it has no cache to keep.
-StateDirectory=blitz-bot
-CacheDirectory=blitz-bot
-
-# ProtectSystem=full, WHERE THE BOT GETS strict, AND THIS IS THE ONE PLACE THE
-# TWO UNITS DIFFER ON PURPOSE. `strict` mounts the entire hierarchy read-only
-# apart from the directories systemd itself opens, which is exactly right for a
-# process that writes one file in its StateDirectory= and exactly wrong for one
-# whose whole job is to write /opt/blitz-bot. `full` keeps /usr, /boot
-# and /etc read-only -- both unit files, this unit's sudo grant and the off
-# switch all live in /etc, so the update cannot rewrite the rules it runs
-# under -- and leaves /opt writable, which git and the install need.
-#
-# NO NoNewPrivileges=true HERE, AND IT IS DELIBERATE. `sudo` is a setuid
-# binary and NoNewPrivileges is precisely the flag that stops one raising
-# privileges, so the two cannot both be true. The bot's unit keeps it (section
-# 6.4); this unit pays for its last line by giving it up.
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=full
-
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=blitz-bot-update
-
-# NO [Install] SECTION, DELIBERATELY. Nothing should ever `enable` this unit:
-# it is started by its timer and by hand, and an enabled oneshot would also run
-# once at every boot -- a deploy triggered by a reboot.
-EOF
-```
-
-```bash
-sudo tee /etc/systemd/system/blitz-bot-update.timer > /dev/null <<'EOF'
-[Unit]
-Description=Check origin/main for a new blitz-bot commit every fifteen minutes
-Documentation=https://github.com/WillMontgomery/blitz-bot
-
-[Timer]
-# FIFTEEN MINUTES, AND THE NUMBER IS A TRADE BETWEEN TWO THINGS THE OWNER CAN
-# FEEL. It is the longest a push can sit on main without arriving, so it is how
-# long "I fixed it" takes to become true. It is also the shortest possible gap
-# between pushing something wrong and the box restarting onto it. Shorter, and
-# an evening's work is a restart every few minutes; longer, and somebody opens
-# an SSH session, which is the habit this timer exists to remove. Ninety-six
-# fetches a day against a public repository is nothing to anybody.
-#
-# A CALENDAR EXPRESSION AND NOT OnUnitActiveSec=, FOR ONE CONCRETE REASON:
-# Persistent= below has an effect only on OnCalendar= timers. Written as a
-# monotonic interval, that line would be accepted and would silently do
-# nothing.
-OnCalendar=*:0/15
-
-# systemd records when this timer last ran, on disk. A box that was off -- a
-# stopped instance, a reboot that took a while -- comes back, sees that it
-# missed a window, and runs the update ONCE, straight away, rather than sitting
-# on last week's code until the next quarter hour. Once, and not once per
-# missed window: it is a catch-up, not a backlog.
-Persistent=true
-
-# WITHOUT THIS THE BOX FETCHES AT :00, :15, :30 AND :45 FOR EVER, on the same
-# second as every other thing anybody ever scheduled on the quarter hour --
-# including this box's own catch-up after a reboot. Five minutes of spread
-# costs nothing when the interval is already an approximation.
-RandomizedDelaySec=300
-
-# NO Unit= LINE. A timer starts the service with the same name, and naming it
-# again is a second place for the name to be wrong.
-
-[Install]
-WantedBy=timers.target
-EOF
-```
-
-**Check all three before enabling any of them.** A typo in a unit file that is
-already enabled becomes a boot-time failure on a box nobody is watching:
-
-```bash
-sudo systemd-analyze verify /etc/systemd/system/blitz-bot.service /etc/systemd/system/blitz-bot-update.service /etc/systemd/system/blitz-bot-update.timer
-```
-
-**Success prints nothing at all.** Any output is a problem to fix before going
-on.
-
-It checks the units, not the world they describe. It will not tell you that
-`/usr/local/bin/blitz-bot-update` is missing, that `/opt/node24` is empty, or
-that the sudoers drop-in is not there. §7 is where those turn up.
-
-```bash
-sudo systemctl daemon-reload
-```
-
-**Now prove the sudo grant from §6.3**, which could not be tried until
-`blitz-bot.service` existed. Run it as `ubuntu` — the user the update runs as.
-On a fresh box the bot has not been started yet, so `try-restart` does nothing
-at all; on a box that is already running one, it restarts it once:
+**Now prove the sudo grant from §6.3**, last, because it is the line the update
+ends on and §7 runs the update next. Run it as `ubuntu` — the user the update
+runs as. On a fresh box the bot has not been started yet, so `try-restart` does
+nothing at all; on a box that is already running one, it restarts it once:
 
 ```bash
 sudo -n /usr/bin/systemctl try-restart blitz-bot.service && echo "the update may restart the bot"
@@ -1345,7 +952,6 @@ the update may restart the bot
 `sudo: a password is required` means the drop-in is not in place, or is not
 spelled the way the script spells it. Left like that, the update gets as far as
 installing the new code and then fails at its last line, every time.
-
 ## 7. Start it, and confirm it connected
 
 **The first deploy is the same command every later one is.** Run the update
@@ -2109,8 +1715,8 @@ for it, and a wrapper script is not a step towards it.
 | **New code on `main`** | The timer fetches it within about fifteen minutes, installs if the lockfile moved, and restarts the bot — **because the commit changed, and only then.** | Nothing. `sudo systemctl start blitz-bot-update` if you would rather not wait. |
 | **The bot crashed** | systemd restarts it on the code already on disk, five seconds later, for as long as it takes. | Nothing — and note what does *not* happen: **a crash does not deploy.** §14. |
 | **`/opt/blitz-bot/.env`** | Nothing. `EnvironmentFile` is read at start. | `sudo systemctl restart blitz-bot`. The update cannot touch `.env` — it is untracked and ignored, which is checked below rather than assumed. |
-| **A unit file, or the timer** | Nothing. They are outside the repo, so no push and no update will ever deploy an edit to one. | `sudo systemctl daemon-reload`, then restart what you changed — `blitz-bot`, or `blitz-bot-update.timer`. |
-| **`/usr/local/bin/blitz-bot-update`** | Nothing. Also outside the repo. | `sudo chmod 755` if it is new. No `daemon-reload` — systemd is not caching it, it is exec'd fresh at every run. |
+| **A unit file, or the timer** | Nothing gets installed. They live in `deploy/` now, so an update brings the new file as far as `/opt/blitz-bot/deploy/` and copies it nowhere. | Land it on `main`, let the update fetch it, then `sudo sh /opt/blitz-bot/deploy/install.sh` — which does the `sudo systemctl daemon-reload` itself. Then restart what you changed: `blitz-bot`, or `blitz-bot-update.timer`. |
+| **`/usr/local/bin/blitz-bot-update`** | Nothing gets installed, for the same reason: `deploy/blitz-bot-update` moves and the installed copy does not. | The same one command, which writes the mode as it writes the file — there is no `chmod` left to forget. No reload is needed for this one; systemd does not cache it, it is exec'd fresh at every run. |
 | **`/etc/sudoers.d/blitz-bot-update`** | Nothing. | Re-check it with `visudo -c` and re-run §6.3's proof. Nothing to reload; sudo reads it per call. |
 | **Node 24 itself** | Nothing. | §2, by hand. `/opt/node24` is set up once and no deploy touches it. |
 | **A tracked file you edited on the box** | It is destroyed at the next **update** — up to fifteen minutes away, and not at the next start. | Nothing. It is already gone, or it will be. See directly below. |

@@ -1,0 +1,84 @@
+[Unit]
+Description=Update blitz-bot to origin/main and restart it if the commit changed
+Documentation=https://github.com/WillMontgomery/blitz-bot
+
+# NOTHING HERE NAMES blitz-bot.service. No Requires=, no BindsTo=, no After=,
+# not even a Wants=. This unit restarts the bot by asking systemd to, in its
+# last line; a dependency would additionally mean that stopping or failing one
+# of them acts on the other, and an ordering dependency between a unit and a
+# unit it restarts is the classic way to wedge a boot.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# oneshot: it runs, it finishes, and `systemctl status` shows the result of the
+# last run rather than a process. Type=simple would report success the instant
+# the script was exec'd, which is the one thing nobody wants to know.
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/blitz-bot
+ExecStart=/usr/local/bin/blitz-bot-update
+
+# NO LEADING `-` ON THAT LINE, WHICH IS THE INVERSE OF THE UNIT THIS REPLACED.
+# There, a failed update had to be ignored or the bot would not have started.
+# Here nothing is waiting, so a failed update is allowed to be a failed unit:
+# red in `systemctl status blitz-bot-update`, and found by
+# `journalctl -u blitz-bot-update -p warning`.
+#
+# NO Restart= EITHER. A oneshot that restarts itself on failure is the fetch
+# loop this whole design exists to remove. The timer is what retries, once, in
+# fifteen minutes.
+
+# The script bounds its own two network steps at 60s and 300s. This is above
+# their sum, so what gives up is the step that hung, with a line in the journal
+# naming it, rather than systemd killing the run and saying only that it timed
+# out.
+TimeoutStartSec=600
+
+# systemd creates /var/lib/blitz-bot and /var/cache/blitz-bot, owns them to
+# User= and makes them writable. The first holds the lockfile stamp, the second
+# is the package cache -- worth keeping between runs, because the alternative
+# is downloading every dependency again on every update.
+#
+# THE BOT'S UNIT DECLARES THE SAME StateDirectory=blitz-bot, DELIBERATELY. Both
+# units get /var/lib/blitz-bot; systemd creates it once and owns it to ubuntu,
+# and both units run as ubuntu, so this is one directory two processes can
+# write rather than two directories or a conflict. They share no FILE in it:
+# this unit writes installed-lock and reads nothing the bot wrote, and the bot
+# writes reported-commit and reads nothing this unit wrote.
+#
+# THIS UNIT MUST NEVER WRITE reported-commit. It is the bot's memory of
+# the last deploy it announced, the bot is its only writer, and a second writer
+# makes the notice either fire on every restart or never fire again. The script
+# says the same thing at the line that sets $STATE (section 6.1).
+#
+# CacheDirectory= IS THIS UNIT'S ALONE, and stays that way: the bot runs no
+# install, so it has no cache to keep.
+StateDirectory=blitz-bot
+CacheDirectory=blitz-bot
+
+# ProtectSystem=full, WHERE THE BOT GETS strict, AND THIS IS THE ONE PLACE THE
+# TWO UNITS DIFFER ON PURPOSE. `strict` mounts the entire hierarchy read-only
+# apart from the directories systemd itself opens, which is exactly right for a
+# process that writes one file in its StateDirectory= and exactly wrong for one
+# whose whole job is to write /opt/blitz-bot. `full` keeps /usr, /boot
+# and /etc read-only -- both unit files, this unit's sudo grant and the off
+# switch all live in /etc, so the update cannot rewrite the rules it runs
+# under -- and leaves /opt writable, which git and the install need.
+#
+# NO NoNewPrivileges=true HERE, AND IT IS DELIBERATE. `sudo` is a setuid
+# binary and NoNewPrivileges is precisely the flag that stops one raising
+# privileges, so the two cannot both be true. The bot's unit keeps it (section
+# 6.4); this unit pays for its last line by giving it up.
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=blitz-bot-update
+
+# NO [Install] SECTION, DELIBERATELY. Nothing should ever `enable` this unit:
+# it is started by its timer and by hand, and an enabled oneshot would also run
+# once at every boot -- a deploy triggered by a reboot.
