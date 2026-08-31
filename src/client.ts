@@ -21,6 +21,9 @@ import {
   createDdb,
   isBanActive,
   qualifyId,
+  type Actor,
+  type AuditHandle,
+  type AuditInput,
   type Ban,
   type BanIssueOutcome,
   type Ddb,
@@ -3386,9 +3389,25 @@ export function announceDeployedCommit(
  * AND IT IS WHY THIS HALF IS A THIRD OF THE SIZE IT WAS. It used to be an embed
  * per top-level heading — eleven messages in his channel — and the first time
  * he read it: "Holy cow - those embeds are plain and LOOONNGGG. The manual
- * should be no more than 1 embed". So the `# ` heading is the embed's title,
- * the lead paragraph under it is the description, and every `## ` section is a
- * FIELD. A reference card read in one screen, rather than a channel to scroll.
+ * should be no more than 1 embed". A reference card read in one screen, rather
+ * than a channel to scroll.
+ *
+ * AND THE WHOLE DOCUMENT IS THE DESCRIPTION, WHICH IS HIS SECOND CORRECTION:
+ * "bot docs headers should be larger font". The `## ` sections used to be embed
+ * FIELDS, and a field name is not a heading — Discord renders it bold, at body
+ * size, and renders no markdown in it at all. The same `## ` line in the
+ * DESCRIPTION is a real heading, at heading size. So the `# ` line is the
+ * embed's title and everything under it is the description, verbatim, headings
+ * and all.
+ *
+ * WHICH MEANS THE DESCRIPTION CAP IS NOW THE ONE THAT BINDS: 4096 units for the
+ * document, where the old shape had six caps to satisfy and 6000 in total. The
+ * manual is prose, so it loses nothing by leaving fields behind — columns earn
+ * their place on /profile, which carries numeric tiles, and not here.
+ *
+ * AND THE LAYOUT CODE WENT WITH THEM: the inline decision, the per-field caps,
+ * the field-by-field comparison, and the refusal of a field with nothing in it.
+ * There are no fields to lay out, to measure, or to leave empty.
  *
  * AND EVERYTHING THAT ONLY EXISTED FOR MANY MESSAGES IS GONE: matching a
  * section to a message by its heading, the per-section reconcile, two sections
@@ -3434,43 +3453,22 @@ export function announceDeployedCommit(
  * does.
  */
 
-/** One `## ` section: the heading, and the text under it. Becomes a field. */
-export interface ManualSection {
-  /** The heading text without its `##`. Becomes the field's name. */
-  readonly heading: string
-
-  /** Everything until the next `## `. Becomes the field's value. */
-  readonly body: string
-}
-
 /**
- * The document, parsed: the one `# ` heading, the lead under it, and the `## `
- * sections in file order.
+ * The document, parsed: the one `# ` heading, and everything under it.
  *
- * THE SHAPE IS THE EMBED'S SHAPE, and that is deliberate — title, description,
- * fields. The parser's job is to say what the document IS, and under this model
- * a document that cannot be described in those three parts is a document that
- * cannot be published at all.
+ * THE SHAPE IS THE EMBED'S SHAPE, and that is deliberate — a title and a
+ * description. The parser's job is to say what the document IS, and under this
+ * model a document that cannot be described in those two parts is a document
+ * that cannot be published at all.
+ *
+ * `body` IS THE FILE'S OWN TEXT AND NOT A RENDERING OF IT. The `## ` lines are
+ * still in it, which is the whole point: Discord renders them as headings in a
+ * description. Nothing here rewrites, wraps or reflows the markdown — what the
+ * file says is what the channel shows.
  */
 export interface Manual {
   readonly title: string
-  readonly lead: string
-  readonly sections: readonly ManualSection[]
-}
-
-/**
- * One field of the embed, as it goes out and as it is read back.
- *
- * `inline` IS PART OF THE VALUE AND NOT A RENDERING DETAIL, which is why it is
- * on both sides of the comparison. Discord lays inline fields out three to a
- * row; whether a section sits in a column or across the width is as much a
- * property of the published manual as its text, and a change to it has to reach
- * the channel like any other. See `INLINE_BODY_CAP`.
- */
-export interface ManualField {
-  readonly name: string
-  readonly value: string
-  readonly inline: boolean
+  readonly body: string
 }
 
 /**
@@ -3489,7 +3487,6 @@ export interface ManualEmbed {
   readonly title: string
   readonly description: string
   readonly colour: number
-  readonly fields: readonly ManualField[]
   readonly footer: string
 }
 
@@ -3513,7 +3510,6 @@ export interface PostedManual {
   readonly title: string
   readonly description: string
   readonly colour: number | null
-  readonly fields: readonly ManualField[]
 }
 
 /**
@@ -3545,23 +3541,33 @@ export interface DocsChannel {
  * the post came back 50035, which is the one outcome the check exists to
  * prevent. `String.length` is the number Discord is checking against.
  *
- * ONE RECORD RATHER THAN SIX CONSTANTS, so `embedBudget` can walk them and so
- * the test over the shipped document can hold docs/bot-manual.md to these
- * numbers without writing any of them down a second time. A cap restated in a
- * test is a cap that is wrong in one of the two places.
+ * ONE RECORD RATHER THAN THREE CONSTANTS, so `embedBudget` can walk them and so
+ * the test over the shipped document can hold the manual to these numbers
+ * without writing any of them down a second time. A cap restated in a test is a
+ * cap that is wrong in one of the two places.
  *
- * THE DOCUMENT THAT SHIPS TODAY FITS ALL SIX WITH ROOM TO SPARE. This is here
- * for the next edit, not for this one: a manual is a file anybody can add a
- * paragraph to without ever running the bot, and the failure it would otherwise
- * cause is a message Discord refuses outright, which is the whole manual gone
- * from the channel rather than one long paragraph.
+ * THREE, WHERE THERE WERE SIX. The `## ` sections are text in the description
+ * now rather than fields, so the three caps that were about fields — how many,
+ * how long a name, how long a value — are caps on a thing this embed no longer
+ * has.
+ *
+ * `description` IS THE ONE THAT BINDS, and that is the price of the change: the
+ * whole document has to fit in 4096 where it used to have 1024 per section and
+ * 6000 across the message. `total` cannot bite while the other two hold — 256
+ * and 4096 and a footer come to well under 6000 — and it stays because it is
+ * Discord's cap on the payload rather than an inference of ours, and inferences
+ * are what stop being true when somebody adds a field back.
+ *
+ * THE DOCUMENT THAT SHIPS TODAY FITS, WITH ABOUT 45 UNITS TO SPARE AGAINST THE
+ * 4096. That is thin, and it is why the test over the shipped document is worth
+ * more than this constant: a manual is a file anybody can add a paragraph to
+ * without ever running the bot, and the failure it would otherwise cause is a
+ * message Discord refuses outright — the whole manual gone from the channel
+ * rather than one long paragraph.
  */
 export const EMBED_CAPS = {
   title: 256,
   description: 4096,
-  fields: 25,
-  fieldName: 256,
-  fieldValue: 1024,
   total: 6000,
 } as const
 
@@ -3577,10 +3583,9 @@ export interface CapSpend {
 /**
  * What one embed spends against each of Discord's caps.
  *
- * `fieldName` AND `fieldValue` ARE THE WORST SINGLE FIELD, not a total, because
- * those two caps are per field. `total` IS the sum, and it counts the footer:
- * Discord adds the title, the description, every field name, every field value
- * and the footer text together against the 6000.
+ * `total` COUNTS THE FOOTER, and that is the only part of this arithmetic that
+ * is not obvious: Discord adds the title, the description and the footer text
+ * together against the 6000, so the `updated` stamp spends against it too.
  *
  * EXPORTED SO THE SHIPPED DOCUMENT CAN BE MEASURED WITH THE SAME ARITHMETIC THE
  * BOT USES. A test that added the lengths up itself would be a second
@@ -3588,18 +3593,10 @@ export interface CapSpend {
  * nobody runs against Discord.
  */
 export function embedBudget(embed: ManualEmbed): CapSpend[] {
-  const names = embed.fields.map((field) => field.name.length)
-  const values = embed.fields.map((field) => field.value.length)
-  const sum = (lengths: number[]): number => lengths.reduce((all, one) => all + one, 0)
-
   const spent: Record<EmbedCap, number> = {
     title: embed.title.length,
     description: embed.description.length,
-    fields: embed.fields.length,
-    fieldName: Math.max(0, ...names),
-    fieldValue: Math.max(0, ...values),
-    total:
-      embed.title.length + embed.description.length + embed.footer.length + sum(names) + sum(values),
+    total: embed.title.length + embed.description.length + embed.footer.length,
   }
 
   // `Object.keys` widens to `string[]`; these are this record's own keys and
@@ -3614,23 +3611,24 @@ export function embedBudget(embed: ManualEmbed): CapSpend[] {
 /**
  * Why this embed cannot be sent at all, or null.
  *
- * A DEFECT IN ONE SECTION IS A DEFECT IN THE WHOLE MESSAGE NOW, and that is the
- * consequence of one embed rather than eleven. There is no per-section refusal
- * left to reach for: Discord takes the message or it does not, so the honest
- * answer to a section that is too long is to leave the channel showing the last
- * version it accepted and say so at error — which reaches the status channel,
- * where a fault that repeats on every restart folds into one line (src/log.ts).
+ * A DEFECT ANYWHERE IN THE DOCUMENT IS A DEFECT IN THE WHOLE MESSAGE, and that
+ * is the consequence of one embed rather than eleven. There is no per-section
+ * refusal left to reach for: Discord takes the message or it does not, so the
+ * honest answer to a document that is too long is to leave the channel showing
+ * the last version it accepted and say so at error — which reaches the status
+ * channel, where a fault that repeats on every restart folds into one line
+ * (src/log.ts).
  *
  * TRUNCATION IS NEVER THE ANSWER. This channel's entire claim is that it says
- * what the file says, and a shortened section reads like the whole of it, so the
- * drift would be invisible and the bot would have caused it.
+ * what the file says, and a shortened document reads like the whole of it, so
+ * the drift would be invisible and the bot would have caused it.
  *
- * AN EMPTY FIELD VALUE IS CHECKED HERE BECAUSE DISCORD REFUSES ONE OUTRIGHT
- * (50035), and refuses the whole message with it. A `## ` heading with nothing
- * under it is a section somebody has started writing, and under the old model it
- * was a message with a title and no body — harmless. Under this one it would
- * take the entire manual out of the channel, so it is named, at error, with the
- * heading that has to be filled in or removed.
+ * IT IS THE CAPS AND NOTHING ELSE NOW. The other refusal here was a `## `
+ * heading with nothing under it — Discord rejects an empty field VALUE outright
+ * and refuses the whole message with it. There are no fields, so there is no
+ * empty one; a half-written section is text in the description like any other,
+ * and the file that has nothing under its `# ` heading at all is answered one
+ * step earlier, by `parseManual`.
  */
 export function unpublishable(
   embed: ManualEmbed,
@@ -3641,15 +3639,6 @@ export function unpublishable(
         why: 'the manual does not fit in one embed and was not published',
         fields: { over: cap, length: spent, cap: limit },
       }
-    }
-  }
-
-  const blank = embed.fields.find((field) => field.value === '')
-
-  if (blank !== undefined) {
-    return {
-      why: 'a manual section has nothing under it, which Discord will not take as a field, so nothing was published',
-      fields: { heading: named(blank.name) },
     }
   }
 
@@ -3670,31 +3659,6 @@ export function unpublishable(
  * disagreeing about a colour nobody can see in the file.
  */
 const MANUAL_COLOUR = 0x5865f2
-
-/**
- * How long a section's body may be and still share a row.
- *
- * INLINE FIELDS SIT UP TO THREE TO A ROW, and a row of short sections in
- * columns is the layout that makes a reference card out of what would otherwise
- * be a stack of one-line paragraphs — the other half of "plain". A row holding
- * one inline field renders at the full width, so a short section with long
- * neighbours costs nothing; the gain is wherever two or three short ones happen
- * to sit together in the file.
- *
- * A LENGTH, NOT A LIST OF HEADINGS. A hand-picked list is a second document to
- * keep in step with the first, and it is wrong the moment somebody renames a
- * heading or adds a section. The threshold judges the thing that actually
- * decides whether a column reads well, which is how many lines the text wraps to
- * in a third of the width.
- *
- * 280 IS CHOSEN AGAINST THE DOCUMENT AS IT STANDS. It takes five of the eleven
- * sections — "Where it looks", "What the poster is told", "The removals
- * channel", "Dry run" and "Maintenance notices" — and those are exactly the five
- * that carry no bullet list, which is the same judgement arrived at from the
- * other side: a list wrapped into a third of the width is unreadable, and a list
- * is what makes a section long.
- */
-const INLINE_BODY_CAP = 280
 
 /**
  * The shortest gap between two writes to the docs channel.
@@ -3767,11 +3731,14 @@ export async function readManual(path: string = botManualPath()): Promise<string
 /**
  * The document's one title: a single `#`, whitespace, then something.
  *
- * WHAT A HEADING MAY CONTAIN, DECIDED: one line of plain text. It is not a
+ * WHAT THE TITLE MAY CONTAIN, DECIDED: one line of plain text. It is not a
  * paragraph of markdown, because it does not become one — it becomes an embed
  * TITLE, and Discord renders nothing in a title. `**Never do this**` in the file
- * is the four asterisks, shown, in the channel. See `HEADING_MARKUP`, and
- * docs/bot-manual.md, which states the rule for the people who write the file.
+ * is the four asterisks, shown, in the channel. See `HEADING_MARKUP`.
+ *
+ * THE RULE IS THE TITLE'S ALONE NOW. A `## ` heading is text in the description,
+ * where Discord renders markdown like anywhere else, so `**bold**` in one is
+ * bold — which is why nothing below warns about them any more.
  *
  * A TRAILING RUN OF `#` IS A CLOSING SEQUENCE AND IS DROPPED. `# Heading #` is
  * one heading called "Heading" to every markdown renderer there is. The closing
@@ -3787,17 +3754,7 @@ export async function readManual(path: string = botManualPath()): Promise<string
 const TOP_LEVEL_HEADING = /^#\s+(\S.*?)(?:\s+#+)?\s*$/u
 
 /**
- * A section: exactly two hashes. `###` and deeper are body.
- *
- * THE SPLIT MOVED DOWN A LEVEL WITH THE MODEL. It used to be that `# ` split the
- * document into messages and `## ` was body; now `# ` is the title and `## ` is
- * a field. `### ` stays body for the reason `## ` used to be body — a parser
- * that split on every heading would make a field out of every paragraph.
- */
-const SECTION_HEADING = /^##\s+(\S.*?)(?:\s+#+)?\s*$/u
-
-/**
- * Inline markdown that got into a heading.
+ * Inline markdown that got into the title.
  *
  * SAID, NOT STRIPPED AND NOT REFUSED. Stripping would silently change what the
  * channel shows against what the file says, and refusing would take the whole
@@ -3805,42 +3762,58 @@ const SECTION_HEADING = /^##\s+(\S.*?)(?:\s+#+)?\s*$/u
  * as written and there is one line in the journal saying why it looks like that.
  *
  * PAIRS ONLY, AND `_` IS DELIBERATELY NOT HERE. Discord does not italicise an
- * underscore inside a word, and this repo's headings are full of variable names
- * like BLITZ_LOG_CHANNEL_ID; a pattern that warned about those would be a
- * warning nobody could act on and everybody would learn to ignore.
+ * underscore inside a word, and a name with underscores in it is a name; a
+ * pattern that warned about those would be a warning nobody could act on and
+ * everybody would learn to ignore.
  */
 const HEADING_MARKUP = /\*[^*\n]+\*|`[^`\n]+`|~~[^~\n]+~~|\|\|[^|\n]+\|\||\[[^\]\n]+\]\([^)\n]+\)/u
 
 /** A fenced code block opening or closing. */
 const CODE_FENCE = /^\s*(?:```|~~~)/u
 
-function warnAboutMarkup(heading: string): void {
-  if (!HEADING_MARKUP.test(heading)) return
+function warnAboutMarkup(title: string): void {
+  if (!HEADING_MARKUP.test(title)) return
 
-  log('warn', 'a manual heading carries markdown, which an embed shows literally', {
-    heading: named(heading),
+  log('warn', 'the manual title carries markdown, which an embed shows literally', {
+    heading: named(title),
   })
 }
 
 /**
- * Split the file into the three parts of an embed, or answer null because it
+ * Split the file into the two parts of an embed, or answer null because it
  * cannot be split at all.
+ *
+ * IT IS A SPLIT AND NO LONGER A STRUCTURE, which is what moving the document
+ * into the description bought. The first `# ` line is the title and every line
+ * after it is the body, carried across as it was written — `## ` headings, code
+ * fences, bullets and all — because Discord's own renderer is what turns them
+ * into headings. There is nothing here that decides what a section IS any more,
+ * so there is nothing here that can get it wrong.
  *
  * NULL IS "LEAVE THE CHANNEL ALONE", AND IT IS THE ONE GUARD THIS HALF KEPT.
  * Every other way of limiting the damage a misparse can do went with the
  * many-message model; this one stayed because it is the case where acting on a
  * bad parse destroys something. An empty file, a file with no `# ` heading in
- * it, and a file whose code fence never closes are all "there is nothing here
- * that can be published" — never an instruction to replace the manual with
- * nothing. The difference between them is in the log line, not in what happens
- * next.
+ * it, a file with nothing under the heading it has, and a file whose code fence
+ * never closes are all "there is nothing here that can be published" — never an
+ * instruction to replace the manual with nothing. The difference between them is
+ * in the log line, not in what happens next.
+ *
+ * A TITLE WITH NOTHING UNDER IT IS ONE OF THOSE, AND THAT IS NEW. Under the old
+ * model the text under the `# ` was the lead paragraph and the sections carried
+ * the document, so an empty lead was an embed with no description and harmless.
+ * The body IS the document now, so publishing an empty one would replace the
+ * manual with a bare title — the same harm as an empty file, and it gets the
+ * same answer.
  *
  * FENCES ARE TRACKED, AND THAT IS NOT FUSSINESS. A shell example in the manual
  * carries `# comment` lines, and a parser that did not know it was inside a
- * fence would read one as the document's title. A fence that never CLOSES
- * swallows every line after it, so the sections below it stop existing as far as
- * the parse is concerned — which is why it answers null and names the line the
- * fence was opened on. The fix is a keystroke once you know where to put it.
+ * fence would read one as the document's title. A fence that never CLOSES no
+ * longer costs anything in the PARSE — the body is verbatim either way — but it
+ * is still refused, because Discord renders the description as markdown: an
+ * unbalanced ``` swallows the rest of the manual into one grey block in the
+ * channel. So it answers null and names the line the fence was opened on, and
+ * the fix is a keystroke once you know where to put it.
  *
  * TEXT ABOVE THE TITLE BELONGS TO NO PART OF THE EMBED AND IS NOT POSTED. It
  * gets a warn rather than being dropped silently, because the whole promise of
@@ -3848,17 +3821,14 @@ function warnAboutMarkup(heading: string): void {
  * quietly would be exactly the drift this exists to make visible.
  *
  * A SECOND `# ` IS BODY, AND IS SAID. There is one embed and it has one title,
- * so the first `# ` is it; a later one is text in whichever section it lands in.
- * Refusing the document over it would take the manual out of the channel, and
- * silently promoting it to a section would move a chunk of the file into a field
- * nobody wrote a heading for.
+ * so the first `# ` is it; a later one is a line of the description like any
+ * other. Refusing the document over it would take the manual out of the channel
+ * for a stray character.
  */
 export function parseManual(markdown: string): Manual | null {
-  const sections: { heading: string; body: string[] }[] = []
-  const lead: string[] = []
+  const body: string[] = []
 
   let title: string | null = null
-  let current: { heading: string; body: string[] } | null = null
   let orphaned = 0
   let extraTitles = 0
 
@@ -3871,7 +3841,7 @@ export function parseManual(markdown: string): Manual | null {
     if (CODE_FENCE.test(raw)) fenced = fenced === 0 ? index + 1 : 0
 
     if (fenced === 0) {
-      // The captures cannot be absent — each pattern has one group and it
+      // The capture cannot be absent — the pattern has one group and it
       // matched — but `noUncheckedIndexedAccess` does not know that, and an
       // assertion here would be the one place in this file that outranks the
       // compiler.
@@ -3884,15 +3854,6 @@ export function parseManual(markdown: string): Manual | null {
       }
 
       if (top !== null) extraTitles += 1
-
-      const section = top === null ? SECTION_HEADING.exec(raw) : null
-
-      if (section !== null && title !== null) {
-        current = { heading: section[1] ?? '', body: [] }
-        sections.push(current)
-        warnAboutMarkup(current.heading)
-        continue
-      }
     }
 
     if (title === null) {
@@ -3900,8 +3861,7 @@ export function parseManual(markdown: string): Manual | null {
       continue
     }
 
-    if (current === null) lead.push(raw)
-    else current.body.push(raw)
+    body.push(raw)
   }
 
   if (fenced !== 0) {
@@ -3923,6 +3883,20 @@ export function parseManual(markdown: string): Manual | null {
     return null
   }
 
+  // `trim` so that the blank line every writer leaves under the title, and the
+  // one at the end of the file, are not part of the text being compared.
+  // Without it, reformatting the file's whitespace would rewrite the message.
+  const text = body.join('\n').trim()
+
+  if (text === '') {
+    log(
+      'error',
+      'the manual has nothing under its top-level heading, so there is nothing to publish and the docs channel was left alone',
+    )
+
+    return null
+  }
+
   if (orphaned > 0) {
     log('warn', 'the manual has text above its first heading, which is in no part of the embed and was not posted', {
       lines: orphaned,
@@ -3935,14 +3909,7 @@ export function parseManual(markdown: string): Manual | null {
     })
   }
 
-  // `trim` so that the blank line every writer leaves under a heading, and the
-  // one before the next, are not part of the text being compared. Without it,
-  // reformatting the file's whitespace would rewrite the whole message.
-  return {
-    title,
-    lead: lead.join('\n').trim(),
-    sections: sections.map(({ heading, body }) => ({ heading, body: body.join('\n').trim() })),
-  }
+  return { title, body: text }
 }
 
 /**
@@ -3958,13 +3925,8 @@ export function parseManual(markdown: string): Manual | null {
 export function manualEmbed(manual: Manual): ManualEmbed {
   return {
     title: manual.title,
-    description: manual.lead,
+    description: manual.body,
     colour: MANUAL_COLOUR,
-    fields: manual.sections.map((section) => ({
-      name: section.heading,
-      value: section.body,
-      inline: section.body.length <= INLINE_BODY_CAP,
-    })),
     footer: `updated ${new Date().toISOString()}`,
   }
 }
@@ -3972,32 +3934,21 @@ export function manualEmbed(manual: Manual): ManualEmbed {
 /**
  * Is the message in the channel already this manual?
  *
- * A PLAIN EQUALITY, FIELD BY FIELD, ON PURPOSE. Both sides are stored strings:
+ * A PLAIN EQUALITY, PART BY PART, ON PURPOSE. Both sides are stored strings:
  * what Discord handed back against what the file says. Anything cleverer here is
  * a source of edits nobody asked for, in a channel whose whole value is that it
  * changes only when the documentation does.
  *
- * THE COLOUR AND THE INLINE FLAGS ARE COMPARED TOO, because they are as much a
- * part of what was published as the text. Leaving them out would let the code
- * and the channel disagree about how the manual looks, silently and forever,
- * which is the drift this feature exists to prevent.
+ * THE COLOUR IS COMPARED TOO, because it is as much a part of what was published
+ * as the text. Leaving it out would let the code and the channel disagree about
+ * how the manual looks, silently and forever, which is the drift this feature
+ * exists to prevent.
  */
 function unchanged(posted: PostedManual, embed: ManualEmbed): boolean {
   return (
     posted.title === embed.title &&
     posted.description === embed.description &&
-    posted.colour === embed.colour &&
-    posted.fields.length === embed.fields.length &&
-    posted.fields.every((field, index) => {
-      const built = embed.fields[index]
-
-      return (
-        built !== undefined &&
-        field.name === built.name &&
-        field.value === built.value &&
-        field.inline === built.inline
-      )
-    })
+    posted.colour === embed.colour
   )
 }
 
@@ -4191,20 +4142,20 @@ export async function syncManual(
 }
 
 /**
- * How much of a heading a log line carries.
+ * How much of the title a log line carries.
  *
- * A CAP BECAUSE THE LINE THAT MOST NEEDS THE HEADING IS THE ONE ABOUT A HEADING
- * THAT IS TOO LONG, and the whole of a 4000-character title in a journal line is
- * a wall that pushes everything else off the status channel post beside it. The
- * first eighty characters are enough to find the section in an editor.
+ * A CAP BECAUSE THE LINE THAT MOST NEEDS THE TITLE IS THE ONE ABOUT A TITLE THAT
+ * IS TOO LONG, and the whole of a 4000-character title in a journal line is a
+ * wall that pushes everything else off the status channel post beside it. The
+ * first eighty characters are enough to find the line in an editor.
  */
 const HEADING_LOG_CAP = 80
 
-function named(heading: string): string {
+function named(title: string): string {
   // Cut by code point, like every other cut in this file: a UTF-16 slice can
   // land inside a surrogate pair and leave half a character in the record.
-  const points = [...heading]
-  if (points.length <= HEADING_LOG_CAP) return heading
+  const points = [...title]
+  if (points.length <= HEADING_LOG_CAP) return title
 
   return `${points.slice(0, HEADING_LOG_CAP).join('')}…`
 }
@@ -4240,12 +4191,6 @@ interface DocsMessage {
 
     /** discord.js's spelling, at the one boundary that has to use it. */
     readonly color: number | null
-
-    readonly fields: readonly {
-      readonly name: string
-      readonly value: string
-      readonly inline?: boolean | undefined
-    }[]
   }[]
 
   readonly createdTimestamp: number
@@ -4301,7 +4246,17 @@ export function docsChannel(client: Client, channelId: string): DocsChannel {
 
     edit: async (id, embed) => {
       const channel = await open()
-      await channel.messages.edit(id, { embeds: [apiEmbed(embed)] })
+
+      // SAID ON THE EDIT TOO, WHICH IT WAS NOT BEFORE. The document now carries
+      // a role tag — the owner asked for the game-ban role to be tagged rather
+      // than described, so a reader sees which one is meant — and this is the
+      // write that runs every time the file changes. An embed resolves no
+      // mention, so the tag cannot notify anybody either way; the write that
+      // republishes a role tag is not the place to leave that unstated.
+      await channel.messages.edit(id, {
+        embeds: [apiEmbed(embed)],
+        allowedMentions: { parse: [] },
+      })
     },
 
     remove: async (id) => {
@@ -4345,21 +4300,14 @@ export function ours(messages: readonly DocsMessage[], selfId: string): PostedMa
       id: message.id,
       title: embed.title,
 
-      // Null is what Discord returns for an embed with no description and '' is
-      // what an empty lead parses to, so the two have to become one value before
-      // the comparison can be a plain equality.
+      // Null is what Discord returns for an embed with no description, and a
+      // leftover from the old model is exactly that: eleven messages whose
+      // whole content was fields. It has to be a string before the comparison
+      // can be a plain equality, and '' is never what the file parses to — a
+      // manual with nothing under its heading does not get this far.
       description: embed.description ?? '',
 
       colour: embed.color,
-
-      fields: embed.fields.map((field) => ({
-        name: field.name,
-        value: field.value,
-
-        // Discord omits `inline` rather than sending false, and the built embed
-        // always carries a boolean — same story as the description above.
-        inline: field.inline === true,
-      })),
 
       at: message.createdTimestamp,
     })
@@ -4367,21 +4315,20 @@ export function ours(messages: readonly DocsMessage[], selfId: string): PostedMa
 
   return mine
     .sort((a, b) => a.at - b.at)
-    .map(({ id, title, description, colour, fields }) => ({
-      id,
-      title,
-      description,
-      colour,
-      fields,
-    }))
+    .map(({ id, title, description, colour }) => ({ id, title, description, colour }))
 }
 
 /**
  * One `ManualEmbed` as discord.js takes it.
  *
- * AN EMPTY DESCRIPTION IS OMITTED RATHER THAN SENT AS `''`, which Discord
- * rejects. A `# ` heading with no lead under it is a manual somebody has started
- * writing, and a description-less embed is the honest rendering of that.
+ * THE DESCRIPTION IS SENT UNCONDITIONALLY, and it used to be omitted when empty
+ * because Discord rejects `''`. It cannot be empty any more: a file with nothing
+ * under its `# ` heading is refused by `parseManual`, which is the honest place
+ * for it — a manual with no body is not a manual to publish without one.
+ *
+ * NO FIELDS. The `## ` sections are lines of the description now, which is the
+ * whole point of the change: Discord renders a heading in a description and
+ * renders a field name bold, at body size, with no markdown at all.
  *
  * NO THUMBNAIL, NO AUTHOR, NO IMAGE — see `ManualEmbed`. This is the only place
  * one could be added, so it is the place to say it was asked about and declined.
@@ -4389,13 +4336,8 @@ export function ours(messages: readonly DocsMessage[], selfId: string): PostedMa
 function apiEmbed(embed: ManualEmbed): APIEmbed {
   return {
     title: embed.title,
-    description: embed.description === '' ? undefined : embed.description,
+    description: embed.description,
     color: embed.colour,
-    fields: embed.fields.map((field) => ({
-      name: field.name,
-      value: field.value,
-      inline: field.inline,
-    })),
     footer: { text: embed.footer },
   }
 }
@@ -4516,6 +4458,105 @@ export function syncDocsChannel(
  *    overwrite that clears the lifted marker, so a replay through that path
  *    would silently un-lift a ban an admin had deliberately lifted. That file's
  *    comment is the long version.
+ *
+ * ═══ THE AUDIT ROW, AND WHY ONLY TWO OF THE THREE ACTIONS WRITE ONE ═══
+ *
+ * The owner: "I would like any admin actions like kicking or banning from
+ * discord to be shown in Ringmaster's audit log." `ringmaster-audit` is the
+ * chronological record of who did what, and until now a Discord ban wrote a ban
+ * row and left no trace in it at all — the console's own `lib/audit.ts` calls an
+ * unlogged admin action the thing that table exists to make impossible.
+ *
+ * THE BAN AND THE LIFT NOW WRITE ONE. `ban.issue` around `bans.issue`,
+ * `ban.lift` around `bans.lift`, both two-phase: `audit.begin` BEFORE the write
+ * and `audit.resolve` after it with what actually happened. See `auditedBan` and
+ * `auditedLift` below.
+ *
+ * THE KICK DOES NOT, AND THAT IS NOT AN OVERSIGHT — IT IS ALREADY THERE. A
+ * Discord kick is relayed to the console's `POST /api/kick`, which begins its
+ * OWN `player.kick` row before it dispatches (fivem-ringmaster
+ * `src/app/api/kick/route.ts`), attributed to the human because this bot sends
+ * their Discord id in `SERVICE_ACTOR_HEADER` and `lib/service.ts` resolves it to
+ * `{ license, name, discordId }` there. Writing a second row from here would put
+ * the same kick in the log twice, in the same words, a few hundred milliseconds
+ * apart — and `reconcileModeration` replays up to `RECONCILE_LIMIT` kicks on a
+ * boot with no cursor, so it would put twenty-five of last week's kicks in the
+ * log dated today. An append-only log cannot take either of those back.
+ *
+ * WHAT THAT LEAVES UNCOVERED, PLAINLY: a Discord kick that never reaches the
+ * console — `COMMAND_SECRET` unset, or the console unreachable — is in this
+ * bot's journal at `warn` and in no audit row anywhere. Closing it needs a
+ * signal this bot does not have, namely whether the console got far enough to
+ * begin a row of its own; `KickResult.commandId` names that row on the
+ * `dispatched` branch and is absent on every other, which is not enough to
+ * decide on.
+ *
+ * ═══ THE RULE HERE IS THE OPPOSITE OF THE CONSOLE'S, DELIBERATELY ═══
+ *
+ * The console's rule is that a failure to record is a failure to act: if
+ * `audit.begin` throws, the action must not proceed. THIS FILE INVERTS IT. A
+ * failed audit write is logged loudly and the ban goes ahead anyway.
+ *
+ * THE DIFFERENCE IS WHO IS DECIDING. The console IS the authority — an admin
+ * clicks, and refusing the click costs nothing but a retry. This bot is
+ * MIRRORING a decision Discord has already carried out: the person is already
+ * banned from the guild, and the ban row is the thing that keeps them off the
+ * game server. Refusing to write it because a log entry failed would trade the
+ * protection for the record, which is the wrong way round — and unlike the
+ * console there is nobody watching a dialog to retry it.
+ *
+ * ═══ THE BOT IS A SECOND WRITER TO `pk = 'AUDIT'` ═══
+ *
+ * Two processes writing one partition whose primary key is `pk` + a millisecond
+ * `ts` means a same-millisecond write is a silent overwrite on a log whose whole
+ * job is that a record cannot go missing. `audit.begin` in src/ddb.ts is
+ * therefore conditional on `attribute_not_exists(pk)` and steps its sort key
+ * FORWARD and retries on a refusal, and `audit.resolve` conditions on the
+ * `commandId` it minted so it can never stamp an outcome onto somebody else's
+ * row. Neither of those is this file's to keep, but both are why this file may
+ * write here at all; src/ddb.ts carries the long version and the one direction
+ * that cannot be closed from this repo.
+ *
+ * ═══ THE ROW GOES PAST THIS BOT'S OWN BAN-ROLE POLLER, AND THAT IS FINE ═══
+ *
+ * src/banrole.ts polls `pk = 'AUDIT'` and treats `ban.issue` and `ban.lift` as
+ * TRIGGERS: read the ban row, and put the game-ban role on whoever a standing
+ * ban is about. The rows written here are those two verbs, so the poller sees
+ * them and acts. Traced end to end, three things make that harmless:
+ *
+ *   IT IS NOT A LOOP. The poller's only writes are one role id and the bot's own
+ *   state row; it cannot ban, kick or write an audit row (its `Pick` of `Ddb`
+ *   has no `audit` in it), so nothing it does comes back here.
+ *
+ *   THE TRIGGER IS NOT THE FACT. The poller never reads `outcome` — it goes and
+ *   reads `ringmaster-bans`. A ban row this file wrote IS a standing game ban by
+ *   the policy at the top of this comment, so "mark them" is the poller's own
+ *   rule applied correctly rather than a false trigger, and a ban whose write
+ *   FAILED leaves no active row and therefore no decision.
+ *
+ *   THE ROLE CANNOT LAND ANYWAY, AND THAT IS THE STRUCTURAL ANSWER. The role is
+ *   for GAME bans: its whole point is that the person keeps limited access to the
+ *   guild and can argue their case with a human. Somebody Discord-banned has no
+ *   guild membership to hold a role — Discord enforces that, not us — so the
+ *   poller's `roles.add` answers `Unknown Member`, which src/banrole.ts already
+ *   treats as the ordinary case and logs at `info`. A Discord ban and a game ban
+ *   happen to write the same verb; only one of them has anybody to mark.
+ *
+ * WHAT IT DOES COST, SAID PLAINLY: the poller records the tag BEFORE it tries the
+ * role (that order is its own safety property), so each mirrored ban leaves an
+ * entry in its tag book that will never correspond to a role. It is dropped when
+ * the ban is lifted, and until then it occupies one of `TAG_LIMIT` slots. Nothing
+ * in this repo can filter it out from this side — the poller's filter is on the
+ * verb alone, deliberately — so it is written down here and reported rather than
+ * worked around.
+ *
+ * AND THE ORDERING HAZARD IS ALREADY ANSWERED. `audit.begin` writes its row
+ * BEFORE the ban row exists, so a poller reading the log at exactly the wrong
+ * moment would find a `ban.issue` with no ban behind it and log "a ban was
+ * issued but no ban row could be found for it". That is what `SETTLE_MS` in
+ * src/banrole.ts is for — it refuses to read the newest five seconds of the log
+ * for precisely this reason — and it was sized against the console's writes,
+ * which have the same shape and the same gap of one DynamoDB round trip.
  */
 
 /** The three things this bot mirrors. Every other audit action is ignored. */
@@ -4665,9 +4706,17 @@ export function roleTaker(client: Client, guildId: string, roleId: string): Role
  *
  * ONE SEAM, AND IT IS WHY EVERY BRANCH BELOW IS TESTABLE WITH NO DISCORD, NO AWS
  * AND NO CONSOLE. `Pick<Ddb, …>` rather than `Ddb` is the access policy written
- * where a compiler reads it: the mirror can read the identifier index and read,
- * issue and lift a ban, and it cannot touch the audit table, the player registry
- * or the maintenance row however it is edited later.
+ * where a compiler reads it: the mirror can read the identifier index and the
+ * player registry, read/issue/lift a ban, and append to the audit log — and it
+ * cannot touch the maintenance row or anything else however it is edited later.
+ *
+ * `audit` AND `players` ARE NEW HERE, AND THIS COMMENT USED TO SAY THE MIRROR
+ * COULD TOUCH NEITHER. What changed is the owner's ask — "any admin actions like
+ * kicking or banning from discord to be shown in Ringmaster's audit log" — and
+ * the two reads pull in opposite directions from the same sentence: `audit` so
+ * the ban and the lift leave a row in the chronological record of who did what,
+ * and `players` so the WHO on that row is a human name rather than a snowflake.
+ * `audit` is the only WRITE the mirror has ever gained that is not a ban.
  */
 export interface MirrorDeps {
   /**
@@ -4678,7 +4727,7 @@ export interface MirrorDeps {
    */
   readonly selfId: string | null
 
-  readonly ddb: Pick<Ddb, 'bans' | 'playerIds'>
+  readonly ddb: Pick<Ddb, 'audit' | 'bans' | 'playerIds' | 'players'>
 
   /** The live kick, or null when `COMMAND_SECRET` is unset. */
   readonly kick: Ringmaster | null
@@ -4869,10 +4918,25 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
    * already happened and refusing would cost the mirror of it. `by: null` with a
    * line in the journal is the cheaper wrong answer, and `byName` — which is
    * what the ban list actually renders — is unaffected.
+   *
+   * ASKED AT MOST ONCE PER ENTRY, AND THAT IS WHY THE ANSWER IS CACHED. It is now
+   * wanted by three callers on one entry — the ban row's `by`, the lift's `by`
+   * once per key, and the audit row's `actorLicense` — and they are all asking
+   * the same question about the same admin at the same instant. Three round trips
+   * for one answer would be three chances for them to DISAGREE as well: a read
+   * that failed on the second attempt would put a license on the ban row and a
+   * null on the audit row beside it, for the same act.
    */
+  let issuer: { licence: string | null } | null = null
+
   async function issuerLicence(): Promise<string | null> {
+    if (issuer !== null) return issuer.licence
+
     const found = await licenceFor(executorId)
-    if (found.ok) return found.value
+    if (found.ok) {
+      issuer = { licence: found.value }
+      return issuer.licence
+    }
 
     log('warn', 'could not read the issuing admin license, so the ban row will not carry one', {
       entry: entry.id,
@@ -4880,6 +4944,11 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
       failure: found.failure.kind,
       detail: found.failure.message,
     })
+
+    // Cached as a FAILURE too, deliberately. Retrying a table that just timed
+    // out, inside the same entry, spends the deadline to arrive at a different
+    // answer for the same act — see above.
+    issuer = { licence: null }
     return null
   }
 
@@ -4891,6 +4960,155 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
    * audit log needs. It is never blank and never the word "unknown".
    */
   const issuerName = entry.executorName ?? executorId
+
+  /**
+   * The acting admin, in the shape the console's audit log names people in.
+   *
+   * ATTRIBUTION IS THE HUMAN, WHICH IS THE WHOLE POINT OF THE ROW. The console
+   * builds this from the Discord id in `SERVICE_ACTOR_HEADER`:
+   * `{ license: grantsForDiscordId(id)?.license ?? null, name: discordName ?? id,
+   * discordId: id }` (fivem-ringmaster `src/lib/service.ts`). This is the same
+   * shape reached by the one road this bot has — see `issuerLicence` on why the
+   * license comes from `ringmaster-player-ids` and not from the grants table.
+   *
+   * "blitz-bot" IS NEVER THE ANSWER. Which process wrote the row is not what
+   * anybody asks an audit log, and an admin who has never played the game is
+   * still a person: they get their Discord id as the name and a NULL license,
+   * which is exactly what the console writes for an admin with no grants row.
+   *
+   * THE NAME IS DISCORD'S FIRST AND THE GAME'S SECOND, in that order and not the
+   * other way round. The console writes the Discord display name, so taking the
+   * in-game name first would file the same admin under two different names
+   * depending on which repo wrote the row. `ringmaster-players` is consulted only
+   * when Discord gave us no name at all — which happens on the boot replay, where
+   * discord.js has no cached user — and it earns its round trip there because the
+   * alternative is a raw snowflake in a permanent record.
+   */
+  let acting: Actor | null = null
+
+  async function actingAs(): Promise<Actor> {
+    if (acting !== null) return acting
+
+    const licence = await issuerLicence()
+
+    // Settled once for the whole entry, for `issuerLicence`'s reason: an unban
+    // that lifts two keys writes two audit rows about ONE act, and two rows
+    // naming the same admin differently would be worse than either name alone.
+    acting = {
+      license: licence,
+      name: entry.executorName ?? (await playedName(licence)) ?? executorId,
+      discordId: executorId,
+    }
+
+    return acting
+  }
+
+  /** The admin's most recent in-game name, or null. Never a guess, never a throw. */
+  async function playedName(licence: string | null): Promise<string | null> {
+    if (licence === null) return null
+
+    const record = await deps.ddb.players.get(licence)
+    if (!record.ok) {
+      log('warn', 'could not read the acting admin`s player record, so the id was used instead', {
+        entry: entry.id,
+        executor: executorId,
+        failure: record.failure.kind,
+        detail: record.failure.message,
+      })
+      return null
+    }
+
+    const name = record.value?.name
+    return typeof name === 'string' && name.length > 0 ? name : null
+  }
+
+  /**
+   * Open an audit row for something this bot is ABOUT to do, or null.
+   *
+   * NULL IS "IT WAS NOT RECORDED", AND THE CALLER CARRIES ON ANYWAY. This is the
+   * console's rule turned exactly around, and the header says why at length: over
+   * there an unlogged action must not proceed, because the console is the
+   * authority and refusing a click costs a retry. Here the Discord ban has
+   * already happened, the ban row is what keeps the person off the game server,
+   * and there is no dialog for anybody to retry from. So a failed audit write is
+   * loud — `error`, which reaches the status channel — and then the ban goes on.
+   *
+   * IT NEVER THROWS. `audit.begin` answers with a `DdbResult`; everything it can
+   * report, including having run out of free sort keys under a colliding writer,
+   * arrives here as a failure rather than as an exception.
+   */
+  async function beginRow(input: AuditInput): Promise<AuditHandle | null> {
+    const opened = await deps.ddb.audit.begin(input)
+
+    if (!opened.ok) {
+      log('error', 'the moderation could not be written to the audit log, but it went ahead', {
+        entry: entry.id,
+        action: input.action,
+        target: input.targetLicense,
+        failure: opened.failure.kind,
+        detail: opened.failure.message,
+      })
+      return null
+    }
+
+    return opened.value
+  }
+
+  /**
+   * Stamp the outcome onto an open audit row. A null handle is a no-op.
+   *
+   * A ROW LEFT AT `pending` IS THE HONEST RECORD OF A BOOKKEEPING FAILURE and is
+   * a different fact from `failed` — the console's `lib/audit.ts` is explicit
+   * that "we asked and never learned what happened" has to stay distinguishable
+   * from "it did not work". So this reports and swallows: the action it describes
+   * has already happened either way.
+   */
+  async function settleRow(
+    handle: AuditHandle | null,
+    outcome: 'ok' | 'failed',
+    error?: string,
+  ): Promise<void> {
+    if (handle === null) return
+
+    const stamped = await deps.ddb.audit.resolve(handle, outcome, error ?? null)
+    if (!stamped.ok) {
+      log('warn', 'the audit row could not be closed, so it stays pending', {
+        entry: entry.id,
+        commandId: handle.commandId,
+        outcome,
+        failure: stamped.failure.kind,
+        detail: stamped.failure.message,
+      })
+    }
+  }
+
+  /**
+   * Did THIS Discord event already write the ban row sitting at `key`?
+   *
+   * A QUESTION ABOUT THE LOG AND NOT ABOUT THE BAN. `bans.issue` decides on its
+   * own whether to write, by the same key and the same attribute; nothing here
+   * changes that. All this decides is whether a replay gets a second audit row —
+   * see the long note at the call site.
+   *
+   * FALSE WHEN THE READ FAILS, so the doubt costs a possible duplicate row rather
+   * than a possible missing one. It is a `warn` and not an `error`: nothing about
+   * the ban is affected, and the next line of the journal reports the ban itself.
+   */
+  async function alreadyMirrored(key: string): Promise<boolean> {
+    const read = await deps.ddb.bans.get(key)
+
+    if (!read.ok) {
+      log('warn', 'could not check whether this ban was already mirrored, so it was logged again', {
+        entry: entry.id,
+        key,
+        failure: read.failure.kind,
+        detail: read.failure.message,
+      })
+      return false
+    }
+
+    return read.value?.discordEntryId === entry.id
+  }
 
   /**
    * Ask the console for a live kick, and report what came back.
@@ -5053,6 +5271,61 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
     const key = licence.value ?? qualifyId('discord', targetId)
     const enforced = enforcedNote(key)
 
+    /**
+     * THE AUDIT ROW IS OPENED BEFORE THE BAN WRITE AND CLOSED AFTER IT, which is
+     * the console's two-phase contract and the whole reason `pending` exists as
+     * an outcome: a row written only on success is missing in exactly the moment
+     * it matters, and its absence looks identical to nobody having tried.
+     *
+     * UNLESS THIS EVENT HAS ALREADY BEEN MIRRORED, IN WHICH CASE THERE IS NO
+     * SECOND ACT TO RECORD. `bans.issue` is idempotent on `discordEntryId` and
+     * answers `duplicate-event`, but it only answers AFTER the write it is about
+     * to skip — and by then the audit row would already be open. That row cannot
+     * be withdrawn: `ringmaster-audit` is append-only and this bot has no delete.
+     * So the cost of finding out too late is permanent, and it is not a rare
+     * case: `reconcileModeration` replays up to `RECONCILE_LIMIT` bans on any
+     * boot with no cursor, which would put twenty-five duplicate bans in the
+     * console's `/audit` page, dated today, describing acts from last week.
+     *
+     * ONE `GetItem`, AND IT IS NOT A SECOND SPELLING OF THE IDEMPOTENCY RULE. It
+     * asks `bans.get` — the same reader `bans.issue` itself uses, by the same key
+     * — one question: did THIS entry write this row. The decision to write or
+     * skip the ban stays entirely inside src/ddb.ts; all that is decided here is
+     * whether there is anything to log.
+     *
+     * A FAILED PROBE FALLS THROUGH TO WRITING THE ROW. The direction matters: an
+     * extra audit row for a replay is noise in a log, and a missing one is a ban
+     * nobody can find afterwards.
+     */
+    const handle = (await alreadyMirrored(key))
+      ? null
+      : await beginRow({
+          action: 'ban.issue',
+          actor: await actingAs(),
+          // The bans table's own key, because that is what `AuditRow.targetLicense`
+          // means to every reader of it — the console's `/audit` page renders it as
+          // the player, and src/banrole.ts feeds it straight back into `bans.get`.
+          targetLicense: key,
+          targetName: entry.targetName,
+          reason: entry.reason ?? BAN_REASON_PLACEHOLDER,
+          detail: {
+            // The console's two, in the console's words: see its
+            // `src/app/api/bans/route.ts`. Both are constants here, because the
+            // policy is that a Discord ban is permanent.
+            expiresAt: null,
+            permanent: true,
+            // PROVENANCE, which the console's rows carry as `incidentId` and this
+            // one carries as the Discord event that caused it. It is also what
+            // makes a duplicate identifiable in the log itself if one ever does
+            // get through the probe above.
+            discordEntryId: entry.id,
+            // `enforced=false` means the row exists and the game's connect gate
+            // cannot see it — see `enforcedNote`. It belongs on the permanent
+            // record for the same reason it is on the journal line.
+            enforced,
+          },
+        })
+
     const issued = await deps.ddb.bans.issue({
       id: key,
       by: await issuerLicence(),
@@ -5071,6 +5344,14 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
     })
 
     if (!issued.ok) {
+      /**
+       * `failed`, NOT A ROW LEFT AT `pending`. We asked and we DID learn what
+       * happened: the write came back refused. That is the case the outcome
+       * field exists to tell apart from silence, and it is the one the brief
+       * insists on — a ban that failed must not leave a row claiming otherwise.
+       */
+      await settleRow(handle, 'failed', issued.failure.message)
+
       log('error', 'the game ban could not be written', {
         entry: entry.id,
         target: targetId,
@@ -5080,6 +5361,16 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
       })
       return { did: 'failed', step: 'issue', failure: issued.failure }
     }
+
+    /**
+     * `ok` FOR EVERY OUTCOME THAT CAME BACK WITHOUT A FAILURE, which is what the
+     * console's `audited()` wrapper does: the outcome field records whether the
+     * ACTION completed, not which branch of it ran. `already-banned` is a
+     * completed action — the admin banned somebody the console had already
+     * banned, the standing ban is not ours to replace, and the row records that
+     * they acted. Which branch it was is on the journal line and on the ban row.
+     */
+    await settleRow(handle, 'ok')
 
     log('info', 'discord ban mirrored to the game', {
       entry: entry.id,
@@ -5195,6 +5486,47 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
       continue
     }
 
+    /**
+     * THE SAME TWO PHASES AS THE BAN, AND THE SAME REASON FOR SKIPPING IT.
+     *
+     * A ROW ALREADY CARRYING `liftedAt` IS ONE `bans.lift` WILL LEAVE ALONE —
+     * that is its own first check, and it exists so a redelivered unban cannot
+     * write over the original lifter's name and time. An audit row opened in
+     * front of that call would be a `ban.lift` for a lift that did not happen,
+     * and on a boot with no cursor `reconcileModeration` replays every recent
+     * unban, so it would be one per replayed unban forever after.
+     *
+     * `liftedAt` AND NOT `isBanActive`, and the difference is a real case rather
+     * than a nicety: a ban that has EXPIRED but was never lifted is still one
+     * `bans.lift` stamps, so it is a real act and earns its row. `isBanActive`
+     * would answer "not in force" for both and quietly drop the second.
+     *
+     * THE ROW IS READ ALREADY. `ban` came from the `bans.get` above, which the
+     * lift path has always made, so this costs nothing.
+     */
+    const handle = ban.liftedAt
+      ? null
+      : await beginRow({
+          action: 'ban.lift',
+          actor: await actingAs(),
+          targetLicense: key,
+          targetName: ban.playerName ?? entry.targetName,
+          reason: entry.reason ?? null,
+          detail: {
+            // The console's two, from its `src/app/api/bans/lift/route.ts`: what
+            // they were banned for, and when. A lift row that carried only the
+            // unban reason would make "what was undone here" unanswerable
+            // without a second lookup.
+            originalReason: ban.reason,
+            bannedAt: ban.at,
+            // Ours: which Discord event lifted it, and which one had banned
+            // them. `liftableBy` compares exactly these two and refuses when the
+            // ban is newer, so the pair is the evidence for the decision.
+            discordEntryId: entry.id,
+            liftsEntryId: ban.discordEntryId ?? null,
+          },
+        })
+
     const result = await deps.ddb.bans.lift({
       id: key,
       by: await issuerLicence(),
@@ -5203,6 +5535,8 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
     })
 
     if (!result.ok) {
+      await settleRow(handle, 'failed', result.failure.message)
+
       log('error', 'the game ban could not be lifted', {
         entry: entry.id,
         key,
@@ -5211,6 +5545,8 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
       })
       return { did: 'failed', step: 'lift', failure: result.failure }
     }
+
+    await settleRow(handle, 'ok')
 
     if (result.value.outcome === 'lifted') lifted.push(key)
 

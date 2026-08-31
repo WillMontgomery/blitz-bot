@@ -312,14 +312,59 @@ const idList = z
   )
 
 /**
+ * The address the community connects to, and the head of the allowlist.
+ *
+ * NAMED SEPARATELY BECAUSE TWO THINGS NEED IT AND ONLY ONE OF THEM IS A FILTER.
+ * The allowlist below answers "may this message name this address"; `connectIp`
+ * answers "which address do we tell somebody to type", which is a question the
+ * maintenance notice asks when it says the server is back up. Both are this same
+ * string, and naming it once is what stops the second reader from pasting a
+ * literal into a sentence — where a server move would leave the notice pointing
+ * players at a box that is not there while the allowlist quietly moved on.
+ */
+const PRIMARY_SERVER_IP = '3.130.92.28'
+
+/**
  * The addresses the bot's own guild runs on, used when the operator names none.
  *
  * THE SAME TWO THE OWNER GAVE, AND THEY ARE IN THE SOURCE ON PURPOSE. A default
  * that lived only in `.env.example` would be a default that a systemd
  * `EnvironmentFile=` — which never reads that file — silently does not have; see
  * this file's header for how that class of bug already bit this repo once.
+ *
+ * EXPORTED SINCE THE MAINTENANCE NOTICE NEEDED AN ADDRESS. src/maintenance.ts is
+ * wired by src/client.ts, which does not hand it a `Config` — so its default has
+ * to come from somewhere, and the only acceptable somewhere is the list an
+ * operator actually configures. See `connectIp`.
  */
-const DEFAULT_SERVER_IPS = ['3.130.92.28', '18.222.244.205']
+export const DEFAULT_SERVER_IPS = [PRIMARY_SERVER_IP, '18.222.244.205']
+
+/**
+ * WHICH ADDRESS A PLAYER IS TOLD TO CONNECT TO.
+ *
+ * THE FIRST ENTRY OF THE ALLOWLIST, AND NOT A CONSTANT OF ITS OWN. The owner's
+ * back-up notice names an address — "Connect: fivem://connect/3.130.92.28" — and
+ * the allowlist already holds that string because links.ts needs it to know which
+ * `fivem://connect/` target is this community's own. A second literal in the
+ * notice would be a copy that nothing keeps in step: move the server, update
+ * `BLITZ_SERVER_IPS`, and the announcement that follows the next restart sends
+ * every player to the old box.
+ *
+ * FIRST RATHER THAN ANY OTHER RULE, because the allowlist is ordered and the
+ * documented order is the community's own: the head is the address people are
+ * given, the rest are the other boxes whose links must not be deleted. There is
+ * nothing on the list that says which is "primary" and inventing a marker would
+ * be a second setting to get wrong.
+ *
+ * THE FALLBACK IS THE SAME STRING THE ALLOWLIST FALLS BACK TO, so a caller with
+ * no list in hand and an operator who never set the variable land on one value.
+ * An allowlist cannot be empty — `ipList` refuses to produce one — so this arm is
+ * unreachable through `loadConfig` and exists because the parameter is a plain
+ * array that a caller can hand over empty.
+ */
+export function connectIp(serverIps: readonly string[] = DEFAULT_SERVER_IPS): string {
+  return serverIps[0] ?? PRIMARY_SERVER_IP
+}
 
 /**
  * What an entry in `BLITZ_SERVER_IPS` has to look like.

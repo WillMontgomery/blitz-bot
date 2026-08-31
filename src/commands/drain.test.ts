@@ -348,7 +348,6 @@ describe('/drain — what the console is asked for, and by whom', () => {
 
       expect(fake.calls).toEqual([])
       expect(shown).toBe(COPY.noSubcommand)
-      expect(shown).toContain('PLACEHOLDER')
     }
   })
 
@@ -447,12 +446,20 @@ describe('/drain — the reply says what is happening and when, not that it aske
   })
 
   /**
-   * EVERY STRING THE ADMIN CAN SEE IS STILL A PLACEHOLDER. The owner supplies
-   * the real wording; until then shipping one by accident has to be obvious in
-   * the channel rather than invisible. The FACTS inside them are real, which is
-   * what the cases above check.
+   * NOT ONE STRING THE ADMIN CAN SEE STILL CARRIES THE MARKER.
+   *
+   * THIS ASSERTION WAS INVERTED RATHER THAN DELETED, and the inversion is the
+   * whole record of the owner's instruction: "remove PLACEHOLDER: from all text
+   * please. The verbiage otherwise looks great." It used to require the marker
+   * on every frame; it now refuses it on every one, so a later edit that
+   * reintroduces the prefix — by copying a neighbouring stand-in, or by
+   * reverting this change — fails here instead of shipping the word to a
+   * channel he has already asked to have it out of.
+   *
+   * THE FACTS INSIDE THE FRAMES ARE REAL AND ALWAYS WERE, which is what the
+   * cases above check.
    */
-  it('marks every frame of the reply as wording nobody supplied', () => {
+  it('carries no PLACEHOLDER marker in any frame of the reply', () => {
     const frames = [
       replyForSchedule(SCHEDULED),
       replyForCancel({ outcome: 'cancelled', status: 200 }),
@@ -466,7 +473,18 @@ describe('/drain — the reply says what is happening and when, not that it aske
       COPY.noSubcommand,
     ]
 
-    for (const frame of frames) expect(frame).toContain('PLACEHOLDER')
+    // Not a vacuous pass: the frames are non-empty sentences, and none of them
+    // says the word.
+    for (const frame of frames) {
+      expect(frame.length).toBeGreaterThan(0)
+      expect(frame).not.toContain('PLACEHOLDER')
+    }
+
+    // And the whole record, including the strings Discord is registered with,
+    // so a description or a subcommand name cannot carry it either.
+    for (const [key, value] of Object.entries(COPY)) {
+      if (typeof value === 'string') expect(value, key).not.toContain('PLACEHOLDER')
+    }
   })
 
   /**

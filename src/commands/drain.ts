@@ -108,18 +108,26 @@ export interface DrainFields {
 }
 
 /**
- * PLACEHOLDER COPY, AND NONE OF IT IS THE OWNER'S WORDING, under the rule
- * ./command.ts sets: every string a member can see is in one record so that
- * supplying the real text is one edit to one object. The strings say what they
- * are on purpose — shipping one by accident has to be obvious in the channel
- * rather than invisible.
+ * EVERY STRING `/drain` CAN SAY, IN ONE RECORD, under the rule ./command.ts
+ * sets: a member-visible sentence lives here so that changing one is one edit
+ * to one object.
  *
- * THE FRAMES ARE PLACEHOLDERS; THE FACTS INSIDE THEM ARE NOT. `scheduled` and
- * the refusals interpolate real values — the drain time the console returned,
- * the console's own reason — because a reply that said only "PLACEHOLDER" would
- * fail the one thing this command is required to do, which is state plainly
- * what is about to happen and when. So the shape and the facts are shipped and
- * are testable, and the prose around them is obviously not his.
+ * ═══ THE `PLACEHOLDER:` MARKER IS GONE, AND THE SENTENCES ARE THE OWNER'S ═══
+ *
+ * These were written as marked stand-ins, each one led by a literal
+ * `PLACEHOLDER:` so that shipping one by accident was obvious in the channel
+ * rather than invisible. He then ran the command and read them: "remove
+ * PLACEHOLDER: from all text please. The verbiage otherwise looks great."
+ *
+ * SO THE MARKER WAS DELETED AND NOTHING ELSE WAS. Not a word after the colon
+ * moved, and none was recapitalised — he approved the sentences AS THEY READ,
+ * and an "improvement" made while removing a prefix is an edit he did not ask
+ * for and cannot see in a diff he reviewed as a deletion.
+ *
+ * THE FACTS INSIDE THE FRAMES WERE ALWAYS REAL. `scheduled` and the refusals
+ * interpolate the drain time the console returned and the console's own reason,
+ * because the one thing this command must do is state plainly what is about to
+ * happen and when.
  *
  * THE DESCRIPTIONS ARE MINE RATHER THAN HIS, for the reason /sticky's are:
  * Discord requires a description on a command, on a subcommand and on an
@@ -136,48 +144,43 @@ export const COPY = {
   /**
    * `start` IS A NAME NOBODY SUPPLIED. The brief says `/drain [note]` and
    * `/drain cancel`, and Discord cannot give both of those on one command (see
-   * the header) — so the scheduling half needs a name of its own and this is a
-   * stand-in for one. It is a COMMAND NAME rather than a sentence, so it cannot
-   * be spelled `PLACEHOLDER:` without being registered that way; this constant
-   * is the marker instead, and it is reported with the rest.
+   * the header) — so the scheduling half needs a name of its own and this is
+   * the one it was given. It is a COMMAND NAME rather than a sentence, so it
+   * was never spelled with the marker the sentences carried; the constant is
+   * kept, and named, so that "the word `start` was not his" stays sayable now
+   * that every marked string in this file has had its marker removed.
    */
   startPlaceholderName: DRAIN_START_SUBCOMMAND,
 
-  /** The reply's frames. Every one of these is a stand-in. */
-  scheduledLead: 'PLACEHOLDER: no wording supplied yet for a window that was scheduled.',
-  doorClosesAt: (at: string) => `PLACEHOLDER: the server stops accepting players ${at}.`,
-  doorClosesUnknown:
-    'PLACEHOLDER: the console did not say when the server stops accepting players.',
+  /** The reply's frames. */
+  scheduledLead: 'no wording supplied yet for a window that was scheduled.',
+  doorClosesAt: (at: string) => `the server stops accepting players ${at}.`,
+  doorClosesUnknown: 'the console did not say when the server stops accepting players.',
   deployWhenEmpty:
-    'PLACEHOLDER: it restarts on its own once the last match finishes, and everybody still playing is dropped then.',
-  deployAtTime: (at: string) =>
-    `PLACEHOLDER: it restarts at ${at}, ending any match still running.`,
-  deployModeUnknown:
-    'PLACEHOLDER: the console did not say what triggers the restart. Check the console.',
-  doorNote: (note: string) => `PLACEHOLDER: players who try to join are told: ${note}`,
-  doorNoteUnknown: 'PLACEHOLDER: the console did not say what players at the door are told.',
+    'it restarts on its own once the last match finishes, and everybody still playing is dropped then.',
+  deployAtTime: (at: string) => `it restarts at ${at}, ending any match still running.`,
+  deployModeUnknown: 'the console did not say what triggers the restart. Check the console.',
+  doorNote: (note: string) => `players who try to join are told: ${note}`,
+  doorNoteUnknown: 'the console did not say what players at the door are told.',
 
-  cancelled: 'PLACEHOLDER: no wording supplied yet for a window that was called off.',
+  cancelled: 'no wording supplied yet for a window that was called off.',
 
   /** The refusals. The console's own words follow each of these, unedited. */
-  refused: (reason: string) => `PLACEHOLDER: nothing was scheduled. The console said: ${reason}`,
-  cancelRefused: (reason: string) =>
-    `PLACEHOLDER: nothing was cancelled. The console said: ${reason}`,
+  refused: (reason: string) => `nothing was scheduled. The console said: ${reason}`,
+  cancelRefused: (reason: string) => `nothing was cancelled. The console said: ${reason}`,
   denied: (code: string) =>
-    `PLACEHOLDER: the console would not accept this call and answered "${code}". An operator has to look at this.`,
+    `the console would not accept this call and answered "${code}". An operator has to look at this.`,
   notConfigured:
-    'PLACEHOLDER: the console has no command credential set, so it cannot take this. An operator has to look at this.',
+    'the console has no command credential set, so it cannot take this. An operator has to look at this.',
   unreachable: (detail: string) =>
-    `PLACEHOLDER: the console did not answer, so nothing is known to have happened: ${detail}. Run this again.`,
+    `the console did not answer, so nothing is known to have happened: ${detail}. Run this again.`,
   unavailable: (detail: string) =>
-    `PLACEHOLDER: the console answered but could not do this: ${detail}. Run this again in a moment.`,
-  unknown: (detail: string) =>
-    `PLACEHOLDER: the console's answer could not be read: ${detail}. Check the console.`,
+    `the console answered but could not do this: ${detail}. Run this again in a moment.`,
+  unknown: (detail: string) => `the console's answer could not be read: ${detail}. Check the console.`,
 
   /** And the two ways this command can fail before it asks anything. */
-  noCredential:
-    'PLACEHOLDER: this bot has no command credential, so it cannot ask the console for anything.',
-  noSubcommand: `PLACEHOLDER: it is not clear whether you meant \`/drain ${DRAIN_START_SUBCOMMAND}\` or \`/drain ${DRAIN_CANCEL_SUBCOMMAND}\`, so nothing was done.`,
+  noCredential: 'this bot has no command credential, so it cannot ask the console for anything.',
+  noSubcommand: `it is not clear whether you meant \`/drain ${DRAIN_START_SUBCOMMAND}\` or \`/drain ${DRAIN_CANCEL_SUBCOMMAND}\`, so nothing was done.`,
 }
 
 /**
@@ -419,11 +422,20 @@ export function drainCommand(drainerFor: DrainerFor): BotCommand {
      * The reply names the admin's note and the console's refusals, which are
      * operational detail rather than an announcement — and the announcement
      * already exists: ../maintenance.ts posts to the maintenance channel when
-     * the window reaches `deploying`, in the owner's chosen shape, for players
-     * rather than for admins. A visible reply here would be a SECOND, earlier
-     * notice of the same outage, in a different channel, saying something the
-     * owner deliberately decided not to say — he wants the outage announced and
-     * not the planning.
+     * the window reaches `draining`, `deploying` and a CONFIRMED `complete`, in
+     * the owner's chosen shape, for players rather than for admins. A visible
+     * reply here would be a second notice of the same outage in a different
+     * channel, carrying the console's refusal text and the admin's typed note,
+     * neither of which is for players.
+     *
+     * THE DRAIN-START NOTICE IS THE MAINTENANCE CHANNEL'S AND NOT THIS REPLY'S,
+     * which is worth stating because the rule it follows was reversed. He used
+     * to want only the outage announced and not the planning; he now wants the
+     * start of the window announced too — "A maintenance window has started and
+     * the game server is no longer accepting new players or matches." That post
+     * is made by ../maintenance.ts off the ROW, so it lands whether the window
+     * came from here or from the console, which a reply built in this file
+     * could never do.
      */
     onlyInvoker: () => true,
 

@@ -75,7 +75,6 @@ import {
   type LiveMember,
   type LiveMessage,
   type ManualEmbed,
-  type ManualField,
   type NoticeChannel,
   type PollText,
   type PostedManual,
@@ -93,6 +92,8 @@ import { COMMANDS } from './commands/index.ts'
 import type { Config } from './config.ts'
 import {
   qualifyId,
+  type AuditInput,
+  type AuditOutcome,
   type Ban,
   type BanIssueInput,
   type BanLiftInput,
@@ -100,6 +101,7 @@ import {
   type Ddb,
   type DdbFailure,
   type DdbResult,
+  type PlayerRecord,
 } from './ddb.ts'
 import { findInviteCodes, type InviteResolver } from './invites.ts'
 import { log, setSink } from './log.ts'
@@ -4981,10 +4983,16 @@ const BLURPLE = 0x5865f2
  * A manual, written the way the file is: one `# ` title, a lead paragraph, and
  * `## ` sections under it.
  *
+ * THE SECTIONS ARE STILL WRITTEN AS SECTIONS EVEN THOUGH NOTHING SPLITS ON THEM
+ * ANY MORE, and that is the point rather than a leftover: `## ` lines are what
+ * the file is full of, they are what has to survive into the description
+ * untouched, and a helper that stopped emitting them would stop exercising the
+ * one thing this change is about.
+ *
  * BUILT AND THEN PARSED RATHER THAN HANDED TO `syncManual` AS A `Manual`. The
- * split is half of what can go wrong — a `###` read as a section, a `#` inside a
- * code fence, whitespace that makes an unchanged document look changed — so the
- * cases below go in through the same door the bot does.
+ * split is half of what can go wrong — a `#` inside a code fence, whitespace
+ * that makes an unchanged document look changed — so the cases below go in
+ * through the same door the bot does.
  */
 const manual = (lead: string, ...sections: (readonly [string, string])[]): string =>
   `# Blitz bot\n\n${lead}\n\n${sections.map(([heading, body]) => `## ${heading}\n\n${body}\n`).join('\n')}`
@@ -4992,6 +5000,12 @@ const manual = (lead: string, ...sections: (readonly [string, string])[]): strin
 /** A document with the usual lead, for the cases that are not about the lead. */
 const doc = (...sections: (readonly [string, string])[]): string =>
   manual('What the bot does.', ...sections)
+
+/**
+ * What that source becomes in the description, so a case can assert on the text
+ * without restating the helper's own formatting.
+ */
+const body = (markdown: string): string => markdown.slice(markdown.indexOf('\n') + 1).trim()
 
 /**
  * The channel as the bot would have left it after publishing this source.
@@ -5006,21 +5020,13 @@ function published(markdown: string): {
   title: string
   description: string
   colour: number
-  fields: ManualField[]
 }[] {
   const parsed = parseManual(markdown)
   if (parsed === null) throw new Error('the source in this test does not parse')
 
   const embed = manualEmbed(parsed)
 
-  return [
-    {
-      title: embed.title,
-      description: embed.description,
-      colour: embed.colour,
-      fields: [...embed.fields],
-    },
-  ]
+  return [{ title: embed.title, description: embed.description, colour: embed.colour }]
 }
 
 /**
@@ -5044,7 +5050,6 @@ function docsHarness(
       title: string
       description?: string
       colour?: number | null
-      fields?: readonly ManualField[]
     }[]
     rejects?: (call: string) => unknown
   } = {},
@@ -5061,7 +5066,6 @@ function docsHarness(
     id: `m${String(index + 1)}`,
     description: '',
     colour: BLURPLE,
-    fields: [],
     ...message,
   }))
 
@@ -5097,7 +5101,6 @@ function docsHarness(
     title: embed.title,
     description: embed.description,
     colour: embed.colour,
-    fields: embed.fields.map((field) => ({ ...field })),
   })
 
   return {
@@ -5168,61 +5171,69 @@ function docsClient(): { client: Client; ready: () => void } {
  * the same way at both ends. This one is the anchor.
  */
 describe('the manual — one embed, one message', () => {
-  it('is the heading, the lead under it, and a field per section', async () => {
+  it('is the heading, and everything under it as the description', async () => {
     const docs = docsHarness()
+    const source = manual('What the bot does to this server.', ['One', 'first'], ['Two', 'second'])
 
-    await syncManual(
-      parseManual(manual('What the bot does to this server.', ['One', 'first'], ['Two', 'second'])),
-      docs.channel,
-      docs.pause,
-    )
+    await syncManual(parseManual(source), docs.channel, docs.pause)
 
     expect(docs.calls).toEqual(['read', 'post'])
     expect(docs.written).toEqual([
       {
         title: 'Blitz bot',
-        description: 'What the bot does to this server.',
+        description: [
+          'What the bot does to this server.',
+          '',
+          '## One',
+          '',
+          'first',
+          '',
+          '## Two',
+          '',
+          'second',
+        ].join('\n'),
         colour: BLURPLE,
-        fields: [
-          { name: 'One', value: 'first', inline: true },
-          { name: 'Two', value: 'second', inline: true },
-        ],
         footer: expect.stringMatching(/^updated \d{4}-\d{2}-\d{2}T[\d:.]+Z$/u),
       },
     ])
   })
 
   /**
-   * THE COLUMNS ARE THE OTHER HALF OF "PLAIN". A short section sits inline —
-   * three to a row — and a long one takes the width, because a paragraph wrapped
-   * into a third of the width is a column of two-word lines. The threshold is a
-   * length rather than a list of headings, so it survives a section being
-   * renamed.
+   * THE `## ` LINES REACH DISCORD AS `## ` LINES, WHICH IS THE WHOLE OF THE
+   * OWNER'S ASK: "bot docs headers should be larger font". A field NAME is bold
+   * body text and renders no markdown at all, so the old shape could not make a
+   * heading out of a heading however it was written. In a description Discord's
+   * own renderer does it. Nothing here may strip, rewrite or reflow that line.
    */
-  it('puts a short section in a column and a long one across the width', async () => {
+  it('carries the section headings into the description as markdown', async () => {
     const docs = docsHarness()
-    const long = 'x'.repeat(281)
 
-    await syncManual(
-      parseManual(doc(['Short', 'brief'], ['Long', long])),
-      docs.channel,
-      docs.pause,
-    )
+    await syncManual(parseManual(doc(['One', 'first'], ['Two', 'second'])), docs.channel, docs.pause)
 
-    expect(at(docs.written, 0).fields).toEqual([
-      { name: 'Short', value: 'brief', inline: true },
-      { name: 'Long', value: long, inline: false },
-    ])
+    const description = at(docs.written, 0).description
+
+    expect(description).toContain('\n## One\n')
+    expect(description).toContain('\n## Two\n')
   })
 
-  /** Exactly on the threshold is short. A cap on the right number, not one that
-   * happens to reject everything near it. */
-  it('counts the threshold in the units the section is measured in', async () => {
+  /**
+   * AND NOTHING ELSE IN THE BODY IS TOUCHED EITHER. Bullets, bold, backticks,
+   * a channel mention and a role tag are all things the file carries today, and
+   * every one of them is Discord's to render rather than this code's to
+   * interpret.
+   */
+  it('carries the rest of the markdown across verbatim', async () => {
     const docs = docsHarness()
 
-    await syncManual(parseManual(doc(['Edge', 'x'.repeat(280)])), docs.channel, docs.pause)
+    const written = [
+      '- **rule** — a bullet with `code` in it.',
+      '',
+      'A channel <#1542603116258525185> and a role <@&1542596612306505808>.',
+    ].join('\n')
 
-    expect(at(docs.written, 0).fields.map((field) => field.inline)).toEqual([true])
+    await syncManual(parseManual(doc(['One', written])), docs.channel, docs.pause)
+
+    expect(at(docs.written, 0).description).toContain(written)
   })
 })
 
@@ -5254,8 +5265,8 @@ describe('the manual — a restart that changes nothing says nothing', () => {
    * start forever.
    */
   it('compares the stored text, not what Discord renders it as', async () => {
-    const body = ['**bold**, `code`, <@1234> and a list:', '', '- one', '- two'].join('\n')
-    const source = doc(['One', body])
+    const written = ['**bold**, `code`, <@1234> and a list:', '', '- one', '- two'].join('\n')
+    const source = doc(['One', written])
     const docs = docsHarness({ messages: published(source) })
 
     await syncManual(parseManual(source), docs.channel, docs.pause)
@@ -5264,15 +5275,22 @@ describe('the manual — a restart that changes nothing says nothing', () => {
   })
 
   /**
-   * Reformatting the blank lines around a section is not a change to it. Without
-   * the trim in the parser, adding a second blank line under a heading would
+   * THE ENDS ARE TRIMMED AND THE MIDDLE IS NOT, and that is narrower than it was
+   * on purpose. The blank line every writer leaves under the `# ` and the
+   * newline every editor leaves at the end of a file are not part of the
+   * document — without the trim, saving the file with one more of either would
    * rewrite the message and stamp it with today's date.
+   *
+   * EVERYTHING BETWEEN THEM IS THE FILE'S OWN TEXT. Blank lines inside the body
+   * used to be squeezed out section by section; they are what Discord uses to
+   * space the document out now, so a second blank line between two paragraphs
+   * IS a change to what the reader sees, and it is written like any other.
    */
-  it('is not disturbed by the blank lines around a section', async () => {
+  it('is not disturbed by the blank lines at either end of the file', async () => {
     const docs = docsHarness({ messages: published(doc(['One', 'first'])) })
 
     await syncManual(
-      parseManual('# Blitz bot\n\n\n\nWhat the bot does.\n\n\n## One\n\n\n\nfirst\n\n\n'),
+      parseManual(`\n# Blitz bot\n\n\n${body(doc(['One', 'first']))}\n\n\n`),
       docs.channel,
       docs.pause,
     )
@@ -5294,11 +5312,7 @@ describe('the manual — a change to the file is one edit', () => {
     )
 
     expect(docs.calls).toEqual(['read', 'edit m1'])
-    expect(at(docs.messages(), 0).fields.map((field) => field.value)).toEqual([
-      'first',
-      'second, and more',
-      'third',
-    ])
+    expect(at(docs.messages(), 0).description).toContain('second, and more')
   })
 
   /**
@@ -5306,7 +5320,7 @@ describe('the manual — a change to the file is one edit', () => {
    * gain of the new model. It used to be a post at the BOTTOM of the channel,
    * because a Discord message cannot be moved and reposting everything below the
    * insertion would have been the bot rewriting its own history. One message has
-   * no order to get wrong.
+   * no order to get wrong — and one description has the file's own order in it.
    */
   it('puts an inserted section where the file puts it', async () => {
     const docs = docsHarness({ messages: published(doc(['One', 'first'], ['Three', 'third'])) })
@@ -5314,11 +5328,7 @@ describe('the manual — a change to the file is one edit', () => {
     await syncManual(parseManual(before), docs.channel, docs.pause)
 
     expect(docs.calls).toEqual(['read', 'edit m1'])
-    expect(at(docs.messages(), 0).fields.map((field) => field.name)).toEqual([
-      'One',
-      'Two',
-      'Three',
-    ])
+    expect(at(docs.messages(), 0).description).toBe(body(before))
   })
 
   /**
@@ -5329,15 +5339,13 @@ describe('the manual — a change to the file is one edit', () => {
    */
   it('drops a section that is no longer in the file', async () => {
     const docs = docsHarness({ messages: published(before) })
+    const after = doc(['One', 'first'], ['Three', 'third'])
 
-    await syncManual(
-      parseManual(doc(['One', 'first'], ['Three', 'third'])),
-      docs.channel,
-      docs.pause,
-    )
+    await syncManual(parseManual(after), docs.channel, docs.pause)
 
     expect(docs.calls).toEqual(['read', 'edit m1'])
-    expect(at(docs.messages(), 0).fields.map((field) => field.name)).toEqual(['One', 'Three'])
+    expect(at(docs.messages(), 0).description).toBe(body(after))
+    expect(at(docs.messages(), 0).description).not.toContain('## Two')
   })
 
   /** A first run against an empty channel posts the manual. */
@@ -5370,12 +5378,11 @@ describe('the manual — a change to the file is one edit', () => {
   })
 
   /**
-   * THE COLOUR AND THE LAYOUT ARE PART OF WHAT WAS PUBLISHED. A message carrying
-   * the right text under the wrong colour, or with a section that should be in a
-   * column laid across the width, is the code and the channel disagreeing about
+   * THE COLOUR IS PART OF WHAT WAS PUBLISHED. A message carrying the right text
+   * under the wrong colour is the code and the channel disagreeing about
    * something a reader can see — so it is a difference, and it is written.
    */
-  it('rewrites a message whose colour or layout is not the one the code builds', async () => {
+  it('rewrites a message whose colour is not the one the code builds', async () => {
     const source = doc(['One', 'first'])
 
     const recoloured = docsHarness({
@@ -5384,16 +5391,6 @@ describe('the manual — a change to the file is one edit', () => {
 
     await syncManual(parseManual(source), recoloured.channel, recoloured.pause)
     expect(recoloured.calls).toEqual(['read', 'edit m1'])
-
-    const relaid = docsHarness({
-      messages: published(source).map((message) => ({
-        ...message,
-        fields: message.fields.map((field) => ({ ...field, inline: false })),
-      })),
-    })
-
-    await syncManual(parseManual(source), relaid.channel, relaid.pause)
-    expect(relaid.calls).toEqual(['read', 'edit m1'])
   })
 })
 
@@ -5433,9 +5430,8 @@ describe('the changeover — eleven messages become one', () => {
       {
         id: 'm1',
         title: 'Blitz bot',
-        description: 'What the bot does.',
+        description: body(doc(['One', 'first'])),
         colour: BLURPLE,
-        fields: [{ name: 'One', value: 'first', inline: true }],
       },
     ])
   })
@@ -5535,11 +5531,10 @@ describe('the manual — the channel is read back, never remembered', () => {
     // The process died here. A new one comes up with no memory of any of it,
     // and the channel is the only thing that carried over.
     const second = docsHarness({
-      messages: first.messages().map(({ title, description, colour, fields }) => ({
+      messages: first.messages().map(({ title, description, colour }) => ({
         title,
         description,
         colour,
-        fields,
       })),
     })
 
@@ -5557,9 +5552,10 @@ describe('the manual — the channel is read back, never remembered', () => {
  * `readManual` has always guarded the file that is not there — a checkout of an
  * older commit, a botched deploy — because reading a missing file as "the manual
  * is now empty" replaces the manual with nothing. The file that IS there and has
- * nothing in it, the file whose headings are all `##`, and the file whose code
- * fence never closes are the same statement: there is nothing here that can be
- * published, which is never an instruction to publish nothing.
+ * nothing in it, the file whose headings are all `##`, the file with nothing
+ * under the one heading it has, and the file whose code fence never closes are
+ * the same statement: there is nothing here that can be published, which is
+ * never an instruction to publish nothing.
  */
 describe('the manual — a file that could not be parsed at all', () => {
   it('does not even read the channel, let alone write to it', async () => {
@@ -5582,7 +5578,26 @@ describe('the manual — a file that could not be parsed at all', () => {
   })
 
   /**
-   * ONE LINE, NOT TWO. `parseManual` names which of the three reasons it was and
+   * AND A TITLE WITH NOTHING UNDER IT, WHICH IS NEW WITH THE DESCRIPTION.
+   *
+   * The text under the `# ` used to be the LEAD, and an empty one was an embed
+   * with no description sitting above eleven fields that carried the document —
+   * published, and harmless. It is the whole document now, so publishing it
+   * would replace the manual with a bare title. That is the same harm an empty
+   * file does, so it gets the same answer.
+   */
+  it('refuses a file with a heading and nothing under it', async () => {
+    const docs = docsHarness({ messages: published(doc(['One', 'first'])) })
+
+    await syncManual(parseManual('# Blitz bot\n\n'), docs.channel, docs.pause)
+
+    expect(docs.calls).toEqual([])
+    expect(at(docs.messages(), 0).description).toBe(body(doc(['One', 'first'])))
+    expect(said('nothing under its top-level heading')).toBe(1)
+  })
+
+  /**
+   * ONE LINE, NOT TWO. `parseManual` names which of the four reasons it was and
    * says the channel was left alone; `syncManual` returning silently on a null is
    * what keeps one fault from writing two lines into the status channel.
    */
@@ -5600,11 +5615,15 @@ describe('the manual — a file that could not be parsed at all', () => {
  * THE SAME REFUSAL FROM THE OTHER END: one unbalanced code fence.
  *
  * The parser tracks fences so that a `# comment` inside a shell example is not
- * read as the document's title. A fence that never closes swallows every line
- * after it, so the sections below it stop existing as far as the parse is
- * concerned — and under the old model the channel is the state, so "stopped
- * existing" was a DELETE of each of their messages, logged as "no longer in the
- * file" about text still sitting in the file one line above the fence.
+ * read as the document's title.
+ *
+ * WHAT AN UNCLOSED FENCE COSTS HAS MOVED, AND IT IS STILL REFUSED. It used to
+ * swallow every section below it out of the parse, and the channel is the
+ * state, so "stopped existing" was a DELETE of each of their messages. The body
+ * is carried verbatim now, so the parse loses nothing — but the description is
+ * rendered as markdown by Discord, and an unbalanced ``` swallows the rest of
+ * the manual into one grey block in front of the reader. Same answer, different
+ * renderer.
  */
 describe('the manual — a code fence that is never closed', () => {
   const source = [
@@ -5639,14 +5658,12 @@ describe('the manual — a code fence that is never closed', () => {
     expect(docs.messages()).toHaveLength(1)
   })
 
-  /** A fence that closes is still an ordinary section, and what is inside it is
-   * still body. */
+  /** A fence that closes is text in the description like everything else, and
+   * the `## Two` inside it stays inside it — the file's own bytes, unaltered. */
   it('is not disturbed by a fence that does close', () => {
-    expect(parseManual(`${source}\n\`\`\`\n`)).toEqual({
-      title: 'Blitz bot',
-      lead: 'What the bot does.',
-      sections: [{ heading: 'One', body: '```sh\necho hello\n\n## Two\n\nsecond\n\n```' }],
-    })
+    const closed = `${source}\n\`\`\`\n`
+
+    expect(parseManual(closed)).toEqual({ title: 'Blitz bot', body: body(closed) })
   })
 })
 
@@ -5654,73 +5671,70 @@ describe('the manual — a code fence that is never closed', () => {
  * DISCORD'S LIMITS, AND THE RULE THAT NOTHING IS EVER SILENTLY SHORTENED.
  *
  * This message's whole claim is that it says the same thing the file says. A
- * truncated section reads like the whole of it, so the drift would be invisible
+ * truncated document reads like the whole of it, so the drift would be invisible
  * and the bot would have caused it.
  *
- * AND A DEFECT IN ONE SECTION IS NOW A DEFECT IN THE WHOLE MESSAGE, which is the
- * price of one embed rather than eleven: there is no per-section refusal left to
- * reach for, so the channel keeps the last version Discord accepted and the
- * refusal is said at error, which is what reaches the status channel.
+ * AND THE LIMIT IS NOW ONE NUMBER OVER THE WHOLE DOCUMENT: 4096 units of
+ * description, where there used to be six caps and a per-section refusal to
+ * reach for. A paragraph too many anywhere in the file stops the whole manual
+ * being published, so the channel keeps the last version Discord accepted and
+ * the refusal is said at error, which is what reaches the status channel.
  */
 describe('the manual — a document that will not fit one embed', () => {
   const standing = (): ReturnType<typeof docsHarness> =>
     docsHarness({ messages: published(doc(['One', 'first'])) })
 
-  it('refuses a section over the field limit rather than cutting it', async () => {
+  /**
+   * THE DESCRIPTION CAP IS THE ONE THAT BINDS NOW, and it binds on the WHOLE
+   * document rather than on one section of it. The old shape had 1024 per field
+   * and 6000 across the message; this has 4096 for everything under the title,
+   * which is the trade the owner's ask comes with.
+   */
+  it('refuses a document over the description limit rather than cutting it', async () => {
     const docs = standing()
 
-    await syncManual(parseManual(doc(['One', 'x'.repeat(1025)])), docs.channel, docs.pause)
+    await syncManual(parseManual(doc(['One', 'x'.repeat(4097)])), docs.channel, docs.pause)
 
     // Not even read: there is nothing the channel could tell us that would make
     // this publishable, and the message that is up keeps the text it has.
     expect(docs.calls).toEqual([])
-    expect(at(docs.messages(), 0).fields.map((field) => field.value)).toEqual(['first'])
+    expect(at(docs.messages(), 0).description).toBe(body(doc(['One', 'first'])))
 
     expect(stderr.join('')).toContain('does not fit in one embed')
-    expect(stderr.join('')).toContain('over="fieldValue"')
-    expect(stderr.join('')).toContain('length=1025')
-    expect(stderr.join('')).toContain('cap=1024')
+    expect(stderr.join('')).toContain('over="description"')
+    expect(stderr.join('')).toContain('cap=4096')
   })
 
-  it('refuses a lead over the description limit', async () => {
+  /**
+   * AND IT IS THE SUM OF THE SECTIONS, NOT THE WORST ONE. Six sections of 700
+   * would each have been a comfortable field under the old caps; together they
+   * are one description over 4096, and this is the case that could not exist
+   * before the document became one string.
+   */
+  it('adds the sections up rather than measuring the longest', async () => {
     const docs = standing()
 
-    await syncManual(parseManual(manual('y'.repeat(4097), ['One', 'first'])), docs.channel, docs.pause)
+    const many = doc(
+      ...Array.from({ length: 6 }, (_, i) => [`H${String(i)}`, 'z'.repeat(700)] as const),
+    )
+
+    await syncManual(parseManual(many), docs.channel, docs.pause)
 
     expect(docs.calls).toEqual([])
     expect(stderr.join('')).toContain('over="description"')
   })
 
-  it('refuses more sections than an embed has fields', async () => {
+  /** The title has a cap of its own, and it is the only other one that can be
+   * spent: a heading nobody would write, but the guard is what stops Discord
+   * refusing the whole message over it. */
+  it('refuses a title over its own limit', async () => {
     const docs = standing()
 
-    const many = doc(...Array.from({ length: 26 }, (_, i) => [`H${String(i)}`, 'body'] as const))
-
-    await syncManual(parseManual(many), docs.channel, docs.pause)
+    await syncManual(parseManual(`# ${'T'.repeat(257)}\n\nbody\n`), docs.channel, docs.pause)
 
     expect(docs.calls).toEqual([])
-    expect(stderr.join('')).toContain('over="fields"')
-    expect(stderr.join('')).toContain('length=26')
-  })
-
-  /**
-   * AND THE CAP NOTHING ELSE CATCHES: six sections a thousand characters each is
-   * under every per-part limit and over the 6000 an embed is allowed in total.
-   * Under the old model this could not bite — one section per message — and it
-   * is the reason the whole-embed total is checked rather than assumed.
-   */
-  it('refuses a document that is under every part limit and over the whole', async () => {
-    const docs = standing()
-
-    const big = doc(
-      ...Array.from({ length: 7 }, (_, i) => [`H${String(i)}`, 'z'.repeat(1000)] as const),
-    )
-
-    await syncManual(parseManual(big), docs.channel, docs.pause)
-
-    expect(docs.calls).toEqual([])
-    expect(stderr.join('')).toContain('over="total"')
-    expect(stderr.join('')).toContain('cap=6000')
+    expect(stderr.join('')).toContain('over="title"')
+    expect(stderr.join('')).toContain('length=257')
   })
 
   /**
@@ -5730,57 +5744,50 @@ describe('the manual — a document that will not fit one embed', () => {
    * `length` overstates an astral character and would refuse a document Discord
    * accepts. Discord's limits are on the JSON string as it arrives, which is
    * UTF-16, so counting code points UNDERSTATES every astral character by half:
-   * 1024 musical symbols are 2048 units, sailed through a 1024 guard, and came
+   * 4096 musical symbols are 8192 units, sailed through a 4096 guard, and came
    * back 50035 from the one check that exists to stop that happening.
    */
-  it('counts a section in the units Discord counts', async () => {
+  it('counts the document in the units Discord counts', async () => {
     const docs = docsHarness()
 
-    await syncManual(parseManual(doc(['One', '𝄞'.repeat(1024)])), docs.channel, docs.pause)
+    // The whole body and nothing else, so the number in the log line is the
+    // arithmetic under test rather than that plus a heading.
+    await syncManual(parseManual(manual('𝄞'.repeat(4096))), docs.channel, docs.pause)
 
     expect(docs.calls).toEqual([])
-    expect(stderr.join('')).toContain('over="fieldValue"')
-    expect(stderr.join('')).toContain('length=2048')
+    expect(stderr.join('')).toContain('over="description"')
+    expect(stderr.join('')).toContain('length=8192')
   })
 
-  /** And the other side of it: 1024 units of astral text is exactly the limit
+  /** And the other side of it: 4096 units of astral text is exactly the limit
    * and is published, so this is a cap on the right number rather than a cap
    * that happens to refuse everything unusual. */
   it('publishes astral text that fits in the units Discord counts', async () => {
     const docs = docsHarness()
 
-    await syncManual(parseManual(doc(['One', '𝄞'.repeat(512)])), docs.channel, docs.pause)
+    await syncManual(parseManual(manual('𝄞'.repeat(2048))), docs.channel, docs.pause)
 
     expect(docs.calls).toEqual(['read', 'post'])
+    expect(at(docs.written, 0).description).toHaveLength(4096)
     expect(stderr.join('')).toBe('')
   })
 
   /**
-   * A `## ` HEADING WITH NOTHING UNDER IT IS THE SAME KIND OF REFUSAL, and it is
-   * new. Discord will not take an embed field with an empty value and refuses the
-   * whole message with it, so a section somebody has started writing would take
-   * the entire manual out of the channel. It is named at error instead, with the
-   * heading that has to be filled in or removed.
+   * A `## ` HEADING WITH NOTHING UNDER IT IS NO LONGER A REFUSAL AT ALL, and
+   * that is a deletion rather than an oversight. Discord rejects an empty field
+   * VALUE outright and refused the whole message with it, so a section somebody
+   * had started writing took the entire manual out of the channel. There are no
+   * fields: a half-written section is a heading with a blank line after it, in
+   * the description, exactly as the file has it.
    */
-  it('refuses a section with nothing under it, and names it', async () => {
-    const docs = standing()
+  it('publishes a section somebody has only started writing', async () => {
+    const docs = docsHarness()
 
     await syncManual(parseManual(doc(['One', 'first'], ['Half written', ''])), docs.channel, docs.pause)
 
-    expect(docs.calls).toEqual([])
-    expect(stderr.join('')).toContain('has nothing under it')
-    expect(stderr.join('')).toContain('heading="Half written"')
-  })
-
-  /** A `# ` heading with no lead under it is not the same thing: Discord takes
-   * an embed with no description, so it is published without one. */
-  it('publishes a manual with no lead under its heading', async () => {
-    const docs = docsHarness()
-
-    await syncManual(parseManual('# Blitz bot\n\n## One\n\nfirst\n'), docs.channel, docs.pause)
-
     expect(docs.calls).toEqual(['read', 'post'])
-    expect(at(docs.written, 0).description).toBe('')
+    expect(at(docs.written, 0).description).toContain('## Half written')
+    expect(stderr.join('')).toBe('')
   })
 })
 
@@ -5991,54 +5998,57 @@ describe('the manual — a channel the bot cannot use', () => {
 
 /**
  * SPLITTING THE FILE. The parser decides what the embed IS, so everything above
- * rests on it: a heading it invents becomes a field nobody wrote, and a heading
- * it misses silently welds two sections into one.
+ * rests on it: a title it invents cuts the document in half, and a title it
+ * misses leaves the whole file looking like a preamble.
+ *
+ * AND IT IS A MUCH SMALLER JOB THAN IT WAS. `## ` is no longer a boundary, so
+ * the cases about what a section IS — a deeper heading, a repeated heading, a
+ * heading carrying markdown — are cases about text that is copied across
+ * untouched. What is left to get wrong is the title, the fences that hide one,
+ * and the whitespace at both ends.
  */
-describe('the manual — splitting the file into a title, a lead and its sections', () => {
-  it('takes the one `#` as the title, the text under it as the lead, and `##` as sections', () => {
+describe('the manual — splitting the file into a title and a body', () => {
+  it('takes the one `#` as the title and everything under it as the body', () => {
     expect(parseManual('# Blitz bot\n\nWhat it does.\n\n## One\n\nfirst\n\n## Two\n\nsecond\n')).toEqual(
       {
         title: 'Blitz bot',
-        lead: 'What it does.',
-        sections: [
-          { heading: 'One', body: 'first' },
-          { heading: 'Two', body: 'second' },
-        ],
+        body: 'What it does.\n\n## One\n\nfirst\n\n## Two\n\nsecond',
       },
     )
   })
 
-  /** `###` is part of the body, for the reason `##` used to be: a parser that
-   * split on every heading would make a field out of every paragraph. */
-  it('treats a deeper heading as body', () => {
-    expect(parseManual('# Blitz bot\n\nlead\n\n## One\n\n### Detail\n\nfirst\n')?.sections).toEqual([
-      { heading: 'One', body: '### Detail\n\nfirst' },
-    ])
+  /**
+   * EVERY HEADING BELOW THE TITLE IS CARRIED, WHATEVER ITS DEPTH. `## ` and
+   * `### ` are both Discord headings in a description — different sizes — and
+   * the parser has no opinion about either. Under the old model `## ` was a
+   * field name and `### ` was body, and neither rendered as a heading at all.
+   */
+  it('carries `##` and deeper headings into the body as written', () => {
+    expect(parseManual('# Blitz bot\n\nlead\n\n## One\n\n### Detail\n\nfirst\n')?.body).toBe(
+      'lead\n\n## One\n\n### Detail\n\nfirst',
+    )
   })
 
   /**
    * A `#` INSIDE A CODE FENCE IS NOT A HEADING. A shell example carries comment
-   * lines, and a parser that did not track fences would cut the section in half
-   * at one and make a field called "set the token".
+   * lines, and this is the one thing the fence tracking is still for: without
+   * it a `# set the token` before the real title would BE the title, and the
+   * document above it would be read as a preamble and dropped.
    */
-  it('does not split on a comment inside a fenced block', () => {
+  it('does not take a comment inside a fenced block as the title', () => {
     const source = [
-      '# Blitz bot',
-      '',
-      'lead',
-      '',
-      '## One',
-      '',
       '```sh',
       '# set the token',
       'export X=1',
       '```',
       '',
+      '# Blitz bot',
+      '',
+      'lead',
+      '',
     ].join('\n')
 
-    expect(parseManual(source)?.sections).toEqual([
-      { heading: 'One', body: '```sh\n# set the token\nexport X=1\n```' },
-    ])
+    expect(parseManual(source)).toEqual({ title: 'Blitz bot', body: 'lead' })
   })
 
   /**
@@ -6050,8 +6060,7 @@ describe('the manual — splitting the file into a title, a lead and its section
   it('warns about a preamble rather than dropping it silently', () => {
     expect(parseManual('a note to the reader\n\n# Blitz bot\n\nlead\n')).toEqual({
       title: 'Blitz bot',
-      lead: 'lead',
-      sections: [],
+      body: 'lead',
     })
 
     expect(stderr.join('')).toContain('text above its first heading')
@@ -6061,12 +6070,12 @@ describe('the manual — splitting the file into a title, a lead and its section
   /**
    * A SECOND `# ` IS BODY, AND IT IS SAID. There is one embed and it has one
    * title. Refusing the document over it would take the manual out of the channel
-   * for a stray character; promoting it silently would move a chunk of the file
-   * into a field nobody wrote a heading for.
+   * for a stray character, and Discord renders a `# ` in a description as its
+   * largest heading — so what the reader sees is what the file says.
    */
   it('keeps a second top-level heading as text and says it did', () => {
-    expect(parseManual('# Blitz bot\n\nlead\n\n## One\n\nfirst\n\n# Stray\n\nmore\n')?.sections).toEqual(
-      [{ heading: 'One', body: 'first\n\n# Stray\n\nmore' }],
+    expect(parseManual('# Blitz bot\n\nlead\n\n## One\n\nfirst\n\n# Stray\n\nmore\n')?.body).toBe(
+      'lead\n\n## One\n\nfirst\n\n# Stray\n\nmore',
     )
 
     expect(said('more than one top-level heading')).toBe(1)
@@ -6075,14 +6084,20 @@ describe('the manual — splitting the file into a title, a lead and its section
   it('reads a file written with Windows line endings', () => {
     expect(parseManual('# Blitz bot\r\n\r\nlead\r\n\r\n## One\r\n\r\nfirst\r\n')).toEqual({
       title: 'Blitz bot',
-      lead: 'lead',
-      sections: [{ heading: 'One', body: 'first' }],
+      body: 'lead\n\n## One\n\nfirst',
     })
   })
 
   it('answers nothing at all for an empty file, and says so once', () => {
     expect(parseManual('')).toBeNull()
     expect(said('no top-level heading')).toBe(1)
+  })
+
+  /** And nothing for a file that is a title and blank lines: the body IS the
+   * document now, so an empty one is an empty document. */
+  it('answers nothing for a title with nothing under it, and says so once', () => {
+    expect(parseManual('# Blitz bot\n\n\n')).toBeNull()
+    expect(said('nothing under its top-level heading')).toBe(1)
   })
 
   /**
@@ -6092,11 +6107,7 @@ describe('the manual — splitting the file into a title, a lead and its section
    * is reads that line as "Heading", and this read it as "Heading #".
    */
   it('reads a closed heading the way markdown does', () => {
-    expect(parseManual('# One #\n\nlead\n\n## Two ###\n\nfirst\n')).toEqual({
-      title: 'One',
-      lead: 'lead',
-      sections: [{ heading: 'Two', body: 'first' }],
-    })
+    expect(parseManual('# One #\n\nlead\n')).toEqual({ title: 'One', body: 'lead' })
   })
 
   /** And only a run separated by whitespace, exactly as the rest of markdown has
@@ -6106,40 +6117,43 @@ describe('the manual — splitting the file into a title, a lead and its section
   })
 
   /**
-   * A HEADING IS PLAIN TEXT, AND THE RULE IS SAID RATHER THAN ENFORCED. Stripping
-   * would silently change what the channel shows against what the file says, and
-   * refusing would take a page of documentation out of the channel over a pair of
-   * asterisks. docs/bot-manual.md states the rule for the people writing the file.
+   * THE TITLE IS PLAIN TEXT, AND THE RULE IS SAID RATHER THAN ENFORCED. An embed
+   * TITLE renders no markdown at all, so asterisks in one are asterisks in the
+   * channel. Stripping them would silently change what the channel shows against
+   * what the file says, and refusing would take a page of documentation out of
+   * the channel over a pair of them.
    */
-  it('says when a heading carries markdown, and publishes it anyway', () => {
+  it('says when the title carries markdown, and publishes it anyway', () => {
     expect(parseManual('# **Loud** and `quoted`\n\nlead\n')?.title).toBe('**Loud** and `quoted`')
 
-    expect(said('a manual heading carries markdown')).toBe(1)
+    expect(said('the manual title carries markdown')).toBe(1)
   })
 
-  /** And not about an underscore inside a word: Discord does not italicise one,
-   * and this repo's headings are full of variable names. A warning nobody can act
-   * on is a warning everybody learns to ignore. */
-  it('says nothing about a variable name in a heading', () => {
-    expect(parseManual('# Blitz bot\n\nlead\n\n## The BLITZ_LOG_CHANNEL_ID channel\n\nfirst\n')
-      ?.sections).toEqual([{ heading: 'The BLITZ_LOG_CHANNEL_ID channel', body: 'first' }])
+  /**
+   * AND IT SAYS NOTHING ABOUT MARKDOWN IN A `## ` HEADING, WHICH IS THE POINT OF
+   * THE CHANGE. Those lines are in the description, where Discord renders
+   * markdown like anywhere else — bold in one is bold. A warning about a heading
+   * that renders correctly is a warning nobody can act on.
+   */
+  it('says nothing about markdown in a section heading', () => {
+    expect(parseManual('# Blitz bot\n\nlead\n\n## The **loud** one\n\nfirst\n')?.body).toBe(
+      'lead\n\n## The **loud** one\n\nfirst',
+    )
 
     expect(stderr.join('')).toBe('')
   })
 
   /**
-   * TWO SECTIONS UNDER ONE HEADING ARE TWO FIELDS AND NOTHING IS SAID, which is
-   * a deletion rather than a feature. A heading used to be the KEY the whole
+   * TWO SECTIONS UNDER ONE HEADING ARE TWO PARAGRAPHS AND NOTHING IS SAID, which
+   * is a deletion rather than a feature. A heading used to be the KEY the whole
    * reconciliation turned on, so a repeated one was ambiguous and had to be
-   * warned about and matched positionally. Field names are not keys; two fields
-   * may share one, and there is nothing left to be ambiguous about.
+   * warned about and matched positionally. There is nothing keyed on a heading
+   * any more, and nothing left to be ambiguous about.
    */
   it('has nothing to say about two sections under one heading', () => {
-    expect(parseManual('# Blitz bot\n\nlead\n\n## One\n\nfirst\n\n## One\n\nsecond\n')?.sections)
-      .toEqual([
-        { heading: 'One', body: 'first' },
-        { heading: 'One', body: 'second' },
-      ])
+    expect(parseManual('# Blitz bot\n\nlead\n\n## One\n\nfirst\n\n## One\n\nsecond\n')?.body).toBe(
+      'lead\n\n## One\n\nfirst\n\n## One\n\nsecond',
+    )
 
     expect(stderr.join('')).toBe('')
   })
@@ -6158,14 +6172,12 @@ describe('the manual — whose messages are read back', () => {
     title: string | null
     description: string | null
     color: number | null
-    fields: { name: string; value: string; inline?: boolean }[]
   }
 
   const embed = (over: Partial<Embed> = {}): Embed => ({
     title: 'Blitz bot',
     description: 'lead',
     color: BLURPLE,
-    fields: [],
     ...over,
   })
 
@@ -6221,9 +6233,13 @@ describe('the manual — whose messages are read back', () => {
     ).toEqual(['a', 'b', 'c'])
   })
 
-  /** An embed with no description and a manual with no lead have to become the
-   * same value, or the comparison is never equal and the message is rewritten on
-   * every start. */
+  /**
+   * A MESSAGE OF OURS WITH NO DESCRIPTION IS EXACTLY WHAT THE OLD MODEL LEFT
+   * BEHIND — eleven embeds whose whole content was fields — and it has to come
+   * back as a string, not a null, or the comparison is comparing two kinds of
+   * thing. It compares unequal to every real manual, which is right: those
+   * messages are leftovers and the first of them is edited over.
+   */
   it('reads a missing description as an empty one', () => {
     expect(at(ours([message({ embeds: [embed({ description: null })] })], SELF), 0).description).toBe(
       '',
@@ -6231,35 +6247,17 @@ describe('the manual — whose messages are read back', () => {
   })
 
   /**
-   * THE FIELDS AND THEIR LAYOUT COME BACK, because they are most of what is being
-   * compared. Discord omits `inline` rather than sending false, so the two have
-   * to become one value before the comparison can be a plain equality — without
-   * that, every start would see a difference and edit the message.
+   * AND THE DESCRIPTION COMES BACK WHOLE, headings and all, because it is now
+   * the entire document and almost all of what is compared. A read that lost the
+   * `## ` lines would see a difference on every start and rewrite the message
+   * every time.
    */
-  it('carries the fields back, with a missing inline flag read as false', () => {
+  it('carries the whole description back, markdown and all', () => {
+    const written = 'lead\n\n## One\n\n- **rule** — first\n\n## Two\n\nsecond'
+
     expect(
-      at(
-        ours(
-          [
-            message({
-              embeds: [
-                embed({
-                  fields: [
-                    { name: 'One', value: 'first', inline: true },
-                    { name: 'Two', value: 'second' },
-                  ],
-                }),
-              ],
-            }),
-          ],
-          SELF,
-        ),
-        0,
-      ).fields,
-    ).toEqual([
-      { name: 'One', value: 'first', inline: true },
-      { name: 'Two', value: 'second', inline: false },
-    ])
+      at(ours([message({ embeds: [embed({ description: written })] })], SELF), 0).description,
+    ).toBe(written)
   })
 
   /** And the colour, which is part of what was published and therefore part of
@@ -6273,8 +6271,8 @@ describe('the manual — whose messages are read back', () => {
 /**
  * THE LIVE ADAPTER, which is the only place `ManualEmbed` becomes something
  * discord.js will send. Everything above it is exercised against an array, so
- * this is where the colour, the fields and the absence of a thumbnail are proved
- * to reach the payload.
+ * this is where the colour, the description and the absence of a thumbnail are
+ * proved to reach the payload.
  */
 describe('the manual — the payload that actually goes to Discord', () => {
   function liveDocs(held: readonly unknown[] = []): {
@@ -6298,6 +6296,11 @@ describe('the manual — the payload that actually goes to Discord', () => {
                 Promise.resolve(
                   new Map(held.map((message, index) => [`m${String(index)}`, message])),
                 ),
+
+              edit: (_id: string, payload: { embeds?: APIEmbed[] }) => {
+                sent.push(payload)
+                return Promise.resolve()
+              },
             },
           }),
       },
@@ -6306,9 +6309,10 @@ describe('the manual — the payload that actually goes to Discord', () => {
     return { client, sent }
   }
 
-  it('sends the colour, the fields and their layout, and no thumbnail', async () => {
+  it('sends the colour and the whole document as the description, and no fields', async () => {
     const { client, sent } = liveDocs()
-    const parsed = parseManual(doc(['Short', 'brief'], ['Long', 'x'.repeat(281)]))
+    const source = doc(['One', 'first'], ['Two', 'second'])
+    const parsed = parseManual(source)
     if (parsed === null) throw new Error('the source in this test does not parse')
 
     await docsChannel(client, DOCS_CHANNEL).post(manualEmbed(parsed))
@@ -6318,21 +6322,50 @@ describe('the manual — the payload that actually goes to Discord', () => {
     if (embed === undefined) throw new Error('nothing was sent')
 
     expect(embed.title).toBe('Blitz bot')
-    expect(embed.description).toBe('What the bot does.')
+    expect(embed.description).toBe(body(source))
     expect(embed.color).toBe(BLURPLE)
-    expect(embed.fields).toEqual([
-      { name: 'Short', value: 'brief', inline: true },
-      { name: 'Long', value: 'x'.repeat(281), inline: false },
-    ])
     expect(embed.footer?.text).toMatch(/^updated /u)
+
+    // THE HEADINGS ARE IN THE PAYLOAD AS `## ` LINES. This is the last place
+    // they could have been turned back into anything else, and the whole ask
+    // was that Discord's renderer gets to see them.
+    expect(embed.description).toContain('\n## One\n')
+
+    // No fields at all, rather than an empty array: an embed with `fields: []`
+    // is the shape this stopped having, and sending one would leave the payload
+    // claiming a layout that is no longer decided anywhere.
+    expect(embed.fields).toBeUndefined()
 
     // Asked about, and declined: on a reference card the width is worth more
     // than a second copy of the bot's own avatar.
     expect(embed.thumbnail).toBeUndefined()
     expect(embed.image).toBeUndefined()
 
-    // The same mention suppression every other send in this file makes.
+    // The same mention suppression every other send in this file makes. The
+    // document carries a role tag and two channel mentions, and an embed
+    // resolves neither — this is the guarantee that they cannot ping anybody.
     expect(payload.allowedMentions).toEqual({ parse: [] })
+  })
+
+  /**
+   * AND THE EDIT SUPPRESSES MENTIONS TOO, which the post has always done and the
+   * edit did not. The document carries a role tag now — the owner asked for the
+   * game-ban role to be tagged rather than described — and the edit is the write
+   * that runs every time the file changes. An embed resolves no mention, so this
+   * is belt and braces on a rule that already holds; it is stated because the
+   * write that republishes a role tag is the wrong place to leave it unsaid.
+   */
+  it('suppresses mentions on the edit as well as on the post', async () => {
+    const { client, sent } = liveDocs()
+    const parsed = parseManual(doc(['One', 'a role <@&1542596612306505808> and nothing else']))
+    if (parsed === null) throw new Error('the source in this test does not parse')
+
+    await docsChannel(client, DOCS_CHANNEL).edit('m1', manualEmbed(parsed))
+
+    const payload = at(sent, 0)
+
+    expect(payload.allowedMentions).toEqual({ parse: [] })
+    expect(at(payload.embeds ?? [], 0).description).toContain('<@&1542596612306505808>')
   })
 
   /**
@@ -6348,7 +6381,7 @@ describe('the manual — the payload that actually goes to Discord', () => {
       Array.from({ length: 100 }, (_, i) => ({
         id: `m${String(i)}`,
         author: { id: DOCS_SELF },
-        embeds: [{ title: `H${String(i)}`, description: 'b', color: null, fields: [] }],
+        embeds: [{ title: `H${String(i)}`, description: 'b', color: null }],
         createdTimestamp: i,
       })),
     )
@@ -6538,17 +6571,16 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
   /**
    * IT FITS IN ONE EMBED, AGAINST EVERY CAP, AND THE NUMBERS ARE THE BOT'S OWN.
    *
-   * WHAT THIS REPLACES. The old version walked the file's top-level sections and
-   * held each body under 4096, because a section WAS an embed description. There
-   * are no sections in that sense any more: the whole document is one embed with
-   * a title, a description and eleven fields, and it can now fail in ways that
-   * check never looked at — a field value over 1024, more than twenty-five
-   * fields, and the 6000 an embed is allowed in TOTAL, which no per-section check
-   * could ever have caught.
+   * THE CAP THAT MATTERS IS NOW THE DESCRIPTION'S, and this is the test that
+   * earns its keep because of it. The whole document goes in one 4096-unit
+   * field, and it ships with about forty units to spare — so the next paragraph
+   * anybody adds is the one that would have Discord refuse the message outright
+   * and leave the channel showing a stale manual. It fails here, in CI, before
+   * that can happen.
    *
    * DERIVED FROM THE BUILDER RATHER THAN RESTATED HERE. `manualEmbed` is what the
    * bot publishes, `embedBudget` is the arithmetic the publish is gated on, and
-   * `EMBED_CAPS` is the six numbers — so a document that passes this is a
+   * `EMBED_CAPS` is the three numbers — so a document that passes this is a
    * document the bot will publish, and a cap that is wrong is wrong in one place
    * rather than in two that can disagree.
    */
@@ -6556,19 +6588,43 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
     const embed = await asEmbed()
 
     // Not a vacuous pass on a document that parsed to a bare title.
-    expect(embed.fields.length).toBeGreaterThan(0)
+    expect(embed.description.length).toBeGreaterThan(0)
 
     for (const { cap, spent, limit } of embedBudget(embed)) {
       expect(spent, cap).toBeLessThanOrEqual(limit)
     }
 
-    // And the whole gate, which is those six plus the thing Discord refuses at
-    // any length: a field with nothing in it.
+    // And the whole gate, which is those three caps and nothing else now.
     expect(unpublishable(embed)).toBeNull()
 
-    // No preamble, no second `# `, no markdown in a heading. Every one of those
+    // No preamble, no second `# `, no markdown in the title. Every one of those
     // would have written a warning while parsing.
     expect(stderr.join('')).toBe('')
+  })
+
+  /**
+   * THE HEADINGS ARE HEADINGS, WHICH IS THE OWNER'S ASK AGAINST THE REAL FILE.
+   *
+   * "bot docs headers should be larger font." A field name renders bold, at body
+   * size, with no markdown in it; a `## ` line in a description renders as a
+   * heading. So every `## ` the file writes has to arrive in the description as
+   * the same `## ` line — a builder that stripped them, or a shape that put them
+   * back into field names, would look correct everywhere except in his channel.
+   */
+  it('carries every section heading into the description as a markdown heading', async () => {
+    const markdown = await shipped()
+    const embed = await asEmbed()
+
+    const headings = [...markdown.matchAll(/^## .+$/gmu)].map((match) => match[0])
+
+    // Not a vacuous pass on a document that has stopped using headings.
+    expect(headings.length).toBeGreaterThan(1)
+
+    for (const heading of headings) expect(embed.description).toContain(`\n${heading}\n`)
+
+    // And nothing above them: the `# ` line is the embed's title, so it is the
+    // one heading that is NOT in the description.
+    expect(embed.description).not.toContain('# Blitz bot')
   })
 
   /**
@@ -6583,81 +6639,97 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
    * crash, in the one channel whose value is that it changes only when the
    * documentation does, and each half passing its own test is exactly how a bug
    * like that survives.
-   *
-   * BOTH WAYS DISCORD CAN REPORT AN INLINE FLAG THAT IS FALSE. It echoes what
-   * was sent, and the key is absent rather than `false` on some paths; `ours`
-   * folds the two into one value, and this is what proves it — with a document
-   * that really does carry fields of both kinds, which the last two assertions
-   * are there to keep true.
    */
   it('is silent on the next restart, read back the way discord.js reports it', async () => {
     const embed = await asEmbed()
 
-    for (const omitFalse of [true, false]) {
-      const posted = ours(
-        [
-          {
-            id: 'm1',
-            author: { id: DOCS_SELF },
-            createdTimestamp: 1,
-            embeds: [
-              {
-                title: embed.title,
-                description: embed.description === '' ? null : embed.description,
-                color: embed.colour,
-                fields: embed.fields.map((field) =>
-                  omitFalse && !field.inline
-                    ? { name: field.name, value: field.value }
-                    : { name: field.name, value: field.value, inline: field.inline },
-                ),
-              },
-            ],
-          },
-        ],
-        DOCS_SELF,
-      )
-
-      const calls: string[] = []
-
-      const record = (name: string): (() => Promise<void>) => () => {
-        calls.push(name)
-        return Promise.resolve()
-      }
-
-      await syncManual(
-        parseManual(await shipped()),
+    const posted = ours(
+      [
         {
-          read: () => {
-            calls.push('read')
-            return Promise.resolve(posted)
-          },
-          post: record('post'),
-          edit: record('edit'),
-          remove: record('remove'),
+          id: 'm1',
+          author: { id: DOCS_SELF },
+          createdTimestamp: 1,
+          embeds: [
+            { title: embed.title, description: embed.description, color: embed.colour },
+          ],
         },
-        () => Promise.resolve(),
-      )
+      ],
+      DOCS_SELF,
+    )
 
-      expect(calls, omitFalse ? 'inline:false omitted' : 'inline:false sent').toEqual(['read'])
+    const calls: string[] = []
+
+    const record = (name: string): (() => Promise<void>) => () => {
+      calls.push(name)
+      return Promise.resolve()
     }
 
-    expect(embed.fields.some((field) => field.inline)).toBe(true)
-    expect(embed.fields.some((field) => !field.inline)).toBe(true)
+    await syncManual(
+      parseManual(await shipped()),
+      {
+        read: () => {
+          calls.push('read')
+          return Promise.resolve(posted)
+        },
+        post: record('post'),
+        edit: record('edit'),
+        remove: record('remove'),
+      },
+      () => Promise.resolve(),
+    )
+
+    expect(calls).toEqual(['read'])
   })
 
   /**
-   * AND THE LAYOUT IS ACTUALLY USED. "Plain" was half the owner's complaint, and
-   * the answer to the other half is that short sections sit in columns while the
-   * ones carrying lists take the width. A threshold that took everything or
-   * nothing would leave the document rendering exactly as it did before while
-   * the code looked as though it had an opinion.
+   * NOTHING IN IT THAT A DISCORD ADMIN CANNOT ACT ON, WHICH IS THE OWNER'S OTHER
+   * INSTRUCTION AND THE ONE THAT WILL BE UNDONE BY ACCIDENT.
+   *
+   * "don't use things like DISCORD_ADMIN_ROLE_ID etc, none of that is relevant
+   * to discord admins who will have no access to code." His reader has no shell
+   * and no checkout: a variable name tells them nothing they can change, and a
+   * repo path is a file they cannot open. The next person to document a feature
+   * will reach for both, because both are what the code calls things.
+   *
+   * A SHAPE RATHER THAN A LIST OF BANNED WORDS. `BLITZ_LOG_CHANNEL_ID` is not
+   * special — SCREAMING_SNAKE_CASE is what every one of them looks like, and
+   * `src/`, `docs/` and a `.md` are what every path in this repo looks like.
    */
-  it('puts some of its sections in columns and not all of them', async () => {
-    const embed = await asEmbed()
-    const inline = embed.fields.filter((field) => field.inline)
+  it('names no environment variable and no file in the repo', async () => {
+    const markdown = await shipped()
 
-    expect(inline.length).toBeGreaterThan(0)
-    expect(inline.length).toBeLessThan(embed.fields.length)
+    expect(markdown).not.toMatch(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/u)
+    expect(markdown).not.toMatch(/\b(?:src|docs|deploy)\//u)
+    expect(markdown).not.toMatch(/[\w-]+\.(?:md|ts|sh|json)\b/u)
+  })
+
+  /**
+   * AND IT POINTS AT THE THINGS THEMSELVES. "If you really want to include
+   * something use #channel instead", and "On the game-ban role, tag it to show
+   * what role you're talking about."
+   *
+   * A CHANNEL MENTION AND A ROLE TAG ARE IDS THAT RENDER AS NAMES, in the
+   * reader's own client, in the role's own colour — so a rename in the server
+   * settings reaches this document with nobody editing it. Written out as text
+   * they would be exactly the drift they replace.
+   */
+  it('points at its channels and its role with mentions rather than names', async () => {
+    const markdown = await shipped()
+
+    // The two channels the bot posts to and the reader can go and read.
+    expect(markdown).toContain('<#1542603116258525185>')
+    expect(markdown).toContain('<#1543345492270915684>')
+
+    // The role a game ban assigns, tagged rather than described.
+    expect(markdown).toContain('<@&1542596612306505808>')
+
+    // And all three survive into what is actually published — a builder that
+    // touched the text would break the rendering and nothing else would say so.
+    const { description } = await asEmbed()
+
+    expect(description).toContain('<#1542603116258525185>')
+    expect(description).toContain('<#1543345492270915684>')
+    expect(description).toContain('<@&1542596612306505808>')
   })
 
   /**
@@ -6822,6 +6894,14 @@ const DISPATCHED: KickResult = {
   attempts: 1,
 }
 
+/** One closed audit row, as the fake saw it happen. */
+interface Settled {
+  commandId: string
+  ts: number
+  outcome: Exclude<AuditOutcome, 'pending'>
+  error: string | null
+}
+
 interface MirrorHarness {
   deps: MirrorDeps
   issued: BanIssueInput[]
@@ -6829,6 +6909,19 @@ interface MirrorHarness {
   reads: string[]
   kicks: KickInput[]
   untagged: string[]
+  /** Every `audit.begin`, in order. The intent rows. */
+  opened: AuditInput[]
+  /** Every `audit.resolve`, in order. The outcomes stamped onto them. */
+  settled: Settled[]
+  /**
+   * The calls the mirror made to DynamoDB, named and in order.
+   *
+   * THE TWO-PHASE CONTRACT IS AN ORDERING AND NOTHING ELSE, so pinning it needs
+   * a record of the order rather than of the arguments. "Before the ban write"
+   * is the whole claim `audit.begin` makes, and it is the claim that would be
+   * silently lost by a refactor that moved one line.
+   */
+  order: string[]
 }
 
 /**
@@ -6847,6 +6940,11 @@ function mirrorHarness(
     get?: Ddb['bans']['get']
     issue?: Ddb['bans']['issue']
     lift?: Ddb['bans']['lift']
+    /** The player registry, keyed on license. Only the admin's name is read. */
+    people?: Record<string, PlayerRecord>
+    player?: Ddb['players']['get']
+    begin?: Ddb['audit']['begin']
+    resolve?: Ddb['audit']['resolve']
     kick?: Ringmaster | null
     kickResult?: KickResult
     untag?: RoleTaker | null
@@ -6856,12 +6954,24 @@ function mirrorHarness(
 ): MirrorHarness {
   const rows = over.rows ?? {}
   const licences = over.licences ?? { [MOD_DISCORD_KEY]: [MOD_LICENCE] }
+  const people = over.people ?? {}
 
   const issued: BanIssueInput[] = []
   const lifts: BanLiftInput[] = []
   const reads: string[] = []
   const kicks: KickInput[] = []
   const untagged: string[] = []
+  const opened: AuditInput[] = []
+  const settled: Settled[] = []
+  const order: string[] = []
+
+  /**
+   * A COUNTER RATHER THAN A CLOCK, so an assertion can pin WHICH intent row an
+   * outcome landed on. The real `audit.begin` mints a uuid and a millisecond
+   * sort key; nothing here depends on either being realistic, only on the two
+   * halves of one row being joinable the way `resolve` joins them.
+   */
+  let minted = 0
 
   const kick: Ringmaster | null =
     over.kick === undefined
@@ -6892,12 +7002,14 @@ function mirrorHarness(
         get:
           over.get ??
           ((id) => {
+            order.push('bans.get')
             reads.push(id)
             return Promise.resolve(ok(rows[id] ?? null))
           }),
         issue:
           over.issue ??
           ((input) => {
+            order.push('bans.issue')
             issued.push(input)
             return Promise.resolve(
               ok({
@@ -6909,16 +7021,42 @@ function mirrorHarness(
         lift:
           over.lift ??
           ((input) => {
+            order.push('bans.lift')
             lifts.push(input)
             return Promise.resolve(
               ok({ outcome: 'lifted' as const, ban: banRow({ license: input.id }) }),
             )
           }),
       },
+      players: {
+        get: over.player ?? ((license) => Promise.resolve(ok(people[license] ?? null))),
+      },
+      audit: {
+        begin:
+          over.begin ??
+          ((input) => {
+            order.push('audit.begin')
+            opened.push(input)
+            minted += 1
+            return Promise.resolve(ok({ commandId: `cmd-${String(minted)}`, ts: minted }))
+          }),
+        resolve:
+          over.resolve ??
+          ((handle, outcome, error) => {
+            order.push('audit.resolve')
+            settled.push({ ...handle, outcome, error: error ?? null })
+            return Promise.resolve(ok(undefined))
+          }),
+        // On the interface and never called from the mirror; a throw is a
+        // louder failure than an empty page if that ever stops being true.
+        recent: () => {
+          throw new Error('the mirror must not read the audit log')
+        },
+      },
     },
   }
 
-  return { deps, issued, lifts, reads, kicks, untagged }
+  return { deps, issued, lifts, reads, kicks, untagged, opened, settled, order }
 }
 
 describe('the moderation mirror — what it will not touch', () => {
@@ -7543,6 +7681,517 @@ describe('a kick is not a ban', () => {
 
     expect(result).toMatchObject({ did: 'failed', step: 'licence' })
     expect(harness.kicks).toEqual([])
+  })
+
+  /**
+   * AND THE CONSOLE WRITES THE `player.kick` ROW, NOT THIS BOT. `POST /api/kick`
+   * over there begins its own audit row before it dispatches, attributed to the
+   * human because the relay sends their Discord id in `SERVICE_ACTOR_HEADER`.
+   * A row from here would be the same kick logged twice a few hundred
+   * milliseconds apart — and the boot replay would put a page of last week's
+   * kicks in the log dated today. `ringmaster-audit` is append-only; neither
+   * could be taken back.
+   */
+  it('leaves the kick`s audit row to the console that actually kicks', async () => {
+    const harness = mirrorHarness()
+    await mirrorEntry(KICK, harness.deps)
+
+    expect(harness.kicks).toHaveLength(1)
+    expect(harness.opened).toEqual([])
+    expect(harness.settled).toEqual([])
+  })
+
+  it('writes no row for a kick it could not relay either', async () => {
+    const harness = mirrorHarness({ kick: null })
+    await mirrorEntry(KICK, harness.deps)
+
+    expect(harness.opened).toEqual([])
+  })
+})
+
+/**
+ * ═══ THE AUDIT ROW — the owner's ask, and the console's contract ═══
+ *
+ * "I would like any admin actions like kicking or banning from discord to be
+ * shown in Ringmaster's audit log." `ringmaster-audit` is the chronological
+ * record of who did what, and a Discord ban used to write a ban row and leave no
+ * trace in it at all.
+ */
+describe('the audit row a mirrored ban leaves behind', () => {
+  const BAN = entryOf()
+
+  /**
+   * THE ORDER IS THE CONTRACT. The console records an INTENT before it acts and
+   * stamps the outcome afterwards, because a log written only on success is
+   * missing in exactly the moment it matters — the ban that never reached the
+   * host leaves no trace, and its absence looks identical to nobody having tried.
+   */
+  it('opens the row before the ban write and closes it after', async () => {
+    const harness = mirrorHarness()
+    await mirrorEntry(BAN, harness.deps)
+
+    expect(harness.order).toEqual(['bans.get', 'audit.begin', 'bans.issue', 'audit.resolve'])
+  })
+
+  it('records a ban.issue that came out ok', async () => {
+    const harness = mirrorHarness()
+    await mirrorEntry(BAN, harness.deps)
+
+    expect(harness.opened).toHaveLength(1)
+    expect(harness.opened[0]).toMatchObject({ action: 'ban.issue' })
+    expect(harness.settled).toEqual([{ commandId: 'cmd-1', ts: 1, outcome: 'ok', error: null }])
+  })
+
+  /**
+   * ATTRIBUTION IS THE HUMAN. "blitz-bot" answers the wrong question — which
+   * process wrote the row is never what anybody asks an audit log — and the
+   * console builds the same three fields from the same Discord id.
+   */
+  it('names the admin who did it, with the licence they play on', async () => {
+    const harness = mirrorHarness({
+      licences: { [MOD_DISCORD_KEY]: [MOD_LICENCE], [qualifyId('discord', MOD_ADMIN)]: ['license:aa'] },
+    })
+    await mirrorEntry(BAN, harness.deps)
+
+    expect(harness.opened[0]?.actor).toEqual({
+      license: 'license:aa',
+      name: 'ownername',
+      discordId: MOD_ADMIN,
+    })
+  })
+
+  /**
+   * AN ADMIN WHO HAS NEVER PLAYED IS STILL A PERSON. The console writes exactly
+   * this for an admin with no grants row: their Discord id as the name, and a
+   * null license. What it must never be is a stand-in for nobody.
+   */
+  it('falls back to the discord id and a null licence when nothing knows them', async () => {
+    const harness = mirrorHarness()
+    await mirrorEntry(entryOf({ executorName: null }), harness.deps)
+
+    expect(harness.opened[0]?.actor).toEqual({
+      license: null,
+      name: MOD_ADMIN,
+      discordId: MOD_ADMIN,
+    })
+  })
+
+  /**
+   * THE GAME'S NAME IS THE SECOND CHANCE, NOT THE FIRST. Discord's name is what
+   * the console writes, so taking the in-game one first would file the same
+   * admin under two names depending on which repo wrote the row. It earns its
+   * read only where Discord gave us nothing — the boot replay, where discord.js
+   * holds no cached user — because the alternative there is a raw snowflake.
+   */
+  it('uses the game name when discord gave none and the admin has played', async () => {
+    const harness = mirrorHarness({
+      licences: { [MOD_DISCORD_KEY]: [MOD_LICENCE], [qualifyId('discord', MOD_ADMIN)]: ['license:aa'] },
+      people: {
+        'license:aa': {
+          license: 'license:aa',
+          name: 'TheOwner',
+          firstSeen: 1,
+          lastSeen: 2,
+          sessions: 1,
+          playtimeMs: 1,
+        },
+      },
+    })
+    await mirrorEntry(entryOf({ executorName: null }), harness.deps)
+
+    expect(harness.opened[0]?.actor).toMatchObject({ license: 'license:aa', name: 'TheOwner' })
+  })
+
+  it('prefers discord`s name over the game`s when it has one', async () => {
+    const harness = mirrorHarness({
+      licences: { [MOD_DISCORD_KEY]: [MOD_LICENCE], [qualifyId('discord', MOD_ADMIN)]: ['license:aa'] },
+      people: {
+        'license:aa': {
+          license: 'license:aa',
+          name: 'TheOwner',
+          firstSeen: 1,
+          lastSeen: 2,
+          sessions: 1,
+          playtimeMs: 1,
+        },
+      },
+    })
+    await mirrorEntry(BAN, harness.deps)
+
+    expect(harness.opened[0]?.actor).toMatchObject({ name: 'ownername' })
+  })
+
+  it('uses the id rather than a blank when the registry read fails', async () => {
+    const harness = mirrorHarness({
+      licences: { [MOD_DISCORD_KEY]: [MOD_LICENCE], [qualifyId('discord', MOD_ADMIN)]: ['license:aa'] },
+      player: () => Promise.resolve(broke()),
+    })
+    await mirrorEntry(entryOf({ executorName: null }), harness.deps)
+
+    expect(harness.opened[0]?.actor).toMatchObject({ name: MOD_ADMIN })
+    expect(stderr.join('')).toContain('the id was used instead')
+  })
+
+  /**
+   * `targetLicense` IS THE BANS TABLE'S KEY, which is what it means to every
+   * reader of it: the console's `/audit` page renders it as the player, and
+   * src/banrole.ts feeds it straight back into `bans.get`.
+   */
+  it('names the target by the key the ban row is stored at', async () => {
+    const harness = mirrorHarness()
+    await mirrorEntry(BAN, harness.deps)
+
+    expect(harness.opened[0]).toMatchObject({
+      targetLicense: MOD_LICENCE,
+      targetName: 'nate',
+      reason: 'cheating',
+    })
+  })
+
+  it('records an unenforceable discord-keyed ban as one', async () => {
+    const harness = mirrorHarness({ licences: {} })
+    await mirrorEntry(BAN, harness.deps)
+
+    expect(harness.opened[0]).toMatchObject({ targetLicense: MOD_DISCORD_KEY })
+    expect(harness.opened[0]?.detail).toMatchObject({ enforced: false })
+  })
+
+  /**
+   * THE PLACEHOLDER TRAVELS INTO THE ROW UNCHANGED. The reason on the ban row is
+   * the reason on the audit row; two different sentences for one act would make
+   * "why were they banned" have two answers.
+   */
+  it('carries the marked placeholder when the dialog was left blank', async () => {
+    const harness = mirrorHarness()
+    await mirrorEntry(entryOf({ reason: null }), harness.deps)
+
+    expect(harness.opened[0]?.reason).toBe(BAN_REASON_PLACEHOLDER)
+    expect(harness.issued[0]?.reason).toBe(BAN_REASON_PLACEHOLDER)
+  })
+
+  it('carries the policy and the provenance in detail', async () => {
+    const harness = mirrorHarness()
+    await mirrorEntry(BAN, harness.deps)
+
+    expect(harness.opened[0]?.detail).toEqual({
+      expiresAt: null,
+      permanent: true,
+      discordEntryId: BAN.id,
+      enforced: true,
+    })
+  })
+
+  /**
+   * A BAN THAT FAILED MUST NOT LEAVE A ROW CLAIMING IT SUCCEEDED, and `failed`
+   * is a different fact from a row left at `pending`: we asked and we DID learn
+   * what happened.
+   */
+  it('stamps failed, with the reason, when the ban write is refused', async () => {
+    const harness = mirrorHarness({ issue: () => Promise.resolve(broke('conflict')) })
+    const result = await mirrorEntry(BAN, harness.deps)
+
+    expect(result).toMatchObject({ did: 'failed', step: 'issue' })
+    expect(harness.settled).toEqual([
+      { commandId: 'cmd-1', ts: 1, outcome: 'failed', error: 'no answer in 2000ms' },
+    ])
+  })
+
+  /**
+   * ═══ THE INVERSION, AND IT IS THE POINT OF THIS WHOLE FILE'S HALF OF IT ═══
+   *
+   * The console's rule is that a failure to record is a failure to act. Here it
+   * is the other way round: the person is ALREADY banned from the guild, the ban
+   * row is what keeps them off the game server, and there is no dialog for
+   * anybody to retry from. The record must never cost the protection.
+   */
+  it('writes the ban anyway when the audit row could not be opened', async () => {
+    const harness = mirrorHarness({ begin: () => Promise.resolve(broke('denied')) })
+    const result = await mirrorEntry(BAN, harness.deps)
+
+    expect(harness.issued).toHaveLength(1)
+    expect(result).toMatchObject({ did: 'ban', outcome: 'issued' })
+  })
+
+  it('says so loudly rather than swallowing it', async () => {
+    const harness = mirrorHarness({ begin: () => Promise.resolve(broke('denied')) })
+    await mirrorEntry(BAN, harness.deps)
+
+    expect(stderr.join('')).toContain('but it went ahead')
+  })
+
+  it('does not try to close a row it never opened', async () => {
+    const harness = mirrorHarness({ begin: () => Promise.resolve(broke('denied')) })
+    await mirrorEntry(BAN, harness.deps)
+
+    expect(harness.settled).toEqual([])
+  })
+
+  /**
+   * A ROW STUCK AT `pending` IS AN HONEST RECORD OF A BOOKKEEPING FAILURE. The
+   * ban happened; turning the failure to say so into an error would invite a
+   * retry of something that already worked.
+   */
+  it('carries on when the outcome could not be stamped on', async () => {
+    const harness = mirrorHarness({ resolve: () => Promise.resolve(broke()) })
+    const result = await mirrorEntry(BAN, harness.deps)
+
+    expect(result).toMatchObject({ did: 'ban', outcome: 'issued' })
+    expect(stderr.join('')).toContain('stays pending')
+  })
+
+  /**
+   * ═══ A REPLAY IS NOT A SECOND ACT ═══
+   *
+   * `bans.issue` is idempotent on the Discord entry id, but it only says so
+   * AFTER the write it is about to skip — by which time an audit row would
+   * already be open, and `ringmaster-audit` is append-only. `reconcileModeration`
+   * replays up to `RECONCILE_LIMIT` bans on a boot with no cursor, so this is the
+   * difference between a clean log and twenty-five duplicate bans dated today.
+   */
+  it('writes no second row for a discord event it has already mirrored', async () => {
+    const harness = mirrorHarness({
+      rows: { [MOD_LICENCE]: banRow({ discordEntryId: BAN.id }) },
+      // The answer `bans.issue` gives for a replay, from its own idempotency
+      // check — which is the answer that arrives too late to act on.
+      issue: () => Promise.resolve(ok({ outcome: 'duplicate-event' as const, ban: banRow() })),
+    })
+    const result = await mirrorEntry(BAN, harness.deps)
+
+    expect(result).toMatchObject({ did: 'ban', outcome: 'duplicate-event' })
+    expect(harness.opened).toEqual([])
+    expect(harness.settled).toEqual([])
+  })
+
+  /**
+   * A DIFFERENT EVENT ABOUT AN ALREADY-BANNED PERSON IS A REAL ACT. A second
+   * admin banning somebody the console had already banned is exactly what the
+   * chronological record is for, even though nothing new is written to the ban
+   * table.
+   */
+  it('records a ban against a row some other event wrote', async () => {
+    const harness = mirrorHarness({
+      rows: { [MOD_LICENCE]: banRow({ discordEntryId: '900000000000000001' }) },
+      issue: () => Promise.resolve(ok({ outcome: 'already-banned' as const, ban: banRow() })),
+    })
+    await mirrorEntry(BAN, harness.deps)
+
+    expect(harness.opened).toHaveLength(1)
+    expect(harness.settled[0]).toMatchObject({ outcome: 'ok' })
+  })
+
+  /**
+   * THE DOUBT FALLS TOWARDS WRITING. An extra row for a replay is noise in a
+   * log; a missing one is a ban nobody can find afterwards.
+   */
+  it('logs the ban again when it could not check for a replay', async () => {
+    const harness = mirrorHarness({ get: () => Promise.resolve(broke()) })
+    await mirrorEntry(BAN, harness.deps)
+
+    expect(harness.opened).toHaveLength(1)
+    expect(harness.issued).toHaveLength(1)
+    expect(stderr.join('')).toContain('already mirrored')
+  })
+
+  /**
+   * NO KEY, NO ROW. The bans table's key depends on the identifier read, so a
+   * row naming a target we had to guess would be a permanent moderation record
+   * pointing at the wrong person.
+   */
+  it('writes nothing at all when the identifier read failed', async () => {
+    const harness = mirrorHarness({ licensesFor: () => Promise.resolve(broke()) })
+    const result = await mirrorEntry(BAN, harness.deps)
+
+    expect(result).toMatchObject({ did: 'failed', step: 'licence' })
+    expect(harness.opened).toEqual([])
+  })
+})
+
+describe('the audit row a mirrored unban leaves behind', () => {
+  const UNBAN = entryOf({ action: 'unban', id: '900000000000009999', reason: 'appealed' })
+  const MIRRORED = banRow({ discordEntryId: '900000000000000001' })
+
+  it('opens the row before the lift and closes it after', async () => {
+    const harness = mirrorHarness({ rows: { [MOD_LICENCE]: MIRRORED } })
+    await mirrorEntry(UNBAN, harness.deps)
+
+    expect(harness.order.slice(0, 4)).toEqual([
+      'bans.get',
+      'audit.begin',
+      'bans.lift',
+      'audit.resolve',
+    ])
+  })
+
+  it('records a ban.lift naming the admin and the target', async () => {
+    const harness = mirrorHarness({ rows: { [MOD_LICENCE]: MIRRORED } })
+    await mirrorEntry(UNBAN, harness.deps)
+
+    expect(harness.opened[0]).toMatchObject({
+      action: 'ban.lift',
+      targetLicense: MOD_LICENCE,
+      reason: 'appealed',
+      actor: { discordId: MOD_ADMIN, name: 'ownername' },
+    })
+    expect(harness.settled[0]).toMatchObject({ outcome: 'ok' })
+  })
+
+  /**
+   * WHAT WAS UNDONE, ON THE ROW THAT UNDID IT. A lift carrying only the unban
+   * reason makes "what was this person banned for" unanswerable without a second
+   * lookup — which is the console's reasoning for the same two fields.
+   */
+  it('carries what the ban was, and which events both halves came from', async () => {
+    const harness = mirrorHarness({ rows: { [MOD_LICENCE]: MIRRORED } })
+    await mirrorEntry(UNBAN, harness.deps)
+
+    expect(harness.opened[0]?.detail).toEqual({
+      originalReason: MIRRORED.reason,
+      bannedAt: MIRRORED.at,
+      discordEntryId: UNBAN.id,
+      liftsEntryId: MIRRORED.discordEntryId,
+    })
+  })
+
+  /**
+   * A ROW ALREADY CARRYING `liftedAt` IS ONE `bans.lift` LEAVES ALONE, so an
+   * audit row in front of that call would describe a lift that did not happen —
+   * once per replayed unban, forever.
+   */
+  it('writes no row for a ban that was already lifted', async () => {
+    const harness = mirrorHarness({
+      rows: { [MOD_LICENCE]: banRow({ discordEntryId: '900000000000000001', liftedAt: 5 }) },
+      lift: () => Promise.resolve(ok({ outcome: 'already-lifted' as const, ban: MIRRORED })),
+    })
+    await mirrorEntry(UNBAN, harness.deps)
+
+    expect(harness.opened).toEqual([])
+  })
+
+  /**
+   * `liftedAt` AND NOT `isBanActive`, and this is the case that tells them apart:
+   * an expired ban that was never lifted is one `bans.lift` still stamps, so it
+   * is a real act and earns its row.
+   */
+  it('records the lift of a ban that had merely expired', async () => {
+    const harness = mirrorHarness({
+      rows: {
+        [MOD_LICENCE]: banRow({ discordEntryId: '900000000000000001', expiresAt: MOD_NOW - 1 }),
+      },
+    })
+    await mirrorEntry(UNBAN, harness.deps)
+
+    expect(harness.opened).toHaveLength(1)
+    expect(harness.lifts).toHaveLength(1)
+  })
+
+  /**
+   * NOTHING LIFTED, NOTHING LOGGED. A console-issued ban is not what the Discord
+   * unban was about, and the refusal already has its own `warn`.
+   */
+  it('writes no row for a ban it refused to lift', async () => {
+    const harness = mirrorHarness({ rows: { [MOD_LICENCE]: banRow() } })
+    await mirrorEntry(UNBAN, harness.deps)
+
+    expect(harness.opened).toEqual([])
+    expect(stderr.join('')).toContain('not created by a discord ban')
+  })
+
+  it('writes no row when there was no ban to lift at all', async () => {
+    const harness = mirrorHarness()
+    await mirrorEntry(UNBAN, harness.deps)
+
+    expect(harness.opened).toEqual([])
+  })
+
+  it('stamps failed when the lift is refused', async () => {
+    const harness = mirrorHarness({
+      rows: { [MOD_LICENCE]: MIRRORED },
+      lift: () => Promise.resolve(broke('conflict')),
+    })
+    const result = await mirrorEntry(UNBAN, harness.deps)
+
+    expect(result).toMatchObject({ did: 'failed', step: 'lift' })
+    expect(harness.settled[0]).toMatchObject({ outcome: 'failed', error: 'no answer in 2000ms' })
+  })
+
+  /**
+   * ONE ROW PER KEY, BECAUSE THEY ARE TWO DECISIONS. Somebody banned under a
+   * `discord:` key who later acquired a license carries two rows, and lifting
+   * them is two acts that can succeed and fail separately.
+   */
+  it('writes one row for each ban it actually lifted', async () => {
+    const harness = mirrorHarness({
+      rows: { [MOD_LICENCE]: MIRRORED, [MOD_DISCORD_KEY]: MIRRORED },
+    })
+    await mirrorEntry(UNBAN, harness.deps)
+
+    expect(harness.opened.map((row) => row.targetLicense)).toEqual([MOD_LICENCE, MOD_DISCORD_KEY])
+    expect(harness.settled.map((row) => row.commandId)).toEqual(['cmd-1', 'cmd-2'])
+  })
+
+  /**
+   * AND THE ADMIN IS LOOKED UP ONCE FOR THE WHOLE ENTRY. Three callers want the
+   * same license for the same admin at the same instant; three round trips would
+   * be three chances for them to disagree, and a failure on the second would put
+   * a license on the ban row and a null on the audit row beside it.
+   */
+  it('asks the identifier index once for the admin, however many keys it lifts', async () => {
+    const asked: string[] = []
+    const harness = mirrorHarness({
+      rows: { [MOD_LICENCE]: MIRRORED, [MOD_DISCORD_KEY]: MIRRORED },
+      licensesFor: (id) => {
+        asked.push(id)
+        return Promise.resolve(ok(id === MOD_DISCORD_KEY ? [MOD_LICENCE] : []))
+      },
+    })
+    await mirrorEntry(UNBAN, harness.deps)
+
+    expect(asked.filter((id) => id === qualifyId('discord', MOD_ADMIN))).toHaveLength(1)
+  })
+
+  /**
+   * AND THE SAME ADMIN IS NAMED THE SAME WAY ON BOTH ROWS. Two rows about one
+   * act that disagree about who did it would be worse than either name alone,
+   * and the registry read is the one that can fail between them.
+   */
+  it('settles the acting admin once for the whole entry', async () => {
+    let looked = 0
+    const harness = mirrorHarness({
+      rows: { [MOD_LICENCE]: MIRRORED, [MOD_DISCORD_KEY]: MIRRORED },
+      licences: {
+        [MOD_DISCORD_KEY]: [MOD_LICENCE],
+        [qualifyId('discord', MOD_ADMIN)]: ['license:aa'],
+      },
+      player: (license) => {
+        looked += 1
+        return Promise.resolve(
+          ok({
+            license,
+            name: 'TheOwner',
+            firstSeen: 1,
+            lastSeen: 2,
+            sessions: 1,
+            playtimeMs: 1,
+          }),
+        )
+      },
+    })
+    await mirrorEntry(entryOf({ action: 'unban', id: UNBAN.id, executorName: null }), harness.deps)
+
+    expect(looked).toBe(1)
+    expect(harness.opened.map((row) => row.actor.name)).toEqual(['TheOwner', 'TheOwner'])
+  })
+
+  it('lifts the ban anyway when the audit row could not be opened', async () => {
+    const harness = mirrorHarness({
+      rows: { [MOD_LICENCE]: MIRRORED },
+      begin: () => Promise.resolve(broke('denied')),
+    })
+    const result = await mirrorEntry(UNBAN, harness.deps)
+
+    expect(harness.lifts).toHaveLength(1)
+    expect(result).toMatchObject({ did: 'unban', lifted: [MOD_LICENCE] })
+    expect(stderr.join('')).toContain('but it went ahead')
   })
 })
 
