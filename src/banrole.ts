@@ -775,28 +775,6 @@ export interface BanRoleStats {
   readonly lastFailureAt: number | null
 }
 
-/**
- * What one `release` did to the role, in the four ways it can end.
- *
- * `cleared` — the role came off, and the tag went with it.
- *
- * `kept` — this bot's own record for the lifted ban was dropped and the ROLE
- *   STAYED ON, because the same Discord account is tagged for another game ban.
- *   The invariant is "the role is on while ANY game ban stands", so this is a
- *   correct outcome and not a partial failure — and it is the one an admin most
- *   needs told, because they will otherwise read the role still being there as
- *   the command not having worked.
- *
- * `not-tagged` — the bot held no record for these keys, so there was nothing of
- *   its to take off. An ordinary answer: most people carrying a game ban were
- *   never in the guild to be marked in the first place.
- *
- * `failed` — the tag row could not be read or written, or the role edit did not
- *   go through. The reconcile pass will try again within five minutes; what
- *   matters here is that the caller does not report success.
- */
-export type ReleaseOutcome = 'cleared' | 'kept' | 'not-tagged' | 'failed'
-
 export interface BanRoleSync {
   /** The boot check on the role. Loud when the role cannot be assigned. */
   check(): void
@@ -808,8 +786,6 @@ export interface BanRoleSync {
   reconcile(): Promise<void>
   /** Somebody joined the guild: mark them if a game ban stands. */
   join(discordId: string): Promise<void>
-  /** A ban has just been lifted by hand: take the role off. See `ReleaseOutcome`. */
-  release(keys: readonly string[]): Promise<ReleaseOutcome>
   stats(): BanRoleStats
 }
 
@@ -1596,88 +1572,12 @@ export function createBanRoleSync(deps: BanRoleDeps): BanRoleSync {
     await saveBook(tags)
   }
 
-  /**
-   * A ban an admin has just lifted by hand: take the role off, and forget it.
-   *
-   * ═══ WHY /unban COMES THROUGH HERE RATHER THAN CALLING `roles.remove` ═══
-   *
-   * The owner's instruction, and it is the whole reason this method exists:
-   * "reuse banrole's own untag path so the role and the bot's tag record stay in
-   * step — do not remove the role behind banrole's back or its book will think
-   * the role is still on." A command that took the role off directly would leave
-   * a tag in `game-ban-role-tags` for a ban that is no longer in force, and the
-   * next reconcile would notice the ban had ended, try to remove a role that is
-   * already gone, get `Unknown Member` or nothing at all, and drop the tag —
-   * harmless in the ordinary case and wrong in the one that matters, because
-   * between the two the book asserts a restriction that is not there.
-   *
-   * `unmark` IS THE PATH, UNCHANGED, so this inherits the two rules that are
-   * easy to get wrong from outside: the role comes off BEFORE the record does
-   * (the mirror image of `mark`, so the failure modes are "role gone, record
-   * kept" and never "record gone, role kept"), and `othersFor` keeps the role on
-   * an account that is tagged for a SECOND game ban that still stands. That
-   * second rule is why this takes a LIST of keys: an account can be banned under
-   * its license and under `discord:<id>` both, /unban lifts both, and asking
-   * about them one at a time in two separate books would let the first call
-   * decide the role must stay because of a tag the second call was about to
-   * drop.
-   *
-   * NOTHING HERE READS OR WRITES A BAN ROW. The lift is the caller's, through
-   * `ddb.bans.lift`, and `BanRoleDeps` deliberately cannot write to
-   * `ringmaster-bans` at all — see there. This method is downstream of a
-   * decision somebody else has already recorded.
-   *
-   * THE BOOK IS OPENED FRESH FROM DYNAMODB, exactly as every other pass does, so
-   * a second `BanRoleSync` built by a command and the background one built at
-   * boot cannot hold two divergent copies of the same row.
-   */
-  async function release(keys: readonly string[]): Promise<ReleaseOutcome> {
-    const tags = await openBook()
-    if (tags === null) return 'failed'
-
-    const held = keys
-      .map((key) => tags.find(key))
-      .filter((entry): entry is TaggedBan => entry !== null)
-
-    if (held.length === 0) return 'not-tagged'
-
-    let cleared = false
-    let kept = false
-    let broke = false
-
-    for (const entry of held) {
-      /**
-       * ASKED BEFORE `unmark` RATHER THAN INFERRED FROM ITS ANSWER. `unmark`
-       * returns `quiet` for two different things — "another ban holds the role"
-       * and "the edit did not go through" — and those are opposite sentences to
-       * an admin. The book already knows which one this is, so it is asked.
-       */
-      const others = tags.othersFor(entry.discordId, entry.key)
-      const step = await unmark(tags, entry)
-
-      if (others) kept = true
-      else if (step === 'edited') cleared = true
-      else broke = true
-    }
-
-    if (!(await saveBook(tags))) broke = true
-
-    // WORST FIRST. A run that both cleared one tag and failed on another has not
-    // finished, and reporting the half that worked would tell an admin the role
-    // is off somebody it is still on.
-    if (broke) return 'failed'
-    if (cleared) return 'cleared'
-
-    return kept ? 'kept' : 'not-tagged'
-  }
-
   return {
     check,
     probe,
     poll,
     reconcile,
     join,
-    release,
     stats: () => ({ tagged, cleared, failed, blocked, lastFailureAt }),
   }
 }

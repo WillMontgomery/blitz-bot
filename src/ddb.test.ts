@@ -1006,7 +1006,13 @@ describe('issuing a ban', () => {
     await ddb.bans.issue({ ...ISSUE, entryId: 'a-second-event' })
 
     const put = fake.calls.find((call) => call.op === 'put')?.input as PutCommandInput
-    expect(put.ConditionExpression).toBe('at = :seenAt')
+    // `at` IS RESERVED IN DYNAMODB, so it has to come through a placeholder.
+    // Naming it directly is what shipped, and DynamoDB refused every write
+    // that replaced an existing ban row with "Invalid ConditionExpression:
+    // Attribute name is a reserved keyword". Asserting the mapping and not
+    // just the string is what makes this a guard rather than a transcription.
+    expect(put.ConditionExpression).toBe('#at = :seenAt')
+    expect(put.ExpressionAttributeNames).toEqual({ '#at': 'at' })
     expect(put.ExpressionAttributeValues).toEqual({ ':seenAt': 1_000 })
   })
 

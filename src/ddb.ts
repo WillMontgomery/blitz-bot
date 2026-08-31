@@ -1314,10 +1314,20 @@ export function createDdb(options: DdbOptions = {}): DdbWithAuditWindow {
           discordEntryId: input.entryId,
         }
 
-        const guard: Pick<PutCommandInput, 'ConditionExpression' | 'ExpressionAttributeValues'> =
+        const guard: Pick<
+          PutCommandInput,
+          'ConditionExpression' | 'ExpressionAttributeNames' | 'ExpressionAttributeValues'
+        > =
           existing
             ? {
-                ConditionExpression: 'at = :seenAt',
+                // `at` IS A RESERVED WORD IN DYNAMODB, so it cannot be named
+                // directly in an expression -- the request comes back "Invalid
+                // ConditionExpression: Attribute name is a reserved keyword".
+                // This shipped and failed in production on the first ban that
+                // replaced an existing row; a first ban takes the other branch
+                // and never touches this one, which is why it looked fine.
+                ConditionExpression: '#at = :seenAt',
+                ExpressionAttributeNames: { '#at': 'at' },
                 ExpressionAttributeValues: { ':seenAt': existing.at },
               }
             : { ConditionExpression: 'attribute_not_exists(license)' }
