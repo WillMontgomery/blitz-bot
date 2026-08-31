@@ -343,12 +343,12 @@ export const DEFAULT_SERVER_IPS = [PRIMARY_SERVER_IP, '18.222.244.205']
  * WHICH ADDRESS A PLAYER IS TOLD TO CONNECT TO.
  *
  * THE FIRST ENTRY OF THE ALLOWLIST, AND NOT A CONSTANT OF ITS OWN. The owner's
- * back-up notice names an address — "Connect: fivem://connect/3.130.92.28" — and
- * the allowlist already holds that string because links.ts needs it to know which
- * `fivem://connect/` target is this community's own. A second literal in the
- * notice would be a copy that nothing keeps in step: move the server, update
- * `BLITZ_SERVER_IPS`, and the announcement that follows the next restart sends
- * every player to the old box.
+ * back-up notice ends by naming an address — "[Click here to connect](fivem://
+ * connect/3.130.92.28)" — and the allowlist already holds that string because
+ * links.ts needs it to know which `fivem://connect/` target is this community's
+ * own. A second literal in the notice would be a copy that nothing keeps in
+ * step: move the server, update `BLITZ_SERVER_IPS`, and the announcement that
+ * follows the next restart sends every player to the old box.
  *
  * FIRST RATHER THAN ANY OTHER RULE, because the allowlist is ordered and the
  * documented order is the community's own: the head is the address people are

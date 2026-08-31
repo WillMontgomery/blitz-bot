@@ -8,7 +8,6 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vite
 
 import type { DdbFailure, DdbResult, MaintenanceState, MaintenanceWindow } from './ddb.ts'
 import {
-  FRESH_TRANSITION_MS,
   MAINTENANCE_POLL_MS,
   maintenanceMemory,
   maintenancePoster,
@@ -20,20 +19,27 @@ import {
 } from './maintenance.ts'
 
 /**
- * The maintenance notices, offline.
+ * The maintenance notice, offline.
  *
  * NOTHING HERE TOUCHES AWS, DISCORD OR A DISK. The row arrives from a fake
  * three lines above the assertion, the channel is an object with a `send` on
  * it, and the memory is a string in a closure — which is possible because
  * `maintenanceWatch` takes all three as options, and is the reason it does.
  *
- * WHAT THIS FILE IS ACTUALLY FOR is not the two sentences the bot posts. It is
- * the far larger set of moments where it must post NOTHING, because every one
- * of those is something the owner said out loud and none of them is visible
- * from reading the happy path:
+ * ═══ THERE IS ONE POST NOW, AND THIS FILE IS MOSTLY ABOUT THE SILENCES ═══
  *
- *   the planning is never announced — `scheduled`, `draining` and `cancelled`
- *   go past in silence, however much the row moves;
+ * "Let's not log any drain action in discord actually… And same for when the
+ * server shuts down. Just post when the server comes back up." So four of the
+ * five states say NOTHING, and that is not a happy path anybody can read off the
+ * one sentence this bot still speaks — it is a set of rules the owner stated out
+ * loud, each of which needs a case:
+ *
+ *   the drain is not announced, and neither is the shutdown — the two notices
+ *   that used to fire there are gone, along with the admin's note, the tag for
+ *   whoever scheduled it, the drain timestamp and the second commit;
+ *
+ *   the planning is not announced either — `scheduled` and `cancelled` go past
+ *   in silence, which was true before the cut and stays true after it;
  *
  *   a window that ran while the bot was down is never caught up on — the audit
  *   trail is the record, and "the server is back" four hours late is worse
@@ -45,7 +51,9 @@ import {
  *   an unreadable row is "cannot see", not "no window" — it changes nothing and
  *   says nothing to the channel;
  *
- *   nobody is ever tagged. The name of whoever scheduled the outage is text.
+ *   nothing routine reaches #bot-status. That channel is fed by log.ts's copy of
+ *   `warn` and `error`, so the LEVEL of every line here is a decision about
+ *   which channel an outage is reported in, and it is asserted as one.
  */
 
 /** The channel from the issue. Recorded so a fake cannot answer for any id. */
@@ -88,19 +96,16 @@ const journal = (): string => [...stdout, ...stderr].join('')
  * ------------------------------------------------------------------ */
 
 const CREATED_AT = 1_756_512_000_000
-const DRAIN_STARTED_AT = CREATED_AT + 300_000
+const DRAIN_STARTS_AT = CREATED_AT + 300_000
 const DEPLOY_STARTED_AT = CREATED_AT + 600_000
 
 /**
  * The clock every case runs against, unless it says otherwise.
  *
  * AN HOUR AFTER THE WINDOW WAS CREATED, WHICH MAKES EVERY FIXTURE ROW STALE BY
- * DEFAULT. Two rules now read the clock — the recency door in
- * `FRESH_TRANSITION_MS` and the grace in `RESTART_GRACE_MS` — and a default
- * `Date.now()` would have made half of this file's answers depend on the real
- * date it ran on. Stale is the conservative default: a case that wants the
- * recency door open has to say so, in the same line as the assertion that
- * depends on it.
+ * DEFAULT. The grace in `RESTART_GRACE_MS` reads the clock, and a default
+ * `Date.now()` would have made those answers depend on the real date the suite
+ * ran on.
  */
 const NOW = CREATED_AT + 3_600_000
 
@@ -111,16 +116,15 @@ const NOW = CREATED_AT + 3_600_000
  * ddb.ts's interface is a DECLARED SUBSET and says so; the console writes
  * another twenty attributes and every one of them arrives on the item. A fake
  * built from the interface alone would be testing a row DynamoDB never returns
- * — and six of these are exactly what the drain notice and the completion gate
- * read.
+ * — and five of these are exactly what the notice and the completion gate read.
  */
 interface RowExtras {
-  drainStartedAt?: number | null
   deployStartedAt?: number | null
   /** Written by the driver when a heartbeat from a NEW process arrives. */
   deployConfirmedAt?: number | null
   /** What the deploy verb returned, when it returned a refusal. */
   deployError?: string | null
+  /** What the deploy actually put on the box. See `runningSha`. */
   deployLandedSha?: string | null
   shownSha?: string | null
   targetSha?: string | null
@@ -139,8 +143,7 @@ function windowRow(
     createdAt: CREATED_AT,
     createdByName: 'Admin One',
     note: 'quick patch, back in five',
-    drainStartsAt: DRAIN_STARTED_AT,
-    drainStartedAt: DRAIN_STARTED_AT,
+    drainStartsAt: DRAIN_STARTS_AT,
     deployMode: 'when-empty',
     deployAt: null,
     deployStartedAt: DEPLOY_STARTED_AT,
@@ -152,13 +155,16 @@ function windowRow(
 
 /**
  * A `complete` row the game has answered on, which is the only kind that
- * produces the back-up notice.
+ * produces a post at all.
  *
  * `deployConfirmedAt` IS WHAT MAKES IT COMPLETE AS FAR AS THIS BOT IS
  * CONCERNED. The console marks the window complete when its deploy verb
  * returns; the owner's rule is that nothing is said until br_ringmaster has
  * delivered its first heartbeat, and this field is the console's durable record
  * that one arrived from a NEW process.
+ *
+ * NO COMMIT ON IT BY DEFAULT, so `BACK_UP` below is the shortest true form of
+ * the notice and the cases that care about the hash add one.
  */
 function confirmedRow(overrides: Partial<MaintenanceWindow> & RowExtras = {}): MaintenanceWindow {
   const completedAt = DEPLOY_STARTED_AT + 30_000
@@ -170,9 +176,25 @@ function confirmedRow(overrides: Partial<MaintenanceWindow> & RowExtras = {}): M
   })
 }
 
-/** The address the back-up notice names, and the line it names it in. */
-const CONNECT = 'The game server is back up and maintenance is complete. Connect: fivem://connect/'
-const BACK_UP = `${CONNECT}3.130.92.28`
+/**
+ * The notice, in his words, as the pieces of it.
+ *
+ * SPELLED OUT HERE AND NOT ASSEMBLED FROM THE MODULE'S OWN CONSTANTS, because
+ * the whole property being tested is that the wording is HIS and unedited. A
+ * string imported from maintenance.ts would agree with whatever that file
+ * happened to say, including a version somebody rephrased.
+ */
+const BACK = 'The game server is back up and maintenance is complete.'
+const connectTo = (ip: string): string => `[Click here to connect](fivem://connect/${ip})`
+const BACK_UP = `${BACK} ${connectTo('3.130.92.28')}.`
+
+/** Where a commit in a maintenance notice has to point. NOT this bot's repo. */
+const GAME_COMMIT = 'https://github.com/WillMontgomery/fivem-br-gamemode/commit/'
+
+/** Forty hex characters, which is the only shape the console writes. */
+const LANDED = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678'
+const PIN = '9876543210fedcba9876543210fedcba98765432'
+const SHOWN = '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c'
 
 const ok = (window: MaintenanceWindow | null): DdbResult<MaintenanceWindow | null> => ({
   ok: true,
@@ -282,7 +304,7 @@ interface WatcherOptions {
    */
   now?: number | (() => number)
 
-  /** The IP allowlist, for the one notice that names an address. */
+  /** The IP allowlist, for the address the notice names. */
   serverIps?: readonly string[]
 }
 
@@ -335,146 +357,79 @@ function at(post: Mock<(content: string) => Promise<void>>, index: number): stri
 }
 
 /* ------------------------------------------------------------------ *
- * The three posts.
+ * The one post.
  * ------------------------------------------------------------------ */
 
-describe('the outage — the three things this bot says', () => {
+describe('the outage — the one thing this bot says', () => {
   /**
-   * ONE WHOLE WINDOW, POLL BY POLL, AND EXACTLY THREE POSTS COME OUT OF IT.
-   * Every other case in this file pins one edge of that; this one is the shape
-   * the owner described, start to finish, and it is the case that would notice
-   * a change making the three notices four.
+   * ONE WHOLE WINDOW, POLL BY POLL, AND EXACTLY ONE POST COMES OUT OF IT.
+   *
+   * THIS CASE USED TO EXPECT THREE. "Let's not log any drain action in discord
+   * actually… We can have the commands but we don't need to post anything when it
+   * happens. And same for when the server shuts down. Just post when the server
+   * comes back up." Every other case in this file pins one edge of that; this one
+   * is the shape he described, start to finish, and it is the case that would
+   * notice a change making the one notice two.
    */
-  it('says three things across a whole window and nothing else', async () => {
+  it('says one thing across a whole window and nothing else', async () => {
     const watch = watcher([
       ok(windowRow('scheduled')),
       ok(windowRow('draining')),
       ok(windowRow('deploying')),
-      ok(confirmedRow()),
+      ok(confirmedRow({ deployLandedSha: LANDED })),
     ])
 
     for (let poll = 0; poll < 4; poll += 1) await watch.check()
 
-    expect(watch.post).toHaveBeenCalledTimes(3)
+    expect(watch.post).toHaveBeenCalledTimes(1)
     expect(at(watch.post, 0)).toBe(
-      'A maintenance window has started and the game server is no longer accepting new players or matches.\nscheduled by Admin One',
+      'The game server is back up and maintenance is complete. ' +
+        `The server is now running [a1b2c3d4](${GAME_COMMIT}${LANDED}). ` +
+        '[Click here to connect](fivem://connect/3.130.92.28).',
     )
-    expect(at(watch.post, 1)).toBe(
-      'the server is going down\nquick patch, back in five\nscheduled by Admin One',
-    )
-    expect(at(watch.post, 2)).toBe(BACK_UP)
   })
 
   /**
-   * THE SECOND WINDOW IS NOT THE FIRST ONE AGAIN. `ringmaster-maintenance` holds
-   * ONE row and the console overwrites it, so the only thing separating this
-   * outage from the last one is `createdAt` — and a bot that keyed on `id`
-   * would key on the literal string `current` and treat every window after the
-   * first as a continuation of it.
-   */
-  it('announces the next window as well as the one before it', async () => {
-    const second = CREATED_AT + 86_400_000
-    const watch = watcher([
-      ok(windowRow('deploying')),
-      ok(windowRow('scheduled', { createdAt: second })),
-      ok(windowRow('deploying', { createdAt: second })),
-    ])
-
-    for (let poll = 0; poll < 3; poll += 1) await watch.check()
-
-    expect(watch.post).toHaveBeenCalledTimes(1)
-    expect(watch.file()).toBe(`${mark('deploying', second)}\n`)
-  })
-
-  it('says the server is going down when the window reaches deploying', async () => {
-    const watch = watcher([ok(windowRow('draining')), ok(windowRow('deploying'))])
-
-    await watch.check()
-    expect(watch.post).not.toHaveBeenCalled()
-
-    await watch.check()
-
-    expect(watch.post).toHaveBeenCalledTimes(1)
-    expect(at(watch.post, 0)).toContain('the server is going down')
-  })
-
-  /**
-   * THE NOTE IS WHAT PLAYERS WERE TOLD AT THE DOOR. The console shows the same
-   * string to anybody refused a connection while the window drains, so the
-   * channel post carrying different words about one outage would be a second
-   * story about it.
-   */
-  it('carries the note the admin wrote', async () => {
-    const row = windowRow('deploying', { note: 'map rotation fix, ten minutes' })
-    const watch = watcher([ok(row)], { seen: mark('draining') })
-
-    await watch.check()
-
-    expect(at(watch.post, 0)).toContain('map rotation fix, ten minutes')
-  })
-
-  it('names whoever scheduled it', async () => {
-    const row = windowRow('deploying', { createdByName: 'Willow' })
-    const watch = watcher([ok(row)], { seen: mark('draining') })
-
-    await watch.check()
-
-    expect(at(watch.post, 0)).toContain('Willow')
-  })
-
-  /**
-   * A NOTE OR A NAME THAT IS NOT THERE IS AN OMITTED LINE, not a blank one and
-   * not a placeholder. The owner's standing rule is that this bot adds no text
-   * nobody asked for, and "no note given" is text nobody asked for.
-   */
-  it('omits the line rather than posting an empty one', async () => {
-    const row = windowRow('deploying', { note: '   ', createdByName: '' })
-    const watch = watcher([ok(row)], { seen: mark('draining') })
-
-    await watch.check()
-
-    expect(at(watch.post, 0)).toBe('the server is going down')
-  })
-
-  /**
-   * THE BACK-UP NOTICE, IN HIS WORDS, WITH NO DURATION IN IT.
+   * ═══ ONE FLOWING PARAGRAPH. THE NEWLINES ARE NOT TO BE PUT BACK ═══
    *
-   * "'The server is back down for 3s' is ridiculous lol." The old notice
-   * computed `completedAt - deployStartedAt` and called it an outage; that
-   * number measured the console's round trip, because `completedAt` is stamped
-   * when the deploy VERB returns and the verb returns as soon as it has
-   * detached the restart. It is gone, and it is not replaced with a better
-   * number: he asked for it dropped.
+   * He asked twice why the notices were "wrapped on multiple lines. That looks so
+   * weird." His wording is flowing sentences, so flowing text is the request
+   * rather than a formatting taste. This is the assertion that fails if somebody
+   * tidies the source by breaking the template literal, or reaches for
+   * `lines.join('\n')` because it reads more neatly in a diff.
    */
-  it('says the server is back up, with the address, and no duration', async () => {
-    const watch = watcher([ok(confirmedRow())], { seen: mark('deploying') })
+  it('is one flowing paragraph and carries no newline at all', async () => {
+    const watch = watcher([ok(confirmedRow({ deployLandedSha: LANDED }))], {
+      seen: mark('deploying'),
+    })
 
     await watch.check()
 
-    expect(at(watch.post, 0)).toBe(
-      'The game server is back up and maintenance is complete. Connect: fivem://connect/3.130.92.28',
-    )
-    expect(at(watch.post, 0)).not.toContain('down for')
+    expect(at(watch.post, 0)).not.toContain('\n')
   })
 
   /**
-   * THE URL IS BARE AND MUST STAY BARE. Discord restricts MASKED links to the
-   * http, https and discord schemes and rejects anything else, in embeds and
-   * components alike — so `[Connect](fivem://…)` does not render as a link at
-   * all, while a plain-text `fivem://` url in ordinary message content does and
-   * launches the game. This assertion exists because the markdown form looks
-   * like an obvious improvement to anybody who has not tried it.
+   * ═══ THE CONNECT LINK IS A MASKED LINK, WHICH IS THE ONE OPEN QUESTION ═══
+   *
+   * HE WROTE IT THAT WAY — "[Click here to connect](fivem:// hyperlink)" — AND IT
+   * SHIPS THAT WAY. Discord documents the masked-link scheme allowlist as http,
+   * https and discord, and rejects a custom scheme in an EMBED and in a BUTTON
+   * COMPONENT; whether it renders in PLAIN MESSAGE CONTENT, which is what this
+   * is, is documented neither way. An earlier version of this file asserted the
+   * opposite — that the markdown form cannot work — and cited the embed rule for
+   * it, which is a rule about a different surface.
+   *
+   * IF IT COMES OUT AS LITERAL BRACKETS HE SEES IT ON THE FIRST CYCLE, and the
+   * fix is `connectLink` returning `fivem://connect/${serverIp}` instead: a bare
+   * url, which is clickable in message content. That is one expression, and this
+   * assertion and the constant above it are what would change with it.
    */
-  it('posts the connect url as plain text and never as a masked link', async () => {
+  it('offers the connect link as the masked link he wrote', async () => {
     const watch = watcher([ok(confirmedRow())], { seen: mark('deploying') })
 
     await watch.check()
 
-    const notice = at(watch.post, 0)
-
-    expect(notice).toContain('fivem://connect/')
-    expect(notice).not.toContain('](fivem:')
-    expect(notice).not.toContain('[')
+    expect(at(watch.post, 0)).toContain('[Click here to connect](fivem://connect/3.130.92.28)')
   })
 
   /**
@@ -490,218 +445,173 @@ describe('the outage — the three things this bot says', () => {
 
     await watch.check()
 
-    expect(at(watch.post, 0)).toBe(`${CONNECT}10.0.0.7`)
+    expect(at(watch.post, 0)).toBe(`${BACK} ${connectTo('10.0.0.7')}.`)
+  })
+
+  /**
+   * THE DURATION IS GONE AND IS NOT REPLACED. "'The server is back down for 3s'
+   * is ridiculous lol." The old notice computed `completedAt - deployStartedAt`
+   * and called it an outage; that number measured the console's round trip,
+   * because `completedAt` is stamped when the deploy VERB returns and the verb
+   * returns as soon as it has detached the restart. He asked for it dropped, so a
+   * truer number is still a number he did not ask for.
+   */
+  it('carries no duration', async () => {
+    const watch = watcher([ok(confirmedRow())], { seen: mark('deploying') })
+
+    await watch.check()
+
+    expect(at(watch.post, 0)).toBe(BACK_UP)
+    expect(at(watch.post, 0)).not.toContain('down for')
+  })
+
+  /**
+   * ═══ WHAT THE DELETED NOTICES CARRIED IS NOT APPENDED TO THIS ONE ═══
+   *
+   * The drain notice held a timestamp and a destination commit; the going-down
+   * notice held the admin's free-text note and a tag for whoever scheduled the
+   * window. He cut both posts, so those four facts have nowhere left to be — and
+   * a fact that was in a message he deleted is not a clause this bot may fold
+   * into the message he kept.
+   *
+   * THE ROW STILL CARRIES THE NOTE AND THE NAME, which is why this is worth
+   * asserting rather than assuming: they are two fields away from any reader in
+   * the file, and a future edit that "restores" either would be reversing a
+   * decision instead of fixing an omission.
+   */
+  it('carries neither the door note nor who scheduled it', async () => {
+    const row = confirmedRow({ note: 'map rotation fix, ten minutes', createdByName: 'Willow' })
+    const watch = watcher([ok(row)], { seen: mark('deploying') })
+
+    await watch.check()
+
+    expect(at(watch.post, 0)).toBe(BACK_UP)
+    expect(at(watch.post, 0)).not.toContain('map rotation fix')
+    expect(at(watch.post, 0)).not.toContain('Willow')
+    expect(at(watch.post, 0)).not.toContain('scheduled by')
+    expect(at(watch.post, 0)).not.toContain('<@')
   })
 })
 
 /* ------------------------------------------------------------------ *
- * The drain notice.
+ * The commit in the notice.
  * ------------------------------------------------------------------ */
 
 /**
- * THE NOTICE THAT REVERSED A RULE.
+ * "THE SERVER IS NOW RUNNING [hash as hyperlink]", WHICH IS HIS MIDDLE CLAUSE.
  *
- * The owner had said post at `deploying` and `complete` and never announce the
- * planning. He now wants the START of the window announced as well, "whether it
- * came from /drain or from the console", carrying the current commit, the commit
- * it is heading for, and who set it going. Every case here is one clause of
- * that.
+ * ONE COMMIT, WHERE THE DELETED NOTICES CARRIED A FROM/TO PAIR. The drain notice
+ * named where the window was heading and the going-down notice sat beside it; his
+ * sentence names one thing, and `runningSha` reads the row in the order that
+ * answers it — what LANDED first, then the destination it was pinned or shown to
+ * be going to.
  */
-describe('the drain notice — the window starting', () => {
-  const STARTED =
-    'A maintenance window has started and the game server is no longer accepting new players or matches.'
-
-  const TIP = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678'
-  const PIN = '9876543210fedcba9876543210fedcba98765432'
-
-  it('says the window has started when the row reaches draining', async () => {
-    const watch = watcher([ok(windowRow('scheduled')), ok(windowRow('draining'))])
-
-    await watch.check()
-    expect(watch.post).not.toHaveBeenCalled()
-
-    await watch.check()
-
-    expect(watch.post).toHaveBeenCalledTimes(1)
-    expect(at(watch.post, 0)).toContain(STARTED)
-  })
+describe('the commit — what the box is running now', () => {
+  const confirmed = (extras: RowExtras): ReturnType<typeof watcher> =>
+    watcher([ok(confirmedRow(extras))], { seen: mark('deploying') })
 
   /**
-   * THE COMMIT IT IS HEADING FOR, OFF THE ROW AND NOT OFF ANYTHING THIS BOT
-   * WORKED OUT. `shownSha` is the destination the console's maintenance page
-   * NAMED when somebody pressed the button — see `MaintenanceWindow.shownSha`
-   * over there, which exists precisely so the claim survives the card that made
-   * it.
+   * `deployLandedSha` IS THE ONLY ONE THAT IS A REPORT RATHER THAN A PLAN, so it
+   * wins. The console nulls it at `schedule` and again at `markDeploying`, so a
+   * value on a `complete` row was written by THIS window's deploy landing — and
+   * `ringmaster-maintenance` holds one row that `schedule` overwrites whole, so
+   * there is nowhere for a stale value from last week to have survived.
    */
-  it('names the commit the window is heading for', async () => {
-    const watch = watcher([ok(windowRow('draining', { shownSha: TIP }))], {
-      seen: mark('scheduled'),
-    })
+  it('prefers what landed over where the window was heading', async () => {
+    const watch = confirmed({ deployLandedSha: LANDED, targetSha: PIN, shownSha: SHOWN })
 
     await watch.check()
 
-    expect(at(watch.post, 0)).toContain('updating to a1b2c3d4')
+    expect(at(watch.post, 0)).toContain(`The server is now running [a1b2c3d4](${GAME_COMMIT}${LANDED}).`)
+    expect(at(watch.post, 0)).not.toContain('98765432')
   })
 
   /**
-   * AND A PINNED SWITCH OUTRANKS IT, WHICH IS THE CONSOLE'S OWN ORDERING.
-   * `targetSha` is a commit the game box ENFORCES — `switchref` refuses if the
-   * branch has moved and `deploy.sh` refuses again — and the route writes
-   * `shownSha` as null for such a window "so a second, weaker commit beside it
-   * cannot invite a comparison against the wrong one". A row carrying both is
-   * not one the console writes; reading the pin first is what makes that
-   * ordering explicit rather than accidental.
+   * AND A PINNED SWITCH OUTRANKS THE PAGE'S OWN READING, which is the console's
+   * ordering. `targetSha` is a commit the game box ENFORCES — `switchref` refuses
+   * if the branch has moved and `deploy.sh` refuses again — and
+   * `POST /api/maintenance` writes `shownSha` as null whenever `targetRef` is set,
+   * precisely so the weaker record cannot be mistaken for the stronger one.
    */
-  it('prefers the pinned commit over the one the page named', async () => {
-    const row = windowRow('draining', { targetSha: PIN, shownSha: TIP })
-    const watch = watcher([ok(row)], { seen: mark('scheduled') })
+  it('falls back to the pinned commit before the one the page named', async () => {
+    const watch = confirmed({ targetSha: PIN, shownSha: SHOWN })
 
     await watch.check()
 
-    expect(at(watch.post, 0)).toContain('updating to 98765432')
-    expect(at(watch.post, 0)).not.toContain('a1b2c3d4')
+    expect(at(watch.post, 0)).toContain(`[98765432](${GAME_COMMIT}${PIN})`)
+    expect(at(watch.post, 0)).not.toContain('0f1e2d3c')
   })
 
-  /**
-   * ABBREVIATED ONLY WHEN IT IS CERTAINLY A COMMIT. Forty hex characters is the
-   * only shape the console ever writes into these fields, and eight is what
-   * every commit card in the console shows — so the two surfaces name one
-   * deploy in one shape. Anything else is printed whole, because a value of an
-   * unexpected shape is not one this bot has any business trimming.
-   */
-  it('prints a value that is not a full commit whole rather than cutting it', async () => {
-    const watch = watcher([ok(windowRow('draining', { shownSha: 'origin/main' }))], {
-      seen: mark('scheduled'),
-    })
+  it('falls back to the commit the console showed when there is nothing else', async () => {
+    const watch = confirmed({ shownSha: SHOWN })
 
     await watch.check()
 
-    expect(at(watch.post, 0)).toContain('updating to origin/main')
+    expect(at(watch.post, 0)).toContain(`[0f1e2d3c](${GAME_COMMIT}${SHOWN})`)
   })
 
   /**
-   * ═══ THE CURRENT COMMIT IS BUILT AND IS ABSENT ON EVERY REAL WINDOW ═══
+   * ═══ AND THE LINK GOES TO THE GAME'S REPO, WHICH IS NOT THIS ONE ═══
    *
-   * `deployLandedSha` is the only commit on this row that was ever OBSERVED on
-   * the game box, and the console writes it at deploy CONFIRMATION — so a window
-   * that is only just draining has never had one, and `schedule()` writes it as
-   * an explicit null besides. The line is built and tested because the day the
-   * console records a running commit at scheduling time this reads it with no
-   * further change; until then the notice names where the server is going and
-   * not where it is.
+   * Every sha on a maintenance row is a commit in `fivem-br-gamemode` — it is what
+   * the game box runs and what `royale-deploy` fetches — and this repo has its own
+   * `REPO_URL` pointing at `blitz-bot` for the deploy notice, three files away.
+   * Building this link on that one produces a URL that resolves, renders and shows
+   * an admin an unrelated commit in a codebase with nothing to do with the deploy
+   * they are reading about, which is worse than no link at all.
    */
-  it('names the running commit when the row carries one', async () => {
-    const watch = watcher([ok(windowRow('draining', { deployLandedSha: PIN, shownSha: TIP }))], {
-      seen: mark('scheduled'),
-    })
+  it('links the commit into the game repo and never into the bot repo', async () => {
+    const watch = confirmed({ deployLandedSha: LANDED })
 
     await watch.check()
 
-    expect(at(watch.post, 0)).toBe(
-      `${STARTED}\nrunning 98765432\nupdating to a1b2c3d4\nscheduled by Admin One`,
-    )
-  })
-
-  /** And an absent commit is an omitted line rather than a blank or a guess. */
-  it('omits both commit lines when the row names neither', async () => {
-    const watch = watcher([ok(windowRow('draining'))], { seen: mark('scheduled') })
-
-    await watch.check()
-
-    expect(at(watch.post, 0)).toBe(`${STARTED}\nscheduled by Admin One`)
-  })
-
-  it('names whoever scheduled it and omits the line when nobody is named', async () => {
-    const named = watcher([ok(windowRow('draining', { createdByName: 'Willow' }))], {
-      seen: mark('scheduled'),
-    })
-
-    await named.check()
-    expect(at(named.post, 0)).toContain('scheduled by Willow')
-
-    const anonymous = watcher([ok(windowRow('draining', { createdByName: '  ' }))], {
-      seen: mark('scheduled'),
-    })
-
-    await anonymous.check()
-    expect(at(anonymous.post, 0)).toBe(STARTED)
+    expect(at(watch.post, 0)).toContain(`(${GAME_COMMIT}${LANDED})`)
+    expect(at(watch.post, 0)).not.toContain('blitz-bot')
   })
 
   /**
-   * THE NOTE IS NOT REPEATED HERE. It rides the going-down notice, and a player
-   * reading both would be told the same sentence twice about one outage.
+   * THE TEXT IS THE SHORT SHA AND THE HREF IS THE FULL ONE. GitHub resolves
+   * either, so the link is built from the unambiguous value and the reader is
+   * shown the eight characters every commit card in the console shows.
    */
-  it('does not repeat the door note the going-down notice carries', async () => {
-    const watch = watcher([ok(windowRow('draining'))], { seen: mark('scheduled') })
+  it('shows eight characters and links the whole commit', async () => {
+    const watch = confirmed({ deployLandedSha: LANDED })
 
     await watch.check()
 
-    expect(at(watch.post, 0)).not.toContain('quick patch, back in five')
+    expect(at(watch.post, 0)).toContain(`[${LANDED.slice(0, 8)}](`)
+    expect(at(watch.post, 0)).toContain(LANDED)
   })
 
   /**
-   * ═══ THE CASE THE WHOLE RECENCY RULE EXISTS FOR ═══
-   *
-   * `/drain` schedules with the drain starting NOW, and `POST /api/maintenance`
-   * ends with `ensureDriver(); void tick()` — the console drives the row it has
-   * just written immediately. So `scheduled` lasts well under a second and this
-   * bot's first sight of a `/drain` is a row that is already `draining`, with no
-   * mark for it. Under the old rule that was silence, and the notice the owner
-   * asked for would have fired only for windows somebody scheduled for later.
+   * ABBREVIATED ONLY WHEN IT IS CERTAINLY A COMMIT, AND LINKED ONLY THEN EITHER.
+   * Forty hex characters is the only shape the console ever writes into these
+   * fields. Anything else is printed whole and BARE: `…/commit/origin/main` is not
+   * a commit URL, and a link that 404s is a promise this bot did not have to make.
    */
-  it('announces a drain that started moments ago even with no mark for it', async () => {
-    const watch = watcher([ok(windowRow('draining'))], { now: DRAIN_STARTED_AT + 9_000 })
+  it('prints a value that is not a full commit whole, and does not link it', async () => {
+    const watch = confirmed({ deployLandedSha: 'origin/main' })
 
     await watch.check()
 
-    expect(watch.post).toHaveBeenCalledTimes(1)
-    expect(at(watch.post, 0)).toContain(STARTED)
+    expect(at(watch.post, 0)).toContain('The server is now running origin/main.')
+    expect(at(watch.post, 0)).not.toContain('github.com')
   })
 
   /**
-   * AND THE DOOR IS ONLY THAT WIDE. A drain runs until the last match finishes,
-   * which can be hours; a bot restarted in the middle of one must not announce a
-   * window an admin watched start forty minutes ago.
+   * AN ABSENT COMMIT COSTS ITS OWN CLAUSE AND NOT THE NOTICE. An automatic
+   * 72-hour window nobody was looking at, or a console whose branch reading was
+   * too old to stand behind, carries no commit at all — and "the game server is
+   * back up and maintenance is complete" followed by the connect link is still the
+   * whole of what he asked to be told.
    */
-  it('says nothing about a drain that started long ago and it never saw', async () => {
-    const watch = watcher([ok(windowRow('draining'))], {
-      now: DRAIN_STARTED_AT + FRESH_TRANSITION_MS + 1,
-    })
+  it('drops the middle clause when the row names no commit', async () => {
+    const watch = confirmed({})
 
     await watch.check()
 
-    expect(watch.post).not.toHaveBeenCalled()
-  })
-
-  /**
-   * A RESTART MID-DRAIN IS NOT A SECOND DRAIN. The mark off disk says this
-   * window was already draining when the process died, so the notice it posted
-   * before the restart is not posted again — whatever the recency rule would say
-   * about the timestamp on its own.
-   */
-  it('does not re-announce a drain it had already announced before a restart', async () => {
-    const watch = watcher([ok(windowRow('draining'))], {
-      seen: mark('draining'),
-      now: DRAIN_STARTED_AT + 9_000,
-    })
-
-    await watch.check()
-
-    expect(watch.post).not.toHaveBeenCalled()
-  })
-
-  /**
-   * THE SAME DOOR FOR THE GOING-DOWN NOTICE, AND FOR THE SAME REASON. A window
-   * that drains on an empty server can go from written to `deploying` inside one
-   * poll, and a bot that refused to speak about it would announce nothing at all
-   * about an outage that was happening while it watched.
-   */
-  it('announces a deploy that started moments ago even with no mark for it', async () => {
-    const watch = watcher([ok(windowRow('deploying'))], { now: DEPLOY_STARTED_AT + 9_000 })
-
-    await watch.check()
-
-    expect(at(watch.post, 0)).toContain('the server is going down')
+    expect(at(watch.post, 0)).toBe(BACK_UP)
+    expect(at(watch.post, 0)).not.toContain('now running')
   })
 })
 
@@ -720,6 +630,10 @@ describe('the drain notice — the window starting', () => {
  * stamps onto this same row when it sees a push from a NEW boot epoch —
  * `ringmaster-telemetry` has no writer at all and the ingest path is in-memory
  * by design, so there is nothing else to read.
+ *
+ * THIS IS THE HALF OF THE OLD FEATURE THE CUT DID NOT TOUCH, and it is why the
+ * one surviving message is worth having: without it the bot would be announcing
+ * that a server is joinable at the moment a deploy script was launched.
  */
 describe('the completion gate — waiting for the game to speak', () => {
   it('says nothing while the row is complete and nothing has confirmed it', async () => {
@@ -858,6 +772,24 @@ describe('the completion gate — waiting for the game to speak', () => {
   })
 
   /**
+   * AND IT IS ONE LINE, like the notice it stands in for. The alarm joined its
+   * two halves with a `\n` while the going-down notice was still stacking lines
+   * above it; "why is anything wrapped on multiple lines" was not a remark about
+   * one post, and this was the last multi-line message in the file.
+   */
+  it('says it on one line, with the reason flowing after it', async () => {
+    const row = windowRow('complete', {
+      completedAt: NOW - 1_000,
+      deployError: 'host refused: no ssh key configured',
+    })
+    const watch = watcher([ok(row)], { seen: mark('deploying') })
+
+    await watch.check()
+
+    expect(at(watch.post, 0)).not.toContain('\n')
+  })
+
+  /**
    * AND AN ALARM IS NOT THE END OF THE STORY. A heartbeat that arrives after the
    * grace has expired is the server coming back, and a channel that said "it has
    * not reported back" and then never mentioned it again is worse than one that
@@ -881,10 +813,13 @@ describe('the completion gate — waiting for the game to speak', () => {
   })
 
   /**
-   * AND `complete` IS NEVER GIVEN THE RECENCY DOOR. The two live notices are
-   * warnings about something happening now; "the server is back up" is a report
-   * about something that finished, and a report is exactly what must not arrive
-   * about a window this process never watched go down.
+   * AND `complete` IS NEVER ANNOUNCED FOR A WINDOW THIS PROCESS DID NOT WATCH.
+   * "The server is back up" is a report about something that finished, and a
+   * report is exactly what must not arrive about an outage that ran while the bot
+   * was being updated. The deleted notices had a recency door — a transition the
+   * ROW timestamped inside the last two minutes was announced by a process that
+   * had not seen it begin — and it was never opened for this one, so it went with
+   * them.
    */
   it('says nothing about a window it never watched, however fresh the confirmation', async () => {
     const watch = watcher([ok(confirmedRow({ completedAt: NOW - 5_000 }))], {
@@ -895,32 +830,95 @@ describe('the completion gate — waiting for the game to speak', () => {
 
     expect(watch.post).not.toHaveBeenCalled()
   })
+
+  /**
+   * DISCORD REJECTS THE WHOLE MESSAGE AT 2000 CHARACTERS, not the overflow, and
+   * `deployError` is the one value left in a post that this repo does not bound:
+   * another codebase writes it out of whatever a shell script or an SSH library
+   * said. The cap moved here off the admin's note when the going-down notice went.
+   */
+  it('caps a console reason that would take the post past what Discord accepts', async () => {
+    const row = windowRow('complete', {
+      completedAt: NOW - 1_000,
+      deployError: 'x'.repeat(5_000),
+    })
+    const watch = watcher([ok(row)], { seen: mark('deploying') })
+
+    await watch.check()
+
+    expect(at(watch.post, 0).length).toBeLessThan(2_000)
+    expect(at(watch.post, 0)).toContain('…')
+  })
+
+  /**
+   * CUT BY CODE POINT, like every other cut in this repo. A UTF-16 slice can land
+   * inside a surrogate pair and put half a character into an announcement.
+   */
+  it('cuts that reason by code point, never through a surrogate pair', async () => {
+    const row = windowRow('complete', {
+      completedAt: NOW - 1_000,
+      deployError: '🎮'.repeat(2_000),
+    })
+    const watch = watcher([ok(row)], { seen: mark('deploying') })
+
+    await watch.check()
+
+    const reason = at(watch.post, 0).split('the console said: ')[1] ?? ''
+    const points = [...reason]
+
+    expect(points.at(-1)).toBe('…')
+    expect(points.slice(0, -1).every((point) => point === '🎮')).toBe(true)
+  })
 })
 
 /* ------------------------------------------------------------------ *
  * The silences.
  * ------------------------------------------------------------------ */
 
-describe('the planning — the two states nothing is ever said about', () => {
+/**
+ * ═══ FOUR OF THE FIVE STATES SAY NOTHING, AND HE CUT TWO OF THEM HIMSELF ═══
+ *
+ * `scheduled` and `cancelled` were always silent: he did not want the planning
+ * announced, and a window that was planned and called off was never an outage.
+ *
+ * `draining` AND `deploying` JOINED THEM AFTER HE WATCHED A FULL CYCLE. "Let's
+ * not log any drain action in discord actually. Sorry for the confusion. We can
+ * have the commands but we don't need to post anything when it happens. And same
+ * for when the server shuts down. Just post when the server comes back up." The
+ * `/drain` command is untouched — it is the POSTING that went — which is why
+ * these cases assert on the channel and not on the row.
+ */
+describe('the four states nothing is ever said about', () => {
+  it.each<MaintenanceState>(['scheduled', 'draining', 'deploying', 'cancelled'])(
+    'says nothing when a window this bot is watching reaches %s',
+    async (state) => {
+      const watch = watcher([ok(windowRow(state))], { seen: mark('scheduled') })
+
+      await watch.check()
+
+      expect(watch.post).not.toHaveBeenCalled()
+    },
+  )
+
   /**
-   * `scheduled` AND `cancelled`, AND THE LIST USED TO HAVE `draining` ON IT.
-   *
-   * IT WAS TAKEN OFF ON THE OWNER'S INSTRUCTION AND NOT BY DRIFT. He had said
-   * post at `deploying` and `complete` and never announce the planning; he has
-   * since asked for the START of the window announced too — "A maintenance
-   * window has started and the game server is no longer accepting new players
-   * or matches" — because that is not the planning, it is the door shutting on
-   * players who are trying to get in right now. The rest of the rule stands,
-   * and this is what holds it: a window that was scheduled for later, or called
-   * off, was never an outage and is never spoken about.
+   * THE DRAIN IS THE ONE HE CHANGED HIS MIND ABOUT, AND THIS IS THE CASE THAT
+   * HOLDS THE SECOND ANSWER. It had a notice of its own — "the server stopped
+   * accepting players and matches", with the moment the door shut and the commit
+   * it was heading for — and a recency door built specifically so a `/drain` the
+   * bot had never seen `scheduled` still produced it. All of that is gone: a fresh
+   * drain with no mark for it now says exactly nothing.
    */
-  it.each<[MaintenanceState, MaintenanceState]>([
-    ['deploying', 'cancelled'],
-    ['draining', 'cancelled'],
-    ['complete', 'scheduled'],
-    ['scheduled', 'cancelled'],
-  ])('says nothing when a window moves from %s to %s', async (from, to) => {
-    const watch = watcher([ok(windowRow(to))], { seen: mark(from) })
+  it('says nothing about a drain that started moments ago', async () => {
+    const watch = watcher([ok(windowRow('draining'))], { now: DRAIN_STARTS_AT + 9_000 })
+
+    await watch.check()
+
+    expect(watch.post).not.toHaveBeenCalled()
+  })
+
+  /** And the same for the shutdown, which had the same door for the same reason. */
+  it('says nothing about a deploy that started moments ago', async () => {
+    const watch = watcher([ok(windowRow('deploying'))], { now: DEPLOY_STARTED_AT + 9_000 })
 
     await watch.check()
 
@@ -928,16 +926,9 @@ describe('the planning — the two states nothing is ever said about', () => {
   })
 
   /**
-   * A CANCELLED WINDOW IS THE CASE THAT MAKES THE RULE WORTH HAVING. A window
-   * scheduled for 3am and called off at 2 says nothing at either end, so the
-   * channel never carries two posts about an outage that did not happen — and
-   * the next real notice in it is read with full attention.
-   *
-   * IT IS CANCELLED FROM `scheduled` RATHER THAN FROM `draining`, which is the
-   * only shape that stays silent now: a window that reached `draining` DID shut
-   * the door, players were turned away, and the notice about that is exactly
-   * the one he asked for. `cancel` in the console refuses anything past
-   * draining anyway.
+   * A CANCELLED WINDOW STILL SAYS NOTHING AT EITHER END, so the channel never
+   * carries a post about an outage that did not happen — and the next real notice
+   * in it is read with full attention.
    */
   it('says nothing about a window that was scheduled and then cancelled', async () => {
     const watch = watcher([
@@ -952,14 +943,18 @@ describe('the planning — the two states nothing is ever said about', () => {
     expect(watch.file()).toBe(`${mark('cancelled')}\n`)
   })
 
+  /**
+   * AND IT STILL RECORDS EVERY ONE OF THEM, WHICH IS LOAD-BEARING AND EASY TO
+   * DELETE. Nothing is posted at `draining`, so a reader could reasonably ask why
+   * the mark is written there at all. The answer is the notice at the other end:
+   * the posting rule is "this window reached `complete` while we were watching",
+   * and the four silent states are the whole of the evidence that we were.
+   */
   it('still records what it watched go past in silence', async () => {
     const watch = watcher([ok(windowRow('draining'))])
 
     await watch.check()
 
-    // Recorded even though nothing was posted, and that is load-bearing: the
-    // posting rule is "this window moved while we were watching", and the
-    // states nothing is said about are what establish that we were watching.
     expect(watch.file()).toBe(`${mark('draining')}\n`)
   })
 
@@ -978,12 +973,12 @@ describe('no catch-up posts — a window the bot did not see begin', () => {
   /**
    * THE CASE THE WHOLE MEMORY EXISTS FOR. The bot is restarted by every update.
    * A window that ran entirely inside one of those restarts is a `createdAt`
-   * this bot has never recorded, and "the server is back" posted hours after
+   * this bot has never recorded, and "the server is back up" posted hours after
    * the fact is the catch-up the owner ruled out — Ringmaster's audit trail is
    * the record of what happened while the bot was not there.
    */
   it('stays silent about a window that ran and finished while the bot was down', async () => {
-    const later = windowRow('complete', {
+    const later = confirmedRow({
       createdAt: CREATED_AT + 86_400_000,
       completedAt: CREATED_AT + 86_700_000,
     })
@@ -995,21 +990,19 @@ describe('no catch-up posts — a window the bot did not see begin', () => {
     expect(watch.file()).toBe(`${mark('complete', CREATED_AT + 86_400_000)}\n`)
   })
 
-  it.each<MaintenanceState>(['deploying', 'complete'])(
-    'stays silent on a first-ever start that finds a window already in %s',
-    async (state) => {
-      const watch = watcher([ok(windowRow(state, { completedAt: DEPLOY_STARTED_AT + 60_000 }))])
+  it('stays silent on a first-ever start that finds a window already complete', async () => {
+    const watch = watcher([ok(confirmedRow())])
 
-      await watch.check()
+    await watch.check()
 
-      expect(watch.post).not.toHaveBeenCalled()
-    },
-  )
+    expect(watch.post).not.toHaveBeenCalled()
+  })
 
   /**
    * THE BASELINE IS ADOPTED, NOT DISCARDED. A bot that came up mid-outage says
-   * nothing about the going-down it slept through — but it is watching now, and
-   * the end of that outage is a transition it sees with its own eyes.
+   * nothing about the shutdown it slept through — it would say nothing about it
+   * anyway now — but it is watching, and the end of that outage is a transition
+   * it sees with its own eyes.
    */
   it('announces the end of an outage it came up in the middle of', async () => {
     const watch = watcher([ok(windowRow('deploying')), ok(confirmedRow())])
@@ -1022,7 +1015,7 @@ describe('no catch-up posts — a window the bot did not see begin', () => {
   })
 
   it('treats a file that does not hold a mark as no memory at all', async () => {
-    const watch = watcher([ok(windowRow('deploying'))], { seen: 'a1b2c3d' })
+    const watch = watcher([ok(confirmedRow())], { seen: 'a1b2c3d' })
 
     await watch.check()
 
@@ -1032,37 +1025,43 @@ describe('no catch-up posts — a window the bot did not see begin', () => {
 
   it.each([
     ['a state that is not one of the five', `${CREATED_AT} deployed`],
-    ['a window that is not a number', 'current deploying'],
+    ['a window that is not a number', 'current complete'],
     ['more than a mark', `${CREATED_AT} deploying and then some`],
     ['nothing at all', '   '],
   ])('treats %s as no memory at all', async (_why, contents) => {
-    const watch = watcher([ok(windowRow('deploying'))], { seen: contents })
+    const watch = watcher([ok(confirmedRow())], { seen: contents })
 
     await watch.check()
 
     expect(watch.post).not.toHaveBeenCalled()
+  })
+
+  /**
+   * THE SECOND WINDOW IS NOT THE FIRST ONE AGAIN. `ringmaster-maintenance` holds
+   * ONE row and the console overwrites it, so the only thing separating this
+   * outage from the last one is `createdAt` — and a bot that keyed on `id` would
+   * key on the literal string `current` and treat every window after the first as
+   * a continuation of it.
+   */
+  it('announces the next window as well as the one before it', async () => {
+    const second = CREATED_AT + 86_400_000
+    const watch = watcher([
+      ok(confirmedRow()),
+      ok(windowRow('deploying', { createdAt: second })),
+      ok(confirmedRow({ createdAt: second })),
+    ])
+
+    for (let poll = 0; poll < 3; poll += 1) await watch.check()
+
+    // Silent on the first, which it never watched begin; the second it did.
+    expect(watch.post).toHaveBeenCalledTimes(1)
+    expect(watch.file()).toBe(`${mark('complete', second)}\n`)
   })
 })
 
 describe('a restart mid-window — the whole job of the state file', () => {
-  /**
-   * THE NOTICE WAS ALREADY POSTED BEFORE THE RESTART. `Restart=always` means a
-   * crash during an outage brings this process back in seconds, and a second
-   * "the server is going down" for the same outage is the noise the owner has a
-   * standing rule against.
-   */
-  it('does not re-announce a going-down it already posted', async () => {
-    const watch = watcher([ok(windowRow('deploying'))], { seen: mark('deploying') })
-
-    await watch.check()
-    await watch.check()
-
-    expect(watch.post).not.toHaveBeenCalled()
-  })
-
   it('does not re-announce a completion it already posted', async () => {
-    const done = windowRow('complete', { completedAt: DEPLOY_STARTED_AT + 60_000 })
-    const watch = watcher([ok(done)], { seen: mark('complete') })
+    const watch = watcher([ok(confirmedRow())], { seen: mark('complete') })
 
     await watch.check()
 
@@ -1071,10 +1070,10 @@ describe('a restart mid-window — the whole job of the state file', () => {
 
   /**
    * THE OTHER HALF: the mark says this bot watched the window go down, so the
-   * outage it announced is one it may finish announcing even though the
+   * outage it was watching is one it may finish announcing even though the
    * `complete` landed while it was restarting.
    */
-  it('still announces the end of the outage it announced the start of', async () => {
+  it('still announces the end of the outage it was watching', async () => {
     const watch = watcher([ok(confirmedRow())], { seen: mark('deploying') })
 
     await watch.check()
@@ -1104,8 +1103,8 @@ describe('a restart mid-window — the whole job of the state file', () => {
    * up.
    */
   it('does not repeat a notice when the mark cannot be written', async () => {
-    const watch = watcher([ok(windowRow('deploying'))], {
-      seen: mark('draining'),
+    const watch = watcher([ok(confirmedRow())], {
+      seen: mark('deploying'),
       unwritable: true,
     })
 
@@ -1118,14 +1117,14 @@ describe('a restart mid-window — the whole job of the state file', () => {
   })
 
   it('says so when the mark cannot be read at all', async () => {
-    const watch = watcher([ok(windowRow('deploying'))], {
+    const watch = watcher([ok(confirmedRow())], {
       seen: new Error('EACCES: permission denied'),
     })
 
     await watch.check()
 
     expect(watch.post).not.toHaveBeenCalled()
-    expect(stderr.join('')).toContain('could not read what maintenance state was last seen')
+    expect(journal()).toContain('could not read what maintenance state was last seen')
   })
 
   /**
@@ -1169,26 +1168,26 @@ describe('an unreadable row is "cannot see", not "no window"', () => {
   /**
    * THE TWO MUST NOT COLLAPSE INTO EACH OTHER. Treating a timeout as an absent
    * window would clear the mark, and the next successful read would then be a
-   * window this bot has never seen — so the outage in progress would go
-   * unannounced AND the notice that it ended would be suppressed as a catch-up.
+   * window this bot has never seen — so the notice that the outage ended would
+   * be suppressed as a catch-up.
    */
   it('changes nothing and posts nothing', async () => {
-    const watch = watcher([failed()], { seen: mark('draining') })
+    const watch = watcher([failed()], { seen: mark('deploying') })
 
     await watch.check()
 
     expect(watch.post).not.toHaveBeenCalled()
     expect(watch.writes()).toBe(0)
-    expect(watch.file()).toBe(`${mark('draining')}\n`)
+    expect(watch.file()).toBe(`${mark('deploying')}\n`)
   })
 
   it('leaves the mark intact, so the notice still lands when the row comes back', async () => {
-    const watch = watcher([failed(), ok(windowRow('deploying'))], { seen: mark('draining') })
+    const watch = watcher([failed(), ok(confirmedRow())], { seen: mark('deploying') })
 
     await watch.check()
     await watch.check()
 
-    expect(at(watch.post, 0)).toContain('the server is going down')
+    expect(at(watch.post, 0)).toBe(BACK_UP)
   })
 
   /**
@@ -1266,7 +1265,7 @@ describe('a channel the bot cannot post in', () => {
    */
   it('says so once and stops', async () => {
     const post = vi.fn(() => Promise.reject(refused))
-    const watch = watcher([ok(windowRow('deploying'))], { seen: mark('draining'), post })
+    const watch = watcher([ok(confirmedRow())], { seen: mark('deploying'), post })
 
     await watch.check()
     await watch.check()
@@ -1291,7 +1290,7 @@ describe('a channel the bot cannot post in', () => {
       return attempts === 1 ? Promise.reject(new Error('rate limited')) : Promise.resolve()
     })
 
-    const watch = watcher([ok(windowRow('deploying'))], { seen: mark('draining'), post })
+    const watch = watcher([ok(confirmedRow())], { seen: mark('deploying'), post })
 
     await watch.check()
     expect(watch.stopped()).toBe(false)
@@ -1300,7 +1299,7 @@ describe('a channel the bot cannot post in', () => {
     await watch.check()
 
     expect(post).toHaveBeenCalledTimes(2)
-    expect(watch.file()).toBe(`${mark('deploying')}\n`)
+    expect(watch.file()).toBe(`${mark('complete')}\n`)
     expect(journal()).toContain('it will be retried')
   })
 
@@ -1311,7 +1310,7 @@ describe('a channel the bot cannot post in', () => {
       return attempts === 1 ? Promise.reject(new Error('rate limited')) : Promise.resolve()
     })
 
-    const watch = watcher([ok(windowRow('deploying'))], { seen: mark('draining'), post })
+    const watch = watcher([ok(confirmedRow())], { seen: mark('deploying'), post })
 
     await watch.check()
     await watch.check()
@@ -1371,53 +1370,65 @@ function channelHarness(options: { sendable?: boolean; missing?: boolean } = {})
   }
 }
 
-describe('the send — named, never tagged', () => {
+describe('the send — nobody is pinged', () => {
   /**
-   * THE OWNER'S RULE, MADE STRUCTURAL. The content carries two strings typed by
-   * a human into the console — a note and a display name — and either can hold
-   * `@everyone` or a raw `<@id>`. Naming who scheduled an outage must never
-   * ping them, and an announcement channel is the worst possible place to find
-   * that out.
+   * ═══ THE SUPPRESSION OUTLIVED THE REASON IT WAS ADDED, ON PURPOSE ═══
+   *
+   * It went in when the going-down notice carried two strings a human had typed
+   * into the console — an admin's note and a display name — and stayed when the
+   * initiator was tagged. Neither exists now: the surviving notice is a fixed
+   * sentence, a commit and an address, and nothing in it is meant to notify
+   * anybody.
+   *
+   * WHICH IS EXACTLY WHY IT IS KEPT RATHER THAN DELETED WITH THEM. It is what
+   * holds the property true whatever a later edit puts in the content, and an
+   * announcement channel is the worst possible place to discover that something
+   * pings.
    */
   it('suppresses every mention on the post', async () => {
     const { client, send } = channelHarness()
 
-    await maintenancePoster(client, MAINTENANCE_CHANNEL)('the server is going down')
+    await maintenancePoster(client, MAINTENANCE_CHANNEL)(BACK_UP)
 
     expect(send).toHaveBeenCalledWith({
-      content: 'the server is going down',
+      content: BACK_UP,
       allowedMentions: { parse: [] },
     })
   })
 
-  it('suppresses them for a note and a name that are trying to ping', async () => {
+  /**
+   * AND IT HOLDS FOR THE ONE STRING IN A POST THAT ANOTHER CODEBASE WROTE. The
+   * console's `deployError` is carried verbatim into the alarm, so it is the one
+   * place text this repo never saw can reach an announcement channel.
+   */
+  it('suppresses them for a console error that is trying to ping', async () => {
     const { client, send, sent } = channelHarness()
-    const row = windowRow('deploying', {
-      note: '@everyone get out',
-      createdByName: '<@280000000000000000>',
+    const row = windowRow('complete', {
+      completedAt: NOW - 1_000,
+      deployError: '@everyone the deploy failed',
     })
 
     const watch = maintenanceWatch({
       read: () => Promise.resolve(ok(row)),
       post: maintenancePoster(client, MAINTENANCE_CHANNEL),
-      memory: fakeMemory({ seen: mark('draining') }).memory,
+      memory: fakeMemory({ seen: mark('deploying') }).memory,
+      now: () => NOW,
     })
 
     await watch.check()
 
     expect(send.mock.calls[0]?.[0].allowedMentions).toEqual({ parse: [] })
 
-    // The text is carried through as text — the name is NAMED, which is what
-    // was asked for — and it is the `allowedMentions` above, not any rewriting
-    // of the content here, that makes it inert.
-    expect(sent[0]).toContain('@everyone get out')
-    expect(sent[0]).toContain('<@280000000000000000>')
+    // The text is carried through as text — the console's own words, unedited —
+    // and it is the `allowedMentions` above, not any rewriting of the content
+    // here, that makes it inert.
+    expect(sent[0]).toContain('@everyone the deploy failed')
   })
 
   it('posts to the channel it was given and no other', async () => {
     const { client, fetched } = channelHarness()
 
-    await maintenancePoster(client, MAINTENANCE_CHANNEL)('the server is back')
+    await maintenancePoster(client, MAINTENANCE_CHANNEL)(BACK_UP)
 
     expect(fetched).toEqual([MAINTENANCE_CHANNEL])
   })
@@ -1430,9 +1441,10 @@ describe('the send — named, never tagged', () => {
     const post = maintenancePoster(client, MAINTENANCE_CHANNEL)
 
     const watch = maintenanceWatch({
-      read: () => Promise.resolve(ok(windowRow('deploying'))),
+      read: () => Promise.resolve(ok(confirmedRow())),
       post,
-      memory: fakeMemory({ seen: mark('draining') }).memory,
+      memory: fakeMemory({ seen: mark('deploying') }).memory,
+      now: () => NOW,
     })
 
     await watch.check()
@@ -1443,58 +1455,20 @@ describe('the send — named, never tagged', () => {
     expect(watch.stopped()).toBe(true)
     expect(stderr.join('')).toContain('maintenance channel unusable')
   })
-
-  /**
-   * DISCORD REJECTS THE WHOLE MESSAGE AT 2000 CHARACTERS, not the overflow. The
-   * note is free text typed into the console's schedule form and nothing
-   * upstream bounds it, so without a cap the single most important post this
-   * feature makes is dropped by the API — invisibly.
-   */
-  it('caps a note that would take the post past what Discord accepts', async () => {
-    const { client, sent } = channelHarness()
-    const row = windowRow('deploying', { note: 'x'.repeat(5_000) })
-
-    const watch = maintenanceWatch({
-      read: () => Promise.resolve(ok(row)),
-      post: maintenancePoster(client, MAINTENANCE_CHANNEL),
-      memory: fakeMemory({ seen: mark('draining') }).memory,
-    })
-
-    await watch.check()
-
-    const content = sent[0] ?? ''
-    expect(content.length).toBeLessThan(2_000)
-    expect(content).toContain('…')
-  })
-
-  /**
-   * CUT BY CODE POINT, like every other cut in this repo. A UTF-16 slice can
-   * land inside a surrogate pair and put half a character into an announcement.
-   */
-  it('cuts a note by code point, never through a surrogate pair', async () => {
-    const { client, sent } = channelHarness()
-    const row = windowRow('deploying', { note: '🎮'.repeat(2_000), createdByName: '' })
-
-    const watch = maintenanceWatch({
-      read: () => Promise.resolve(ok(row)),
-      post: maintenancePoster(client, MAINTENANCE_CHANNEL),
-      memory: fakeMemory({ seen: mark('draining') }).memory,
-    })
-
-    await watch.check()
-
-    const note = (sent[0] ?? '').split('\n')[1] ?? ''
-    const points = [...note]
-
-    expect(points.at(-1)).toBe('…')
-    expect(points.slice(0, -1).every((point) => point === '🎮')).toBe(true)
-  })
 })
 
 describe('the poll loop', () => {
+  /**
+   * The one read `watchMaintenance` wires, and nothing else.
+   *
+   * IT BRIEFLY WIRED TWO. `players.get` was here to turn the initiator's licence
+   * into a Discord tag for the going-down notice; nobody is named in the notice
+   * that survives, so the `Pick` narrowed back — see the block at the foot of this
+   * file, which is where that is asserted rather than assumed.
+   */
   const ddb = (
     answer: DdbResult<MaintenanceWindow | null>,
-  ): { maintenance: { current: () => Promise<DdbResult<MaintenanceWindow | null>> } } => ({
+  ): Parameters<typeof watchMaintenance>[2] => ({
     maintenance: { current: () => Promise.resolve(answer) },
   })
 
@@ -1502,8 +1476,9 @@ describe('the poll loop', () => {
     vi.useFakeTimers()
     const { client, send, fetched, ready } = channelHarness()
 
-    watchMaintenance(client, MAINTENANCE_CHANNEL, ddb(ok(windowRow('deploying'))), {
-      memory: fakeMemory({ seen: mark('draining') }).memory,
+    watchMaintenance(client, MAINTENANCE_CHANNEL, ddb(ok(confirmedRow())), {
+      memory: fakeMemory({ seen: mark('deploying') }).memory,
+      now: () => NOW,
     })
 
     await vi.advanceTimersByTimeAsync(MAINTENANCE_POLL_MS * 3)
@@ -1516,9 +1491,9 @@ describe('the poll loop', () => {
   })
 
   /**
-   * THE FIRST POLL IS IMMEDIATE AND ALWAYS SILENT: it is what establishes the
-   * baseline. Waiting fifteen seconds to do that would only delay the point
-   * from which real transitions are visible.
+   * THE FIRST POLL IS IMMEDIATE AND IS WHAT ESTABLISHES THE BASELINE. Waiting
+   * fifteen seconds to do that would only delay the point from which a real
+   * transition is visible.
    */
   it('polls once immediately and then on the interval', async () => {
     vi.useFakeTimers()
@@ -1584,14 +1559,14 @@ describe('the poll loop', () => {
 
     const current = vi.fn(async () => {
       await held
-      return ok(windowRow('deploying'))
+      return ok(confirmedRow())
     })
 
     watchMaintenance(
       client,
       MAINTENANCE_CHANNEL,
       { maintenance: { current } },
-      { memory: fakeMemory({ seen: mark('draining') }).memory },
+      { memory: fakeMemory({ seen: mark('deploying') }).memory, now: () => NOW },
     )
 
     ready()
@@ -1633,13 +1608,13 @@ describe('the poll loop', () => {
   it('stops polling once the channel has been found unusable', async () => {
     vi.useFakeTimers()
     const { client, ready } = channelHarness({ missing: true })
-    const current = vi.fn(() => Promise.resolve(ok(windowRow('deploying'))))
+    const current = vi.fn(() => Promise.resolve(ok(confirmedRow())))
 
     watchMaintenance(
       client,
       MAINTENANCE_CHANNEL,
       { maintenance: { current } },
-      { memory: fakeMemory({ seen: mark('draining') }).memory },
+      { memory: fakeMemory({ seen: mark('deploying') }).memory, now: () => NOW },
     )
 
     ready()
@@ -1648,6 +1623,117 @@ describe('the poll loop', () => {
     // The latch stops the reads too, not just the posts: a loop that kept
     // reading a table it can never report on is a bill with no output.
     expect(current).toHaveBeenCalledTimes(1)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * Which channel a maintenance window is allowed to appear in.
+ * ------------------------------------------------------------------ */
+
+/**
+ * ═══ "A MAINTENANCE WINDOW DOES NOT NEED TO WRITE TO #bot-status" ═══
+ *
+ * "…since it's already writing to #maintenance-notifications." He said it after
+ * watching a full drain cycle, and the mechanism is log.ts: `warn` and `error`
+ * are COPIED to the status channel and `info` is not, so the level of a line in
+ * this module is a decision about which Discord channel it lands in. That is why
+ * these are assertions about `stderr` and `stdout` rather than about text — the
+ * journal keeps every line either way, and the stream is the part that decides
+ * whether it also reaches him.
+ *
+ * THE THREE LINES AT `info` ARE THE BOT'S OWN BOOKKEEPING about the state file:
+ * unreadable, unparseable, unwritable. None of them is the bot failing at what it
+ * is FOR — it can still see the window and still post the notice — and the whole
+ * consequence is that a restart in the next few minutes could repeat ONE notice.
+ *
+ * TWO STAY ABOVE IT, AND THEY ARE THE TWO HE NAMED AS EXCEPTIONS: a window this
+ * bot could not READ, and a notice it could not POST. Neither is maintenance
+ * progress. Both mean an outage may go unannounced, which is the one failure in
+ * this feature that is completely invisible from Discord — a notice that never
+ * landed looks exactly like a window that never happened.
+ */
+describe('the status channel — what a maintenance window may put in front of him', () => {
+  it('says nothing to the status channel across a whole window', async () => {
+    const watch = watcher(
+      [
+        ok(windowRow('scheduled')),
+        ok(windowRow('draining')),
+        ok(windowRow('deploying')),
+        ok(confirmedRow()),
+      ],
+      // Unwritable, which is the condition that used to make this the noisiest
+      // path in the module: one warn per transition, three per window.
+      { unwritable: true },
+    )
+
+    for (let poll = 0; poll < 4; poll += 1) await watch.check()
+
+    expect(watch.post).toHaveBeenCalledTimes(1)
+    expect(stderr.join('')).toBe('')
+  })
+
+  it.each([
+    [
+      'the state file cannot be written',
+      { unwritable: true } as WatcherOptions,
+      'could not record the maintenance state',
+    ],
+    [
+      'the state file cannot be read',
+      { seen: new Error('EACCES: permission denied') } as WatcherOptions,
+      'could not read what maintenance state was last seen',
+    ],
+    [
+      'the state file holds something that is not a mark',
+      { seen: 'a1b2c3d' } as WatcherOptions,
+      'does not hold a mark',
+    ],
+  ])('keeps the journal and not the channel when %s', async (_why, options, line) => {
+    const watch = watcher([ok(windowRow('draining')), ok(windowRow('deploying'))], {
+      seen: mark('scheduled'),
+      ...options,
+    })
+
+    await watch.check()
+    await watch.check()
+
+    expect(stdout.join('')).toContain(line)
+    expect(stderr.join('')).toBe('')
+  })
+
+  /**
+   * THE FIRST OF THE TWO EXCEPTIONS. A minute of failed reads means the bot
+   * cannot see maintenance at all, and the outage it is blind to is one nobody
+   * will notice went unannounced.
+   */
+  it('reaches the channel when it cannot read the window at all', async () => {
+    const watch = watcher([failed()])
+
+    // Four, which is a minute of them. One failed read is a poll rather than a
+    // problem and stays on `info`; see `MAINTENANCE_BLIND_POLLS`.
+    for (let poll = 0; poll < 4; poll += 1) await watch.check()
+
+    expect(stderr.join('')).toContain('an outage may go unannounced')
+  })
+
+  /**
+   * THE SECOND. A channel this bot cannot post in has stopped the whole feature
+   * permanently, and it is the one fault that cannot be reported in the channel
+   * it is about.
+   */
+  it('reaches the channel when it cannot post the notice at all', async () => {
+    const { client } = channelHarness({ missing: true })
+
+    const watch = maintenanceWatch({
+      read: () => Promise.resolve(ok(confirmedRow())),
+      post: maintenancePoster(client, MAINTENANCE_CHANNEL),
+      memory: fakeMemory({ seen: mark('deploying') }).memory,
+      now: () => NOW,
+    })
+
+    await watch.check()
+
+    expect(stderr.join('')).toContain('maintenance channel unusable')
   })
 })
 
@@ -1664,19 +1750,22 @@ describe('what this module is allowed to touch', () => {
    * maintenance lifecycle and owns the consequences of moving it; a Discord bot
    * that could mark a window complete would be a second, less careful
    * implementation of a path that stops a live server.
+   *
+   * ONE READ AGAIN, AND `players` IS BACK ON THE FORBIDDEN LIST. It was legitimate
+   * for exactly as long as the going-down notice tagged whoever scheduled the
+   * window; nobody is named in the notice that survives, so a lookup against the
+   * player registry from this file would be a read with nothing to answer.
    */
   it('asks the data layer for exactly one thing', async () => {
     const current = vi.fn(() => Promise.resolve(ok(windowRow('draining'))))
 
-    // Everything else on the Ddb throws if it is reached at all. The type only
-    // offers `maintenance`; this is the second lock, for a cast that got past
-    // it.
     const forbidden = (name: string): never => {
       throw new Error(`maintenance.ts must not call ${name}`)
     }
 
     const ddb = {
       maintenance: { current },
+      players: { get: () => forbidden('players.get') },
       audit: {
         begin: () => forbidden('audit.begin'),
         resolve: () => forbidden('audit.resolve'),
@@ -1684,6 +1773,11 @@ describe('what this module is allowed to touch', () => {
       },
       botState: { get: () => forbidden('botState.get'), put: () => forbidden('botState.put') },
       bans: { get: () => forbidden('bans.get') },
+      playerIds: { licensesFor: () => forbidden('playerIds.licensesFor') },
+      gamePlayers: {
+        profile: () => forbidden('gamePlayers.profile'),
+        matches: () => forbidden('gamePlayers.matches'),
+      },
     }
 
     const { client, ready } = channelHarness()
@@ -1777,11 +1871,11 @@ describe('where the mark is kept', () => {
 
       await expect(memory.seen()).rejects.toMatchObject({ code: 'ENOENT' })
 
-      await memory.remember(mark('deploying'))
+      await memory.remember(mark('complete'))
 
       // The trailing newline is deliberate, like the reported-commit file
       // beside it: `cat` of this should not run into the next prompt.
-      await expect(memory.seen()).resolves.toBe(`${mark('deploying')}\n`)
+      await expect(memory.seen()).resolves.toBe(`${mark('complete')}\n`)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

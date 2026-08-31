@@ -8,58 +8,80 @@ import type { Ddb, DdbResult, MaintenanceState, MaintenanceWindow } from './ddb.
 import { log } from './log.ts'
 
 /**
- * THE OUTAGE, ANNOUNCED IN A CHANNEL PLAYERS READ — AND NOTHING ELSE.
+ * THE SERVER COMING BACK, ANNOUNCED ONCE. NOTHING ELSE IS ANNOUNCED AT ALL.
  *
- * The console already runs the whole maintenance lifecycle: an admin schedules
- * a window, the server stops letting people in, it deploys, it comes back. All
- * of that is in `ringmaster-maintenance` and all of it is visible in the
- * console. What was missing is the half that reaches somebody who is not
- * looking at the console — a player who tries to connect and cannot, or who is
- * dropped mid-match and does not know whether to wait five minutes or give up.
+ * The console runs the whole maintenance lifecycle: an admin schedules a window,
+ * the server stops letting people in, it deploys, it comes back. All of that is
+ * in `ringmaster-maintenance` and all of it is visible in the console. This file
+ * carries exactly one moment of it into a channel players read.
  *
- * THREE POSTS PER WINDOW, AND THE OWNER PICKED WHICH THREE. Into `draining`:
- * a maintenance window has started and nobody new is getting in. Into
- * `deploying`: the server is going down. Into a CONFIRMED `complete`: the
- * server is back and here is the address. `scheduled` and `cancelled` post
- * NOTHING — he does not want the planning announced. That is not an oversight
- * to be helpfully filled in later: a channel that also carried "a window has
- * been scheduled for 3am" and then "it was cancelled" is a channel that has
- * said two things about an outage that never happened, and the next real
- * notice in it is read with that much less attention.
+ * ═══ ONE POST PER WINDOW, AND THE CUT IS THE OWNER'S ═══
  *
- * ═══ THE DRAIN NOTICE REVERSES AN EARLIER RULE, ON PURPOSE ═══
+ * He watched a full cycle and then said it: "Let's not log any drain action in
+ * discord actually. Sorry for the confusion. We can have the commands but we
+ * don't need to post anything when it happens. And same for when the server
+ * shuts down. Just post when the server comes back up."
  *
- * This file used to post at `deploying` and `complete` and nowhere else, under
- * his instruction that the planning was not to be announced. He has since said
- * the opposite about one of the three: the START of the window is to be
- * announced too, "whether it came from /drain or from the console", in his
- * words — "A maintenance window has started and the game server is no longer
- * accepting new players or matches." That is not the planning; it is the moment
- * the door shuts, which a player hits as a refused connection. `scheduled` and
- * `cancelled` are still silent, and that half of the old rule stands.
+ * So `scheduled`, `draining`, `deploying` and `cancelled` are watched, recorded
+ * and never spoken about. THAT IS FOUR OF THE FIVE STATES SILENT, and the four
+ * are silent for one reason rather than four: a channel that narrates an outage
+ * from both ends is a channel somebody scrolls past, and the post that actually
+ * matters — the server is joinable again — is the one that then gets scrolled
+ * past with it.
  *
- * ═══ AND `complete` NO LONGER MEANS THE SERVER IS ANSWERING ═══
+ * ═══ WHAT WENT WITH THE OTHER TWO NOTICES ═══
  *
+ * This file used to post at `draining` and at `deploying` as well, and a stack
+ * of machinery existed only to fill those two sentences in: the initiator's
+ * licence resolved through `ringmaster-players` into a Discord id so the person
+ * who scheduled the window could be tagged, the admin's free-text note, a
+ * timestamp for the moment the door shut, and a from/to pair of commits. Every
+ * one of those is gone with the sentences that held it. NOBODY IS NAMED IN THE
+ * MESSAGE THAT SURVIVES, so there is nothing left to resolve a licence for —
+ * which is also why the data access below narrowed back to one table.
+ *
+ * ═══ AND `complete` STILL DOES NOT MEAN THE SERVER IS ANSWERING ═══
+ *
+ * This is the reason the surviving message is worth trusting, and it is the one
+ * piece of the old machinery that had nothing to do with the deleted notices.
  * "The maintenance complete message should NEVER show until br_ringmaster has
- * delivered its first heartbeat." The console marks a window `complete` when
- * the deploy VERB returns, which is the moment `royale-deploy` has been kicked
- * off rather than the moment FXServer is back — so "the server is back" used to
- * land over a box that was still down. See `heartbeatAfterDeploy` for the one
- * field on this row that can prove the game is speaking again, and
- * `RESTART_GRACE_MS` for what is said when it never does.
+ * delivered its first heartbeat." The console marks a window `complete` when the
+ * deploy VERB returns, which is the moment `royale-deploy` has been kicked off
+ * rather than the moment FXServer is back — so "the server is back up" would
+ * otherwise land over a box that is still down, which is the exact failure the
+ * one remaining post exists to not have.
  *
- * NAMED, NEVER TAGGED. `createdByName` is a plain display name and goes into
- * the post as text; nothing here mentions, pings or resolves anybody. The
- * owner's rule, and `post` states it at the send rather than trusting a
- * client-wide default that any other send can replace.
+ * See `heartbeatAfterDeploy` for the one field on this row that can prove the
+ * game is speaking again, and `RESTART_GRACE_MS` for what is said when it never
+ * does. A wait with no end is silence, and a server that never came back is
+ * exactly what an admin needs to know.
  *
- * READS ONLY. This module calls exactly one thing on the data layer —
- * `maintenance.current()`, a GetItem against one row — and the parameter type
- * below is `Pick<Ddb, 'maintenance'>` so that is not a promise in a comment.
+ * ═══ THE COMMIT LINKS INTO THE GAME'S REPO, NOT INTO THIS ONE ═══
+ *
+ * Every sha on a maintenance row is a commit in `fivem-br-gamemode`, NOT in
+ * blitz-bot: they are what the game box is running and what `royale-deploy` is
+ * fetching. See `GAME_REPO_URL`. Linking them at client.ts's `REPO_URL` would
+ * produce a link that works, looks right, and shows an admin an unrelated commit
+ * in the wrong codebase.
+ *
+ * ═══ NOTHING ROUTINE HERE REACHES #bot-status ═══
+ *
+ * "A maintenance window does not need to write to #bot-status since it's already
+ * writing to #maintenance-notifications." log.ts copies `warn` and `error` to the
+ * status channel and `info` to nothing, so the level IS the choice of channel.
+ * Everything that is maintenance PROGRESS is `info`. Two things are not progress
+ * and stay above it: a window this bot could not READ (`blind`) and a notice it
+ * could not POST (`check`). Those are the bot failing, not maintenance
+ * happening, and they are the only two reasons a maintenance window is allowed
+ * to appear in the status channel at all.
+ *
+ * READS ONLY, AND NOW EXACTLY ONE READ. This module calls one thing on the data
+ * layer — `maintenance.current()`, a GetItem against one row — and the parameter
+ * type below is `Pick<Ddb, 'maintenance'>` so that is not a promise in a comment.
  * Nothing here writes a Ringmaster table. The console owns this lifecycle and
  * owns the consequences of moving it; a Discord bot that could mark a window
- * complete would be a second, less careful implementation of a path that stops
- * a live server.
+ * complete would be a second, less careful implementation of a path that stops a
+ * live server.
  *
  * A GETITEM ON A TIMER RATHER THAN A STREAM OR A WEBHOOK. DynamoDB Streams
  * would be exact and would need a Lambda, an IAM role and a second deployable;
@@ -73,13 +95,8 @@ import { log } from './log.ts'
  * How often the row is read.
  *
  * FIFTEEN SECONDS IS A LATENCY BUDGET, NOT A COST ONE. The read is trivially
- * cheap either way; what it buys is how stale "the server is going down" is
- * allowed to be by the time it lands, and a notice that arrives after the
- * server has already dropped everybody is not a warning, it is an epitaph.
- *
- * IT IS ALSO THE WIDTH OF THE ONE RACE THIS MODULE CANNOT WIN — see
- * `noticeFor`, where a window that is created AND deployed inside a single
- * interval is silent.
+ * cheap either way; what it buys is how long a server that is already back stays
+ * unannounced while players sit at a connect screen deciding whether to give up.
  */
 export const MAINTENANCE_POLL_MS = 15_000
 
@@ -119,40 +136,11 @@ const MAINTENANCE_BLIND_POLLS = 4
 export const RESTART_GRACE_MS = 5 * 60_000
 
 /**
- * How recently a transition must have happened to be announced by a bot that
- * did not watch it arrive.
- *
- * ═══ WHY THIS EXISTS AT ALL ═══
- *
- * `noticeFor`'s oldest rule is that a window this bot has no mark for is never
- * announced, because it cannot tell a window that started a second ago from one
- * that ran while the process was down. That rule alone would have made the
- * drain notice fire almost never. `POST /api/maintenance` ends with
- * `ensureDriver(); void tick()` — the console drives the window it has just
- * written IMMEDIATELY — and `/drain` schedules with the drain starting now, so
- * the `scheduled` state exists for well under a second and this bot's very
- * first sight of a `/drain` is a row that is ALREADY `draining`. A rule that
- * required having seen the state before would have shipped a notice that only
- * lands for windows somebody scheduled for later.
- *
- * SO RECENCY REPLACES MEMORY, AND ONLY FOR THE TWO LIVE STATES. A window that
- * began draining thirty seconds ago is happening NOW whether or not this
- * process watched it start, and saying so is a warning rather than a history
- * lesson. `complete` is deliberately NOT given this door: "the server is back"
- * about a window the bot never saw go down is the catch-up post the owner ruled
- * out, and it is the one notice that can be hours late without looking it.
- *
- * TWO MINUTES IS EIGHT POLLS, WHICH IS THE POINT OF THE SIZE. It has to be
- * several intervals wide or an ordinary poll landing at the wrong moment would
- * miss the transition it exists to catch; and it has to be far shorter than a
- * drain, which waits for the last match to finish and can run for hours, so
- * that a bot restarted mid-window announces nothing an admin watched happen
- * half an hour ago.
- */
-export const FRESH_TRANSITION_MS = 120_000
-
-/**
  * The five states, as values, so a string off disk can be checked against them.
+ *
+ * ALL FIVE, THOUGH ONLY ONE OF THEM IS EVER ANNOUNCED. The mark records what was
+ * SEEN and not what was posted — see `Mark` — so the four silent states are as
+ * much a part of this list as `complete` is.
  *
  * TYPED AS THE UNION, so a sixth state added to ddb.ts and forgotten here is a
  * compile error rather than a mark that silently stops parsing.
@@ -177,16 +165,15 @@ function isState(raw: string): raw is MaintenanceState {
  * The last thing this bot SAW, which is deliberately more than the last thing
  * it POSTED.
  *
- * WHY OBSERVED AND NOT POSTED, since only two of the five states are ever
- * posted about. The posting rule below is "this window moved while we were
- * watching", and answering that needs the states nothing is said about as much
- * as the two that are. Consider a window recorded only when it is announced:
- * the mark still names LAST week's window while this one runs through
- * `scheduled` and `draining` under our nose, so when it reaches `deploying`
- * the mark disagrees about which window this is and the notice — the one post
- * that actually matters — is suppressed as a catch-up. Recording every
- * observation is what makes "we watched this window arrive" a fact the file
- * can carry.
+ * WHY OBSERVED AND NOT POSTED, AND IT MATTERS MORE NOW THAN IT EVER DID. Only
+ * one of the five states is posted about, and the posting rule is "this window
+ * moved to `complete` while we were watching" — which is a question about the
+ * four states nothing is said about. Consider a window recorded only when it is
+ * announced: the mark still names LAST week's window while this one runs through
+ * `scheduled`, `draining` and `deploying` under our nose, so when it reaches
+ * `complete` the mark disagrees about which window this is and the one post this
+ * feature makes is suppressed as a catch-up. Recording every observation is what
+ * makes "we watched this window arrive" a fact the file can carry.
  *
  * THE WINDOW IS IDENTIFIED BY `createdAt`, NOT BY `id`. `id` is the table's
  * key and it is the literal string `current` on every row there will ever be —
@@ -281,52 +268,76 @@ function parseMark(raw: string): Mark | null {
  * ------------------------------------------------------------------ */
 
 /**
- * The owner's words, and the whole of what this bot says.
+ * The owner's sentence, and the whole of what this bot says.
  *
- * VERBATIM, AND THE CONSTANTS ARE WHERE THAT IS ENFORCED. Everything else in a
- * post is a field off the row — the note the admin typed, the name of whoever
- * scheduled it, the commit the console recorded. No sentence here was invented
- * by this bot, and the one frame that has no wording from him yet says so in
- * the string itself; see `NOT_BACK`.
- */
-const DRAIN_STARTED =
-  'A maintenance window has started and the game server is no longer accepting new players or matches.'
-
-const GOING_DOWN = 'the server is going down'
-
-/**
- * The back-up notice, and the address is not a second copy of anything.
+ * ═══ HIS WORDING, VERBATIM, WITH TWO HOLES IN IT ═══
  *
- * HIS WORDING, AND THE DURATION IS GONE. This used to read "the server is back"
- * followed by "down for 3s", computed off `completedAt - deployStartedAt`. His
- * verdict: "'The server is back down for 3s' is ridiculous lol." The arithmetic
- * was never the problem — `completedAt` is stamped when the deploy VERB
- * returns, seconds after it detaches `royale-deploy` and long before FXServer is
- * back, so the number was measuring the console's round trip and calling it an
- * outage. The gate below now waits for the game itself, and the duration is not
- * replaced by a better one: he asked for it dropped and a truer number is still
- * a number he did not ask for.
+ * "The game server is back up and maintenance is complete. The server is now
+ * running [hash as hyperlink]. [Click here to connect](fivem:// hyperlink)."
  *
- * ═══ THE URL IS BARE, AND THAT IS A DISCORD CONSTRAINT RATHER THAN A STYLE ═══
+ * NO SENTENCE HERE WAS INVENTED BY THIS BOT. The two holes are a commit off the
+ * row and an address off the allowlist, and the one frame that has no wording
+ * from him yet says so in the string itself; see `NOT_BACK`.
  *
- * DO NOT "TIDY" THIS INTO `[Connect](fivem://connect/…)`. Discord restricts
- * MASKED links to the http, https and discord schemes and rejects anything else
- * — in embeds and in components alike — so the markdown form does not render as
- * a link at all. A PLAIN-TEXT `fivem://` url in ordinary message content IS
- * clickable and does launch the game. So the url is posted as text on purpose,
- * and this paragraph is here because the alternative looks like an obvious
- * improvement to anybody who has not tried it.
+ * ═══ ONE FLOWING PARAGRAPH. THE NEWLINES ARE NOT TO BE PUT BACK ═══
  *
- * THE ADDRESS COMES FROM THE ALLOWLIST. `connectIp` reads the head of
- * `BLITZ_SERVER_IPS`, which links.ts already uses to decide whose server a
- * `fivem://connect/` link points at. A literal here would be the same string
- * written down twice, and the day the community moves boxes one of the two
- * copies gets updated.
+ * He asked twice why the old notices were "wrapped on multiple lines. That looks
+ * so weird." His wording is flowing sentences, so it is built as flowing text: a
+ * `\n` inserted between the clauses to make the source or the post look tidy
+ * re-creates the stack he objected to. That is why this is one template literal
+ * and not a `lines.join('\n')`, and why the optional middle clause carries its
+ * own leading space so dropping it leaves the punctuation intact.
+ *
+ * ═══ THE DURATION IS GONE AND IS NOT COMING BACK ═══
+ *
+ * This used to be followed by "down for 3s", computed off
+ * `completedAt - deployStartedAt`. His verdict: "'The server is back down for 3s'
+ * is ridiculous lol." The arithmetic was never the problem — `completedAt` is
+ * stamped when the deploy VERB returns, seconds after it detaches
+ * `royale-deploy` and long before FXServer is back, so the number was measuring
+ * the console's round trip and calling it an outage. The gate below now waits for
+ * the game itself, and the duration is not replaced by a better one: he asked for
+ * it dropped and a truer number is still a number he did not ask for.
  */
 const BACK = 'The game server is back up and maintenance is complete.'
 
-function backUp(serverIp: string): string {
-  return `${BACK} Connect: fivem://connect/${serverIp}`
+/**
+ * The connect link, in his markdown as well as his words.
+ *
+ * ═══ THE ONE THING IN THIS NOTICE NOBODY CAN SETTLE OFFLINE ═══
+ *
+ * HE WROTE IT AS A MASKED LINK — "[Click here to connect](fivem:// hyperlink)" —
+ * AND IT SHIPS THAT WAY ON PURPOSE. Discord documents the masked-link scheme
+ * allowlist as http, https and discord, and rejects a custom scheme in an EMBED
+ * and in a BUTTON COMPONENT. Whether `fivem://` behind `[text](…)` renders in
+ * PLAIN MESSAGE CONTENT, which is what this is, is documented neither way. An
+ * earlier version of this file asserted flatly that it does not and cited the
+ * embed rule as the proof, which is a rule about a different surface.
+ *
+ * SO THE FIRST CYCLE ANSWERS THE QUESTION AND THE FALLBACK IS ONE EXPRESSION.
+ * If it renders as literal brackets he sees it in the channel immediately, and
+ * the whole fix is the return below becoming `fivem://connect/${serverIp}` — a
+ * bare url, which IS clickable in message content and does launch the game.
+ * Nothing else in the notice moves. That is the reason the link is a function of
+ * its own rather than spelled into the sentence: the change has to be small
+ * enough to make on the evidence of one post.
+ *
+ * THE ADDRESS COMES FROM THE ALLOWLIST AND NOT FROM A LITERAL HERE. `connectIp`
+ * reads the head of `BLITZ_SERVER_IPS`, which links.ts already uses to decide
+ * whose server a `fivem://connect/` link points at. A second copy in this file is
+ * the copy that does not get updated the day the community moves boxes.
+ */
+function connectLink(serverIp: string): string {
+  return `[Click here to connect](fivem://connect/${serverIp})`
+}
+
+function backUp(window: MaintenanceWindow, serverIp: string): string {
+  const sha = runningSha(window)
+  const running = sha === null ? '' : ` The server is now running ${commitLink(sha)}.`
+
+  // One line, deliberately over the width the rest of this file keeps to. See
+  // `BACK`: breaking the literal is how the newlines get back in.
+  return `${BACK}${running} ${connectLink(serverIp)}.`
 }
 
 /**
@@ -342,27 +353,35 @@ function backUp(serverIp: string): string {
  * reason /drain shows a refusal verbatim: this bot cannot know better than the
  * thing that tried the deploy, and a house summary of somebody else's error is
  * a worse copy of it.
+ *
+ * ONE LINE, LIKE THE NOTICE ABOVE IT. This used to join its two halves with a
+ * `\n` and it was the last multi-line message left in the file once the drain
+ * and going-down notices went. "Why is anything wrapped on multiple lines" was
+ * not a remark about one post.
  */
 const NOT_BACK = 'PLACEHOLDER: the update finished but the game server has not reported back.'
 
 function didNotConfirm(reason: string | null): string {
-  return reason === null ? NOT_BACK : `${NOT_BACK}\nPLACEHOLDER: the console said: ${reason}`
+  return reason === null
+    ? NOT_BACK
+    : `${NOT_BACK} PLACEHOLDER: the console said: ${capped(reason, REASON_CAP)}`
 }
 
 /**
- * How much of the admin's note is carried.
+ * How much of the console's stated reason is carried.
  *
  * A CAP BECAUSE DISCORD'S IS 2000 CHARACTERS AND IT REJECTS THE WHOLE MESSAGE,
- * not the overflow. The note is free text typed into the console's schedule
- * form, so nothing upstream of here bounds it, and the failure without this cap
- * is the single most important post this feature makes being dropped by the
- * API — invisibly, because a notice that never landed leaves no gap anybody can
- * see. 1500 is far more note than anyone writes and far less than the limit.
+ * not the overflow. This cap used to sit on the admin's free-text note, which
+ * went with the going-down notice; it is kept and moved rather than deleted
+ * because `deployError` is now the one value in a post that this repo does not
+ * bound — it is written by another codebase out of whatever a shell script or an
+ * SSH library said, and nothing between there and here shortens it. The failure
+ * without a cap is that the message reporting a server which never came back is
+ * itself dropped by the API, invisibly.
+ *
+ * 1500 IS FAR MORE REASON THAN ANY OF THEM CARRY and far less than the limit.
  */
-const NOTE_CAP = 1500
-
-/** The same, for a display name. Eighty is a Discord username and then some. */
-const NAME_CAP = 80
+const REASON_CAP = 1500
 
 /**
  * Cut by code point, like every other cut in this repo: a UTF-16 slice can land
@@ -381,15 +400,14 @@ function capped(value: string, cap: number): string {
  * ddb.ts's `MaintenanceWindow` IS A DECLARED SUBSET of the console's row and
  * says so at its definition: the console writes another twenty fields about the
  * deploy itself, and every one of them arrives on the item whether or not the
- * interface mentions it. Six of those matter here — when the drain and the
- * deploy began, when a heartbeat from a NEW process confirmed the restart, what
- * the deploy verb returned when it refused, and the two commits — and none of
- * them is in the subset.
+ * interface mentions it. Five of those matter here — when the deploy began, when
+ * a heartbeat from a NEW process confirmed the restart, what the deploy verb
+ * returned when it refused, and the commits — and none of them is in the subset.
  *
  * READ DEFENSIVELY BECAUSE THE TYPE CANNOT VOUCH FOR THEM. A cast promising
  * `number` would be an assertion about a field TypeScript has never checked, on
  * a row written by another repo. Anything of the wrong shape is ABSENT here,
- * and absent costs a line of a notice rather than the notice — except on the
+ * and absent costs a clause of the notice rather than the notice — except on the
  * completion gate, where absent is what keeps the bot from claiming a server is
  * back that it cannot prove is back.
  *
@@ -415,27 +433,13 @@ function deployStartedAt(window: MaintenanceWindow): number | null {
   return numberOn(window, 'deployStartedAt')
 }
 
-/**
- * When the door actually shut.
- *
- * TWO FIELDS, AND THE SECOND IS IN THE DECLARED SUBSET. `markDraining` stamps
- * `drainStartedAt` in the same write that moves the state, which is the exact
- * moment; `drainStartsAt` is when the console INTENDED to, and the driver acts
- * on it within a tick, so it is the same instant to within seconds. Falling back
- * to it means a row written before the console recorded the first field still
- * dates its own transition.
- */
-function drainBeganAt(window: MaintenanceWindow): number | null {
-  return numberOn(window, 'drainStartedAt') ?? numberOn(window, 'drainStartsAt')
-}
-
 /** When the deploy verb returned. `markComplete` writes it with the state change. */
 function completedAt(window: MaintenanceWindow): number | null {
   return numberOn(window, 'completedAt')
 }
 
 /**
- * A commit as it goes into a notice.
+ * A commit as it goes into the notice.
  *
  * ABBREVIATED TO THE CONSOLE'S OWN EIGHT, AND ONLY WHEN IT IS CERTAINLY A FULL
  * COMMIT. A forty-character hex string in an announcement players read is
@@ -455,124 +459,96 @@ function shortSha(sha: string): string {
 }
 
 /**
- * The commit this window is HEADING FOR, off the row, or null.
+ * ═══ THE REPO EVERY COMMIT ON A MAINTENANCE ROW BELONGS TO ═══
  *
- * TWO FIELDS BECAUSE THE CONSOLE WRITES ONE OR THE OTHER AND NEVER BOTH.
- * `targetSha` is a PIN — a window that switches the box to a named branch at a
- * named commit, which the game host enforces twice before it deploys.
- * `shownSha` is the destination the maintenance page NAMED when somebody
- * pressed the button, and `POST /api/maintenance` writes it as null whenever
- * `targetRef` is set precisely so the weaker record cannot be mistaken for the
- * stronger one. Reading the pin first is reading them in that order.
+ * NOT THIS BOT'S REPO, AND GETTING THAT WRONG IS THE WHOLE HAZARD. client.ts has
+ * a `REPO_URL` pointing at `blitz-bot` and it is correct there: the sha in the
+ * deploy notice is the commit THIS PROCESS was built from, read out of a file the
+ * bot's own updater wrote. Every sha on a maintenance row is a different thing
+ * entirely — `deployLandedSha`, `targetSha` and `shownSha` are what the GAME box
+ * is running and what `royale-deploy` is fetching, and the console says so in
+ * lib/github.ts: "every sha this console renders … is a commit in
+ * `fivem-br-gamemode`". A link built on the wrong one of those two constants
+ * resolves, renders, and shows an admin an unrelated commit in a codebase that
+ * has nothing to do with the deploy they are reading about — which is worse than
+ * printing the sha with no link at all, because it looks authoritative.
  *
- * NULL IS ORDINARY AND COSTS THE LINE, NOT THE NOTICE. An automatic 72-hour
+ * THE SAME URL THE CONSOLE'S `GAME_REPO` HOLDS, and a copy rather than an import
+ * for the reason every other console constant in this repo is a copy: the two
+ * repos deploy separately and share no package. If the game moves, both change.
+ *
+ * NO TRAILING SLASH; `commitLink` adds its own. `/commit/<sha>` is GitHub's own
+ * route.
+ */
+const GAME_REPO_URL = 'https://github.com/WillMontgomery/fivem-br-gamemode'
+
+/**
+ * A commit, as a masked link to the game repo — or bare when it is not a commit.
+ *
+ * "SAME FOR THE BUILD HASH BEING A HYPERLINK", which is a standing rule rather
+ * than a request about one notice. A MASKED LINK WORKS HERE BECAUSE THE SCHEME IS
+ * https: Discord's own allowlist covers it, so unlike the connect link two
+ * functions up there is nothing uncertain about this one rendering.
+ *
+ * ONLY A VALUE THAT IS CERTAINLY A COMMIT IS LINKED, and everything else is
+ * printed exactly as `shortSha` would print it. `runningSha` can return a value
+ * of another shape — a ref name off an older row — and
+ * `${GAME_REPO_URL}/commit/origin/main` is not a commit URL. Sending an admin to
+ * a 404 is a smaller failure than the wrong-repo one above, and it is still one
+ * worth not shipping; a sha with no link says the same true thing and promises
+ * nothing.
+ *
+ * THE HREF CARRIES THE FULL SHA AND THE TEXT CARRIES THE EIGHT. GitHub resolves
+ * either, so the link is built from the unambiguous one and the reader is shown
+ * the short one — which is also the rule `shortSha` states about abbreviations:
+ * for reading, never for identifying.
+ */
+function commitLink(sha: string): string {
+  return FULL_SHA.test(sha) ? `[${shortSha(sha)}](${GAME_REPO_URL}/commit/${sha})` : sha
+}
+
+/**
+ * The commit the box is running now that the deploy has landed, or null.
+ *
+ * ═══ ONE COMMIT, WHERE THE OLD NOTICES CARRIED A FROM/TO PAIR ═══
+ *
+ * The drain notice named where the window was HEADING and the going-down notice
+ * sat beside it; between them they printed two shas about one outage. His
+ * sentence names one thing — "the server is NOW RUNNING [hash]" — and this is the
+ * row's best answer to it, read in the order the console writes.
+ *
+ * `deployLandedSha` FIRST, BECAUSE IT IS THE ONLY ONE THAT IS A REPORT RATHER
+ * THAN A PLAN. The console nulls it at `schedule` and nulls it AGAIN at
+ * `markDeploying`, so a value sitting on a `complete` row was written by this
+ * window's deploy landing and cannot be left over from the window before — and
+ * `ringmaster-maintenance` holds one row that `schedule` overwrites whole, so
+ * there is nowhere else for a stale value to have come from. That double-null is
+ * also why this field is worthless on a `draining` row, which is what retired it
+ * from the drain notice.
+ *
+ * THEN THE DESTINATION, PIN BEFORE PAGE. `targetSha` is a commit the game box
+ * ENFORCES — `switchref` refuses if the branch has moved and `deploy.sh` refuses
+ * again — and `POST /api/maintenance` writes `shownSha` as null whenever
+ * `targetRef` is set, precisely so the weaker record cannot be mistaken for the
+ * stronger one. Reading the pin first is reading them in the console's own order.
+ *
+ * THE DESTINATION IS ONLY HONEST HERE BECAUSE OF THE GATE. "Heading for" and
+ * "now running" are the same commit exactly when the deploy worked, and the one
+ * caller of this function is a notice that does not post until a heartbeat from a
+ * NEW process has proved it did.
+ *
+ * NULL IS ORDINARY AND COSTS THE CLAUSE, NOT THE NOTICE. An automatic 72-hour
  * window nobody was looking at, or a console whose branch reading was too old to
- * stand behind, carries no destination at all — and the console's own rule for
- * that state is to show no arrow rather than to invent one.
+ * stand behind, carries no commit at all — and "the game server is back up and
+ * maintenance is complete" followed by the connect link is still the whole of
+ * what he asked to be told.
  */
-function headingFor(window: MaintenanceWindow): string | null {
-  return stringOn(window, 'targetSha') ?? stringOn(window, 'shownSha')
-}
-
-/**
- * The commit the box is RUNNING, off the row, or null.
- *
- * ═══ AND AT DRAIN TIME THE ANSWER IS ALWAYS NULL. READ THIS BEFORE "FIXING" IT ═══
- *
- * `deployLandedSha` is the only commit on this row that was ever OBSERVED on the
- * game box, and the console writes it at deploy confirmation — the moment a
- * heartbeat proves `deploy.sh` has been through fetch, reset and restart. It is
- * therefore about the deploy that is FINISHING, not the code that is running as
- * one starts: `schedule()` writes the field as an explicit null (the row is a
- * full `put`, and it argues at length that carrying the previous window's
- * landing forward would be the exact mistake the field was added to fix), and
- * `markDeploying` nulls it again.
- *
- * SO THE ONLY COMMIT THE ROW CAN ANSWER WITH AT `draining` IS THE DESTINATION.
- * "What is the box running right now" is `runningShaNow` in the console's
- * lib/maintenance.ts, off the live `status` reading it takes over SSH — which
- * this bot has no route to and should not grow one for. The line is BUILT and
- * OMITTED rather than left unwritten, because the day the console records a
- * running commit at scheduling time this reads it with no further change; until
- * then the drain notice names where the server is going and not where it is.
- *
- * NOT SUBSTITUTED WITH A GUESS, AND THE TEMPTING ONE IS REMEMBERING THE LAST
- * WINDOW'S LANDING. The console spells out why that value goes stale: anything
- * that moves the box outside a console-scheduled window — a deploy run on the
- * game host, a restart, a branch switch — leaves it describing a server that has
- * moved on. A commit nobody looked at is worse than no commit.
- */
-function runningNow(window: MaintenanceWindow): string | null {
-  return stringOn(window, 'deployLandedSha')
-}
-
-/**
- * Whoever scheduled the window, as a line, or nothing.
- *
- * NAMED, NEVER TAGGED — the owner's standing rule, and the reason it is a
- * capped plain string rather than a mention. `maintenancePoster` states the same
- * rule again at the send, because a name typed into the console can contain a
- * raw `<@id>`.
- *
- * AN EMPTY NAME IS AN OMITTED LINE, not a blank one and not a placeholder. This
- * bot adds no text nobody asked for, and "scheduled by nobody" is text nobody
- * asked for.
- */
-function scheduledBy(window: MaintenanceWindow): string | null {
-  const name = capped(window.createdByName, NAME_CAP)
-
-  return name === '' ? null : `scheduled by ${name}`
-}
-
-/**
- * The drain-start notice: his sentence, the two commits, and who set it going.
- *
- * THE SENTENCE IS VERBATIM AND THE THREE LINES UNDER IT ARE FACTS OFF THE ROW.
- * He asked for "the CURRENT commit, the commit we are GOING TO, and WHO
- * initiated it"; the labels around those values are the only words here that are
- * not his, and they are deliberately two of them. See `runningNow` for why the
- * first line is absent on every window the console can write today.
- *
- * THE NOTE IS NOT REPEATED HERE. It rides the going-down notice already, and a
- * player who reads both would be told the same sentence twice about one outage.
- */
-function drainStarted(window: MaintenanceWindow): string {
-  const lines = [DRAIN_STARTED]
-
-  const running = runningNow(window)
-  if (running !== null) lines.push(`running ${shortSha(running)}`)
-
-  const heading = headingFor(window)
-  if (heading !== null) lines.push(`updating to ${shortSha(heading)}`)
-
-  const by = scheduledBy(window)
-  if (by !== null) lines.push(by)
-
-  return lines.join('\n')
-}
-
-/**
- * The going-down notice.
- *
- * THE NOTE IS INCLUDED BECAUSE IT IS WHAT PLAYERS WERE TOLD AT THE DOOR. The
- * console shows it to anybody refused a connection while the window is
- * draining, so a channel post carrying different words about the same outage
- * would be a second story. The same string, in both places.
- *
- * AN EMPTY NOTE OR NAME IS AN OMITTED LINE, not a blank one and not a
- * placeholder. The owner's standing rule is that this bot adds no text nobody
- * asked for, and "no note given" is text nobody asked for.
- */
-function goingDown(window: MaintenanceWindow): string {
-  const lines = [GOING_DOWN]
-
-  const note = capped(window.note, NOTE_CAP)
-  if (note !== '') lines.push(note)
-
-  const by = scheduledBy(window)
-  if (by !== null) lines.push(by)
-
-  return lines.join('\n')
+function runningSha(window: MaintenanceWindow): string | null {
+  return (
+    stringOn(window, 'deployLandedSha') ??
+    stringOn(window, 'targetSha') ??
+    stringOn(window, 'shownSha')
+  )
 }
 
 /* ------------------------------------------------------------------ *
@@ -665,15 +641,14 @@ function graceExpired(window: MaintenanceWindow, now: number): boolean {
  * ------------------------------------------------------------------ */
 
 /**
- * The three things a poll can decide, and `hold` is the one that is new.
+ * The three things a poll can decide, and `hold` is the one that is not obvious.
  *
- * `hold` MEANS "SAY NOTHING AND DO NOT WRITE THE MARK DOWN", which no earlier
- * version of this file needed: every decision used to be final at the moment the
- * state changed. The completion gate is not — the row says `complete` and the
- * question "is the game answering" has no answer yet — so the poll has to be
- * able to leave the window exactly as unfinished as it found it and ask again in
- * fifteen seconds. Advancing the mark there would record the transition as
- * handled and cost the notice permanently.
+ * `hold` MEANS "SAY NOTHING AND DO NOT WRITE THE MARK DOWN". A decision that was
+ * final at the moment the state changed would not need it; the completion gate is
+ * not final — the row says `complete` and the question "is the game answering"
+ * has no answer yet — so the poll has to be able to leave the window exactly as
+ * unfinished as it found it and ask again in fifteen seconds. Advancing the mark
+ * there would record the transition as handled and cost the notice permanently.
  */
 type Step =
   | { readonly kind: 'post'; readonly content: string; readonly alarm: boolean }
@@ -689,7 +664,7 @@ const say = (content: string, alarm = false): Step => ({ kind: 'post', content, 
 interface Moment {
   readonly now: number
 
-  /** The address a player is told to type. See `backUp`. */
+  /** The address a player is told to connect to. See `connectLink`. */
   readonly serverIp: string
 
   /**
@@ -720,14 +695,7 @@ interface Moment {
  * this bot posts is about the GAME finishing, and they are tens of seconds
  * apart on a good day.
  *
- * FOUR ANSWERS, IN THIS ORDER:
- *
- *   A WINDOW THIS BOT NEVER WATCHED — silence, and this is the one state that
- *   keeps the oldest rule unrelaxed. `FRESH_TRANSITION_MS` lets the two live
- *   notices speak about a window the process did not see begin, because those
- *   are warnings about something happening now; "the server is back" is a
- *   report about something that finished, and a report is exactly what must not
- *   arrive hours late.
+ * THREE ANSWERS AND A WAIT, IN THIS ORDER:
  *
  *   THE HOST REFUSED — say so at once, with its reason. Waiting for a heartbeat
  *   here would be waiting for a restart that never started.
@@ -746,7 +714,7 @@ function completion(mark: Mark, window: MaintenanceWindow, at: Moment): Step {
   if (failure !== null) return said ? QUIET : say(didNotConfirm(failure), true)
 
   if (heartbeatAfterDeploy(window) !== null) {
-    return !said || at.alarmed === window.createdAt ? say(backUp(at.serverIp)) : QUIET
+    return !said || at.alarmed === window.createdAt ? say(backUp(window, at.serverIp)) : QUIET
   }
 
   if (said) return QUIET
@@ -755,68 +723,34 @@ function completion(mark: Mark, window: MaintenanceWindow, at: Moment): Step {
 }
 
 /**
- * Did this transition happen just now?
- *
- * OFF THE ROW'S OWN TIMESTAMP AND NEVER OFF WHEN THIS PROCESS NOTICED. A bot
- * that had just started would otherwise find every transition fresh, which is
- * precisely the catch-up post the recency rule is standing in for a memory of.
- *
- * NO TIMESTAMP IS NOT FRESH. A row that cannot say when it moved cannot be
- * announced by a process that did not watch it move.
- */
-function justNow(at: number | null, now: number): boolean {
-  if (at === null) return false
-
-  return now - at >= 0 && now - at < FRESH_TRANSITION_MS
-}
-
-/**
  * What to do, given what was last seen and what the row says now.
  *
- * PURE, AND IT IS WHERE EVERY RULE THE OWNER STATED ACTUALLY LIVES.
+ * PURE, AND IT IS WHERE THE TWO SILENCES LIVE.
+ *
+ *   ANY STATE BUT `complete` — nothing. "We don't need to post anything when it
+ *   happens. And same for when the server shuts down. Just post when the server
+ *   comes back up." `scheduled`, `draining`, `deploying` and `cancelled` are all
+ *   watched and all recorded, and the recording is not decoration: it is what
+ *   proves this process was here when the window began. See `Mark`.
  *
  *   A DIFFERENT WINDOW, OR NO MARK AT ALL — this process did not watch this
- *   window arrive. It is announced only where the row itself proves the
- *   transition is happening right now; see `FRESH_TRANSITION_MS`, and see
- *   `completion` for why the back-up notice is never given that door.
+ *   window arrive, so it says nothing about it ending. "The server is back up" is
+ *   a report about something that finished, and a report is exactly what must not
+ *   turn up hours late for an outage that ran while the bot was being updated;
+ *   Ringmaster's audit trail is the record of what happened while it was gone.
+ *   The deleted notices had a recency door — a transition the ROW timestamped
+ *   inside the last two minutes was announced by a process that had not seen it
+ *   begin — and that door was never opened for this notice, so it went with them.
  *
- *   THE SAME STATE — nothing moved. This is what stops a restart mid-window
- *   re-announcing: the mark comes back off disk saying `deploying`, the row
- *   still says `deploying`, and the going-down notice this bot already posted
- *   before the restart is not posted a second time. `complete` is the one state
- *   where the same state can still produce a post, and only to correct an alarm
- *   this process itself raised.
- *
- *   A STATE NOBODY ASKED ABOUT — `scheduled` and `cancelled` are watched and
- *   recorded and never spoken about. He wants the outage announced, and a
- *   window that was planned and called off was never an outage.
+ * SPELLED OUT AS A NULL CHECK AND A COMPARISON rather than through a `known`
+ * boolean, because a boolean derived from a null check does not narrow the value:
+ * this is the form the compiler can see, and it is the same test.
  */
 function decide(mark: Mark | null, window: MaintenanceWindow, at: Moment): Step {
-  const known = mark !== null && mark.window === window.createdAt
-  const moved = known && mark.state !== window.state
+  if (window.state !== 'complete') return QUIET
+  if (mark === null || mark.window !== window.createdAt) return QUIET
 
-  switch (window.state) {
-    case 'draining':
-      return moved || (!known && justNow(drainBeganAt(window), at.now))
-        ? say(drainStarted(window))
-        : QUIET
-
-    case 'deploying':
-      return moved || (!known && justNow(deployStartedAt(window), at.now))
-        ? say(goingDown(window))
-        : QUIET
-
-    // Spelled out rather than reusing `known`, because a boolean derived from a
-    // null check does not narrow the value: this is the form the compiler can
-    // see, and it is the same test.
-    case 'complete':
-      return mark !== null && mark.window === window.createdAt
-        ? completion(mark, window, at)
-        : QUIET
-
-    default:
-      return QUIET
-  }
+  return completion(mark, window, at)
 }
 
 /* ------------------------------------------------------------------ *
@@ -834,7 +768,7 @@ function decide(mark: Mark | null, window: MaintenanceWindow, at: Moment): Step 
 class UnusableChannel extends Error {}
 
 /**
- * Sending one notice to the maintenance channel.
+ * Sending the notice to the maintenance channel.
  *
  * NOT `statusPoster` FROM client.ts, AND THE DUPLICATION IS DELIBERATE TWICE
  * OVER. client.ts is the file that wires this module, so importing back out of
@@ -843,14 +777,19 @@ class UnusableChannel extends Error {}
  * carries an announcement players read, so a failure here has to say which of
  * the two ids is wrong.
  *
- * `allowedMentions: { parse: [] }` IS THE OWNER'S RULE MADE STRUCTURAL. The
- * content carries two strings typed by a human into the console — a note and a
- * display name — and either can contain `@everyone` or a raw `<@id>`. Naming
- * who scheduled an outage must never ping them, and an announcement channel is
- * the worst possible place to discover that it does. Stated at the send rather
- * than left to the client-wide default, because that default is silently
- * replaced by any send that passes an `allowedMentions` of its own and a reader
- * of this function cannot see whether one did.
+ * `allowedMentions: { parse: [] }` STAYS, THOUGH THE REASON IT WAS ADDED IS GONE.
+ * It went in when the going-down notice carried two strings a human had typed
+ * into the console — an admin's note and a display name — either of which could
+ * hold `@everyone`, and later when the initiator was tagged. Neither exists any
+ * more: the surviving notice is a fixed sentence, a commit and an address, and
+ * nothing in it is meant to notify anybody. That is exactly why the suppression
+ * is worth keeping rather than deleting — it is the thing that holds the property
+ * true whatever a later edit puts in the content, and an announcement channel is
+ * the worst possible place to discover that something pings.
+ *
+ * STATED AT THE SEND rather than left to the client-wide default, because that
+ * default is silently replaced by any send that passes an `allowedMentions` of
+ * its own and a reader of this function cannot see whether one did.
  */
 export function maintenancePoster(
   client: Client,
@@ -900,13 +839,14 @@ export interface MaintenanceWatch {
 }
 
 export interface MaintenanceWatchOptions {
-  /** The one call this module makes. See the module comment: reads only. */
+  /** The one call this module makes on the data layer. See the module comment: reads only. */
   readonly read: () => Promise<DdbResult<MaintenanceWindow | null>>
   readonly post: (content: string) => Promise<void>
+
   readonly memory?: MaintenanceMemory
 
   /**
-   * The IP allowlist, whose head is the address the back-up notice names.
+   * The IP allowlist, whose head is the address the notice tells people to type.
    *
    * OPTIONAL, AND THE DEFAULT IS THE LIST'S OWN DEFAULT rather than a literal
    * of this module's. src/client.ts wires this watcher and hands it a channel
@@ -919,7 +859,7 @@ export interface MaintenanceWatchOptions {
    */
   readonly serverIps?: readonly string[]
 
-  /** The clock, so the grace and the recency rule can be tested offline. */
+  /** The clock, so the grace can be tested offline. */
   readonly now?: () => number
 }
 
@@ -957,9 +897,17 @@ export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceW
    * The mark off disk, once.
    *
    * AN ABSENT FILE IS THE ORDINARY STATE OF A BOX NOBODY HAS RUN THIS ON and
-   * gets no line at all, exactly like the deploy notice's missing files. A file
-   * that cannot be READ is different: the anti-re-announce protection is off
-   * until somebody fixes the directory, and that needs a person.
+   * gets no line at all, exactly like the deploy notice's missing files.
+   *
+   * BOTH OF THE OTHER TWO ARE `info`, AND THEY USED TO BE `warn`. This is the
+   * owner's "a maintenance window does not need to write to #bot-status" applied
+   * where it bites: log.ts copies warn and error into that channel, so a warn
+   * here put the bot's own bookkeeping in front of him beside the outage notice
+   * he was already reading in #maintenance-notifications. Neither of these is the
+   * bot failing at what it is for — it can still see the window and still post
+   * the notice. The whole cost of an unreadable or unparseable mark is that a
+   * restart in the next few minutes could repeat ONE notice, which does not need
+   * a human at 3am; the journal has the line for whoever is debugging.
    */
   async function baseline(): Promise<Mark | null> {
     if (loaded) return mark
@@ -970,7 +918,7 @@ export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceW
       raw = await memory.seen()
     } catch (error) {
       if (!(error instanceof Error && (error as NodeJS.ErrnoException).code === 'ENOENT')) {
-        log('warn', 'could not read what maintenance state was last seen', { error })
+        log('info', 'could not read what maintenance state was last seen', { error })
       }
       return null
     }
@@ -978,7 +926,7 @@ export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceW
     // The content is never logged, only whether it parsed. Whatever sits in a
     // file this process did not write is not a thing to copy into a channel.
     mark = parseMark(raw)
-    if (mark === null) log('warn', 'the maintenance state file does not hold a mark')
+    if (mark === null) log('info', 'the maintenance state file does not hold a mark')
 
     return mark
   }
@@ -989,9 +937,9 @@ export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceW
    * AN UNREADABLE ROW IS NOT "NO WINDOW", IT IS "CANNOT SEE", and the two must
    * not collapse into each other. Treating a timeout as an absent window would
    * clear the mark and turn the next successful read into a window this bot has
-   * never seen — so the outage in progress would go unannounced AND the notice
-   * that it ended would be suppressed as a catch-up. So: change nothing, say
-   * nothing to the channel, and leave the mark exactly where it was.
+   * never seen — so the notice that the outage ended would be suppressed as a
+   * catch-up. So: change nothing, say nothing to the channel, and leave the mark
+   * exactly where it was.
    *
    * A MISSED NOTICE IS INVISIBLE, WHICH IS WHY THE JOURNAL LINE IS NOT
    * OPTIONAL. Every other failure in this bot leaves a mark somebody can trip
@@ -999,6 +947,12 @@ export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceW
    * maintenance notice that was never posted looks precisely like a maintenance
    * window that never happened, from Discord, forever. These lines are the only
    * evidence that the bot was blind while the server went down.
+   *
+   * THIS IS ONE OF THE TWO THINGS THAT MAY STILL REACH #bot-status. "A
+   * maintenance window does not need to write to the status channel" is about
+   * maintenance PROGRESS, and a window this bot cannot read is not progress —
+   * it is the bot unable to do the job, and the notice it is failing to post is
+   * the one whose absence nobody can see from Discord.
    */
   function blind(failure: unknown): void {
     failures += 1
@@ -1061,6 +1015,14 @@ export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceW
       } catch (error) {
         if (permanent(error)) {
           usable = false
+
+          // THE OTHER OF THE TWO THINGS THAT MAY STILL REACH #bot-status, and
+          // `error` rather than `warn` for log.ts's own reason: the bot has
+          // stopped doing something it is for, permanently, and no maintenance
+          // notice will ever be posted again until somebody fixes the id. That
+          // is not maintenance progress in a status channel — it is the only
+          // warning anybody will get that #maintenance-notifications has gone
+          // silent, and it cannot be announced in the channel it is about.
           log('error', 'maintenance channel unusable, nothing more will be posted to it', { error })
           return
         }
@@ -1096,7 +1058,14 @@ export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceW
     try {
       await memory.remember(formatMark(next))
     } catch (error) {
-      log('warn', 'could not record the maintenance state, a restart may re-announce it', { error })
+      // `info`, AND THIS IS THE LINE THE OWNER ACTUALLY SAW. It fires once per
+      // state change, so an unwritable state directory put three warns into
+      // #bot-status over one drain cycle — a running commentary on the window he
+      // was already reading about in #maintenance-notifications, which is the
+      // complaint. The consequence is bounded and small: the mark is advanced in
+      // memory above, so a failed write costs at most ONE repeated notice, and
+      // only if the process restarts before the next transition.
+      log('info', 'could not record the maintenance state, a restart may re-announce it', { error })
     }
   }
 
@@ -1113,18 +1082,11 @@ export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceW
  * `once`, because a reconnect is not a restart — a second interval on the same
  * client would double every read and race two posts of the same notice.
  *
- * THE FIRST POLL RUNS IMMEDIATELY AND IS USUALLY SILENT. It is what establishes
+ * THE FIRST POLL RUNS IMMEDIATELY AND IS ALWAYS SILENT. It is what establishes
  * the baseline: either the mark off disk matches the window in front of it, in
  * which case nothing has moved, or it does not, in which case this is a window
- * the bot did not see begin. Waiting fifteen seconds to do that would only
- * delay the point from which real transitions are visible.
- *
- * "USUALLY" RATHER THAN "ALWAYS" SINCE THE DRAIN NOTICE, and it is the one case
- * where a first poll speaks: a window that started draining in the last two
- * minutes is announced even by a process that has just come up, because that is
- * a warning about a door that is shut right now rather than a report about
- * something finished. See `FRESH_TRANSITION_MS`, which also explains why the
- * completion notice is not given the same door.
+ * the bot did not see begin and will say nothing about. Waiting fifteen seconds
+ * to do that would only delay the point from which a real transition is visible.
  *
  * `unref` FOR THE REASON EVERY OTHER TIMER IN THIS BOT IS UNREFFED: a poll
  * loop is not a reason for `systemctl stop` to sit through its timeout.
@@ -1133,6 +1095,13 @@ export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceW
  * Discord request, so a tick CAN outlast the interval — and two overlapping
  * checks would both read the same transition before either had advanced the
  * mark, and post it twice.
+ *
+ * `Pick<Ddb, 'maintenance'>`, AND IT IS BACK TO ONE MEMBER. It briefly held
+ * `players` as well, to turn the initiator's licence into a Discord tag for the
+ * going-down notice; nobody is named in the notice that survives, so the second
+ * read went with it. The bans, the audit log and the bot's own state table are
+ * all absent from the pick, so a later edit of this file cannot reach one however
+ * it is written.
  */
 export function watchMaintenance(
   client: Client,

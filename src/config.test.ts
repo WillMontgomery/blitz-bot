@@ -557,11 +557,11 @@ describe('BLITZ_SERVER_IPS', () => {
 /**
  * WHICH ADDRESS A PLAYER IS TOLD TO CONNECT TO.
  *
- * THE MAINTENANCE NOTICE NAMES ONE — "The game server is back up and
- * maintenance is complete. Connect: fivem://connect/3.130.92.28" — and the
- * owner's instruction was that it "should come from the server-ip allowlist
- * already in config rather than being a second copy of a constant". This is
- * where the two are one thing.
+ * THE MAINTENANCE NOTICE ENDS WITH ONE — "The game server is back up and
+ * maintenance is complete. … [Click here to connect](fivem://connect/
+ * 3.130.92.28)." — and the owner's instruction was that it "should come from the
+ * server-ip allowlist already in config rather than being a second copy of a
+ * constant". This is where the two are one thing.
  */
 describe('connectIp', () => {
   const base = { DISCORD_BOT_TOKEN: 'token', DISCORD_GUILD_ID: 'guild' }
