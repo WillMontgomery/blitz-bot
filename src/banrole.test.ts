@@ -263,14 +263,14 @@ function harness(
           ((key) => {
             const value = state.get(key)
             return Promise.resolve(
-              ok(value === undefined ? null : { key, value, updatedAt: NOW - 1 }),
+              ok(value === undefined ? null : { id: key, value, updatedAt: NOW - 1 }),
             )
           }),
         put:
           over.statePut ??
           ((key, value) => {
             state.set(key, value)
-            return Promise.resolve(ok({ key, value, updatedAt: NOW }))
+            return Promise.resolve(ok({ id: key, value, updatedAt: NOW }))
           }),
       },
       auditWindow: {
@@ -1005,7 +1005,7 @@ describe('where the poll reads from', () => {
       statePut: (key, value) =>
         key === CURSOR_KEY
           ? Promise.resolve(failed<BotStateRow>())
-          : Promise.resolve(ok({ key, value, updatedAt: NOW })),
+          : Promise.resolve(ok({ id: key, value, updatedAt: NOW })),
     })
 
     await h.sync.poll()
@@ -1036,7 +1036,7 @@ describe('where the poll reads from', () => {
       statePut: (key, value) => {
         if (key === TAGS_KEY && !allowed) return Promise.resolve(failed<BotStateRow>())
         allowed = false
-        return Promise.resolve(ok({ key, value, updatedAt: NOW }))
+        return Promise.resolve(ok({ id: key, value, updatedAt: NOW }))
       },
     })
 
@@ -1323,7 +1323,7 @@ describe('the order the record and the role are written in', () => {
       statePut: (key, value) =>
         key === TAGS_KEY
           ? Promise.resolve(failed<BotStateRow>())
-          : Promise.resolve(ok({ key, value, updatedAt: NOW })),
+          : Promise.resolve(ok({ id: key, value, updatedAt: NOW })),
     })
 
     await h.sync.poll()

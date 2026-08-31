@@ -722,11 +722,11 @@ describe('the bot state table', () => {
 
     expect(result).toEqual({
       ok: true,
-      value: { key: 'reported-commit', value: 'abc1234', updatedAt: 1_700_000_000_000 },
+      value: { id: 'reported-commit', value: 'abc1234', updatedAt: 1_700_000_000_000 },
     })
     expect(fake.calls[0]?.input).toMatchObject({
       TableName: 'ringmaster-bot-state',
-      Item: { key: 'reported-commit', value: 'abc1234', updatedAt: 1_700_000_000_000 },
+      Item: { id: 'reported-commit', value: 'abc1234', updatedAt: 1_700_000_000_000 },
     })
   })
 

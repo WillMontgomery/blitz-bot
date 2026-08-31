@@ -738,8 +738,17 @@ export function isMaintenanceDraining(
  * which at least puts the parse somewhere a type can watch it.
  */
 export interface BotStateRow {
-  /** Partition key. */
-  key: string
+  /**
+   * Partition key.
+   *
+   * NAMED `id`, NOT `key`, BECAUSE THAT IS WHAT THE TABLE HAS. It was created
+   * with `id` (String) and docs/deploy.md tells an operator to create it that
+   * way, so an attribute called anything else answers "The provided key element
+   * does not match the schema" on every read and every write -- which is
+   * exactly what it did in production, silently disabling the deploy-notice
+   * memory, the audit cursor and the ban-role tag book at once.
+   */
+  id: string
   value: string
   /** Stamped by this module, so no caller has to remember to. */
   updatedAt: number
@@ -1808,7 +1817,7 @@ export function createDdb(options: DdbOptions = {}): DdbWithAuditWindow {
     botState: {
       get(key) {
         return call('get', tables.botState, async (o) => {
-          const res = await doc.get({ TableName: tables.botState, Key: { key } }, o)
+          const res = await doc.get({ TableName: tables.botState, Key: { id: key } }, o)
           return (res.Item as BotStateRow | undefined) ?? null
         })
       },
@@ -1825,7 +1834,7 @@ export function createDdb(options: DdbOptions = {}): DdbWithAuditWindow {
        * `updatedAt` to know what is now in the table.
        */
       put(key, value) {
-        const row: BotStateRow = { key, value, updatedAt: now() }
+        const row: BotStateRow = { id: key, value, updatedAt: now() }
 
         return call('put', tables.botState, async (o) => {
           await doc.put({ TableName: tables.botState, Item: row }, o)

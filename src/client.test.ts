@@ -7556,10 +7556,10 @@ describe('catching up on what was missed while the bot was down', () => {
 
     const state = {
       get: (key: string): Promise<DdbResult<BotStateRow | null>> =>
-        Promise.resolve(ok(value === null ? null : { key, value, updatedAt: 1 })),
+        Promise.resolve(ok(value === null ? null : { id: key, value, updatedAt: 1 })),
       put: (key: string, next: string): Promise<DdbResult<BotStateRow>> => {
         puts.push({ key, value: next })
-        return Promise.resolve(ok({ key, value: next, updatedAt: 2 }))
+        return Promise.resolve(ok({ id: key, value: next, updatedAt: 2 }))
       },
     }
 
