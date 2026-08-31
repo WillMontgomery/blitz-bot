@@ -5195,7 +5195,12 @@ describe('the manual — one embed, one message', () => {
           'second',
         ].join('\n'),
         colour: BLURPLE,
-        footer: expect.stringMatching(/^updated \d{4}-\d{2}-\d{2}T[\d:.]+Z$/u),
+
+        // The word alone. What used to be here was `updated <ISO string>`, and
+        // the ISO string is gone from the text entirely — it is `stampedAt`
+        // now, and Discord renders it per reader.
+        footer: 'updated',
+        stampedAt: expect.any(Date),
       },
     ])
   })
@@ -5361,10 +5366,10 @@ describe('the manual — a change to the file is one edit', () => {
   })
 
   /**
-   * LAST-CHANGED, NOT LAST-CHECKED. The footer goes out only on a write, so an
-   * unchanged manual keeps the date of the edit that really happened — which is
-   * the only reading of a timestamp on a document that is worth anything. It is
-   * also deliberately not part of the comparison: a footer rebuilt every start
+   * LAST-CHANGED, NOT LAST-CHECKED. The stamp goes out only on a write, so an
+   * unchanged manual keeps the moment of the edit that really happened — which
+   * is the only reading of a timestamp on a document that is worth anything. It
+   * is also deliberately not part of the comparison: a stamp taken every start
    * and then compared would differ every start.
    */
   it('stamps the message only when it wrote one', async () => {
@@ -5376,7 +5381,51 @@ describe('the manual — a change to the file is one edit', () => {
     await syncManual(parseManual(doc(['One', 'moved'])), moved.channel, moved.pause)
 
     expect(moved.written).toHaveLength(1)
-    expect(at(moved.written, 0).footer).toMatch(/^updated \d{4}-\d{2}-\d{2}T[\d:.]+Z$/u)
+    expect(at(moved.written, 0).footer).toBe('updated')
+    expect(at(moved.written, 0).stampedAt).toBeInstanceOf(Date)
+  })
+
+  /**
+   * THE REGRESSION THE EXCLUSION EXISTS TO PREVENT, WITH THE CLOCK ACTUALLY
+   * MOVED. Every other case here runs both syncs inside the same millisecond, so
+   * a `stampedAt` wrongly added to `PostedManual` and `unchanged` could compare
+   * equal by accident and the suite would stay green while the bot reposted the
+   * manual on every deploy — which fails no test and is only visible as a docs
+   * channel that rewrites itself forever.
+   *
+   * SO THE TIME IS FORCED APART BY A DAY between the publish and the restart,
+   * and the assertion is that the second run writes NOTHING. The two stamps are
+   * compared first, so this cannot pass because the clock did not move.
+   */
+  it('does not republish on a restart when only the stamp has moved', async () => {
+    vi.useFakeTimers()
+
+    try {
+      vi.setSystemTime(new Date('2026-08-29T09:00:00.000Z'))
+
+      const docs = docsHarness()
+      const parsed = parseManual(before)
+      if (parsed === null) throw new Error('the source in this test does not parse')
+
+      await syncManual(parsed, docs.channel, docs.pause)
+      expect(docs.calls).toEqual(['read', 'post'])
+
+      // A day later, same prose, same process shape: the bot restarts and syncs
+      // the identical file against the message it left behind.
+      vi.setSystemTime(new Date('2026-08-30T09:00:00.000Z'))
+
+      // Not vacuous: the embed this run builds really does carry a different
+      // instant from the one that was published.
+      expect(manualEmbed(parsed).stampedAt).not.toEqual(at(docs.written, 0).stampedAt)
+
+      await syncManual(parsed, docs.channel, docs.pause)
+
+      // One read, and no second write of any kind.
+      expect(docs.calls).toEqual(['read', 'post', 'read'])
+      expect(docs.written).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   /**
@@ -6326,7 +6375,7 @@ describe('the manual — the payload that actually goes to Discord', () => {
     expect(embed.title).toBe('Blitz bot')
     expect(embed.description).toBe(body(source))
     expect(embed.color).toBe(BLURPLE)
-    expect(embed.footer?.text).toMatch(/^updated /u)
+    expect(embed.footer?.text).toBe('updated')
 
     // THE HEADINGS ARE IN THE PAYLOAD AS `## ` LINES. This is the last place
     // they could have been turned back into anything else, and the whole ask
@@ -6347,6 +6396,89 @@ describe('the manual — the payload that actually goes to Discord', () => {
     // document carries a role tag and two channel mentions, and an embed
     // resolves neither — this is the guarantee that they cannot ping anybody.
     expect(payload.allowedMentions).toEqual({ parse: [] })
+  })
+
+  /**
+   * THE TIME IS ON THE NATIVE FIELD AND THE FOOTER TEXT IS THE WORD ALONE.
+   *
+   * WHAT THIS REPLACED WAS `updated <ISO string>` — the same characters for
+   * every reader, in a format written for machines, sitting in a channel people
+   * read. `timestamp` is rendered by each reader's own client in their own
+   * timezone and locale, so one instant on the wire is the right local time
+   * everywhere.
+   *
+   * AND IT CANNOT BE DONE IN THE TEXT, WHICH IS WHY THE ASSERTIONS BELOW ARE
+   * ABOUT WHAT IS *NOT* THERE. `footer.text` parses no markdown: a `<t:…>` put
+   * there is shown as those literal characters, so the obvious-looking fix would
+   * have published angle brackets into a documentation channel — strictly worse
+   * than the ISO string it replaced. Nothing that looks like markup, and nothing
+   * that looks like a machine timestamp, may appear in that field again.
+   */
+  it('sends the time as the embed timestamp and leaves the footer text as the word', async () => {
+    const { client, sent } = liveDocs()
+    const parsed = parseManual(doc(['One', 'first']))
+    if (parsed === null) throw new Error('the source in this test does not parse')
+
+    const built = manualEmbed(parsed)
+    await docsChannel(client, DOCS_CHANNEL).post(built)
+
+    const [embed] = at(sent, 0).embeds ?? []
+    if (embed === undefined) throw new Error('nothing was sent')
+
+    // The owner's word, and only the owner's word. Discord draws the rendered
+    // time after it, separated by a bullet, so no copy is needed for the join.
+    expect(embed.footer?.text).toBe('updated')
+
+    // No ISO string in the text any more, and no timestamp markup either: both
+    // would be raw characters on the reader's screen.
+    expect(embed.footer?.text).not.toMatch(/\d{4}-\d{2}-\d{2}T/u)
+    expect(embed.footer?.text).not.toContain('<t:')
+    expect(embed.footer?.text).not.toContain('<')
+
+    // The instant goes on the field Discord actually renders, as the ISO8601
+    // string that field is typed as, and it is the moment the embed was built.
+    expect(embed.timestamp).toBe(built.stampedAt.toISOString())
+    expect(new Date(embed.timestamp ?? '').getTime()).not.toBeNaN()
+  })
+
+  /**
+   * THE 6000 IS SUMMED OVER EXACTLY WHAT WENT ON THE WIRE.
+   *
+   * Discord documents that budget by ENUMERATION — title, description,
+   * field.name, field.value, footer.text, author.name — and `timestamp` is not
+   * in the list, so it costs nothing. Both ways of getting this wrong are
+   * invisible until a real message is refused: counting the stamp reserves
+   * budget that is never spent, and dropping the footer stops counting
+   * characters that are still sent.
+   *
+   * SO THE EXPECTATION IS READ OFF THE PAYLOAD RATHER THAN RESTATED. The sum
+   * here is built from the fields of the APIEmbed that `docsChannel` handed to
+   * discord.js, which is the closest this suite gets to asking Discord itself.
+   */
+  it('counts against the 6000 exactly the fields it sends, and not the timestamp', async () => {
+    const { client, sent } = liveDocs()
+    const parsed = parseManual(doc(['One', 'first'], ['Two', 'second']))
+    if (parsed === null) throw new Error('the source in this test does not parse')
+
+    const built = manualEmbed(parsed)
+    await docsChannel(client, DOCS_CHANNEL).post(built)
+
+    const [embed] = at(sent, 0).embeds ?? []
+    if (embed === undefined) throw new Error('nothing was sent')
+
+    const total = embedBudget(built).find(({ cap }) => cap === 'total')
+
+    // The charged fields of the sent payload, and only those.
+    const charged =
+      (embed.title?.length ?? 0) + (embed.description?.length ?? 0) + (embed.footer?.text.length ?? 0)
+
+    expect(total?.spent).toBe(charged)
+
+    // And the equality above is not vacuous about the stamp: there IS a
+    // timestamp on the wire, it is not a short string, and none of it was
+    // counted.
+    expect((embed.timestamp ?? '').length).toBeGreaterThan(0)
+    expect(total?.spent).toBeLessThan(charged + (embed.timestamp ?? '').length)
   })
 
   /**

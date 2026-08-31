@@ -3500,12 +3500,29 @@ export interface Manual {
  * owner was asked and said no: a thumbnail takes about a fifth of the width off
  * every line of a reference card, and the bot's own avatar is already at the top
  * of the message. Width is worth more than a second copy of the avatar.
+ *
+ * THE STAMP IS AN INSTANT AND NOT A STRING, WHICH IS THE POINT OF THE FIELD.
+ * `footer` is the word "updated" and nothing else; `stampedAt` is the moment,
+ * carried as a `Date` all the way to `apiEmbed`, which is the only place it
+ * becomes the ISO8601 text Discord's `timestamp` field wants. Discord renders
+ * that field on the footer line — footer text, a bullet, then the time IN EACH
+ * READER'S OWN TIMEZONE — so the two halves are one line to a reader and two
+ * values here.
+ *
+ * AND THE TIME IS NOT IN `footer` BECAUSE IT CANNOT BE. `footer.text` parses no
+ * markdown: `<t:1234567890:f>` written there is shown as those literal
+ * characters, so the timestamp markup that works in a description would publish
+ * angle brackets into a documentation channel. The native field is the only
+ * mechanism on this surface that renders, and Discord has declined to add
+ * another (discord/discord-api-docs#3777, 2026-02-08: embeds are getting no new
+ * features), so this will not become possible later either.
  */
 export interface ManualEmbed {
   readonly title: string
   readonly description: string
   readonly colour: number
   readonly footer: string
+  readonly stampedAt: Date
 }
 
 /**
@@ -3518,10 +3535,16 @@ export interface ManualEmbed {
  * gave back, verbatim. Comparing anything that had been through a renderer would
  * make every start a diff of two formattings and every restart an edit.
  *
- * THE FOOTER IS NOT HERE, because it is the `updated` stamp and is never
- * compared — it is rebuilt on every start, so comparing it would rewrite the
- * channel forever. It goes out only on a write, which is what makes it a
- * last-CHANGED stamp rather than a last-checked one.
+ * NEITHER HALF OF THE `updated` STAMP IS HERE — not the word and not the time —
+ * and the time is the half that matters. `stampedAt` is a fresh instant on every
+ * start, so reading it back and comparing it would make every start differ from
+ * the last one and rewrite the channel forever. It goes out only on a write,
+ * which is what makes it a last-CHANGED stamp rather than a last-checked one.
+ *
+ * THE WORD IS LEFT OUT ON THE SAME GROUNDS RATHER THAN BECAUSE IT MOVES. It is a
+ * constant now and comparing it would be harmless today, which is exactly the
+ * kind of harmless that stops being true the moment the footer carries anything
+ * built per start again. The rule is that the stamp is not compared.
  */
 export interface PostedManual {
   readonly id: string
@@ -3614,9 +3637,20 @@ export interface CapSpend {
 /**
  * What one embed spends against each of Discord's caps.
  *
- * `total` COUNTS THE FOOTER, and that is the only part of this arithmetic that
- * is not obvious: Discord adds the title, the description and the footer text
- * together against the 6000, so the `updated` stamp spends against it too.
+ * `total` COUNTS THE FOOTER TEXT AND NOT THE TIMESTAMP, and that is the only
+ * part of this arithmetic that is not obvious. Discord's 6000 is documented by
+ * ENUMERATION — it names title, description, field.name, field.value,
+ * footer.text and author.name — and `timestamp` is absent from that list, along
+ * with `url`, `color` and the image URLs. So the word "updated" spends seven
+ * units here and the instant beside it spends nothing at all, which is the whole
+ * reason the native field is the right mechanism: a per-reader local time for
+ * free, where any string in the footer would be charged for.
+ *
+ * BOTH DIRECTIONS OF THAT ARE A FAULT, WHICH IS WHY IT IS SPELLED OUT. Counting
+ * `stampedAt` would reserve budget Discord never charges; dropping `footer` from
+ * the sum would stop counting characters that ARE still sent. Either leaves this
+ * function approving a payload on numbers that are not Discord's, and the place
+ * it shows up is a 50035 on a message the caps said was fine.
  *
  * EXPORTED SO THE SHIPPED DOCUMENT CAN BE MEASURED WITH THE SAME ARITHMETIC THE
  * BOT USES. A test that added the lengths up itself would be a second
@@ -4328,19 +4362,32 @@ export function parseManual(markdown: string): Manual | null {
 /**
  * The manual as one embed, stamped now.
  *
- * THE FOOTER IS BUILT HERE AND ONLY REACHES DISCORD ON A WRITE. That is what
+ * THE STAMP IS BUILT HERE AND ONLY REACHES DISCORD ON A WRITE. That is what
  * makes it a last-CHANGED stamp rather than a last-checked one: an unchanged
  * manual returns before this embed is ever handed to `post` or `edit`, so the
- * message keeps the date of the edit that really happened. It is also why the
- * footer is not part of the comparison — comparing it would make every start
+ * message keeps the moment of the edit that really happened. It is also why the
+ * stamp is not part of the comparison — comparing it would make every start
  * differ from the last one and rewrite the channel forever.
+ *
+ * THE TIME IS TAKEN HERE, AND HERE IS THE RIGHT PLACE ONLY BECAUSE OF THAT RULE.
+ * `new Date()` in a builder means "whenever this object was constructed", which
+ * is a lie in any design that rebuilds the embed without writing it. This one
+ * does not: the object is built once per sync and the only paths that carry it
+ * onward are the two writes. If that ever stops holding, the instant has to be
+ * passed IN — the moment the document was published — rather than read off the
+ * clock at build time.
+ *
+ * THE WORD IS THE OWNER'S AND IS THE WHOLE OF THE COPY. "updated", then whatever
+ * Discord's client decides to render beside it. Nothing here writes a second
+ * word of user-facing prose.
  */
 export function manualEmbed(manual: Manual): ManualEmbed {
   return {
     title: manual.title,
     description: manual.body,
     colour: MANUAL_COLOUR,
-    footer: `updated ${new Date().toISOString()}`,
+    footer: 'updated',
+    stampedAt: new Date(),
   }
 }
 
@@ -4745,6 +4792,20 @@ export function ours(messages: readonly DocsMessage[], selfId: string): PostedMa
  *
  * NO THUMBNAIL, NO AUTHOR, NO IMAGE — see `ManualEmbed`. This is the only place
  * one could be added, so it is the place to say it was asked about and declined.
+ *
+ * `timestamp` IS THE ONE MECHANISM THAT GIVES EACH READER THEIR OWN CLOCK, and
+ * it is a sibling of `footer` rather than part of it. Discord draws them on one
+ * line separated by a bullet — "updated • Today at 4:20 PM" — and renders the
+ * time in the viewer's timezone and locale, so the same instant reads 14:00 to a
+ * reader at UTC+2 and 12:00 to one at UTC. It is an ISO8601 string on the wire
+ * and that string is never what anybody sees.
+ *
+ * WHAT IT IS NOT IS "2 hours ago". The native field has no style parameter — the
+ * two requests for one were declined — so it is a fixed instant re-rendered per
+ * reader, absolute, with "Today"/"Yesterday" for recent days. A relative time
+ * that keeps counting needs a surface that parses markdown, which the footer is
+ * not; it would have to be a `-# <t:…:R>` line at the end of the DESCRIPTION,
+ * and that is a change to what the document says, not to how it is stamped.
  */
 function apiEmbed(embed: ManualEmbed): APIEmbed {
   return {
@@ -4752,6 +4813,7 @@ function apiEmbed(embed: ManualEmbed): APIEmbed {
     description: embed.description,
     color: embed.colour,
     footer: { text: embed.footer },
+    timestamp: embed.stampedAt.toISOString(),
   }
 }
 
