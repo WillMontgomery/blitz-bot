@@ -136,17 +136,59 @@ deploy() {
   return "$status"
 }
 
+# Every DynamoDB expression string in src/, read against DynamoDB's own list of
+# 573 reserved words, failing on any attribute name that is not behind a `#`
+# placeholder.
+#
+# WHY IT IS A STEP HERE AND NOT A TEST. Two DynamoDB bugs reached production on
+# 2026-08-30 and neither could have been caught by `npm test`, because of what
+# the test suite is: every test injects a fake client, and a fake accepts
+# whatever string the code hands it. The fake and the code agree with each other
+# and both disagree with DynamoDB. One of the two even had a passing test that
+# asserted the broken string verbatim, so the suite was green AND held the bug in
+# place. The missing rule comes from outside the program -- AWS's reserved word
+# list -- applied to the source text, which is a static check and not a test.
+#
+# WHAT THIS IS NOT. It makes no AWS call, needs no credentials, and reads only
+# files. It is not a substitute for the schema check that would have caught the
+# OTHER bug that day; the foot of scripts/check-ddb-expressions.ts says why that
+# one is not shippable and what would make it possible.
+ddb_expressions() {
+  # It parses src/ with TypeScript's own parser rather than matching a regex,
+  # which means it needs the compiler -- already a devDependency, and free.
+  #
+  # SKIPPED LOUDLY WHERE IT IS NOT INSTALLED, the same as systemd-analyze below
+  # and for the same reason: a check that could not run has to say so, or the
+  # skip reads as a tick. `npm ci` installs it on a laptop and on CI; only a
+  # production install (`npm ci --omit=dev`) omits it, and nothing runs this file
+  # there.
+  if [ ! -d node_modules/typescript ]; then
+    printf 'ddb-expressions: no node_modules/typescript here, so expression strings were NOT checked\n'
+    printf 'ddb-expressions: `npm ci` installs it, and CI runs that, so CI does check them\n'
+    return 0
+  fi
+
+  node scripts/check-ddb-expressions.ts
+}
+
 step 'npm run typecheck' npm run typecheck
 step 'npm run lint' npm run lint
 step 'npm test' npm test
+
+# AFTER THE THREE ABOVE, BECAUSE IT READS THE SOURCE AS A PROGRAM. It hands src/
+# to the TypeScript parser, so a file that does not parse gives it nothing useful
+# to say -- exactly the relationship `tsc` has with lint and test, and the reason
+# the same ordering applies. Before deploy/ because that one has to stay last;
+# see below.
+step 'src/ -- DynamoDB expression strings' ddb_expressions
 
 # LAST, AND THE ORDER ABOVE IT IS THE REASON. Those three are ordered against
 # each other because a `tsc` failure makes the next two into noise. This one has
 # no such relationship with any of them -- it reads shell and ini files, not the
 # TypeScript program -- so it goes where it cannot displace a compile error as
-# the first thing reported. It is also the only step that can half-run, and its
-# "NOT checked" line belongs at the end as a note rather than at the top as a
-# headline.
+# the first thing reported. It, and the expression check above it, are the only
+# steps that can half-run, and a "NOT checked" line belongs at the end as a note
+# rather than at the top as a headline.
 step 'deploy/ -- shell syntax and unit files' deploy
 
-printf '\nverify: typecheck, lint, test and deploy/ all passed\n'
+printf '\nverify: typecheck, lint, test, DynamoDB expressions and deploy/ all passed\n'

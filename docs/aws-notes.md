@@ -122,7 +122,7 @@ game's from `DDB_GAME_TABLE_PREFIX` (`br-`).
 | `ringmaster-player-ids` | `id` (S) | read | `lib/players.ts` |
 | `ringmaster-maintenance` | `id` (S), one row, `id = "current"` | read | `lib/maintenance.ts` |
 | `ringmaster-audit` | `pk` (S) + `ts` (N) | read **and write** | `lib/audit.ts` |
-| `ringmaster-bot-state` | `key` (S) | read **and write** | this repo |
+| `ringmaster-bot-state` | `id` (S) | read **and write** | this repo |
 | `br-players` | `pk` (S) + `sk` (S), `sk = "profile"` | read | `lib/gameProfile.ts` |
 
 Two of those are worth reading twice.
@@ -132,21 +132,28 @@ hangs several rows off one partition — `profile`, `purchases`, one `match#…`
 match. A `GetItem` with the wrong key shape returns no row rather than an error,
 which reads as "this player has never played".
 
-**`ringmaster-bot-state` does not exist yet.** Nothing has created it and the bot
-will not create it for you; the symptom is `no-such-table` on every state read
-and write, and nothing else affected. On-demand capacity like every other table
-in `aws-setup.md` §1:
+**`ringmaster-bot-state` exists on the live box** and was created by hand. The
+bot will not create it for you, so a second environment needs this. The symptom
+of its absence is `no-such-table` on every state read and write.
+
+**THE PARTITION KEY IS `id`, AND THAT IS NOT A DETAIL.** This document said
+`key` until the code and the table disagreed in production: every read and
+write answered "The provided key element does not match the schema", which
+silently disabled the deploy notice's memory, the audit cursor and the ban-role
+tag book at once. The code was corrected and this document was not, so anybody
+standing a second environment up from it would have rebuilt the same outage at
+the create-table step below.
 
 ```bash
 aws dynamodb create-table \
   --region us-east-2 \
   --table-name ringmaster-bot-state \
-  --attribute-definitions AttributeName=key,AttributeType=S \
-  --key-schema AttributeName=key,KeyType=HASH \
+  --attribute-definitions AttributeName=id,AttributeType=S \
+  --key-schema AttributeName=id,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST
 ```
 
-It carries `{ key, value, updatedAt }` — the handful of things the bot has to
+It carries `{ id, value, updatedAt }` — the handful of things the bot has to
 remember across a restart and currently keeps in files under
 `/var/lib/blitz-bot`, which survive a restart and do not survive the box.
 
