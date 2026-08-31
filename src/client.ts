@@ -2161,9 +2161,15 @@ export function createClient(config: Config): Client {
    * REGISTERED AFTER THE GUILD CHECK, so a bot that cannot find its guild says
    * the halt line first. Documentation is not moderation and must never come
    * before it — nor block it: `syncDocsChannel` catches everything.
+   *
+   * THE CONFIG GOES WITH IT BECAUSE THE DOCUMENT IS RENDERED AGAINST IT. Two
+   * passages of the manual describe exemptions and are published only when those
+   * exemptions are actually running — see `renderManual`. `ManualConfig` is a
+   * `Pick` of the three fields that decides, so this call hands over the whole
+   * `Config` and the renderer can still only read those three.
    */
   if (config.docsChannelId !== null) {
-    syncDocsChannel(client, config.docsChannelId)
+    syncDocsChannel(client, config.docsChannelId, config)
   }
 
   /**
@@ -3385,6 +3391,12 @@ export function announceDeployedCommit(
  * has to remember to update a wiki, and the docs cannot drift from the code
  * without the drift being visible in a channel the admins already read.
  *
+ * THE FILE IS NOW A TEMPLATE AND THE CONFIGURATION IS THE OTHER HALF. Two of its
+ * passages describe exemptions and are published only when those exemptions are
+ * running, and one of them names the exempted channels inline. `renderManual`
+ * and the header above it are the whole of that; everything below this line
+ * works on the RENDERED document and does not know a template was involved.
+ *
  * THE WHOLE MANUAL IS ONE EMBED IN ONE MESSAGE. THAT IS THE OWNER'S CORRECTION
  * AND IT IS WHY THIS HALF IS A THIRD OF THE SIZE IT WAS. It used to be an embed
  * per top-level heading — eleven messages in his channel — and the first time
@@ -3433,7 +3445,13 @@ export function announceDeployedCommit(
  * This process restarts on every deploy and on every crash, and a channel that
  * stirs each time is a channel nobody reads — the same argument the deploy
  * notice above is built around. The comparison is a plain equality between what
- * Discord handed back and what the file says; see `unchanged`.
+ * Discord handed back and what the file RENDERS TO; see `unchanged`.
+ *
+ * WHICH IS WHY A CONFIGURATION CHANGE REPUBLISHES AND AN UNCHANGED ONE DOES NOT.
+ * The compared text is the rendering, so exempting a channel edits the message
+ * on the next start with nobody touching the file, and a restart that changes no
+ * setting renders the identical string and writes nothing. Both halves fall out
+ * of comparing the rendering rather than the file; see `syncDocsChannel`.
  *
  * THE CHANNEL IS THE STATE, AND THERE IS NO LOCAL RECORD OF WHAT WAS POSTED.
  * A file saying "the manual is message 123" is a claim about a channel any admin
@@ -3558,12 +3576,25 @@ export interface DocsChannel {
  * Discord's cap on the payload rather than an inference of ours, and inferences
  * are what stop being true when somebody adds a field back.
  *
- * THE DOCUMENT THAT SHIPS TODAY FITS, WITH ABOUT 45 UNITS TO SPARE AGAINST THE
- * 4096. That is thin, and it is why the test over the shipped document is worth
- * more than this constant: a manual is a file anybody can add a paragraph to
- * without ever running the bot, and the failure it would otherwise cause is a
- * message Discord refuses outright — the whole manual gone from the channel
- * rather than one long paragraph.
+ * THE DOCUMENT THAT SHIPS TODAY FITS, AND THE TEST OVER IT IS WORTH MORE THAN
+ * THIS CONSTANT. A manual is a file anybody can add a paragraph to without ever
+ * running the bot, and the failure that causes is a message Discord refuses
+ * outright — the whole manual gone from the channel rather than one long
+ * paragraph.
+ *
+ * AND THE 4096 IS MEASURED ON THE RENDERING, WHICH IS WHAT THE TEMPLATE CHANGED.
+ * There is no longer one document: `renderManual` produces a family of them, and
+ * the one that has to fit is the LONGEST — every conditional block included,
+ * with the exempt channels spelled out as `<#…>` mentions.
+ *
+ * WHICH MEANS THE LENGTH IS NO LONGER SOMETHING ONLY AN EDIT CAN GROW. Each
+ * exempt channel costs about twenty-four units, and an operator adds one by
+ * changing a setting and restarting — no commit, no review, nothing that would
+ * make anybody look at this number. As the file stands there is room for roughly
+ * thirty of them; the test works the figure out rather than restating it here,
+ * because it is the prose that moves it. Going over is `unpublishable`'s
+ * refusal like any other: the channel keeps the last version Discord accepted
+ * and the owner gets one error line.
  */
 export const EMBED_CAPS = {
   title: 256,
@@ -3726,6 +3757,388 @@ export async function readManual(path: string = botManualPath()): Promise<string
 
     return null
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * THE DOCUMENT IS A TEMPLATE AND THE CONFIG IS THE OTHER HALF OF IT.
+ * ------------------------------------------------------------------ */
+
+/**
+ * ═══ WHY THE MANUAL IS NO LONGER A FILE THAT IS PUBLISHED VERBATIM ═══
+ *
+ * THE OWNER'S ASK, AND IT IS ABOUT TRUTH RATHER THAN TIDINESS: "only show the
+ * blurb about exempted channels if there are any configured. If there are, tell
+ * us what they are inline. Same goes for admin exemption — don't show the text
+ * if not applicable." A bullet saying "Channels that have been exempted" in a
+ * guild where none are is not a shorter truth, it is a false one — an admin
+ * reads it and believes there is a list somewhere. And when there IS a list, the
+ * document that describes the bot is the one place a reader can find out which
+ * channels are on it.
+ *
+ * SO THE FILE IS NOW A TEMPLATE AND THE RENDERING IS WHAT GETS PUBLISHED. Two
+ * passages appear only when the thing they describe is switched on, and one of
+ * them names the channels inline as #mentions — which is what makes a rename in
+ * the server settings reach this document with nobody editing it, exactly as the
+ * two channel mentions and the role tag already do.
+ *
+ * ═══ THE MARKUP IS LEGIBLE IN THE FILE, WHICH IS THE POINT ═══
+ *
+ * "Keep it legible in the source file — somebody editing the manual should be
+ * able to see what is conditional without reading the publisher." So a block is
+ * an HTML comment on a line of its own, opened and closed by name:
+ *
+ *     <!-- when: exempt-channels -->
+ *     - Channels that have been exempted: {{exempt-channels}}. ...
+ *     <!-- end: exempt-channels -->
+ *
+ * HTML COMMENTS BECAUSE THAT IS MARKDOWN'S OWN WAY OF CARRYING SOMETHING THE
+ * READER OF THE FILE IS NOT MEANT TO SEE. Anybody who previews the file — on
+ * GitHub, in an editor — sees the conditional paragraph and none of the markup
+ * around it, and anybody who OPENS the file sees a marker that says in English
+ * what it does. The alternatives were worse in both directions: a lead character
+ * on the line (`?- Channels…`) is invisible to a reader who does not know the
+ * convention, and a data file listing which paragraphs are conditional puts the
+ * answer in a second place nobody editing prose would think to look.
+ *
+ * THE CLOSE NAMES THE CONDITION TOO, and that is not redundancy: the two blocks
+ * sit next to each other in the same section, and a bare `<!-- end -->` between
+ * them is a line a reader has to count brackets to place. It also turns a block
+ * closed in the wrong order into a refusal rather than a silently mis-scoped
+ * paragraph.
+ *
+ * ═══ A TEMPLATE THAT DOES NOT MAKE SENSE TAKES THE WHOLE DOCUMENT OUT ═══
+ *
+ * Every defect below answers null, and null means the channel is left exactly as
+ * it was found — the same answer, for the same reason, as the unclosed code
+ * fence in `parseManual`. This is the case where acting on a bad parse destroys
+ * something: the alternatives are publishing `<!-- when: exempt-chanels -->` as
+ * literal text into a channel admins read, or GUESSING whether a block whose
+ * condition nobody recognises belongs in the document. The second is the
+ * dangerous one — guessing "include" tells admins a channel is exempt when it is
+ * not, and guessing "drop" quietly deletes a paragraph of documentation. There
+ * is no safe guess, so there is no guess.
+ *
+ * ═══ THE CONDITIONS ASK THE QUESTION THE BOT ACTUALLY ASKS ═══
+ *
+ * AND EACH OF THEM HAD AN OBVIOUS WRONG VERSION. See `conditionsFor` for both,
+ * which is where the argument belongs; the short of it is that "is the variable
+ * set" is not the question in either case, and getting it wrong publishes a
+ * document that describes a bot other than this one.
+ *
+ * ═══ THE RENDERING HAPPENS BEFORE THE PARSE, AND THAT IS LOAD-BEARING ═══
+ *
+ * `syncManual` compares what Discord handed back against the DESCRIPTION it is
+ * about to write, and the description is now the rendered text. So the rule that
+ * a restart which changes nothing says nothing keeps holding, and gains the half
+ * it needs: a CONFIG change renders a different document and therefore edits the
+ * message, and a config that did not change renders the identical document and
+ * is silent. Neither needed a line of new code in the reconciler, and that is
+ * the argument for rendering here rather than teaching the comparison about
+ * config.
+ *
+ * WHICH ALSO MOVES THE 4096-UNIT CAP ONTO THE RENDERED TEXT. `unpublishable`
+ * measures the embed, and the embed is built from the rendering, so the document
+ * that has to fit is the LONGEST one this file can produce — every block
+ * included, with the channel list spelled out — and not the one today's
+ * configuration happens to produce. The test over the shipped document renders
+ * it that way for exactly that reason.
+ */
+
+/**
+ * What the manual may be written against.
+ *
+ * A UNION AND A `Record` KEYED ON IT, so a third condition is a compile error in
+ * `conditionsFor` rather than a block that silently never renders. The names are
+ * the tokens the file writes, verbatim, because a mapping between what the file
+ * says and what the code calls it is a mapping somebody has to keep.
+ */
+export type ManualCondition = 'exempt-admins' | 'exempt-channels'
+
+/** What the manual may ask to have spelled out inline. */
+export type ManualValue = 'exempt-channels'
+
+/**
+ * The configuration the document is rendered against.
+ *
+ * A `Pick` RATHER THAN THE WHOLE `Config`, like `watchMaintenance` takes
+ * `Pick<Ddb, 'maintenance'>`: these three fields are the whole of what the
+ * document can be conditional on, so a renderer that grew an opinion about the
+ * bot token or the docs channel id would not compile.
+ */
+export type ManualConfig = Pick<Config, 'adminRoleId' | 'exemptAdmins' | 'exemptChannelIds'>
+
+/**
+ * Which passages belong in the document this configuration describes.
+ *
+ * `exempt-channels` IS "ARE THERE ANY", NOT "IS THE VARIABLE SET". There is no
+ * difference to ask about: the list is a `string[]` that is empty when the
+ * operator named no channels, when they named a blank list, and when they set
+ * nothing at all — config.ts collapses all three, and it is right to, because
+ * all three mean the same thing to the scanner. The question the bullet answers
+ * is "is any channel skipped", and the only honest way to ask it is to count the
+ * list.
+ *
+ * `exempt-admins` NEEDS BOTH HALVES, AND EITHER ONE ALONE IS WRONG IN A WAY THAT
+ * SHIPS. It is the exact condition `decide` guards the admin exemption with, and
+ * it has to be: the flag DEFAULTS TO TRUE, so asking the flag alone puts the
+ * bullet in front of every guild that never set an admin role — the majority
+ * case, and one where no post by anybody is skipped. Asking the role alone
+ * publishes the bullet in a guild that has a role and has deliberately turned
+ * the exemption off. The passage describes an exemption that is running, so the
+ * condition is the one that decides whether it runs.
+ *
+ * IF THE GUARD IN `decide` EVER CHANGES, THIS CHANGES WITH IT. They are two
+ * statements of one policy, and the failure of letting them drift is a document
+ * that describes a bot other than the one posting it.
+ */
+function conditionsFor(config: ManualConfig): Record<ManualCondition, boolean> {
+  return {
+    'exempt-channels': config.exemptChannelIds.length > 0,
+    'exempt-admins': config.exemptAdmins && config.adminRoleId !== null,
+  }
+}
+
+/**
+ * What the document asks to have spelled out, spelled out.
+ *
+ * #MENTIONS AND NOT NAMES, which is the rule the rest of the document already
+ * follows — "If you really want to include something use #channel instead". An
+ * id rendered as `<#…>` becomes the channel's name in the reader's own client
+ * and follows a rename with nobody editing anything; the name written out as
+ * text is the drift the mentions exist to replace. It is also the only rendering
+ * available here: the bot has a list of ids and no guild lookup at this point,
+ * and going and fetching names would put a channel's name in a message that
+ * outlives the fetch.
+ *
+ * JOINED WITH COMMAS AND NOTHING ELSE. An "and" before the last one is a wording
+ * decision, and the wording in this document is the owner's; a separator is not.
+ *
+ * THE OPERATOR'S ORDER IS KEPT. `BLITZ_EXEMPT_CHANNEL_IDS` is a list somebody
+ * typed, and sorting it would make the rendered document differ from the file
+ * they can go and read — and, worse, would reorder itself under an edit that
+ * only added one id, which is an edit to the channel for no visible reason.
+ */
+function valuesFor(config: ManualConfig): Record<ManualValue, string> {
+  return {
+    'exempt-channels': config.exemptChannelIds.map((id) => `<#${id}>`).join(', '),
+  }
+}
+
+/**
+ * A conditional block opening and closing: an HTML comment alone on its line.
+ *
+ * ALONE ON ITS LINE, DELIBERATELY. A marker at the end of a paragraph would be
+ * a marker a reader scrolls past, and removing it would leave the paragraph's
+ * own text to be spliced rather than the line to be dropped — the difference
+ * between "delete these lines" and a string edit that can leave a double space
+ * behind. Whole lines in, whole lines out.
+ */
+const BLOCK_OPEN = /^<!--\s*when:\s*([a-z][a-z0-9-]*)\s*-->\s*$/u
+const BLOCK_END = /^<!--\s*end:\s*([a-z][a-z0-9-]*)\s*-->\s*$/u
+
+/**
+ * A value the document wants spliced into a sentence.
+ *
+ * DOUBLED BRACES BECAUSE SINGLE ONES ARE PROSE. `{note}` is a plausible thing to
+ * write about a slash command's argument; `{{note}}` is not something anybody
+ * types by accident.
+ */
+const SUBSTITUTION = /\{\{\s*([a-z][a-z0-9-]*)\s*\}\}/gu
+
+/**
+ * Is `name` one of this record's keys?
+ *
+ * A GUARD RATHER THAN A CAST, and it is worth the three lines: the alternative
+ * is `name as ManualCondition` on a string that came out of a file anybody can
+ * edit, which is the one place in this half where an assertion would be
+ * outranking the compiler about a value the compiler is right about.
+ *
+ * SOUND BECAUSE BOTH RECORDS ARE OBJECT LITERALS with exactly the union's keys —
+ * see `conditionsFor` and `valuesFor`. A record built any other way could carry
+ * a key the type does not name, and this would let it through.
+ */
+function known<K extends string>(record: Record<K, unknown>, name: string): name is K {
+  return Object.hasOwn(record, name)
+}
+
+/**
+ * One line with its `{{…}}` filled in, and anything wrong about it collected.
+ *
+ * COLLECTED RATHER THAN THROWN, so a document with three bad tokens in it names
+ * all three in one line of the journal instead of one per edit-and-restart.
+ * `readManual`'s neighbours in config.ts make the same argument about naming
+ * every missing variable at once.
+ *
+ * A BAD TOKEN IS LEFT IN PLACE IN THE RETURNED STRING, which is never published:
+ * the caller answers null the moment either set is non-empty. It is written this
+ * way round because a replacer has to return something, and returning the token
+ * keeps the failure legible if this is ever called for anything but publishing.
+ */
+function substituted(
+  line: string,
+  values: Record<ManualValue, string>,
+  unknown: Set<string>,
+  empty: Set<string>,
+): string {
+  return line.replace(SUBSTITUTION, (whole: string, name: string) => {
+    if (!known(values, name)) {
+      unknown.add(name)
+      return whole
+    }
+
+    // Empty here does not mean "nothing to say", it means this token got out of
+    // the block that is only rendered when it has something to say — somebody
+    // moved the sentence and left the token behind. Publishing it would put
+    // "Channels that have been exempted: ." in front of a reader.
+    if (values[name] === '') {
+      empty.add(name)
+      return whole
+    }
+
+    return values[name]
+  })
+}
+
+/**
+ * The document this configuration describes, or null because the template does
+ * not make sense.
+ *
+ * NULL IS "LEAVE THE CHANNEL ALONE", exactly as it is out of `parseManual`, and
+ * the header above this section is the argument. Every branch that answers null
+ * writes one error line first — error rather than warn, because it reaches the
+ * status channel and because nothing gets better until somebody edits the file.
+ *
+ * FENCES ARE TRACKED FOR `parseManual`'S REASON, one step earlier. A shell
+ * example carrying a `{{…}}` is a great deal more likely than one carrying a
+ * `# comment`, and a renderer that substituted into a code block would corrupt
+ * an example instead of documenting one. A fence that never closes swallows the
+ * markers after it, which shows up here as a block that is never closed and in
+ * `parseManual` as the fence itself; both name their line and either one is the
+ * fix.
+ *
+ * THE LINE NUMBERS ARE THE FILE'S, one-based, because the only thing the person
+ * reading the journal has to do is open the file and go to a line.
+ */
+export function renderManual(markdown: string, config: ManualConfig): string | null {
+  const conditions = conditionsFor(config)
+  const values = valuesFor(config)
+
+  const kept: string[] = []
+  const unknown = new Set<string>()
+  const empty = new Set<string>()
+
+  let block: { readonly name: ManualCondition; readonly line: number } | null = null
+  let fenced = 0
+
+  for (const [index, raw] of markdown.split(/\r?\n/u).entries()) {
+    const line = index + 1
+
+    if (CODE_FENCE.test(raw)) fenced = fenced === 0 ? line : 0
+
+    if (fenced === 0) {
+      const opened = BLOCK_OPEN.exec(raw)
+
+      if (opened !== null) {
+        // The capture cannot be absent — the pattern has one group and it
+        // matched — but `noUncheckedIndexedAccess` does not know that, and the
+        // fallback lands on the unknown-condition branch below either way.
+        const name = opened[1] ?? ''
+
+        if (block !== null) {
+          log(
+            'error',
+            'the manual opens a conditional block inside another one, so it cannot be published and the docs channel was left alone',
+            { line, opened: block.line, condition: block.name },
+          )
+
+          return null
+        }
+
+        if (!known(conditions, name)) {
+          log(
+            'error',
+            'the manual is written against a condition this bot does not know, so it cannot be published and the docs channel was left alone',
+            { line, condition: name },
+          )
+
+          return null
+        }
+
+        block = { name, line }
+        continue
+      }
+
+      const closed = BLOCK_END.exec(raw)
+
+      if (closed !== null) {
+        const name = closed[1] ?? ''
+
+        if (block === null) {
+          log(
+            'error',
+            'the manual closes a conditional block that was never opened, so it cannot be published and the docs channel was left alone',
+            { line, condition: name },
+          )
+
+          return null
+        }
+
+        if (block.name !== name) {
+          log(
+            'error',
+            'the manual closes a conditional block other than the one it opened, so it cannot be published and the docs channel was left alone',
+            { line, opened: block.name, closed: name },
+          )
+
+          return null
+        }
+
+        block = null
+        continue
+      }
+    }
+
+    // A dropped block takes WHOLE LINES with it, markers included, so that what
+    // is left is byte-for-byte a document that never had the passage in it. That
+    // is what keeps the blank line above and below a block from doubling up, and
+    // it is why the rule that an unchanged document is silent survives a
+    // configuration that switches a block off.
+    if (block !== null && !conditions[block.name]) continue
+
+    kept.push(fenced === 0 ? substituted(raw, values, unknown, empty) : raw)
+  }
+
+  if (block !== null) {
+    log(
+      'error',
+      'the manual has a conditional block that is never closed, so it cannot be published and the docs channel was left alone',
+      { line: block.line, condition: block.name },
+    )
+
+    return null
+  }
+
+  if (unknown.size > 0) {
+    log(
+      'error',
+      'the manual asks for a value this bot does not have, so it cannot be published and the docs channel was left alone',
+      { values: [...unknown].join(', ') },
+    )
+
+    return null
+  }
+
+  if (empty.size > 0) {
+    log(
+      'error',
+      'the manual asks for a value that is empty under this configuration, which means the sentence is outside the block that guards it, so it cannot be published and the docs channel was left alone',
+      { values: [...empty].join(', ') },
+    )
+
+    return null
+  }
+
+  return kept.join('\n')
 }
 
 /**
@@ -4354,10 +4767,22 @@ function apiEmbed(embed: ManualEmbed): APIEmbed {
  *
  * EVERY FAILURE ENDS HERE. The bot is moderating a live guild; a document that
  * could not be published is not a reason for any of that to stop.
+ *
+ * THE THREE STEPS ARE READ, RENDER, PARSE, AND THAT ORDER IS THE FEATURE. The
+ * file is a template; `renderManual` turns it into the document THIS bot's
+ * configuration describes; `parseManual` splits that into the embed. Which
+ * means the text `syncManual` compares against the channel is the RENDERED one,
+ * so a configuration change edits the message and an unchanged configuration
+ * writes nothing — neither of which the reconciler had to be told about.
+ *
+ * EACH STEP ANSWERS NULL FOR "LEAVE THE CHANNEL ALONE" AND HAS ALREADY SAID WHY.
+ * Nothing is added here on any of the three, for `syncManual`'s reason: a second
+ * line about one fault is a second post in the status channel.
  */
 export function syncDocsChannel(
   client: Client,
   channelId: string,
+  config: ManualConfig,
   read: () => Promise<string | null> = readManual,
   open: (client: Client, channelId: string) => DocsChannel = docsChannel,
 ): void {
@@ -4366,7 +4791,10 @@ export function syncDocsChannel(
       const markdown = await read()
       if (markdown === null) return
 
-      await syncManual(parseManual(markdown), open(client, channelId))
+      const rendered = renderManual(markdown, config)
+      if (rendered === null) return
+
+      await syncManual(parseManual(rendered), open(client, channelId))
     })().catch((error: unknown) => {
       log('warn', 'the bot manual could not be synchronised', { error })
     })

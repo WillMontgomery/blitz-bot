@@ -15,14 +15,6 @@ Six rules.
 
 Nothing else is moderated. **No word filter, no warnings, no mutes.**
 
-## Why a clip or version number vanished
-
-**Four numbers separated by dots read as an IP address**, wherever they sit — prose, a filename, an attachment.
-
-- Kept: **our own server address**, whatever punctuation follows it.
-
-Rename the file and post it again.
-
 ## Where it looks
 
 Message text, embeds, buttons and the links behind them, poll questions and answers, attachment filenames and alt text, and sticker names. A forwarded message is read the same way.
@@ -31,9 +23,13 @@ Message text, embeds, buttons and the links behind them, poll questions and answ
 
 ## What it never touches
 
-- Its own messages, direct messages, and any other server it is in.
-- Channels that have been exempted. **A thread is exempted separately from its channel.**
+- Its own messages and direct messages.
+<!-- when: exempt-channels -->
+- Channels that have been exempted: {{exempt-channels}}. **A thread is exempted separately from its channel.**
+<!-- end: exempt-channels -->
+<!-- when: exempt-admins -->
 - Posts by admins, while that exemption is on. **Webhooks are never exempt.**
+<!-- end: exempt-admins -->
 - An invite code Discord will not answer for: it removes on a confirmed answer, never a guess.
 
 ## What the poster is told
@@ -42,9 +38,9 @@ The bot **DMs them**, naming the rule that fired. If their DMs are shut it tags 
 
 Nothing it posts quotes the removed text.
 
-## The removals channel
+## The moderation channel
 
-<#1542603116258525185>. One line per removal: who posted it, which channel, which rule, and the invite codes when the rule found any. Never what the message said.
+<#1542603116258525185>. One line per moderation event: who posted it, which channel, which rule, and the invite codes when the rule found any. Never what the message said.
 
 ## The status channel
 

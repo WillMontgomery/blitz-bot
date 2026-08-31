@@ -53,6 +53,7 @@ import {
   ours,
   parseManual,
   readManual,
+  renderManual,
   remover,
   removalNotice,
   reportDeployedCommit,
@@ -74,6 +75,7 @@ import {
   type LiveGuild,
   type LiveMember,
   type LiveMessage,
+  type ManualConfig,
   type ManualEmbed,
   type NoticeChannel,
   type PollText,
@@ -6423,6 +6425,7 @@ describe('the manual — the file, and the bot carrying on without it', () => {
     syncDocsChannel(
       client,
       DOCS_CHANNEL,
+      cfg(),
       () => readManual(join(tmpdir(), 'blitz-bot-no-such-manual.md')),
       () => docs.channel,
     )
@@ -6456,6 +6459,7 @@ describe('the manual — the file, and the bot carrying on without it', () => {
     syncDocsChannel(
       client,
       DOCS_CHANNEL,
+      cfg(),
       () => Promise.reject(new Error('disk on fire')),
       () => docsHarness().channel,
     )
@@ -6482,8 +6486,10 @@ describe('the manual — the file, and the bot carrying on without it', () => {
     // it wrong points the bot at a channel of evidence it would then edit.
     const source = await readFile(new URL('./client.ts', import.meta.url), 'utf8')
 
-    expect(source).toContain('syncDocsChannel(client, config.docsChannelId)')
-    expect(source).not.toMatch(/syncDocsChannel\([^)]*(?:logChannelId|statusChannelId)/u)
+    expect(source).toContain('syncDocsChannel(client, config.docsChannelId, config)')
+    expect(source).not.toMatch(
+      /syncDocsChannel\(client, config\.(?:logChannelId|statusChannelId|maintenanceChannelId)/u,
+    )
   })
 })
 
@@ -6547,6 +6553,313 @@ describe('the maintenance watcher — installed, and only when there is a channe
 })
 
 /**
+ * THE DOCUMENT IS A TEMPLATE, AND THIS IS THE HALF THAT TURNS IT INTO A
+ * DOCUMENT.
+ *
+ * THE OWNER'S ASK: "only show the blurb about exempted channels if there are
+ * any configured. If there are, tell us what they are inline. Same goes for
+ * admin exemption — don't show the text if not applicable." So two passages are
+ * conditional and one of them names the channels, and the rendering happens
+ * before anything else in the pipeline sees the document.
+ *
+ * NOTHING HERE TOUCHES DISCORD OR THE DISK. `renderManual` is a function of a
+ * string and three fields of the config, which is why every awkward template
+ * below can be written out in the case that cares about it.
+ *
+ * WHAT IS PINNED IS THE MECHANISM AND NEVER THE WORDING. The prose in the file
+ * is the owner's; the cases below are built from documents this file invents so
+ * that a rewrite of his never fails one of them. What the SHIPPED file renders
+ * to is the describe after this one, and even there the assertions are about
+ * length and structure rather than about sentences.
+ */
+describe('the manual — rendered against the configuration', () => {
+  /** Nothing exempted and no admin role: the emptiest guild there is. */
+  const NOTHING: ManualConfig = {
+    exemptChannelIds: [],
+    exemptAdmins: true,
+    adminRoleId: null,
+  }
+
+  /** A guild with both exemptions actually running. */
+  const BOTH: ManualConfig = {
+    exemptChannelIds: ['111111111111111111', '222222222222222222'],
+    exemptAdmins: true,
+    adminRoleId: '333333333333333333',
+  }
+
+  /**
+   * A document with one conditional block in the middle of a list, which is
+   * where both of the real ones sit.
+   */
+  const template = [
+    '# Blitz bot',
+    '',
+    '## What it never touches',
+    '',
+    '- Its own messages.',
+    '<!-- when: exempt-channels -->',
+    '- Exempted: {{exempt-channels}}.',
+    '<!-- end: exempt-channels -->',
+    '- An invite code Discord will not answer for.',
+    '',
+  ].join('\n')
+
+  /** The same document as somebody would have written it without the block. */
+  const without = [
+    '# Blitz bot',
+    '',
+    '## What it never touches',
+    '',
+    '- Its own messages.',
+    '- An invite code Discord will not answer for.',
+    '',
+  ].join('\n')
+
+  /**
+   * A DROPPED BLOCK LEAVES NO SCAR, AND THAT IS THE ASSERTION THAT MATTERS MOST
+   * IN THIS FILE.
+   *
+   * Byte-for-byte the document somebody would have written without the passage —
+   * not "near enough". The markers are their own lines and are removed as lines,
+   * so nothing doubles a blank line and nothing leaves a dangling space. If it
+   * did, the description would differ from the one a guild without the block
+   * publishes for a reason no reader could see, and the only symptom would be an
+   * edit in the docs channel that nobody can account for.
+   */
+  it('drops the block and its markers as whole lines, leaving the plain document', () => {
+    expect(renderManual(template, NOTHING)).toBe(without)
+  })
+
+  /** And an included block is the passage with the markers gone. */
+  it('keeps the block, without its markers, when the condition holds', () => {
+    expect(renderManual(template, BOTH)).toBe(
+      [
+        '# Blitz bot',
+        '',
+        '## What it never touches',
+        '',
+        '- Its own messages.',
+        '- Exempted: <#111111111111111111>, <#222222222222222222>.',
+        '- An invite code Discord will not answer for.',
+        '',
+      ].join('\n'),
+    )
+  })
+
+  /**
+   * THE OPERATOR'S ORDER, KEPT. `BLITZ_EXEMPT_CHANNEL_IDS` is a list somebody
+   * typed; sorting it would make the document disagree with the setting they can
+   * go and read, and would reorder itself under an edit that only added one id —
+   * an edit to the channel for no visible reason.
+   */
+  it('names the channels in the order they were configured', () => {
+    const config = { ...BOTH, exemptChannelIds: ['999999999999999999', '111111111111111111'] }
+
+    expect(renderManual(template, config)).toContain(
+      '<#999999999999999999>, <#111111111111111111>',
+    )
+  })
+
+  /**
+   * THE CONDITION IS "ARE THERE ANY", NOT "IS THE VARIABLE SET", and there is no
+   * other question available: config.ts collapses unset, blank and empty into
+   * one empty array, because all three mean the same thing to the scanner.
+   */
+  it('drops the channel passage for an empty list however the operator spelled it', () => {
+    expect(renderManual(template, { ...BOTH, exemptChannelIds: [] })).toBe(without)
+  })
+
+  /**
+   * THE ADMIN CONDITION NEEDS BOTH HALVES, and this is the case that would ship
+   * broken if it asked only one.
+   *
+   * `exemptAdmins` DEFAULTS TO TRUE. A guild that never set an admin role has
+   * the flag on and the exemption running over nobody — `decide` skips the whole
+   * branch — so asking the flag alone publishes a passage about an exemption
+   * that is not happening, in the majority case. Asking the role alone publishes
+   * it in a guild that has a role and turned the exemption off on purpose.
+   */
+  it('publishes the admin passage only when the exemption is really running', () => {
+    const admins = [
+      '# Blitz bot',
+      '',
+      '<!-- when: exempt-admins -->',
+      '- Posts by admins.',
+      '<!-- end: exempt-admins -->',
+      '- Everything else.',
+      '',
+    ].join('\n')
+
+    const bare = '# Blitz bot\n\n- Everything else.\n'
+
+    const on = { exemptAdmins: true, adminRoleId: '333333333333333333', exemptChannelIds: [] }
+
+    expect(renderManual(admins, on)).toContain('- Posts by admins.')
+    expect(renderManual(admins, { ...on, exemptAdmins: false })).toBe(bare)
+    expect(renderManual(admins, { ...on, adminRoleId: null })).toBe(bare)
+    expect(renderManual(admins, { exemptAdmins: false, adminRoleId: null, exemptChannelIds: [] })).toBe(bare)
+  })
+
+  /**
+   * THE TEMPLATE THAT DOES NOT MAKE SENSE TAKES THE WHOLE DOCUMENT OUT, which is
+   * `parseManual`'s answer to an unclosed code fence and is here for the same
+   * reason: this is the case where acting on a bad parse destroys something.
+   * Including a block nobody can name would tell admins an exemption is running
+   * when it is not; dropping it would delete documentation. There is no safe
+   * guess, so there is no guess.
+   *
+   * ONE TABLE RATHER THAN SIX CASES, because what is being asserted is identical
+   * in all of them — null, one error line, and the line number of the fault.
+   */
+  it.each([
+    {
+      what: 'a condition this bot does not know',
+      source: '# T\n\n<!-- when: exempt-chanels -->\nx\n<!-- end: exempt-chanels -->\n',
+      says: 'a condition this bot does not know',
+      at: 'line=3',
+    },
+    {
+      what: 'a block that is never closed',
+      source: '# T\n\n<!-- when: exempt-admins -->\nx\n',
+      says: 'conditional block that is never closed',
+      at: 'line=3',
+    },
+    {
+      what: 'a close with nothing open',
+      source: '# T\n\nx\n<!-- end: exempt-admins -->\n',
+      says: 'closes a conditional block that was never opened',
+      at: 'line=4',
+    },
+    {
+      what: 'a close that names the other block',
+      source: '# T\n\n<!-- when: exempt-admins -->\nx\n<!-- end: exempt-channels -->\n',
+      says: 'closes a conditional block other than the one it opened',
+      at: 'line=5',
+    },
+    {
+      what: 'a block opened inside another one',
+      source:
+        '# T\n\n<!-- when: exempt-admins -->\n<!-- when: exempt-channels -->\nx\n<!-- end: exempt-channels -->\n<!-- end: exempt-admins -->\n',
+      says: 'opens a conditional block inside another one',
+      at: 'line=4',
+    },
+    {
+      what: 'a value this bot does not have',
+      source: '# T\n\nExempted: {{exempt-chanels}}.\n',
+      says: 'asks for a value this bot does not have',
+      at: 'values="exempt-chanels"',
+    },
+  ])('refuses the whole document over $what, and says where', ({ source, says, at }) => {
+    expect(renderManual(source, BOTH)).toBeNull()
+
+    expect(said(says)).toBe(1)
+    expect(stderr.join('')).toContain('level=error')
+    expect(stderr.join('')).toContain(at)
+
+    // And it says the channel was left alone, which is what null means to
+    // `syncDocsChannel` and what the reader of the status channel needs to know.
+    expect(stderr.join('')).toContain('the docs channel was left alone')
+  })
+
+  /**
+   * THE TOKEN THAT ESCAPED ITS BLOCK, which is the defect this markup makes easy
+   * to introduce: somebody moves the sentence up a line while editing and the
+   * `{{exempt-channels}}` goes with it. In a guild with no exempt channels that
+   * publishes "Exempted: ." to a channel admins read, and nothing else in the
+   * pipeline could tell that from prose.
+   *
+   * IT IS ONLY A DEFECT WHEN THE VALUE IS EMPTY, and that asymmetry is right: a
+   * token outside the block renders correctly in every guild that HAS exempt
+   * channels, so refusing it always would take the manual out of the owner's own
+   * channel over a sentence that reads perfectly there.
+   */
+  it('refuses a value that escaped the block that guards it', () => {
+    const escaped = '# T\n\nExempted: {{exempt-channels}}.\n'
+
+    expect(renderManual(escaped, BOTH)).toContain('<#111111111111111111>')
+
+    expect(renderManual(escaped, NOTHING)).toBeNull()
+    expect(said('asks for a value that is empty under this configuration')).toBe(1)
+  })
+
+  /**
+   * FENCES ARE TRACKED, ONE STEP EARLIER THAN `parseManual` DOES IT. A shell
+   * example carrying a `{{…}}` is a good deal more likely than one carrying a
+   * `# comment`, and a renderer that substituted into a code block would corrupt
+   * the example rather than document it.
+   */
+  it('leaves markers and tokens inside a code fence exactly as written', () => {
+    const fenced = [
+      '# T',
+      '',
+      '```',
+      '<!-- when: exempt-admins -->',
+      'echo {{exempt-channels}}',
+      '<!-- end: exempt-admins -->',
+      '```',
+      '',
+    ].join('\n')
+
+    expect(renderManual(fenced, NOTHING)).toBe(fenced)
+  })
+
+  /**
+   * AND THE WHOLE PIPELINE IN ORDER: read, render, parse, publish. The rendering
+   * has to happen before the parse or the markers reach the channel as literal
+   * text — the one failure that would be visible to every admin at once.
+   */
+  it('publishes the rendering and not the file', async () => {
+    const docs = docsHarness()
+    const { client, ready } = docsClient()
+
+    syncDocsChannel(client, DOCS_CHANNEL, cfg({ exemptChannelIds: [] }), () => Promise.resolve(template), () => docs.channel)
+
+    ready()
+    await settle()
+
+    expect(docs.written).toHaveLength(1)
+    expect(docs.written[0]?.description).toBe(body(without))
+  })
+
+  /**
+   * A TEMPLATE DEFECT LEAVES THE CHANNEL EXACTLY AS IT WAS FOUND — not read, not
+   * written, not emptied. Same guarantee as a missing file and an unclosed
+   * fence, and the same reason: the manual in the channel is the last version
+   * that was correct, and a bad template is somebody's half-finished edit.
+   */
+  it('does not touch the channel when the template does not make sense', async () => {
+    const docs = docsHarness({ messages: published(doc(['One', 'first'])) })
+    const { client, ready } = docsClient()
+
+    syncDocsChannel(
+      client,
+      DOCS_CHANNEL,
+      cfg(),
+      () => Promise.resolve('# T\n\n<!-- when: exempt-admins -->\nx\n'),
+      () => docs.channel,
+    )
+
+    ready()
+    await settle()
+
+    expect(docs.calls).toEqual([])
+    expect(docs.messages()).toHaveLength(1)
+  })
+
+  /**
+   * A DOCUMENT WITH NO MARKUP IN IT IS UNCHANGED, WHICH IS WORTH ONE CASE. Most
+   * of the file is not conditional and never will be, and a renderer that
+   * touched ordinary prose — a stray trim, a rewritten blank line — would rewrite
+   * the docs channel on the start after it shipped and every start after that.
+   */
+  it('returns a document with no markup in it byte for byte', () => {
+    const plain = '# Blitz bot\n\nA paragraph.\n\n## A section\n\n- A bullet with {braces} in it.\n'
+
+    expect(renderManual(plain, BOTH)).toBe(plain)
+  })
+})
+
+/**
  * THE MANUAL THIS REPO SHIPS, checked against the message it has to fit in and
  * against the bot it claims to describe.
  *
@@ -6562,8 +6875,46 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
     return markdown
   }
 
-  const asEmbed = async (): Promise<ManualEmbed> => {
-    const parsed = parseManual(await shipped())
+  /**
+   * A DISCORD ID OF THE LENGTH DISCORD ACTUALLY ISSUES, and that matters here in
+   * a way it does not anywhere else in this file: the exempt-channel list is
+   * spelled into the document as `<#…>` mentions, so its cost against the
+   * 4096-unit cap is a function of how long an id is. Nineteen digits is what
+   * every snowflake in this repo has, and `1000000000000000000` is past
+   * `Number.MAX_SAFE_INTEGER`, hence the bigint.
+   */
+  const exempt = (count: number): string[] =>
+    Array.from({ length: count }, (_, i) => String(1000000000000000000n + BigInt(i)))
+
+  /**
+   * THE CONFIGURATION THAT RENDERS THE LONGEST VERSION OF THIS FILE.
+   *
+   * "Check the longest case, not today's." The document is conditional now, so
+   * "the manual" is a family of documents and the one that has to fit is the one
+   * with every block in it — not whichever one the owner's current settings
+   * happen to produce. A guild that exempts nothing renders a shorter manual
+   * than this and always will; measuring THAT one would be a test that passes
+   * until the day somebody exempts a channel.
+   *
+   * THE CHANNEL COUNT HERE IS A PLAUSIBLE GUILD AND NOT A LIMIT. How many
+   * mentions the document can carry is the next case below, which works it out
+   * rather than assuming it.
+   */
+  const EVERYTHING: ManualConfig = {
+    exemptChannelIds: exempt(4),
+    exemptAdmins: true,
+    adminRoleId: '1542596612306505808',
+  }
+
+  /** The file as this configuration renders it — what the channel would show. */
+  const rendered = async (config: ManualConfig = EVERYTHING): Promise<string> => {
+    const markdown = renderManual(await shipped(), config)
+    if (markdown === null) throw new Error('docs/bot-manual.md does not render')
+    return markdown
+  }
+
+  const asEmbed = async (config: ManualConfig = EVERYTHING): Promise<ManualEmbed> => {
+    const parsed = parseManual(await rendered(config))
     if (parsed === null) throw new Error('docs/bot-manual.md does not parse into an embed')
     return manualEmbed(parsed)
   }
@@ -6571,12 +6922,16 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
   /**
    * IT FITS IN ONE EMBED, AGAINST EVERY CAP, AND THE NUMBERS ARE THE BOT'S OWN.
    *
-   * THE CAP THAT MATTERS IS NOW THE DESCRIPTION'S, and this is the test that
-   * earns its keep because of it. The whole document goes in one 4096-unit
-   * field, and it ships with about forty units to spare — so the next paragraph
-   * anybody adds is the one that would have Discord refuse the message outright
-   * and leave the channel showing a stale manual. It fails here, in CI, before
-   * that can happen.
+   * THE CAP THAT MATTERS IS THE DESCRIPTION'S, and this is the test that earns
+   * its keep because of it. The whole document goes in one 4096-unit field, so
+   * the paragraph that takes it over is the one that has Discord refuse the
+   * message outright and leave the channel showing a stale manual. It fails
+   * here, in CI, before that can happen.
+   *
+   * AND IT IS MEASURED ON THE RENDERING, WHICH IS THE PART THAT IS NEW. The
+   * embed is built from what `renderManual` produced, so the text under the cap
+   * is the text Discord will be handed — a file that fits and a rendering that
+   * does not is exactly the failure this would otherwise miss.
    *
    * DERIVED FROM THE BUILDER RATHER THAN RESTATED HERE. `manualEmbed` is what the
    * bot publishes, `embedBudget` is the arithmetic the publish is gated on, and
@@ -6584,11 +6939,16 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
    * document the bot will publish, and a cap that is wrong is wrong in one place
    * rather than in two that can disagree.
    */
-  it('fits in one embed, against every cap the bot enforces', async () => {
+  it('fits in one embed, against every cap the bot enforces, with every block in', async () => {
     const embed = await asEmbed()
 
     // Not a vacuous pass on a document that parsed to a bare title.
     expect(embed.description.length).toBeGreaterThan(0)
+
+    // Nor on a rendering that quietly dropped the conditional passages: this is
+    // the LONGEST case, so both of them have to actually be in it.
+    expect(embed.description).toContain('<#1000000000000000000>')
+    expect(embed.description).toContain('<#1000000000000000003>')
 
     for (const { cap, spent, limit } of embedBudget(embed)) {
       expect(spent, cap).toBeLessThanOrEqual(limit)
@@ -6600,6 +6960,66 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
     // No preamble, no second `# `, no markdown in the title. Every one of those
     // would have written a warning while parsing.
     expect(stderr.join('')).toBe('')
+  })
+
+  /**
+   * HOW MUCH ROOM THE SPELLED-OUT CHANNEL LIST HAS, WORKED OUT RATHER THAN
+   * ASSUMED — and it is the one input to this document that the operator can
+   * grow without touching the file at all.
+   *
+   * THE FAILURE THIS GUARDS IS SLOW AND SILENT. Every paragraph added to the
+   * manual takes mentions off this number, and nothing about writing a paragraph
+   * says so. The day it reaches zero the bot stops being able to publish the
+   * manual in the owner's own guild, and the only sign is one error line. This
+   * fails in CI instead, and the message says how many are left.
+   *
+   * A FLOOR RATHER THAN AN EXACT COUNT, because the exact count moves on every
+   * legitimate edit to the prose and a test that pinned it would fail for a
+   * typo fix. Twenty is well past any list the owner has described and far
+   * enough from zero to leave room for the document to grow.
+   */
+  it('leaves room for a realistic number of exempt channels', async () => {
+    const markdown = await shipped()
+
+    const fits = (count: number): boolean => {
+      const text = renderManual(markdown, { ...EVERYTHING, exemptChannelIds: exempt(count) })
+      if (text === null) return false
+
+      const parsed = parseManual(text)
+      if (parsed === null) return false
+
+      return unpublishable(manualEmbed(parsed)) === null
+    }
+
+    let room = 0
+    while (room < 500 && fits(room + 1)) room += 1
+
+    expect(room, 'exempt channels the shipped manual can name').toBeGreaterThanOrEqual(20)
+
+    // And the number means something: one more does not fit. Without this the
+    // loop above could be passing because the cap is never reached at all.
+    expect(fits(room + 1)).toBe(false)
+  })
+
+  /**
+   * AND OVER THE CAP IS A REFUSAL, NOT A SHORTER MANUAL. The cap is measured on
+   * the rendering, so a configuration — not an edit — can now be what takes the
+   * document over it. The answer has to be the one `unpublishable` already
+   * gives: leave the channel showing the last version Discord accepted, and say
+   * so at error, where it reaches the owner. A truncated document would read
+   * like the whole of it.
+   */
+  it('leaves the channel alone when the configuration renders it too long', async () => {
+    const markdown = await shipped()
+    const docs = docsHarness({ messages: published(doc(['One', 'first'])) })
+
+    const text = renderManual(markdown, { ...EVERYTHING, exemptChannelIds: exempt(500) })
+    if (text === null) throw new Error('a long exempt list is not a template defect')
+
+    await syncManual(parseManual(text), docs.channel, docs.pause)
+
+    expect(docs.calls).toEqual([])
+    expect(stderr.join('')).toContain('the manual does not fit in one embed')
   })
 
   /**
@@ -6665,7 +7085,7 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
     }
 
     await syncManual(
-      parseManual(await shipped()),
+      parseManual(await rendered()),
       {
         read: () => {
           calls.push('read')
@@ -6679,6 +7099,133 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
     )
 
     expect(calls).toEqual(['read'])
+  })
+
+  /**
+   * THE OTHER HALF OF THAT RULE, AND IT IS THE ONE THE TEMPLATE ADDED: A CONFIG
+   * CHANGE HAS TO REACH THE CHANNEL.
+   *
+   * "The 'nothing is posted when nothing changed' rule compares the rendered
+   * document, not the file, so a config change must now be able to trigger a
+   * republish and an unchanged config must not." Both directions are here
+   * against the document that really ships, because each of them is broken by a
+   * different mistake: comparing the FILE would make the first case silent, and
+   * putting anything per-start into the rendering — a timestamp, a count — would
+   * make the second one write on every restart forever.
+   */
+  it('republishes when the configuration changes and stays silent when it does not', async () => {
+    const before = await asEmbed({ ...EVERYTHING, exemptChannelIds: exempt(1) })
+
+    const channel = (calls: string[]): DocsChannel => ({
+      read: () => {
+        calls.push('read')
+
+        return Promise.resolve([
+          {
+            id: 'm1',
+            title: before.title,
+            description: before.description,
+            colour: before.colour,
+          },
+        ])
+      },
+
+      post: () => {
+        calls.push('post')
+        return Promise.resolve()
+      },
+
+      edit: (id) => {
+        calls.push(`edit ${id}`)
+        return Promise.resolve()
+      },
+
+      remove: () => {
+        calls.push('remove')
+        return Promise.resolve()
+      },
+    })
+
+    // A channel exempted since the last start. Nobody edited the file.
+    const changed: string[] = []
+
+    await syncManual(
+      parseManual(await rendered({ ...EVERYTHING, exemptChannelIds: exempt(2) })),
+      channel(changed),
+      () => Promise.resolve(),
+    )
+
+    expect(changed).toEqual(['read', 'edit m1'])
+
+    // The same settings again: an ordinary restart, and it says nothing.
+    const same: string[] = []
+
+    await syncManual(
+      parseManual(await rendered({ ...EVERYTHING, exemptChannelIds: exempt(1) })),
+      channel(same),
+      () => Promise.resolve(),
+    )
+
+    expect(same).toEqual(['read'])
+  })
+
+  /**
+   * THE TWO CONDITIONAL PASSAGES ARE REALLY CONDITIONAL, AGAINST THE REAL FILE.
+   *
+   * A MECHANISM ASSERTION AND NOT A WORDING ONE, deliberately. What the passages
+   * SAY is the owner's and is not this test's business — the rules list above
+   * explains at length why pinning his prose makes the assertion weaker every
+   * time he rewrites it. What is pinned is that turning each exemption off takes
+   * something out of the published document and turning it on puts it back,
+   * which is the whole of what he asked for and the only part the code owns.
+   *
+   * SHORTER IS THE ASSERTION, because it holds whatever the passages say. A
+   * rendering that dropped nothing would be the same length.
+   */
+  it('drops each exemption passage when that exemption is not running', async () => {
+    const everything = (await asEmbed()).description
+
+    const noChannels = (await asEmbed({ ...EVERYTHING, exemptChannelIds: [] })).description
+    const noAdmins = (await asEmbed({ ...EVERYTHING, exemptAdmins: false })).description
+    const noRole = (await asEmbed({ ...EVERYTHING, adminRoleId: null })).description
+
+    expect(noChannels.length).toBeLessThan(everything.length)
+    expect(noAdmins.length).toBeLessThan(everything.length)
+
+    // THE FLAG DEFAULTS TO TRUE, so a guild that never named an admin role has
+    // the exemption switched on and running over nobody. Asking the flag alone
+    // would publish the passage there, which is the mistake this pins.
+    expect(noRole).toBe(noAdmins)
+
+    // Neither passage is load-bearing for the other, and the section they share
+    // survives losing both.
+    const neither = (await asEmbed({ exemptChannelIds: [], exemptAdmins: false, adminRoleId: null }))
+      .description
+
+    expect(neither.length).toBeLessThan(noChannels.length)
+    expect(neither.length).toBeLessThan(noAdmins.length)
+
+    // No marker and no token reaches the channel in any of them.
+    for (const text of [everything, noChannels, noAdmins, neither]) {
+      expect(text).not.toContain('<!--')
+      expect(text).not.toContain('{{')
+    }
+  })
+
+  /**
+   * AND THE CHANNELS ARE NAMED INLINE, AS MENTIONS. "If there are, tell us what
+   * they are inline" — and the rest of the document's rule for naming a channel
+   * is a `<#…>`, which renders as the channel's name in the reader's own client
+   * and follows a rename with nobody editing anything.
+   */
+  it('names the exempted channels inline as mentions', async () => {
+    const { description } = await asEmbed({ ...EVERYTHING, exemptChannelIds: exempt(3) })
+
+    expect(description).toContain('<#1000000000000000000>, <#1000000000000000001>, <#1000000000000000002>')
+
+    // The ids themselves never appear bare — that would be an unclickable
+    // eighteen-digit number in the middle of a sentence.
+    expect(description).not.toMatch(/(?<!<#)\b1000000000000000000\b/u)
   })
 
   /**
