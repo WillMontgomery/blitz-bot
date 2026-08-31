@@ -15,6 +15,7 @@ import {
   type SendableChannels,
 } from 'discord.js'
 
+import { installGameBanRole } from './banrole.ts'
 import type { Config } from './config.ts'
 import {
   createDdb,
@@ -1775,19 +1776,34 @@ export function createClient(config: Config): Client {
      * `GuildMessages` to be told a message exists, and `MessageContent` to be
      * allowed to read it.
      *
-     * `GuildMembers` IS DELIBERATELY ABSENT, AND THE ADMIN EXEMPTION DOES NOT
-     * NEED IT. A `messageCreate` payload carries the author's member object
-     * OPPORTUNISTICALLY — often, not always — and this comment used to claim it
-     * always did, which is how "no member, so skip the message" came to be the
-     * shipped default. The rule is now "no member, so fetch one" (`memberRoles`,
-     * one cached REST call per uncached author) and "fetch failed, so scan", so
-     * the missing intent costs at most a lookup and never a bypass.
+     * `GuildMembers` IS NOW ASKED FOR, AND THIS COMMENT USED TO ARGUE AT LENGTH
+     * THAT IT NEVER SHOULD BE. Both halves of that argument still stand and
+     * neither is what changed. The moderation path genuinely does not need it —
+     * a `messageCreate` payload carries the author's member OPPORTUNISTICALLY,
+     * and the rule is "no member, so fetch one" (`memberRoles`) and "fetch
+     * failed, so scan", so the missing intent cost at most a lookup and never a
+     * bypass. And it is still true that this application's credentials are shared
+     * with the Ringmaster console, so a privileged intent is widened for every
+     * consumer of the token and not only for this feature.
      *
-     * IT STAYS ABSENT FOR A REASON BEYOND TIDINESS. This application's
-     * credentials are shared with the Ringmaster console, and its grant is
-     * already wider than that console's own docs describe. Adding a second
-     * privileged intent widens it again, for every consumer of the token, to
-     * save one REST call.
+     * WHAT CHANGED IS THAT A FEATURE NOW NEEDS THE EVENT ITSELF. blitz-bot#2 puts
+     * the game-ban role on somebody the console has banned; a banned player who
+     * is not in the guild cannot be marked until they arrive, and `guildMemberAdd`
+     * is the only way to learn that they have. Without it, leaving and rejoining
+     * is how you take the role off. The owner has approved enabling it.
+     *
+     * IT IS PRIVILEGED, SO THE TICK IN THE DEVELOPER PORTAL HAS TO BE ON BEFORE
+     * THIS SHIPS — your app -> Bot -> Privileged Gateway Intents -> Server Members
+     * Intent. The signature of getting that wrong is the one `MessageContent`
+     * already documents above and it is the whole bot rather than this feature:
+     * the gateway rejects the identify, closes with code 4014, `client.login()`
+     * rejects, index.ts exits non-zero and systemd restarts into the same wall.
+     * `code=4014` on the `gateway disconnected` line is the evidence.
+     *
+     * IT ALSO MAKES THE MEMBER CACHE REAL. discord.js will now hold guild members
+     * it is told about, which costs memory in proportion to the guild. Nothing
+     * here asks for a full member list — `installGameBanRole` works from ids and
+     * REST writes — so what accumulates is what the gateway pushes.
      */
     /**
      * `GuildModeration` IS NEW AND IS NOT PRIVILEGED. It is the intent that
@@ -1811,6 +1827,7 @@ export function createClient(config: Config): Client {
       GatewayIntentBits.GuildMessages,
       GatewayIntentBits.MessageContent,
       GatewayIntentBits.GuildModeration,
+      GatewayIntentBits.GuildMembers,
     ],
 
     /**
@@ -2166,6 +2183,29 @@ export function createClient(config: Config): Client {
    * mirroring the wrong guild's bans.
    */
   installBanMirror(client, config, createDdb())
+
+  /**
+   * THE OTHER DIRECTION OF THE SAME POLICY — blitz-bot#2.
+   *
+   * `installBanMirror` above carries a DISCORD decision into the game. This one
+   * carries a GAME decision into Discord: a ban issued in the console puts the
+   * game-ban role on, and lifting or EXPIRING it takes the role off. Neither
+   * direction can ban anybody on Discord, which is the asymmetry the owner
+   * settled and which both files state at length.
+   *
+   * IT IS WIRED HERE, UNCONDITIONALLY, FOR THE MIRROR'S REASONS. There is no
+   * channel id to hang it off because it is not a thing the bot says, and its one
+   * configurable part — the role id — has a default rather than an absence.
+   *
+   * A SEPARATE `Ddb` FOR THE SAME REASON THE MAINTENANCE WATCHER HAS ONE:
+   * `createDdb` opens no socket and resolves no credentials, and each caller then
+   * gets exactly the `Pick` of it that its own module declares.
+   *
+   * REGISTERED AFTER THE GUILD CHECK, like everything else here, and not taken off
+   * by the halt: it checks the guild id on every join and reads a role id from the
+   * config rather than anything it discovered in the guild.
+   */
+  installGameBanRole(client, config, createDdb())
 
   return client
 }

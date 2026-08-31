@@ -19,6 +19,12 @@ import {
   type Invocation,
   type Responder,
 } from './command.ts'
+import {
+  drainCommand,
+  DRAIN_NOTE_OPTION,
+  lazyDrainer,
+  type DrainFields,
+} from './drain.ts'
 import { help } from './help.ts'
 import { lazyReadsFrom, profileCommand } from './profile.ts'
 import { sticky, STICKY_TEXT_OPTION, unsticky } from './sticky.ts'
@@ -38,8 +44,15 @@ import { sticky, STICKY_TEXT_OPTION, unsticky } from './sticky.ts'
  * client. `lazyReadsFrom` defers that to the first `/profile` and then keeps the
  * one client for the life of the process, which is what `createDdb`'s own
  * comment asks for. See ./profile.ts.
+ *
+ * `/drain` IS HANDED A FUNCTION FOR THE SAME REASON AND A SECOND ONE. Its relay
+ * needs `ringmasterUrl` and `COMMAND_SECRET`, and there is no config at import
+ * time; it also has to answer "there is no secret, so there is no console to
+ * ask" per invocation rather than deciding that once, here, before the config
+ * has been loaded. Both fall out of passing `lazyDrainer()` instead of a relay.
  */
 export const COMMANDS: readonly BotCommand[] = [
+  drainCommand(lazyDrainer()),
   help,
   profileCommand(lazyReadsFrom(() => createDdb())),
   sticky,
@@ -247,7 +260,31 @@ export interface CommandSource {
   readonly user: InteractionUser
 
   readonly member: InteractionMember | null
-  readonly options: { get: (name: string) => SuppliedOption | null }
+
+  readonly options: {
+    get: (name: string) => SuppliedOption | null
+
+    /**
+     * Which subcommand was invoked, for the one command that has any.
+     *
+     * `getSubcommand(false)` AND NEVER `getSubcommand()`. The zero-argument
+     * overload is typed `(required?: true) => string` and THROWS when the
+     * interaction carries no subcommand — and that throw would happen while
+     * `invocationOf` is assembling `runCommand`'s arguments, which is outside
+     * the promise the listener catches. It would escape into discord.js's own
+     * emit rather than becoming a reply, and every command in the bot would
+     * answer "The application did not respond" for as long as it kept
+     * happening. Passing `false` is the overload that answers null.
+     *
+     * OPTIONAL, AND THAT IS ABOUT THE TESTS RATHER THAN ABOUT DISCORD. The real
+     * `ChatInputCommandInteraction` always has this method — the context-menu
+     * interactions that do not are refused above by `isChatInputCommand` — but
+     * a dozen `CommandSource` fakes in commands.test.ts build `options` as
+     * `{ get: ... }` and a required method would make every one of them a
+     * compile error over a value they never read.
+     */
+    getSubcommand?: (required: false) => string | null
+  }
 }
 
 /**
@@ -349,14 +386,61 @@ function textOf(options: CommandSource['options']): string | null {
 }
 
 /**
+ * The `note` option `/drain` supplied, or null.
+ *
+ * THE SAME TWO CHECKS `textOf` MAKES, AND A SEPARATE FIELD RATHER THAN REUSING
+ * `text`. Reading two differently-named options into one slot would mean a
+ * command declaring both has a field whose value depends on which name this
+ * function asks for first — and `text` means "the sticky's message" everywhere
+ * else in the bot. A note shown to players at the door is not that.
+ *
+ * IT IS READ INSIDE A SUBCOMMAND AND THAT COSTS NOTHING. discord.js hoists the
+ * invoked subcommand's own options, so `get('note')` finds `/drain start`'s
+ * note exactly as it finds a top-level one.
+ */
+function noteOf(options: CommandSource['options']): string | null {
+  const option = options.get(DRAIN_NOTE_OPTION)
+
+  if (option === null || option.type !== ApplicationCommandOptionType.String) return null
+  return typeof option.value === 'string' ? option.value : null
+}
+
+/**
+ * Which subcommand was invoked, or null.
+ *
+ * NULL FOR EVERY COMMAND THAT HAS NO SUBCOMMANDS, which is four of the five, so
+ * this costs nothing to ask on their behalf. `/drain` is the only reader and it
+ * refuses rather than guessing when the answer is null — see `subcommandOf` in
+ * ./drain.ts, which will not pick the half that restarts the game server on the
+ * strength of a payload it could not parse.
+ *
+ * THE METHOD IS OPTIONAL ON THE RECORD, so this also answers null for a fake
+ * that does not have one. See `CommandSource`.
+ */
+function subcommandOf(options: CommandSource['options']): string | null {
+  const name = options.getSubcommand?.(false) ?? null
+
+  return typeof name === 'string' && name !== '' ? name : null
+}
+
+/**
  * Reduce a live interaction to the record the gate and the handlers read.
  *
  * STRUCTURAL RATHER THAN discord.js's `ChatInputCommandInteraction`, for the
  * reason `snapshot` in client.ts is structural: the real thing cannot be built
  * in a test without a client and a token, and this is the function that decides
  * what the gate gets to see.
+ *
+ * THE RETURN TYPE IS WIDER THAN `Invocation`, AND THAT IS TEMPORARY SCAFFOLDING
+ * rather than a design. `Invocation` lives in ./command.ts, which this change
+ * does not own; `DrainFields` declares the two fields `/drain` needs as an
+ * OPTIONAL intersection, which is what `StickyFields` was before `channelId`
+ * and `text` moved into `Invocation` proper. Everything downstream still takes
+ * an `Invocation` — `runCommand` and every handler — so the widening is visible
+ * only to the one command that reads it. When those fields move over there,
+ * this annotation and that interface are deleted together.
  */
-export function invocationOf(interaction: CommandSource): Invocation {
+export function invocationOf(interaction: CommandSource): Invocation & DrainFields {
   const target = targetOf(interaction.options)
 
   return {
@@ -385,6 +469,10 @@ export function invocationOf(interaction: CommandSource): Invocation {
     targetDisplayName: target?.displayName,
 
     text: textOf(interaction.options),
+
+    // `/drain`'s two, null for every other command. See `DrainFields`.
+    subcommand: subcommandOf(interaction.options),
+    note: noteOf(interaction.options),
   }
 }
 

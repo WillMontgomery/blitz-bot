@@ -74,8 +74,10 @@ Anything done while the bot was down is picked up at the next start.
 
 ## The commands
 
-Four, re-registered on every start. **Admin** means holding `DISCORD_ADMIN_ROLE_ID`; with that unset, nothing admin-only runs.
+Five, re-registered on every start. **Admin** means holding `DISCORD_ADMIN_ROLE_ID`; with that unset, nothing admin-only runs.
 
+- `/drain start [note]` — **admin**. Stops the server letting anybody in, then updates and restarts it, ending every match in progress. `note` is what players who try to join are shown. Private.
+- `/drain cancel` — **admin**. Calls that window off. The console does not open that route to this bot yet, so it is refused. Private.
 - `/help [user]` — anyone. Links the player guide. Posted in the channel when aimed at somebody, private otherwise.
 - `/profile` — anyone. Your own progression and match record. Private.
 - `/profile <user>` — **admin**. Bans, career, registry row, last five matches, and a button to the console. Private.

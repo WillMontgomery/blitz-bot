@@ -168,9 +168,10 @@ const OUR_OTHER_IP = '18.222.244.205'
  * what keeps the next unconditional listener a one-line edit here instead of
  * three edits scattered through the file.
  *
- * TWO TODAY: the guild check, and the moderation mirror's boot replay.
+ * THREE TODAY: the guild check, the moderation mirror's boot replay, and the
+ * game-ban role sync's boot check and pollers (blitz-bot#2).
  */
-const ALWAYS_READY = 2
+const ALWAYS_READY = 3
 
 function cfg(over: Partial<Config> = {}): Config {
   return {
@@ -3171,12 +3172,31 @@ describe('createClient — the wiring that would otherwise fail silently', () =>
     await client.destroy()
   })
 
-  it('does not request the GuildMembers intent', async () => {
-    // The member arrives attached to the message payload, so the admin
-    // exemption works without a second privileged intent. Asking for one that
-    // is not needed is another switch in the portal to get wrong.
+  /**
+   * THIS TEST USED TO ASSERT THE OPPOSITE, and the reason it did is still true:
+   * the admin exemption reads the member off the message payload and never needed
+   * a second privileged intent. What changed is that blitz-bot#2 needs the EVENT.
+   * A player the console has banned who is not in the guild cannot be marked until
+   * they arrive, so without `guildMemberAdd` leaving and rejoining is how somebody
+   * takes the game-ban role off.
+   *
+   * IT IS PINNED BECAUSE IT IS A DEPLOYMENT PRECONDITION AND NOT A PREFERENCE. The
+   * Server Members Intent has to be ticked on in the Developer Portal before this
+   * ships, and getting that wrong takes the WHOLE bot down in a restart loop
+   * (close code 4014), not just this feature — the same trap `MessageContent`
+   * already carries. A change that quietly dropped this intent would take the
+   * feature away with nothing failing; a change that quietly added a third one
+   * should have to say so here.
+   */
+  it('asks for GuildMembers, which blitz-bot#2 needs and the portal has to allow', async () => {
     const client = createClient(cfg())
-    expect(client.options.intents.has(GatewayIntentBits.GuildMembers)).toBe(false)
+
+    expect(client.options.intents.has(GatewayIntentBits.GuildMembers)).toBe(true)
+
+    // And still no OTHER privileged intent: Presence is the third one and
+    // nothing in this bot has ever had a use for it.
+    expect(client.options.intents.has(GatewayIntentBits.GuildPresences)).toBe(false)
+
     await client.destroy()
   })
 
@@ -7789,12 +7809,70 @@ describe('the mirror, wired to the gateway', () => {
    * THE INTENT IS THE FEATURE. `GuildModeration` is what delivers
    * `guildAuditLogEntryCreate`; it is not privileged, and the View Audit Log
    * permission is what actually has to be granted in the guild.
+   *
+   * THE SECOND ASSERTION HERE USED TO BE `GuildMembers` IS ABSENT, which was #16's
+   * true statement about #16. blitz-bot#2 needs that one and asks for it, and the
+   * test that pins it now lives with the other intent decisions in
+   * `createClient — the wiring that would otherwise fail silently`. What is still
+   * worth pinning HERE is that the mirror's own intent is not privileged, since
+   * that is what makes #16 deployable without a portal change.
    */
-  it('asks for the moderation intent and no new privileged one', async () => {
+  it('asks for the moderation intent, which needs no tick in the portal', async () => {
     const client = createClient(cfg())
 
     expect(client.options.intents.has(GatewayIntentBits.GuildModeration)).toBe(true)
-    expect(client.options.intents.has(GatewayIntentBits.GuildMembers)).toBe(false)
+
+    await client.destroy()
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * The other direction — blitz-bot#2.
+ * ------------------------------------------------------------------ */
+
+describe('the game-ban role, wired to the gateway', () => {
+  /**
+   * BOTH DIRECTIONS ARE WIRED UNCONDITIONALLY, AND THAT IS ONE DECISION RATHER
+   * THAN TWO. `installBanMirror` carries a Discord decision into the game;
+   * `installGameBanRole` carries a game decision into Discord. Neither is a thing
+   * the bot SAYS, so neither has a channel id to hang off and neither has an off
+   * switch — the role id has a default rather than an absence, and everything that
+   * can go wrong with it is reported rather than switched off.
+   *
+   * A SOURCE ASSERTION, LIKE THE MIRROR'S, because a fake client cannot tell
+   * whether the call was made behind an `if`: the listener count is the same
+   * either way for a config that happens to satisfy the condition.
+   */
+  it('is installed for every config, with a reader of its own', async () => {
+    const source = await readFile(new URL('./client.ts', import.meta.url), 'utf8')
+
+    expect(source).toContain('installGameBanRole(client, config, createDdb())')
+  })
+
+  /**
+   * IT IS THE HALF OF THE POLICY #16 DOES NOT COVER, and the two must not be
+   * confused: a game ban assigns the role and never bans anybody on Discord.
+   * `createClient` is where both are attached, so a change that drops one is
+   * visible here.
+   */
+  it('is attached alongside the mirror rather than instead of it', async () => {
+    const source = await readFile(new URL('./client.ts', import.meta.url), 'utf8')
+
+    expect(source).toContain('installBanMirror(client, config, createDdb())')
+    expect(source.indexOf('installBanMirror(client, config, createDdb())')).toBeLessThan(
+      source.indexOf('installGameBanRole(client, config, createDdb())'),
+    )
+  })
+
+  /**
+   * A JOIN LISTENER EXISTS AT ALL, which is what the privileged intent was taken
+   * on for. Without it a banned player who is not in the guild is never marked,
+   * and leaving and rejoining is how somebody sheds the role.
+   */
+  it('listens for members joining, which is what the new intent is for', async () => {
+    const client = createClient(cfg())
+
+    expect(client.listenerCount(Events.GuildMemberAdd)).toBe(1)
 
     await client.destroy()
   })

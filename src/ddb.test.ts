@@ -27,8 +27,8 @@ import {
   type AuditRow,
   type Ban,
   type BanIssueInput,
-  type Ddb,
   type DdbOp,
+  type DdbWithAuditWindow,
   type DdbResult,
   type DocumentClient,
   type MaintenanceWindow,
@@ -171,7 +171,10 @@ function awsError(name: string, message = 'from the fake'): Error {
  * is on it has to survive the deadline, the classification and the write
  * inventory below.
  */
-const EXERCISES: Array<{ name: string; run: (ddb: Ddb) => Promise<DdbResult<unknown>> }> = [
+const EXERCISES: Array<{
+  name: string
+  run: (ddb: DdbWithAuditWindow) => Promise<DdbResult<unknown>>
+}> = [
   { name: 'bans.get', run: (d) => d.bans.get(LICENSE) },
   { name: 'bans.issue', run: (d) => d.bans.issue(ISSUE) },
   {
@@ -186,6 +189,10 @@ const EXERCISES: Array<{ name: string; run: (ddb: Ddb) => Promise<DdbResult<unkn
   { name: 'audit.begin', run: (d) => d.audit.begin({ action: 'player.kick', actor: ACTOR }) },
   { name: 'audit.resolve', run: (d) => d.audit.resolve({ commandId: 'c1', ts: 1 }, 'ok') },
   { name: 'audit.recent', run: (d) => d.audit.recent(10) },
+  // A window that is open, deliberately: `since` answers a closed one without
+  // asking DynamoDB, so `(1, 1]` would exercise nothing at all.
+  { name: 'auditWindow.since', run: (d) => d.auditWindow.since(1, 2, 10) },
+  { name: 'auditWindow.newest', run: (d) => d.auditWindow.newest() },
   { name: 'botState.get', run: (d) => d.botState.get('reported-commit') },
   { name: 'botState.put', run: (d) => d.botState.put('reported-commit', 'abc1234') },
 ]
@@ -1541,6 +1548,204 @@ describe('stamping an outcome', () => {
 
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.failure.kind).toBe('conflict')
+  })
+})
+
+/**
+ * The audit log read as a stream — what blitz-bot#2's poller consumes.
+ *
+ * THE FAILURE THESE GUARD AGAINST IS SILENCE. Every other read in this module
+ * fails loudly when it is wrong; this one answers "no rows" to a caller that
+ * cannot tell an idle log from a log it has lost, so the window arithmetic and
+ * the partition it addresses both have to be pinned rather than described.
+ */
+describe('reading the audit log as a stream', () => {
+  /** A `since` query's key condition values, off the recorded call. */
+  function values(fake: Fake): Record<string, unknown> {
+    const input = fake.calls[0]?.input as QueryCommandInput | undefined
+    return (input?.ExpressionAttributeValues ?? {}) as Record<string, unknown>
+  }
+
+  /**
+   * THE CURSOR IS EXCLUSIVE AND `BETWEEN` IS NOT, WHICH IS THE WHOLE ARITHMETIC.
+   * Off by one here means either replaying the row at the cursor on every pass
+   * forever, or skipping the row immediately after it.
+   */
+  it('asks for the row after the cursor, up to and including the far end', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    await ddb.auditWindow.since(1_700_000_000_000, 1_700_000_005_000, 10)
+
+    expect(fake.calls[0]?.input).toMatchObject({
+      TableName: 'ringmaster-audit',
+      KeyConditionExpression: 'pk = :pk AND ts BETWEEN :from AND :to',
+      ScanIndexForward: true,
+      Limit: 10,
+    })
+
+    expect(values(fake)).toEqual({
+      ':pk': 'AUDIT',
+      ':from': 1_700_000_000_001,
+      ':to': 1_700_000_005_000,
+    })
+  })
+
+  /**
+   * OLDEST FIRST, WHICH IS THE OPPOSITE OF `recent` AND IS NOT A DETAIL. A
+   * cursor can only be advanced over rows already dealt with, so a page that
+   * arrived newest-first would have to be held whole to work out where to
+   * resume — and a pass that stopped early would resume from the wrong end.
+   */
+  it('walks forwards, unlike every other query in this module', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    await ddb.auditWindow.since(1, 2)
+    await ddb.audit.recent(5)
+
+    expect((fake.calls[0]?.input as QueryCommandInput).ScanIndexForward).toBe(true)
+    expect((fake.calls[1]?.input as QueryCommandInput).ScanIndexForward).toBe(false)
+  })
+
+  /**
+   * A CLOSED WINDOW IS ANSWERED WITHOUT A ROUND TRIP. A caught-up poller asks
+   * for `(t, t]` on every tick, and a billed read that cannot return anything,
+   * every thirty seconds, for the life of the process, is a real cost for a
+   * known answer.
+   */
+  it('does not ask DynamoDB about a window that cannot hold anything', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    const same = await ddb.auditWindow.since(1_700_000_000_000, 1_700_000_000_000)
+    const backwards = await ddb.auditWindow.since(1_700_000_000_000, 1_699_999_999_000)
+
+    expect(same).toEqual({ ok: true, value: [] })
+    expect(backwards).toEqual({ ok: true, value: [] })
+    expect(fake.calls).toEqual([])
+  })
+
+  it('clamps the page size rather than trusting the caller', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    await ddb.auditWindow.since(1, 2, 10_000)
+    await ddb.auditWindow.since(1, 2, 0)
+
+    expect((fake.calls[0]?.input as QueryCommandInput).Limit).toBe(200)
+    // A caller asking for none gets one row rather than DynamoDB's own reading
+    // of `Limit: 0`, which is the same clamp `gamePlayers.matches` makes.
+    expect((fake.calls[1]?.input as QueryCommandInput).Limit).toBe(1)
+  })
+
+  it('hands back the rows it was given, in the order they arrived', async () => {
+    const rows: AuditRow[] = [
+      {
+        pk: 'AUDIT',
+        ts: 2,
+        commandId: 'c2',
+        action: 'ban.issue',
+        outcome: 'pending',
+        actorLicense: null,
+        actorName: 'Console',
+        actorDiscordId: null,
+      },
+      {
+        pk: 'AUDIT',
+        ts: 3,
+        commandId: 'c3',
+        action: 'player.kick',
+        outcome: 'pending',
+        actorLicense: null,
+        actorName: 'Console',
+        actorDiscordId: null,
+      },
+    ]
+
+    const ddb = createDdb({
+      document: fakeDocument({ query: () => Promise.resolve({ ...META, Items: rows }) }).doc,
+    })
+
+    const page = await ddb.auditWindow.since(1, 10)
+
+    expect(page.ok && page.value.map((row) => row.ts)).toEqual([2, 3])
+  })
+
+  /**
+   * TRAP 5 — the probe. `since` returning nothing means either "nobody has done
+   * anything" or "this partition is not where the log is any more", and only
+   * this question separates them.
+   */
+  it('answers whether the partition holds anything at all, in one row', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    const empty = await ddb.auditWindow.newest()
+
+    expect(empty).toEqual({ ok: true, value: null })
+    expect(fake.calls[0]?.input).toMatchObject({
+      TableName: 'ringmaster-audit',
+      KeyConditionExpression: 'pk = :pk',
+      ScanIndexForward: false,
+      Limit: 1,
+    })
+  })
+
+  it('answers with the newest row when there is one', async () => {
+    const row: AuditRow = {
+      pk: 'AUDIT',
+      ts: 1_700_000_000_000,
+      commandId: 'c1',
+      action: 'maintenance.deploy',
+      outcome: 'ok',
+      actorLicense: null,
+      actorName: 'Console',
+      actorDiscordId: null,
+    }
+
+    const ddb = createDdb({
+      document: fakeDocument({ query: () => Promise.resolve({ ...META, Items: [row] }) }).doc,
+    })
+
+    expect(await ddb.auditWindow.newest()).toEqual({ ok: true, value: row })
+  })
+
+  /**
+   * TRAP 5 — the partition is a setting, not four literals.
+   *
+   * The console's own note says this key becomes `AUDIT#<yyyy-mm>` one day. A
+   * reader with `'AUDIT'` baked in returns zero rows forever, with no error at
+   * any layer. This asserts that following that migration is ONE option and
+   * that it moves the writes with the reads — a bot reading the new partition
+   * and writing the old one would be a log split in half.
+   */
+  it('addresses one partition everywhere, and it is settable', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc, auditPartition: 'AUDIT#2027-03' })
+
+    expect(ddb.auditWindow.partition).toBe('AUDIT#2027-03')
+
+    await ddb.auditWindow.since(1, 2)
+    await ddb.auditWindow.newest()
+    await ddb.audit.recent(1)
+    await ddb.audit.begin({ action: 'ban.issue', actor: ACTOR })
+    await ddb.audit.resolve({ commandId: 'c1', ts: 1 }, 'ok')
+
+    const put = fake.calls.find((call) => call.op === 'put')
+    const update = fake.calls.find((call) => call.op === 'update')
+
+    for (const query of fake.calls.filter((call) => call.op === 'query')) {
+      const input = query.input as QueryCommandInput
+      expect(input.ExpressionAttributeValues?.[':pk']).toBe('AUDIT#2027-03')
+    }
+
+    expect((put?.input as PutCommandInput).Item?.pk).toBe('AUDIT#2027-03')
+    expect((update?.input as UpdateCommandInput).Key?.pk).toBe('AUDIT#2027-03')
+  })
+
+  it('is AUDIT when nobody says otherwise, which is what the console writes today', () => {
+    expect(createDdb({ document: fakeDocument().doc }).auditWindow.partition).toBe('AUDIT')
   })
 })
 

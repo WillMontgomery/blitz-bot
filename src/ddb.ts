@@ -144,6 +144,12 @@ export interface DdbOptions {
   timeoutMs?: number
 
   /**
+   * The audit log's partition key. See `AUDIT_PK` for why this is an option at
+   * all and why it is not an environment variable.
+   */
+  auditPartition?: string
+
+  /**
    * The document client to use, for tests.
    *
    * THE ONLY SEAM, AND IT IS THE RIGHT ONE. Everything above the seam — name
@@ -820,8 +826,43 @@ export interface AuditInput {
   detail?: AuditRow['detail']
 }
 
-/** The audit log's single partition key. From lib/audit.ts. */
+/**
+ * The audit log's single partition key. From lib/audit.ts.
+ *
+ * A DEFAULT AND NO LONGER A BAKED-IN LITERAL, BECAUSE THE CONSOLE HAS WRITTEN
+ * DOWN THAT IT WILL MOVE. `fivem-ringmaster/src/lib/audit.ts` says the whole log
+ * lives in one partition today and that the answer to that partition growing is
+ * `AUDIT#<yyyy-mm>` — a key derived from the clock, one partition per month.
+ *
+ * THE FAILURE THAT WOULD CAUSE IS SILENT AND IS THE WHOLE REASON THIS IS AN
+ * OPTION. A writer pointed at the old key keeps working (it creates the old
+ * partition again), and a READER pointed at it returns zero rows, forever,
+ * without an error of any kind — which is exactly what src/banrole.ts's poller
+ * consumes. "No new bans" and "the log moved out from under me" are the same
+ * empty page. src/banrole.ts closes that with a probe (see `PARTITION_SILENCE_MS`
+ * there); this constant is the other half, so that following the migration is one
+ * edit in one file rather than four literals in three functions.
+ *
+ * DELIBERATELY NOT AN ENVIRONMENT VARIABLE, and that is not an oversight. The
+ * shape the console describes is derived from the current month, so a value
+ * pasted into a dotenv file would be correct until the first of the following
+ * month and then wrong in exactly the silent way above. When the migration lands
+ * the right change here is a function of the clock, not a string an operator
+ * maintains. The option exists so there is one place to write that function, and
+ * so a test can drive a moved partition today.
+ */
 const AUDIT_PK = 'AUDIT'
+
+/**
+ * How many audit rows one `since` may return, whatever the caller asks for.
+ *
+ * A CEILING ON A NUMBER SOMEBODY ELSE PICKS, exactly as `MATCH_LIMIT_CAP` is. The
+ * caller decides how much work it can do in a pass; this decides how much the bot
+ * will ever pull out of the log in one round trip. A poller that fell behind
+ * would otherwise ask for its whole backlog at once and spend the deadline on a
+ * page it cannot process anyway — the pass is bounded, so the query has to be.
+ */
+const AUDIT_QUERY_CAP = 200
 
 /* ------------------------------------------------------------------ */
 
@@ -924,13 +965,90 @@ export interface Ddb {
   }
 }
 
-export function createDdb(options: DdbOptions = {}): Ddb {
+/**
+ * Reading the audit log as a STREAM rather than as a page.
+ *
+ * A CAPABILITY OF ITS OWN AND NOT THREE MORE MEMBERS ON `Ddb.audit`, which is
+ * the same argument the `Pick<Ddb, …>` at every call site makes, one level up.
+ * `Ddb`'s own comment says its shape IS the access policy: everything on it is
+ * offered to every caller that holds one. `begin` and `resolve` are how an
+ * action gets recorded and `recent` is how a page of the log is rendered; this
+ * is how a background process CONSUMES the log, which is a different job with a
+ * different hazard — a poller that silently reads nothing forever — and exactly
+ * one consumer (src/banrole.ts). Keeping it separate means the module that polls
+ * cannot write an audit row, and the modules that write one cannot poll.
+ *
+ * THE PARTITION IS PART OF THE CAPABILITY, not a setting beside it, because a
+ * consumer that comes back empty has to be able to say WHICH partition it found
+ * nothing in — and, on the day the console splits the log by month, whether the
+ * one it is reading is still the one being written. See `AUDIT_PK`.
+ */
+export interface AuditWindow {
+  /** The partition every audit read and write in this module addresses. */
+  readonly partition: string
+
+  /**
+   * Rows in a closed window of the sort key, OLDEST FIRST.
+   *
+   * A WINDOW AND NOT AN OPEN-ENDED "EVERYTHING AFTER", which is the shape a
+   * cursor-driven poll actually needs and the reason this is not `recent`
+   * reversed. `after` is exclusive and `until` is inclusive, so consecutive
+   * passes over `(cursor, until]` see every row exactly once and never twice:
+   * `ts` is half the primary key, so no two rows in one partition share one.
+   *
+   * `until` IS WHAT LETS A CALLER REFUSE TO READ ITS OWN TAIL. An audit row is
+   * written BEFORE the action it describes (see `begin`), so the newest rows in
+   * this table are intents whose consequences have not landed in any other table
+   * yet. A reader that treats such a row as a trigger to go and look at
+   * `ringmaster-bans` has to hold back far enough that the ban row is there to
+   * find; that hold-back is the caller's policy and this parameter is how it
+   * expresses it. See `SETTLE_MS` in src/banrole.ts.
+   *
+   * OLDEST FIRST, UNLIKE `recent`, because a cursor can only be advanced over
+   * rows that have been dealt with in order. Newest-first would mean holding the
+   * whole page to work out where to resume.
+   *
+   * AN EMPTY ANSWER IS AN ANSWER AND NOT AN ABSENCE, and here that distinction
+   * has teeth: an empty page is also what a reader pointed at a partition that
+   * has MOVED gets, forever and without an error. `newest` is what tells the two
+   * apart.
+   */
+  since(after: number, until: number, limit?: number): Promise<DdbResult<AuditRow[]>>
+
+  /**
+   * The newest row in the partition, or null when the partition holds nothing.
+   *
+   * THE MIGRATION PROBE, AND IT IS THE ONLY QUESTION THAT SEPARATES A QUIET LOG
+   * FROM A LOST ONE. `since` returning nothing means either "nobody has done
+   * anything" or "this partition is not where the log is any more", and those
+   * two need opposite responses from an operator. A partition that has never
+   * held a single row, on a system that has been moderating for months, is the
+   * second one. See `AUDIT_PK`.
+   */
+  newest(): Promise<DdbResult<AuditRow | null>>
+}
+
+/**
+ * What `createDdb` actually returns: a `Ddb`, plus the audit stream.
+ *
+ * AN EXTENSION RATHER THAN A WIDER `Ddb`, so that everything already written
+ * against `Ddb` — including the hand-built fakes that deliberately implement it
+ * whole — keeps compiling and keeps meaning what it meant. A caller that wants
+ * the stream asks for this type or for a `Pick` of it; every other caller goes on
+ * taking the narrowest thing it needs.
+ */
+export interface DdbWithAuditWindow extends Ddb {
+  readonly auditWindow: AuditWindow
+}
+
+export function createDdb(options: DdbOptions = {}): DdbWithAuditWindow {
   const region = options.region ?? DEFAULT_REGION
   const prefix = options.tablePrefix ?? DEFAULT_TABLE_PREFIX
   const gamePrefix = options.gameTablePrefix ?? DEFAULT_GAME_TABLE_PREFIX
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const now = options.now ?? Date.now
   const tables = tableNames(prefix, gamePrefix)
+  const auditPk = options.auditPartition ?? AUDIT_PK
 
   // Eagerly, unlike the console's lazy proxy: constructing a client opens no
   // socket and resolves no credentials, and this factory is called once from
@@ -1501,7 +1619,7 @@ export function createDdb(options: DdbOptions = {}): Ddb {
           const ts = nextTs()
 
           const row: AuditRow = {
-            pk: AUDIT_PK,
+            pk: auditPk,
             ts,
             commandId,
             action: input.action,
@@ -1580,7 +1698,7 @@ export function createDdb(options: DdbOptions = {}): Ddb {
           await doc.update(
             {
               TableName: tables.audit,
-              Key: { pk: AUDIT_PK, ts: handle.ts },
+              Key: { pk: auditPk, ts: handle.ts },
               ConditionExpression: 'commandId = :c',
               // `error` is a DynamoDB reserved word. The console aliases it
               // the same way; without the alias the update is a syntax error
@@ -1605,7 +1723,7 @@ export function createDdb(options: DdbOptions = {}): Ddb {
             {
               TableName: tables.audit,
               KeyConditionExpression: 'pk = :pk',
-              ExpressionAttributeValues: { ':pk': AUDIT_PK },
+              ExpressionAttributeValues: { ':pk': auditPk },
               // Backwards along the sort key, which is how "latest" comes out
               // of DynamoDB without sorting client-side.
               ScanIndexForward: false,
@@ -1614,6 +1732,75 @@ export function createDdb(options: DdbOptions = {}): Ddb {
             o,
           )
           return (res.Items ?? []) as AuditRow[]
+        })
+      },
+    },
+
+    auditWindow: {
+      partition: auditPk,
+
+      /**
+       * A closed window of the sort key, oldest first. See `AuditWindow.since`
+       * for what the two bounds are for.
+       *
+       * `BETWEEN` RATHER THAN `ts > :after`, AND THE `+ 1` IS WHY. DynamoDB's
+       * `BETWEEN` is inclusive at both ends and there is no exclusive form, so
+       * "strictly after the cursor" has to be spelled as "from the next possible
+       * key". `ts` is a whole number of milliseconds everywhere it is written —
+       * `nextTs` above returns `Date.now()` or `lastTs + 1`, and the console's
+       * counter does the same — so `after + 1` is the next key that CAN exist
+       * rather than an approximation of one.
+       *
+       * AN EMPTY WINDOW IS NOT SENT TO DYNAMODB. A caller whose cursor has caught
+       * up asks for `(t, t]`, a range that cannot contain anything; the answer is
+       * known here without a round trip, and asking anyway would be a billed read
+       * on every idle poll for the life of the process.
+       *
+       * THE LIMIT IS ROWS READ, NOT ROWS MATCHED, and there is no pagination on
+       * purpose. A caller that gets a full page has not seen the whole window — it
+       * advances its cursor over what it did see and the next pass continues,
+       * which is the same shape as "the most recent N" elsewhere in this file and
+       * is what keeps one pass bounded.
+       */
+      since(after, until, limit = AUDIT_QUERY_CAP) {
+        if (until <= after) return Promise.resolve({ ok: true as const, value: [] })
+
+        return call('query', tables.audit, async (o) => {
+          const res = await doc.query(
+            {
+              TableName: tables.audit,
+              KeyConditionExpression: 'pk = :pk AND ts BETWEEN :from AND :to',
+              ExpressionAttributeValues: { ':pk': auditPk, ':from': after + 1, ':to': until },
+              // Forwards, because a cursor is only ever advanced in order.
+              ScanIndexForward: true,
+              Limit: Math.max(1, Math.min(Math.floor(limit), AUDIT_QUERY_CAP)),
+            },
+            o,
+          )
+          return (res.Items ?? []) as AuditRow[]
+        })
+      },
+
+      /**
+       * One row off the end of the partition. See `AuditWindow.newest`.
+       *
+       * `Limit: 1` AND NOT A COUNT. "Is there anything here" needs one item, and
+       * a `Select: COUNT` over a partition with a million rows in it is a scan of
+       * the partition dressed up as an aggregate.
+       */
+      newest() {
+        return call('query', tables.audit, async (o) => {
+          const res = await doc.query(
+            {
+              TableName: tables.audit,
+              KeyConditionExpression: 'pk = :pk',
+              ExpressionAttributeValues: { ':pk': auditPk },
+              ScanIndexForward: false,
+              Limit: 1,
+            },
+            o,
+          )
+          return ((res.Items ?? []) as AuditRow[])[0] ?? null
         })
       },
     },

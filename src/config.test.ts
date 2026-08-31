@@ -718,6 +718,33 @@ describe('loadConfig, on the console relay', () => {
     expect(template).toContain('1542596612306505808')
     expect(template).toContain('http://127.0.0.1:3000')
   })
+
+  /**
+   * BLITZ-BOT#2'S TWO PRECONDITIONS ARE NOT VARIABLES, WHICH IS EXACTLY WHY THEY
+   * HAVE TO BE IN THIS FILE. Neither is settable and both are silent when wrong:
+   *
+   *   THE ROLE HAS TO SIT BELOW THE BOT'S OWN. Discord refuses a role edit unless
+   *   the acting member's highest role is above it, and a new role lands wherever
+   *   it lands. There is no environment variable that can fix this — it is a drag
+   *   in a settings page — so the only place an operator can be told is here.
+   *
+   *   THE SERVER MEMBERS INTENT HAS TO BE TICKED IN THE DEVELOPER PORTAL. Getting
+   *   that wrong does not break the feature, it takes the WHOLE BOT down in a
+   *   restart loop on close code 4014, which looks like a bad token to anybody who
+   *   has not been told otherwise.
+   *
+   * ASSERTED RATHER THAN DESCRIBED because this file is a template people copy
+   * once and never read again, and a paragraph that quietly disappears in an edit
+   * is a deploy that fails at 3am with the answer nowhere.
+   */
+  it('tells operators the two things about the game-ban role that are not variables', () => {
+    const template = repoFile('.env.example')
+
+    expect(template).toContain('BELOW THE BOT')
+    expect(template).toContain('Manage Roles')
+    expect(template).toContain('Server Members Intent')
+    expect(template).toContain('4014')
+  })
 })
 
 describe('loadConfig, when neither source supplies the required variables', () => {

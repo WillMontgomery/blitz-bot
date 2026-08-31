@@ -4,14 +4,23 @@ import { setSink } from './log.ts'
 import {
   classify,
   COMMAND_SECRET_HEADER,
+  createDrainer,
   createRingmaster,
+  DRAIN_DEPLOY_MODE,
+  DRAIN_IN_MINUTES,
+  DRAIN_NOTE_CAP,
+  DRAIN_TIMEOUT_MS,
   KICK_ATTEMPTS,
   KICK_PATH,
   KICK_RETRY_MS,
   KICK_TIMEOUT_MS,
   KICK_TTL_MS,
   LICENSE,
+  MAINTENANCE_CANCEL_PATH,
+  MAINTENANCE_PATH,
   SERVICE_ACTOR_HEADER,
+  type Drainer,
+  type DrainerOptions,
   type Fetcher,
   type HttpResponse,
   type KickInput,
@@ -520,5 +529,489 @@ describe('the settings, which are arithmetic rather than taste', () => {
     // The window is the outer bound and the count is the inner one, so a clock
     // that jumps backwards cannot turn "until it is stale" into "forever".
     expect(KICK_ATTEMPTS * KICK_RETRY_MS).toBeGreaterThanOrEqual(KICK_TTL_MS)
+  })
+})
+
+/**
+ * `/drain` — THE MAINTENANCE RELAY, DRIVEN ENTIRELY OFFLINE.
+ *
+ * SAME DISCIPLINE AS THE KICK ABOVE AND THE SAME REASON FOR IT: every case here
+ * is written against an answer shape transcribed from
+ * fivem-ringmaster/src/app/api/maintenance/route.ts, its cancel route,
+ * lib/service.ts and `errorResponse` in lib/actions.ts — never invented. A test
+ * that asserts against a body the console does not send passes while the
+ * integration is broken, and this integration RESTARTS A GAME SERVER.
+ *
+ * THE SENTENCES BELOW ARE THE CONSOLE'S, COPIED. `nothingToDeploy`'s reason and
+ * `maint.schedule`'s "Cancel it first" are quoted verbatim so that the
+ * assertion "we show the console's words" is checked against the actual words.
+ */
+
+/** What the maintenance route really answers on success: 201 and the window. */
+const WINDOW = {
+  state: 'scheduled',
+  note: 'a server update',
+  drainStartsAt: 1_700_000_000_000,
+  deployMode: 'when-empty',
+  deployAt: null,
+}
+
+const SCHEDULED = { ok: true, window: { ...WINDOW, id: 'current', createdByName: 'Nate' } }
+
+/** `nothingToDeploy().reason`, from the console's lib/maintenance.ts. */
+const NOTHING_TO_DEPLOY =
+  'The server is already running the latest code — there is nothing to deploy.'
+
+/** `maint.schedule`'s throw, which the route turns into a 409. */
+const ALREADY = 'A maintenance window is already scheduled. Cancel it first.'
+
+function drainer(fetch: Fetcher, over: Partial<DrainerOptions> = {}): Drainer {
+  return createDrainer({ baseUrl: BASE, secret: SECRET, fetch, ...over })
+}
+
+function sent(calls: { init: Parameters<Fetcher>[1] }[]): Record<string, unknown> {
+  return JSON.parse(calls[0]?.init.body ?? '{}') as Record<string, unknown>
+}
+
+describe('/drain — the request the console actually receives', () => {
+  it('posts to /api/maintenance under the base url', async () => {
+    const { fetch, calls } = replies(answer(201, SCHEDULED))
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.url).toBe(`${BASE}${MAINTENANCE_PATH}`)
+    expect(calls[0]?.init.method).toBe('POST')
+  })
+
+  /**
+   * THE PATHS ARE PINNED AS LITERALS, exactly as the kick's is, and for a
+   * sharper reason: `SERVICE_ROUTES` is an EXACT-match allowlist and
+   * `/api/maintenance/force` — the button that skips the drain and restarts the
+   * box now — lives under the same prefix and is deliberately not on it.
+   */
+  it('spells the two maintenance paths the way the console spells them', () => {
+    expect(MAINTENANCE_PATH).toBe('/api/maintenance')
+    expect(MAINTENANCE_CANCEL_PATH).toBe('/api/maintenance/cancel')
+    expect(MAINTENANCE_PATH).not.toContain('force')
+  })
+
+  it('presents the secret and the acting admin in the headers the console reads', async () => {
+    const { fetch, calls } = replies(answer(201, SCHEDULED))
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(calls[0]?.init.headers[COMMAND_SECRET_HEADER]).toBe(SECRET)
+    expect(calls[0]?.init.headers[SERVICE_ACTOR_HEADER]).toBe(ADMIN)
+    expect(calls[0]?.init.headers['content-type']).toBe('application/json')
+  })
+
+  it('never puts the secret in the url or the body', async () => {
+    const { fetch, calls } = replies(answer(201, SCHEDULED))
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN, note: 'shipping the loot fix' })
+
+    expect(calls[0]?.url).not.toContain(SECRET)
+    expect(calls[0]?.init.body).not.toContain(SECRET)
+  })
+
+  /**
+   * THE DOOR CLOSES NOW AND THE RESTART WAITS FOR THE LAST MATCH. Both are what
+   * `/drain` means, and both are asserted because the route requires them and
+   * the alternative — `at-time` — ends matches that are still running.
+   */
+  it('closes the door immediately and lets the last match finish', async () => {
+    const { fetch, calls } = replies(answer(201, SCHEDULED))
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(sent(calls)).toEqual({ drainInMinutes: 0, deployMode: 'when-empty' })
+    expect(DRAIN_IN_MINUTES).toBe(0)
+    expect(DRAIN_DEPLOY_MODE).toBe('when-empty')
+  })
+
+  /**
+   * NO `targetRef` OR `targetSha`, EVER. The route pairs them — both or
+   * neither — and the sha is a promise the game box enforces twice. A Discord
+   * command has no page reading to pin one from, so a branch switch is not a
+   * thing this relay can ask for.
+   */
+  it('never asks for a branch switch', async () => {
+    const { fetch, calls } = replies(answer(201, SCHEDULED))
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN, note: 'x' })
+
+    const body = sent(calls)
+    expect(body).not.toHaveProperty('targetRef')
+    expect(body).not.toHaveProperty('targetSha')
+  })
+
+  /**
+   * THE NOTE IS THE ADMIN'S WORDS. Players turned away at the door are shown
+   * it, so it goes out exactly as typed — not trimmed into a house style, not
+   * capitalised, not summarised.
+   */
+  it('sends the note verbatim when there is one', async () => {
+    const note = 'back in ~10 min — shipping the loot fix. sorry!'
+    const { fetch, calls } = replies(answer(201, SCHEDULED))
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN, note })
+
+    expect(sent(calls)).toEqual({ drainInMinutes: 0, deployMode: 'when-empty', note })
+  })
+
+  /**
+   * OMITTED RATHER THAN NULL OR INVENTED, which is the same rule the kick's
+   * `reason` follows and matters more here. `scheduleSchema` says the console
+   * GENERATES this when it is absent, because a maintenance window is always
+   * the same thing; a default written on this side would be a second wording
+   * for the same silence, shown to players, written by nobody who was asked.
+   */
+  it('omits the note entirely when there is none, so the console writes its own', async () => {
+    const { fetch, calls } = replies(answer(201, SCHEDULED))
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN, note: null })
+
+    expect(sent(calls)).not.toHaveProperty('note')
+  })
+
+  it('drops a whitespace-only note rather than putting blanks on the door', async () => {
+    const { fetch, calls } = replies(answer(201, SCHEDULED))
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN, note: '   ' })
+
+    expect(sent(calls)).not.toHaveProperty('note')
+  })
+
+  /**
+   * The console's `scheduleSchema` accepts 200. Truncating keeps the drain; a
+   * zod message back would lose it over the length of a sentence. Discord also
+   * refuses the input at this length in the client, so this is the belt behind
+   * that.
+   */
+  it('truncates a note too long for the console rather than losing the drain', async () => {
+    const { fetch, calls } = replies(answer(201, SCHEDULED))
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN, note: 'x'.repeat(400) })
+
+    expect(sent(calls).note).toHaveLength(DRAIN_NOTE_CAP)
+    expect(DRAIN_NOTE_CAP).toBe(200)
+  })
+})
+
+describe('/drain — what the console said, shown as it was said', () => {
+  it('reports a scheduled window and reads the row it was handed', async () => {
+    const { fetch } = replies(answer(201, SCHEDULED))
+    const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(result).toEqual({ outcome: 'scheduled', status: 201, window: WINDOW })
+  })
+
+  /**
+   * THE 409 THAT IS THE OWNER'S "FAIL IF NO UPDATES ARE AVAILABLE" RULE. It is
+   * enforced in the route and nowhere else, which is the whole argument for
+   * going through the API — and the reason it carries has to reach the admin
+   * unedited, because this bot cannot see what the console looked at.
+   */
+  it('carries "there is nothing to deploy" through word for word', async () => {
+    const { fetch } = replies(answer(409, { ok: false, error: NOTHING_TO_DEPLOY }))
+    const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      failure: 'refused',
+      detail: NOTHING_TO_DEPLOY,
+      status: 409,
+    })
+  })
+
+  /**
+   * AND THE OTHER 409, WHICH IS `maint.schedule` REFUSING TO STAMP OVER A LIVE
+   * WINDOW. A raw PutItem would have overwritten it — one fixed key, one full
+   * put — mid-drain, on a server already turning players away.
+   */
+  it('carries "a window is already scheduled" through word for word', async () => {
+    const { fetch } = replies(answer(409, { ok: false, error: ALREADY }))
+    const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(result).toMatchObject({ outcome: 'refused', failure: 'refused', detail: ALREADY })
+  })
+
+  /** A zod message from `scheduleSchema`, which `errorResponse` sends as a 400. */
+  it('treats a 400 with a sentence as a refusal with that sentence', async () => {
+    const { fetch } = replies(answer(400, { ok: false, error: 'Choose a time for the deploy.' }))
+    const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(result).toMatchObject({ failure: 'refused', detail: 'Choose a time for the deploy.' })
+  })
+
+  /**
+   * THE SERVICE GATE'S SHAPE, WHICH IS THE ONE EASIEST TO MISS: no `outcome`,
+   * no sentence, a machine code. It is what a stale secret produces, which is
+   * the single most likely thing to be wrong on the day this is wired up.
+   */
+  it('recognises every refusal from the console`s door as denied', async () => {
+    const doors: [number, string][] = [
+      [401, 'auth'],
+      [403, 'scope'],
+      [400, 'actor'],
+      [403, 'role-revoked'],
+    ]
+
+    for (const [status, error] of doors) {
+      const { fetch, calls } = replies(answer(status, { ok: false, error }))
+      const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+      expect(result).toMatchObject({ failure: 'denied', detail: error, status })
+      expect(calls).toHaveLength(1)
+    }
+  })
+
+  /** An operator's job, and kept apart from a stale secret on purpose. */
+  it('tells an unset COMMAND_SECRET on the console from a wrong one', async () => {
+    const { fetch } = replies(answer(503, { ok: false, error: 'not-configured' }))
+    const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(result).toMatchObject({ failure: 'not-configured', status: 503 })
+  })
+
+  /** The gate's two transient refusals, and any other 5xx, are the console`s fault. */
+  it('reports the console`s own outages as unavailable rather than as a refusal', async () => {
+    for (const error of ['store', 'role-error']) {
+      const { fetch } = replies(answer(503, { ok: false, error }))
+      const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+      expect(result).toMatchObject({ failure: 'unavailable', detail: error })
+    }
+
+    // `errorResponse`'s catch-all, which carries a sentence at 500. It is the
+    // console falling over, not a refusal of anything.
+    const { fetch } = replies(
+      answer(500, { ok: false, error: 'Something went wrong. It has been logged.' }),
+    )
+
+    expect(await drainer(fetch).schedule({ actorDiscordId: ADMIN })).toMatchObject({
+      failure: 'unavailable',
+      status: 500,
+    })
+  })
+
+  it('treats a body that is not JSON as unreadable rather than as a refusal', async () => {
+    const { fetch } = replies(answer(502, '<html>502 Bad Gateway</html>'))
+    const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(result).toMatchObject({ failure: 'unknown', status: 502 })
+    expect(result).toMatchObject({ detail: expect.stringContaining('not JSON') as unknown as string })
+  })
+
+  /** `typeof null === 'object'`, which is how a body of `null` becomes a crash. */
+  it('does not come apart on a body that parses to null', async () => {
+    const { fetch } = replies(answer(200, 'null'))
+    const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(result).toMatchObject({ outcome: 'refused', failure: 'unknown' })
+  })
+
+  it('refuses to read an answer that never said ok as a scheduled window', async () => {
+    const { fetch } = replies(answer(200, { window: WINDOW }))
+    const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(result).toMatchObject({ outcome: 'refused', failure: 'unknown' })
+  })
+
+  /**
+   * A SUCCESS WITH NO READABLE WINDOW IS STILL A SUCCESS. `ok: true` means the
+   * row is written and the driver will act on it — the server IS going down —
+   * so reporting "we could not read the answer" over a missing field would tell
+   * an admin nothing happened while the box drains underneath them.
+   */
+  it('reports a schedule whose window it could not read, with the fields null', async () => {
+    const { fetch } = replies(answer(201, { ok: true }))
+    const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(result).toEqual({
+      outcome: 'scheduled',
+      status: 201,
+      window: {
+        state: null,
+        note: null,
+        drainStartsAt: null,
+        deployMode: null,
+        deployAt: null,
+      },
+    })
+  })
+
+  /**
+   * `1e999` PARSES TO `Infinity`, AND A TIMESTAMP OF `Infinity` RENDERS AS A
+   * DATE NOBODY CAN READ. Absence is the honest reading of it, and the reply
+   * says so in words rather than promising an instant.
+   */
+  it('reads a non-finite timestamp as absent rather than passing it on', async () => {
+    const { fetch } = replies(answer(201, '{"ok":true,"window":{"drainStartsAt":1e999}}'))
+    const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(result).toMatchObject({ outcome: 'scheduled', window: { drainStartsAt: null } })
+  })
+})
+
+/**
+ * ONE ATTEMPT, AND THE OPPOSITE OF THE KICK'S RULE.
+ *
+ * The route's work is not idempotent — an audit row and a window — so a request
+ * that timed out MAY HAVE LANDED, and sending it again asks the console to
+ * restart the game server a second time on the strength of a guess. A human is
+ * watching a deferred reply and can simply run it again.
+ */
+describe('/drain — it asks exactly once, whatever comes back', () => {
+  it('does not retry an outage the kick would have retried', async () => {
+    const { fetch, calls } = replies(answer(503, { ok: false, error: 'store' }))
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(calls).toHaveLength(1)
+  })
+
+  it('does not retry a request nothing answered', async () => {
+    const calls: string[] = []
+    const fetch: Fetcher = (url) => {
+      calls.push(url)
+      return Promise.reject(new Error('ECONNREFUSED'))
+    }
+
+    const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(calls).toHaveLength(1)
+    expect(result).toMatchObject({ outcome: 'refused', failure: 'unreachable', status: null })
+    expect(result).toMatchObject({
+      detail: expect.stringContaining('ECONNREFUSED') as unknown as string,
+    })
+  })
+
+  /**
+   * THE DEADLINE IS A RACE AND NOT ONLY A SIGNAL — src/ddb.ts's reasoning, and
+   * `post`'s. This fake deliberately does not listen to the abort, so without
+   * the race the call would hang for ever.
+   */
+  it('gives up on a request that never answers, signal or no signal', async () => {
+    let signal: AbortSignal | undefined
+    const fetch: Fetcher = (_url, init) => {
+      signal = init.signal
+      return new Promise<HttpResponse>(() => {})
+    }
+
+    const result = await drainer(fetch, { timeoutMs: 5 }).schedule({ actorDiscordId: ADMIN })
+
+    expect(result).toMatchObject({ failure: 'unreachable' })
+    expect(result).toMatchObject({ detail: expect.stringContaining('no answer') as unknown as string })
+    // And the socket is released rather than pinned for the life of the process.
+    expect(signal?.aborted).toBe(true)
+  })
+
+  it('treats an answer whose body cannot be read as unreachable', async () => {
+    const fetch: Fetcher = () =>
+      Promise.resolve({ status: 201, text: () => Promise.reject(new Error('socket hang up')) })
+    const result = await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(result).toMatchObject({ outcome: 'refused', failure: 'unreachable', status: 201 })
+  })
+
+  /**
+   * THE DEADLINE OUTLASTS THE CONSOLE'S OWN WORK, which for this route is more
+   * than the kick's: a five-second Discord role re-check, then one SSH round
+   * trip to the game box under a six-second wall, then a grants read, the audit
+   * write and the window's PutItem.
+   */
+  it('leaves room for the role check, the ssh refresh and three dynamo calls', () => {
+    expect(DRAIN_TIMEOUT_MS).toBeGreaterThan(5_000 + 6_000)
+    expect(DRAIN_TIMEOUT_MS).toBeGreaterThan(KICK_TIMEOUT_MS)
+  })
+})
+
+describe('/drain cancel — which the console does not open to this bot yet', () => {
+  it('posts to the cancel route, not to the scheduling one', async () => {
+    const { fetch, calls } = replies(answer(200, { ok: true }))
+    await drainer(fetch).cancel({ actorDiscordId: ADMIN })
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.url).toBe(`${BASE}${MAINTENANCE_CANCEL_PATH}`)
+    expect(calls[0]?.init.method).toBe('POST')
+    expect(calls[0]?.init.headers[SERVICE_ACTOR_HEADER]).toBe(ADMIN)
+  })
+
+  it('reports a cancel the console accepted', async () => {
+    const { fetch } = replies(answer(200, { ok: true }))
+
+    expect(await drainer(fetch).cancel({ actorDiscordId: ADMIN })).toEqual({
+      outcome: 'cancelled',
+      status: 200,
+    })
+  })
+
+  /**
+   * ═══ TODAY'S REAL ANSWER, PINNED SO IT CANNOT BE MISTAKEN FOR A BUG ═══
+   *
+   * `SERVICE_ROUTES` in the console is `/api/bans`, `/api/kick` and
+   * `/api/maintenance` — an exact-match allowlist that does not include the
+   * cancel path — and that route authorises with `authorize('process', 'write')`,
+   * which is session-bound. So the gate answers 403 `scope` and nothing is
+   * cancelled. This asserts the bot classifies that honestly rather than
+   * pretending, and it is the case to delete when the console opens the route.
+   */
+  it('reports the console`s scope refusal as denied rather than pretending', async () => {
+    const { fetch } = replies(answer(403, { ok: false, error: 'scope' }))
+    const result = await drainer(fetch).cancel({ actorDiscordId: ADMIN })
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      failure: 'denied',
+      detail: 'scope',
+      status: 403,
+    })
+  })
+
+  /** The route's own two refusals, both of which are sentences for a person. */
+  it('carries the cancel route`s own refusals through unedited', async () => {
+    const none = 'There is no maintenance window to cancel.'
+    const deploying = 'The deploy has already started. It cannot be cancelled now.'
+
+    expect(
+      await drainer(replies(answer(404, { ok: false, error: none })).fetch).cancel({
+        actorDiscordId: ADMIN,
+      }),
+    ).toMatchObject({ failure: 'refused', detail: none, status: 404 })
+
+    expect(
+      await drainer(replies(answer(409, { ok: false, error: deploying })).fetch).cancel({
+        actorDiscordId: ADMIN,
+      }),
+    ).toMatchObject({ failure: 'refused', detail: deploying, status: 409 })
+  })
+})
+
+/**
+ * THE JOURNAL, WHICH IS THE ONLY PLACE A RESTART IS EXPLAINED AFTERWARDS.
+ *
+ * A scheduled window is `warn` because it is the line that answers "why did the
+ * server go down and everybody's match end"; the door's refusals are `error`
+ * because they mean `/drain` is broken for every admin until an operator acts.
+ * `log` sends both to stderr, which is what these assert against.
+ */
+describe('/drain — what reaches the journal', () => {
+  it('says loudly that a window was scheduled and the server will restart', async () => {
+    const { fetch } = replies(answer(201, SCHEDULED))
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    const line = stderr.join('')
+    expect(line).toContain('level=warn')
+    expect(line).toContain('restart')
+    expect(line).toContain(ADMIN)
+    // And never the credential, on any path.
+    expect(line).not.toContain(SECRET)
+  })
+
+  it('says nothing loud about a refusal the console reasoned about', async () => {
+    const { fetch } = replies(answer(409, { ok: false, error: NOTHING_TO_DEPLOY }))
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(stderr.join('')).toBe('')
+    expect(stdout.join('')).toContain('level=info')
+  })
+
+  it('treats the door`s refusals as an operator`s problem', async () => {
+    const { fetch } = replies(answer(401, { ok: false, error: 'auth' }))
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN })
+
+    expect(stderr.join('')).toContain('level=error')
   })
 })

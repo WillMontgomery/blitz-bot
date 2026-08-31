@@ -21,6 +21,7 @@ import {
   type Invocation,
   type Responder,
 } from './command.ts'
+import { DRAIN_NOTE_OPTION } from './drain.ts'
 import { help } from './help.ts'
 import { STICKY_TEXT_OPTION } from './sticky.ts'
 import {
@@ -699,6 +700,8 @@ describe('invocationOf — a live interaction reduced to a record', () => {
       targetAvatarUrl: undefined,
       targetDisplayName: undefined,
       text: null,
+      subcommand: null,
+      note: null,
     })
   })
 
@@ -887,6 +890,79 @@ describe('invocationOf — a live interaction reduced to a record', () => {
 
     expect(invocationOf(source({ options })).text).toBe('')
   })
+
+  /**
+   * `/drain`'s NOTE IS ITS OWN FIELD AND NOT `text`. The two are read by
+   * different names into different slots on purpose: `text` means the sticky's
+   * message everywhere else in this bot, and a note shown to players at a
+   * closed door is not that. A single slot fed by two names would make the
+   * value depend on which name this seam asked for first.
+   */
+  it('reads /drain’s note by its own name, into its own field', () => {
+    const options = optionNamed(DRAIN_NOTE_OPTION, {
+      type: ApplicationCommandOptionType.String,
+      value: 'shipping the loot fix',
+    })
+
+    const invocation = invocationOf(source({ options }))
+
+    expect(invocation.note).toBe('shipping the loot fix')
+    expect(invocation.text).toBeNull()
+  })
+
+  it('is null for a command that supplied no note', () => {
+    expect(invocationOf(source()).note).toBeNull()
+  })
+
+  /** The same trap again: a USER option named `note` is not a note. */
+  it('ignores a note-named option of the wrong type, rather than throwing', () => {
+    const options = optionNamed(DRAIN_NOTE_OPTION, {
+      type: ApplicationCommandOptionType.User,
+      user: account(TARGET),
+    })
+
+    expect(invocationOf(source({ options })).note).toBeNull()
+  })
+
+  /**
+   * THE SUBCOMMAND IS READ WITH `getSubcommand(false)` AND THAT ARGUMENT IS THE
+   * WHOLE POINT. discord.js's zero-argument overload THROWS when the
+   * interaction carries no subcommand, and the throw would happen here — while
+   * `runCommand`'s arguments are being assembled, outside the promise the
+   * listener catches — so it would escape into discord.js's own emit and every
+   * command in the bot would answer "The application did not respond".
+   */
+  it('reads which subcommand was invoked', () => {
+    const options: CommandSource['options'] = {
+      get: () => null,
+      getSubcommand: () => 'cancel',
+    }
+
+    expect(invocationOf(source({ options })).subcommand).toBe('cancel')
+  })
+
+  it('asks for the subcommand in the overload that answers null instead of throwing', () => {
+    const asked: unknown[] = []
+    const options: CommandSource['options'] = {
+      get: () => null,
+      getSubcommand: (required) => {
+        asked.push(required)
+        return null
+      },
+    }
+
+    expect(invocationOf(source({ options })).subcommand).toBeNull()
+    expect(asked).toEqual([false])
+  })
+
+  /**
+   * FOUR OF THE FIVE COMMANDS HAVE NO SUBCOMMANDS, so the fakes above build
+   * `options` without the method at all — which is also what a payload for one
+   * of those commands amounts to. Null, never a throw.
+   */
+  it('is null when the interaction carries no subcommand at all', () => {
+    expect(invocationOf(source()).subcommand).toBeNull()
+  })
 })
 
 /**
@@ -924,6 +1000,7 @@ describe('registerCommands', () => {
    */
   it('registers every command this bot has', () => {
     expect(COMMANDS.map((one) => one.data.name)).toEqual([
+      'drain',
       'help',
       'profile',
       'sticky',
@@ -954,8 +1031,27 @@ describe('registerCommands', () => {
   it('hides exactly the unconditionally admin-only commands from the client', () => {
     const hidden = COMMANDS.filter((one) => commandData(one).defaultMemberPermissions === 0n)
 
-    expect(hidden.map((one) => one.data.name)).toEqual(['sticky', 'unsticky'])
+    expect(hidden.map((one) => one.data.name)).toEqual(['drain', 'sticky', 'unsticky'])
     expect(hidden.every((one) => one.adminOnly === true)).toBe(true)
+  })
+
+  /**
+   * AND `/drain` IS IN THAT LIST, WHICH IS THE ONE MEMBERSHIP WORTH ASSERTING
+   * BY NAME. It stops the game server letting anybody in and then restarts it,
+   * ending every session on the box; a build in which it had drifted out of the
+   * hidden set would put the most consequential command in this bot into the
+   * picker of every member in the guild. The gate that actually refuses them is
+   * `refusalFor`, and this is the default that keeps them from finding it.
+   */
+  it('hides and gates the command that restarts the game server', () => {
+    const drain = COMMANDS.find((one) => one.data.name === 'drain')
+    if (drain === undefined) throw new Error('/drain is not in the command list')
+
+    expect(drain.adminOnly).toBe(true)
+    expect(commandData(drain).defaultMemberPermissions).toBe(0n)
+
+    // And it answers only the person who ran it, whatever else changes.
+    expect(drain.onlyInvoker(invocation())).toBe(true)
   })
 
   /**
