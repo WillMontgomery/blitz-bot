@@ -1,36 +1,62 @@
 # blitz-bot
 
 The Discord bot for the Blitz Royale community server. It is a single Node
-process — discord.js v14, no web server, no database — that runs under systemd
-on the Ringmaster box alongside the admin console and shares nothing with it.
-See [docs/deploy.md](docs/deploy.md).
+process — discord.js v14, no web server — that runs under systemd on the
+Ringmaster box alongside the admin console. It runs independently of the
+console, but it is not isolated from it: it reads and writes the console's
+DynamoDB tables, with the console's instance role, and calls the console over
+the loopback for the two things it cannot do itself — dropping somebody from a
+match, and draining the server. See
+[docs/deploy.md](docs/deploy.md).
 
 ## What it does today
 
-**It deletes Discord invites that are not for our guild.** An invite to our own
-server is left where it is; every other invite posted in the guild is removed.
-That is the whole feature set. Nothing else in this repo moderates anything.
+**It moderates messages, mirrors Discord's moderation into the game, and answers
+five slash commands.**
+
+Six rules remove a message, and nothing else does: an invite to another Discord
+server, more invite codes in one message than it will check, a
+`fivem://connect/` link to another game server, a `cfx.re/join` or
+`servers.fivem.net` listing, an IP address that is not ours, and a link
+shortener. **No word filter, no warnings, no mutes.**
+
+Around that: a ban, unban or kick in Discord is carried into the game and
+written to DynamoDB; a ban issued in the console puts the game-ban role on the
+player here and takes it off again when it is lifted or expires; the console's
+closed incidents become an embed in the moderation channel; `/sticky` keeps a
+message at the bottom of a channel; and `docs/bot-manual.md` is published to a
+channel and reconciled at every start.
 
 Behaviour is set entirely by the environment, and `.env.example` is the
-authority on it:
+authority on it. All fourteen, in the order `src/config.ts` reads them:
 
 | Variable | |
 |---|---|
 | `DISCORD_BOT_TOKEN` | Required. The bot's own token. |
 | `DISCORD_GUILD_ID` | Required. Our guild — the one guild whose invites are allowed. |
-| `DISCORD_ADMIN_ROLE_ID` | The role treated as admin. Unset disables the admin exemption. |
-| `BLITZ_EXEMPT_ADMINS` | Skip messages from holders of that role. Default `true`. |
+| `DISCORD_ADMIN_ROLE_ID` | The role treated as admin. Unset disables the admin exemption and refuses every admin-only command to everybody. |
+| `BLITZ_LOG_CHANNEL_ID` | The moderation record: removals, and an embed per incident closed in the console. Unset means journal only. |
+| `BLITZ_STATUS_CHANNEL_ID` | The bot's own faults, and the commit it came up on when that changed. Unset means journal only. |
+| `BLITZ_DOCS_CHANNEL_ID` | Where `docs/bot-manual.md` is published. Unset turns the manual off. |
+| `BLITZ_MAINTENANCE_CHANNEL_ID` | Where players are told the server is back up. Unset turns the watcher off. |
 | `BLITZ_EXEMPT_CHANNEL_IDS` | Comma-separated channels the scanner skips. Default: none. |
-| `BLITZ_LOG_CHANNEL_ID` | Channel removals are logged to. Unset means journal only. |
+| `BLITZ_SERVER_IPS` | Our own servers' addresses. Blank means the two in `src/config.ts`, not an empty list. |
+| `BLITZ_EXEMPT_ADMINS` | Skip messages from holders of the admin role. Default `true`. |
 | `BLITZ_DRY_RUN` | Scan and log, delete nothing. Default `false`. |
+| `COMMAND_SECRET` | The secret the console's command routes want — the same value under the same name in the console's own dotenv file. Unset turns the live kick off and nothing else. |
+| `BLITZ_RINGMASTER_URL` | Where the console answers. Blank means its loopback origin, not "off". |
+| `BLITZ_GAME_BAN_ROLE_ID` | The role a game ban puts on somebody. Blank means the id in `src/config.ts`, not "no role". |
 
 The process refuses to start if either required variable is missing or blank,
 and names every problem at once rather than one per restart (`src/config.ts`).
 
-**The bot does not talk to members.** No DM, no reply, no "your message was
-removed", ever. A removal is a line in the journal and, if
-`BLITZ_LOG_CHANNEL_ID` is set, one message in a channel admins read. That is a
-standing rule and not an omission — do not add user-facing copy to this bot.
+**The bot does talk to members, in exactly one place.** When it removes a
+message it DMs the poster naming the rule that fired, and if their DMs are shut
+it tags them in the channel instead and takes that note down after about half a
+minute — the one message it sends that pings anybody. Nothing it posts quotes
+the removed text. Everything else it says goes to admins:
+`BLITZ_LOG_CHANNEL_ID`, `BLITZ_STATUS_CHANNEL_ID` and the journal. The
+member-facing wording is the owner's; do not add copy of your own.
 
 ## Running it locally
 
@@ -50,12 +76,21 @@ Fill in `DISCORD_BOT_TOKEN` and `DISCORD_GUILD_ID`, then:
 node --env-file=.env --disable-warning=ExperimentalWarning src/index.ts
 ```
 
-**A token alone is not enough to get a working bot.** The application needs the
-**Message Content** privileged intent turned on, and the bot needs to be in the
-guild with **Manage Messages**; without the intent the gateway closes with code
-4014 and login fails on every attempt, and without the permission every delete
-fails. [docs/deploy.md §4](docs/deploy.md) is the checklist, and it applies to a
-laptop exactly as it does to the box.
+**A token alone is not enough to get a working bot.** The application needs
+**both** privileged intents turned on — **Message Content** and **Server
+Members** — and the bot needs to be in the guild, invited with the `bot` and
+`applications.commands` scopes, holding **Manage Messages**, **Manage Roles**
+and **View Audit Log**, with its own role above the game-ban role. Miss an
+intent and the gateway closes with code 4014 and login fails on every attempt.
+Miss a scope or a permission and the process still starts and still looks
+healthy: no command is ever registered, or every delete fails, or no game ban is
+marked, or Discord's bans never reach the game.
+[docs/deploy.md §4](docs/deploy.md) is the checklist, and it applies to a laptop
+exactly as it does to the box.
+
+**AWS is not optional either.** `src/ddb.ts` reads and writes eight DynamoDB
+tables, and on a laptop the SDK will find whatever credentials your environment
+gives it. See [docs/aws-notes.md](docs/aws-notes.md).
 
 `npm start` is the same command without `--env-file`, because in production
 systemd's `EnvironmentFile` has already put those variables in the process

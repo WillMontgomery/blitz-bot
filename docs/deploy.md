@@ -45,8 +45,11 @@ never be a hard dependency of the bot.** Concretely:
   `BindsTo=`, no `After=`, not even a `Wants=`. A `Wants=` looks harmless and
   is how one service ends up starting the other at boot and then being blamed
   for its failures.
-- They share no socket, no port, no file, no database handle **and no Node
-  binary**. The only thing they have in common is the kernel.
+- They share no socket, no file **and no Node binary**. What they do share is
+  data and identity rather than process: the console's DynamoDB tables (§15),
+  the box's instance role (§15), one Discord application (§4.4), and one secret
+  under one name in two dotenv files (`COMMAND_SECRET`, §5). None of those is a
+  handle either service holds on the other.
 - **Either may be down, and the other will not notice.** The console is what
   admins reach for while something is going wrong; a bot in a crash loop must
   not take it with it. Equally, deploying the console must not stop moderation
@@ -57,8 +60,10 @@ never be a hard dependency of the bot.** Concretely:
   that touches `/opt/ringmaster`, and nothing on that timer knows the console
   exists.
 
-If the two ever do need to talk, they talk over HTTP with a timeout and a
-failure path, like strangers. They do not become one unit.
+Where the two do talk — the live kick, and `/drain` — they talk over HTTP on the
+loopback, with a timeout and a failure path, like strangers. With the console
+down the ban is still written and still enforced at the player's next connect;
+only the immediate removal is lost. They do not become one unit.
 
 ## 0. Getting an SSH prompt on the box
 
@@ -387,16 +392,32 @@ removes nothing, or a bot that has stopped moderating with `systemctl status`
 still green. §12 and §14 name the line in the journal that tells each of those
 apart.
 
-### 4.1 Turn on the Message Content intent
+### 4.1 Turn on the two privileged intents
 
 **Developer Portal → your app → Bot → Privileged Gateway Intents → Message
-Content → on → Save.**
+Content → on, Server Members Intent → on → Save.**
 
-The bot requests this intent at connect time (`src/client.ts`). Requesting an
-intent the application has not been granted is not a warning — Discord closes
-the gateway with **close code 4014**, `login()` rejects, and the process exits
-1. With `Restart=always` below, that is a restart loop. The journal shows both
-of these:
+**Both, and the second one is the half this section used to leave out.**
+`src/client.ts` connects with five intents — `Guilds`, `GuildMessages`,
+`MessageContent`, `GuildModeration` and `GuildMembers` — and two of those are
+privileged and have to be ticked:
+
+| Portal switch | Intent | What it carries |
+|---|---|---|
+| **Message Content** | `MessageContent` | A message's text, embeds, components and attachments — everything the six rules read. |
+| **Server Members Intent** | `GuildMembers` | The member-join event. It is how somebody already banned in the game gets the game-ban role when they arrive in the guild. |
+
+`Guilds`, `GuildMessages` and `GuildModeration` need no tick and no review.
+`GuildModeration` is what delivers the ban, unban and kick entries the bot
+mirrors into the game, and it costs nothing here — but it does need the **View
+Audit Log** permission on the bot's role, which is §4.2 and fails silently.
+
+Requesting an intent the application has not been granted is not a warning —
+Discord closes the gateway with **close code 4014**, `login()` rejects, and the
+process exits 1. With `Restart=always` below, that is a restart loop. **Either
+missing tick produces exactly this, and the journal cannot tell you which one**,
+so confirm both switches rather than looking for a difference between them. The
+journal shows both of these:
 
 ```
 2026-08-29T18:04:11.104Z level=warn msg="gateway disconnected" shard=0 code=4014
@@ -410,7 +431,7 @@ for. (It is discord.js's wording, not ours.)
 there is no session: the process never logs `ready`, never receives a message,
 and never deletes or fails to delete anything. That cuts both ways, and the
 second half is the one worth carrying — **a `ready` line from this boot is
-proof the intent is on.**
+proof both intents are on.**
 
 > This section used to claim the opposite as the ordinary case: a bot that
 > connects, logs a healthy `ready`, receives every message and reads
@@ -425,29 +446,76 @@ proof the intent is on.**
 
 **Developer Portal → your app → OAuth2 → OAuth2 URL Generator.**
 
-- **Scopes:** `bot`. Only `bot` — this bot registers no slash commands, so
-  `applications.commands` would be a permission nobody uses.
-- **Bot Permissions:** **Manage Messages**. That is the one permission the
-  feature needs: it is what allows deleting somebody else's message. Without it
-  every delete fails and the bot otherwise looks perfectly healthy — see §12.2.
+- **Scopes:** `bot` **and** `applications.commands`. Both. The bot registers
+  five guild slash commands on every start — `registerCommands` in
+  `src/commands/index.ts` calls `guild.commands.set`, and §4.5 lists what it
+  registers. Without the second scope that call is refused, nothing else
+  breaks, and not one command ever appears in anybody's client.
+- **Bot Permissions**, and there are three of them rather than one:
+  - **Manage Messages** — deleting somebody else's message. Without it every
+    delete fails and the bot otherwise looks perfectly healthy — see §12.2.
+  - **Manage Roles** — putting the game-ban role on and taking it off
+    (`src/banrole.ts`). Without it no game ban is ever marked in the guild.
+    This one is not silent: the bot checks at start and before every edit and
+    names the problem in `#bot-status`.
+  - **View Audit Log** — reading the ban, unban and kick entries the bot
+    carries into the game (§4.1). This one **is** silent: without it the
+    `GuildModeration` intent is still accepted, the gateway still connects, and
+    the events simply never arrive, which reads exactly like a guild in which
+    nobody has been banned.
 - **View Channel** it normally inherits from `@everyone`. In a guild where
   channels are locked down, the bot's role needs it explicitly — it cannot
   moderate a channel it cannot see, and it will not say so.
-- The bot also needs **Send Messages** in the `#bot-status` channel, because
-  `BLITZ_LOG_CHANNEL_ID` points there. A channel-level override is enough; it
-  does not need it guild-wide.
+- The bot also needs **Send Messages** in every channel §5 points a variable at:
+  **`#moderation-notifications`**, where `BLITZ_LOG_CHANNEL_ID` points,
+  **`#bot-status`**, where `BLITZ_STATUS_CHANNEL_ID` points, and the docs and
+  maintenance channels if those are configured. A channel-level override is
+  enough; it does not need it guild-wide. **The first two are different channels
+  and this document used to swap them** — see the box in §5. The docs channel
+  also needs **Read Message History**, because the bot reconciles the manual it
+  already posted there rather than posting a second copy.
 
 Open the generated URL, pick the Blitz Royale guild, authorise. Then check the
 role Discord created for the bot actually carries Manage Messages in the
 channels you care about — a channel-level override that denies it beats the
 guild-level grant, silently.
 
+**Then move the bot's role above the game-ban role.** Server Settings → Roles.
+Discord refuses a role edit unless the acting member's highest role is above the
+role being assigned, and a new role lands at the bottom of the list, so Manage
+Roles on its own is not enough — `BLITZ_GAME_BAN_ROLE_ID` (§5) has to sit
+*below* the bot. `src/banrole.ts` checks both and names whichever is wrong.
+
+An install done with only the `bot` scope announces nothing in Discord — the
+commands are simply not there, which reads as a build that did not ship them.
+One line in the journal says otherwise:
+
+```
+2026-08-29T18:04:12.883Z level=error msg="slash commands could not be registered" guild="1543345492270915002" error="DiscordAPIError[50001]: Missing Access"
+```
+
+Adding the scope to the OAuth2 URL is not enough on its own: the authorisation
+already granted does not gain it. Re-open the generated URL with both scopes
+ticked and authorise again for the same guild, then restart the bot — §4.5.
+
 ### 4.3 Get the guild and channel ids
 
 **Discord client → User Settings → Advanced → Developer Mode → on.** Then
-right-click and *Copy Server ID* for `DISCORD_GUILD_ID`, and *Copy Channel ID*
-on `#bot-status` for `BLITZ_LOG_CHANNEL_ID`. They are 17–20 digit snowflakes;
-if what you pasted has letters in it, it is a name and not an id.
+right-click and *Copy Server ID* for `DISCORD_GUILD_ID`, *Copy Channel ID* on
+**`#moderation-notifications`** for `BLITZ_LOG_CHANNEL_ID`, and *Copy Channel ID*
+on **`#bot-status`** for `BLITZ_STATUS_CHANNEL_ID`. They are 17–20 digit
+snowflakes; if what you pasted has letters in it, it is a name and not an id.
+
+Two more channels are optional and are copied the same way when the owner wants
+them: `BLITZ_DOCS_CHANNEL_ID`, where the bot keeps `docs/bot-manual.md` posted,
+and `BLITZ_MAINTENANCE_CHANNEL_ID`, where players are told the server is back
+up. Both are off while their variable is blank — §5.
+
+**Check which channel each id came off before you paste it.** The two are the
+easiest thing in this document to swap, they both accept any snowflake, and
+neither the bot nor Discord will tell you they are the wrong way round: the
+moderation record simply appears in the faults channel and the faults appear
+where the moderation record should be. §5 has both ids written out.
 
 `DISCORD_GUILD_ID` is not decoration. It is the one thing that separates "our
 invite, leave it" from "somebody else's invite, delete it", so a wrong one does
@@ -478,13 +546,14 @@ will tell you** — see §12.1.
 **This is the same Discord application the Ringmaster admin console uses for
 its OAuth login.** One application, one set of credentials, two consumers.
 
-That has a consequence worth writing down: adding the `bot` scope and Manage
-Messages above **widens what this application can do**, and the console's own
-docs still describe it as a login-only OAuth app. Anyone reading those docs
-will underestimate what a leak of these credentials costs — it is no longer
-"someone can sign in as our app", it is "someone can delete messages in the
-guild". The console's `.env.local` and this bot's `.env` now hold pieces of the
-same identity.
+That has a consequence worth writing down: the scopes and permissions in §4.2
+**widen what this application can do**, and the console's own docs still
+describe it as a login-only OAuth app. Anyone reading those docs will
+underestimate what a leak of these credentials costs — it is no longer "someone
+can sign in as our app", it is "someone can delete messages, hand out roles and
+register commands in the guild". The console's `.env.local` and this bot's
+`.env` now hold pieces of the same identity, and since §5 they hold the same
+`COMMAND_SECRET` as well.
 
 Splitting the bot onto its own Discord application, so that the console's
 credentials and the bot's are genuinely separate, is **tracked as a known
@@ -493,13 +562,72 @@ something to attempt during an incident. Until it is done, treat both `.env`
 files as carrying the same blast radius, and rotating either one means
 re-deploying both services.
 
+### 4.5 The five commands it registers
+
+Registration is a bulk put at every start — `set` replaces the guild's whole
+list — so what is registered cannot drift from what is in the repo, and there is
+no separate "deploy commands" step to remember. `docs/bot-manual.md` is what the
+guild is told about them; this is what the operator needs:
+
+| Command | Who | What it needs beyond the scope |
+|---|---|---|
+| `/drain start`, `/drain cancel` | admin | `COMMAND_SECRET` and `BLITZ_RINGMASTER_URL` (§5) |
+| `/help` | anyone | nothing |
+| `/profile` | anyone, for their own; another member's is admin | AWS (§15) |
+| `/sticky`, `/unsticky` | admin | nothing |
+
+**Admin** means holding `DISCORD_ADMIN_ROLE_ID`. Left blank, the admin-only
+commands refuse everybody rather than admitting everybody — the safe direction,
+and why §5 leaves it blank until §9.
+
+Guild-scoped, not global, so a change is live the moment the bot restarts rather
+than propagating for an hour. One line at every start says what went out:
+
+```
+2026-08-29T18:04:12.883Z level=info msg="slash commands registered" guild="1543345492270915002" commands="drain,help,profile,sticky,unsticky"
+```
+
+A registration that fails leaves the guild with whatever list it had before, so
+the bot goes on answering the previous deploy's commands and this journal line
+is the only thing that says the list is stale.
+
 ## 5. The environment file, and the dry run
 
 **`BLITZ_DRY_RUN=true` is the setting this whole section exists for.** With it
 on, the bot scans every message, decides exactly what it would remove, writes a
-line to the journal and posts a line to `#bot-status` — and deletes nothing. It
-is how you find out what this bot does to a live community without finding out
-the expensive way.
+line to the journal and posts a line to `#moderation-notifications` — and deletes
+nothing. It is how you find out what this bot does to a live community without
+finding out the expensive way.
+
+> ### Correction: these two ids were the wrong way round
+>
+> Every version of this document before 2026-08-31 carried this line, which is
+> wrong: `BLITZ_LOG_CHANNEL_ID=1543345492270915684`, described in the table
+> beside it as "`#bot-status`, admin-only". **That snowflake is the status
+> channel**, and
+> `BLITZ_LOG_CHANNEL_ID` is the moderation record — so following this guide put
+> the removal lines, and the embed for every incident closed in the console, into
+> the channel meant for the bot's own faults. `docs/bot-manual.md` has had the
+> right pairing all along.
+>
+> | Variable | Channel | Id |
+> |---|---|---|
+> | `BLITZ_LOG_CHANNEL_ID` | `#moderation-notifications` | `1542603116258525185` |
+> | `BLITZ_STATUS_CHANNEL_ID` | `#bot-status` | `1543345492270915684` |
+>
+> **If you installed from an earlier copy of this guide, `/opt/blitz-bot/.env` on
+> the box is still wrong.** Nothing in this repository will fix it for you and
+> nothing will warn you: both ids are valid channels the bot can post to, so the
+> only symptom is records in the wrong room. Fix the file by hand and
+> `sudo systemctl restart blitz-bot`.
+
+**Every variable `src/config.ts` reads is in the block below, including the ones
+that are meant to stay blank.** That is deliberate: an operator who can see the
+whole list can tell "off on purpose" from "nobody knew about it", and this
+document shipped for a while with six of them missing entirely — which is how an
+install ends up with no manual, no maintenance announcement and no kick relay,
+none of which announce their own absence. `.env.example` is the authority and
+this list is checked against it.
 
 Write the file in one block. It contains no secret yet:
 
@@ -508,10 +636,17 @@ cat > /opt/blitz-bot/.env <<'EOF'
 DISCORD_BOT_TOKEN=
 DISCORD_GUILD_ID=
 DISCORD_ADMIN_ROLE_ID=
-BLITZ_LOG_CHANNEL_ID=1543345492270915684
+BLITZ_LOG_CHANNEL_ID=1542603116258525185
+BLITZ_STATUS_CHANNEL_ID=1543345492270915684
+BLITZ_DOCS_CHANNEL_ID=
+BLITZ_MAINTENANCE_CHANNEL_ID=
 BLITZ_EXEMPT_CHANNEL_IDS=
+BLITZ_SERVER_IPS=
 BLITZ_EXEMPT_ADMINS=true
 BLITZ_DRY_RUN=true
+COMMAND_SECRET=
+BLITZ_RINGMASTER_URL=
+BLITZ_GAME_BAN_ROLE_ID=
 EOF
 ```
 
@@ -526,15 +661,19 @@ The path is absolute deliberately. `chmod 600 .env` depends on the shell still
 standing in `/opt/blitz-bot` from some earlier block, and a shell that is
 somewhere else silently leaves a Discord token world-readable.
 
-Now fill in the two blank values:
+Now fill in the three values that have to be typed in:
 
 ```bash
 nano /opt/blitz-bot/.env
 ```
 
-Put the bot token from the Developer Portal after `DISCORD_BOT_TOKEN=` and the
-guild id from §4.3 after `DISCORD_GUILD_ID=`. Save with **Ctrl-O, Enter**, exit
-with **Ctrl-X**.
+Put the bot token from the Developer Portal after `DISCORD_BOT_TOKEN=`, the
+guild id from §4.3 after `DISCORD_GUILD_ID=`, and after `COMMAND_SECRET=` the
+value that is **already** in `/opt/ringmaster/.env.local` under that same name.
+Copy it; do not generate a new one. It is one secret shared by two services, and
+a value that does not match the console's is the same as no value at all —
+except that it fails on every kick instead of saying so once at boot. Save with
+**Ctrl-O, Enter**, exit with **Ctrl-X**.
 
 Three things about this file, because systemd's `EnvironmentFile` is **not** a
 shell and the differences are all silent:
@@ -549,15 +688,26 @@ shell and the differences are all silent:
   `src/config.ts` trims before it checks, so a stray space is not a
   one-character token.
 
-What the other five are set to, and why:
+What the other twelve are set to, and why. **Blank does not mean the same thing
+in every row**, which is the reason this table is long: for some of them blank
+turns something off, and for three of them blank means a value that lives in
+`src/config.ts` rather than in any file on this box. A default kept only in
+`.env.example` would be a default systemd never reads, so the source holds them.
 
 | Variable | Value here | Why |
 |---|---|---|
-| `DISCORD_ADMIN_ROLE_ID` | blank | Blank disables the admin exemption outright. Leave it blank through §8 and §9 — **with a role set here, an invite you post yourself would be skipped**, and the smoke test would look like a broken bot. |
-| `BLITZ_LOG_CHANNEL_ID` | `1543345492270915684` | `#bot-status`, admin-only. Every removal, and every dry-run would-be removal, is posted there. This is what makes the dry run readable without an SSH session. |
-| `BLITZ_EXEMPT_CHANNEL_IDS` | blank | No channel is skipped. Add ids later if the owner asks for it. |
+| `DISCORD_ADMIN_ROLE_ID` | blank | Blank disables the admin exemption outright, and refuses every admin-only slash command to everybody. Leave it blank through §8 and §9 — **with a role set here, an invite you post yourself would be skipped**, and the smoke test would look like a broken bot. |
+| `BLITZ_LOG_CHANNEL_ID` | `1542603116258525185` | **`#moderation-notifications`**, admin-only. The moderation record: every removal, every dry-run would-be removal, and an embed for every incident closed in the Ringmaster console. This is what makes the dry run readable without an SSH session. |
+| `BLITZ_STATUS_CHANNEL_ID` | `1543345492270915684` | **`#bot-status`**, admin-only. The bot's OWN faults and nothing else — a delete that failed, a rate limit, a channel it cannot post in — plus the commit it came up on when that has changed. A different channel from the one above deliberately: one is a record of what the bot did to the guild, the other is a record of what went wrong with the bot. |
+| `BLITZ_DOCS_CHANNEL_ID` | blank | Where the bot keeps `docs/bot-manual.md` posted, reconciled at every start. Blank turns the manual off: the file is not read and nothing is posted. Set it when the owner wants the guild to have the manual — and give the bot **Read Message History** there (§4.2), or it cannot find the copy it posted last time. |
+| `BLITZ_MAINTENANCE_CHANNEL_ID` | blank | Where players are told the server is back up — one message, after the game server itself reports in. Blank turns the watcher off and the maintenance row is never read. Nothing else is ever posted there. |
+| `BLITZ_EXEMPT_CHANNEL_IDS` | blank | No channel is skipped. Add ids later if the owner asks for it. A thread is exempted separately from its channel. |
+| `BLITZ_SERVER_IPS` | blank | **Blank means our own servers, not an empty list.** `src/config.ts` holds the addresses; an empty list would make the bot delete the message that names our own server. Order matters — the first address is the one the maintenance notice tells players to connect to — so if you ever set this by hand, put the box people join at the front. A malformed entry stops the bot at boot. |
 | `BLITZ_EXEMPT_ADMINS` | `true` | The default. It does nothing at all while `DISCORD_ADMIN_ROLE_ID` is blank. |
 | `BLITZ_DRY_RUN` | `true` | **Delete nothing.** §9 is the only place this changes. |
+| `COMMAND_SECRET` | the console's | Filled in above. It is what the console's command routes want in the `x-ringmaster-service` header, and it is the only switch that turns the live kick off. Unset, the bans are still written and still enforced at the player's next connect; what is lost is dropping them from the match they are in, and every mirrored ban puts one warning in `#bot-status` saying so. |
+| `BLITZ_RINGMASTER_URL` | blank | **Blank is the console's loopback origin, not "off".** `src/config.ts` holds it; the bot is the second service on the console's own box and port 3000 is closed to the internet, which is the whole reason the relay goes over loopback rather than out through Cloudflare and back with the secret on it. Origin only — a stray path is refused at boot rather than becoming a 404 that reads like a console outage. |
+| `BLITZ_GAME_BAN_ROLE_ID` | blank | **Blank is the role the owner settled on, not "no role".** `src/config.ts` holds the id. It marks somebody banned in the game but not on Discord, so they keep limited access and can argue their case; lifting or expiring the ban takes it off. It needs Manage Roles and it needs the role to sit below the bot's own — §4.2. A malformed id stops the bot at boot. |
 
 Confirm the file reads back the way you meant, without printing the token:
 
@@ -1092,8 +1242,8 @@ in both places.
 
 **Do not skip this.** Up to here you have proved a process is running and
 talking to Discord. You have not proved it reads messages, recognises a foreign
-invite, or can post to `#bot-status`. In dry run that proof costs one message
-and removes nothing.
+invite, or can post to `#moderation-notifications`. In dry run that proof costs
+one message and removes nothing.
 
 First get an invite that is definitely **not** for our guild. In Discord: **+ →
 Create My Own → For me and my friends**, name it anything, then **Invite People
@@ -1105,7 +1255,7 @@ can see.
 
 **One:** the message stays up. It is a dry run.
 
-**Two:** a line appears in `#bot-status`, within a second or two:
+**Two:** a line appears in `#moderation-notifications`, within a second or two:
 
 ```
 Dry run, nothing removed. Author <@000000000000000000> (`your_username`), channel <#000000000000000000>, reason: foreign-invite, invite codes: XXXXXXX
@@ -1131,8 +1281,8 @@ journalctl -u blitz-bot -n 50 --no-pager | grep 'would have deleted'
 
 If all three happened, the bot works. Delete the test message yourself.
 
-If the journal line appeared but the `#bot-status` line did not, the bot cannot
-post to that channel — see §12.3. If neither appeared, see §12.1.
+If the journal line appeared but the `#moderation-notifications` line did not,
+the bot cannot post to that channel — see §12.3. If neither appeared, see §12.1.
 
 Post an invite to **our own** guild in the same channel as well. Nothing should
 happen, in either place: no channel line, no journal line. That is the half of
@@ -1184,7 +1334,7 @@ above again.
 
 **One:** the message disappears.
 
-**Two:** `#bot-status` says so:
+**Two:** `#moderation-notifications` says so:
 
 ```
 Removed a message. Author <@000000000000000000> (`your_username`), channel <#000000000000000000>, reason: foreign-invite, invite codes: XXXXXXX
@@ -1332,7 +1482,7 @@ meant to find.
 `channel=` is the channel to go and fix. Check that channel's permission
 overrides for the bot's role, not just the role's guild-level permissions.
 
-### 12.3 It cannot post to `#bot-status`
+### 12.3 It cannot post to `#moderation-notifications`
 
 `BLITZ_LOG_CHANNEL_ID` points at a channel that does not exist, was deleted, or
 that the bot cannot send in. Moderation is completely unaffected — messages are
@@ -1346,7 +1496,7 @@ journalctl -u blitz-bot -n 200 --no-pager | grep -e 'log channel is missing' -e 
 A wrong id, or a channel the bot cannot send in:
 
 ```
-2026-08-29T18:33:19.006Z level=error msg="log channel is missing or cannot be posted to" channel="1543345492270915684"
+2026-08-29T18:33:19.006Z level=error msg="log channel is missing or cannot be posted to" channel="1542603116258525185"
 ```
 
 The send itself was rejected:
@@ -1356,8 +1506,14 @@ The send itself was rejected:
 ```
 
 Fix: check `BLITZ_LOG_CHANNEL_ID` in `/opt/blitz-bot/.env` against *Copy Channel
-ID* on `#bot-status`, and give the bot's role **Send Messages** there (§4.2).
-Then `sudo systemctl restart blitz-bot` and redo the §8 smoke test.
+ID* on `#moderation-notifications`, and give the bot's role **Send Messages**
+there (§4.2). Then `sudo systemctl restart blitz-bot` and redo the §8 smoke test.
+
+**Check the id itself before you check the permissions.** If that variable holds
+`1543345492270915684` the bot is posting the moderation record into
+`#bot-status`, which is the swap §5 corrects — it will not error, because that
+channel exists and the bot can send in it. The moderation record is
+`1542603116258525185`.
 
 ### 12.4 You cannot read the journal, and it looks like an empty one
 
@@ -1410,16 +1566,24 @@ the bot has stopped being able to tell you anything itself: it will not start,
 or it is up and moderating nothing, or something happened in the guild that has
 no line to match it.
 
-**Removals do reach admins without an SSH session.** Every removal, and every
-dry-run would-be removal, is posted to `#bot-status` through
+**Removals reach admins without an SSH session.** Every removal, and every
+dry-run would-be removal, is posted to `#moderation-notifications` through
 `BLITZ_LOG_CHANNEL_ID`. That is built and it is what §8 tested.
 
-**The bot's own faults do not.** A delete that failed, moderation halted at
-startup, a gateway that will not stay connected: those exist in the journal and
-nowhere else, so they are seen only by somebody who already suspected something
-and opened an SSH session to check. Sending the bot's own faults to `#bot-status`
-is **tracked as issue #9 and is not built yet**; until it is, everything below is
-the only way those lines are ever read.
+**So do the bot's own faults, in a different channel.** A delete that failed,
+moderation halted at startup, a gateway that will not stay connected: every
+`warn` and `error` the bot writes is copied to `#bot-status` through
+`BLITZ_STATUS_CHANNEL_ID` (`statusReporter` in `src/client.ts`), scrubbed and
+inside a code fence, with a repeating fault folded into one message so a broken
+channel is one line rather than one every half minute. `info` never goes there,
+deliberately — a channel that also carries `ready` is a channel nobody reads.
+
+> This section used to say that half was "tracked as issue #9 and is not built
+> yet". It shipped. What is still true is the reason the journal is below: the
+> copy in Discord depends on the gateway being up and on that channel being
+> postable, and neither is true in the failures worth reading about most — a
+> login that never succeeds has no gateway to post over at all. The journal is
+> underneath all of it and is the thing that cannot fail to be written.
 
 ```bash
 journalctl -u blitz-bot -f
@@ -1555,7 +1719,7 @@ three ways that file bites.
 
 | What repeats | What it is | What to do |
 |---|---|---|
-| `msg="login failed"` with `error="Error: Used disallowed intents"` | The Message Content intent is off in the portal. | §4.1. It will loop until you tick it; the token is fine. |
+| `msg="login failed"` with `error="Error: Used disallowed intents"` | A privileged intent is off in the portal — **Message Content, Server Members, or both.** The line is identical either way and never names which. | §4.1. Confirm both switches rather than guessing at one; it will loop until every intent the bot asks for is granted, and the token is fine. |
 | `msg="login failed"` with `error="DiscordjsError [TokenInvalid]: An invalid token was provided."` | Wrong, rotated or revoked token. | New token in the portal, into `.env`, restart. |
 | `msg="login failed"` with a timeout, DNS or connection error, **or** repeating `msg="gateway disconnected"` lines from a process that stays up | Discord, or this box's network. Not us. | Nothing to fix here. Check <https://discordstatus.com>. `Restart=always` is doing its job; it will reconnect on its own. |
 
@@ -1622,19 +1786,40 @@ except you can read the journal.
 
 ## 15. AWS
 
-**The bot uses the box's instance role, and nothing in this slice calls AWS at
-all.** No SDK is installed, no credentials are configured, and there is nothing
-to set up here today.
+**The bot uses the box's instance role, and it calls AWS on every start.** Both
+`@aws-sdk/client-dynamodb` and `@aws-sdk/lib-dynamodb` are runtime dependencies
+in `package.json`, `src/ddb.ts` is a full DynamoDB layer over **eight tables**,
+and `createDdb()` is reached from the client and from the command wiring. Bans,
+kicks and unbans are written there; `/profile` and the incident record read from
+there. A bot that could not reach DynamoDB would go on moderating messages,
+keeping the sticky and publishing the manual, and would do almost nothing else:
+no ban mirror, no game-ban role, no `/profile`, no incident record and no
+maintenance notice.
 
-That is worth writing down anyway, because of what it would mean the moment it
-stopped being true: the instance role on this box belongs to the **console**,
-and carries the console's DynamoDB access. Any AWS call the bot ever made would
-arrive with the console's permissions over the console's tables — a moderation
-bot holding admin-console credentials because of where it happens to be
-running.
+**There is still nothing to configure here, and that is the problem rather than
+the convenience.** No credentials go in `.env` and none should — the SDK's
+default provider chain finds the instance role from instance metadata, and
+`src/config.ts` has no AWS-shaped variable to set. If you find yourself adding
+one, the deployment is wrong.
+
+**The instance role that chain finds belongs to the console.** It carries the
+console's DynamoDB access — `ringmaster-*`, every action, `DeleteItem` and
+`Scan` included — so every call the bot makes arrives with the admin console's
+permissions over the admin console's tables, because of where the bot happens to
+be running.
 
 Scoping the bot to its own IAM user with its own policy is tracked as
-**issue #4**. Do that before the first AWS call, not after.
+**issue #4**. It was written down as something to do *before* the first AWS
+call; the first AWS call shipped ahead of it, so it is overdue rather than
+pending, and the ban write is the first thing a wrong grant could not have made
+harmless.
+
+**[`docs/aws-notes.md`](aws-notes.md) is the reference for the rest of it** —
+which eight tables, which action on each, the exact policy #4 has to write, and
+the region default and why getting it wrong reads as a table that does not
+exist. Nothing there is a step to perform, and nothing in this section is
+either: on this box, AWS works or it does not, and §13 is where you find out
+which.
 
 ## 16. Deploying an update
 

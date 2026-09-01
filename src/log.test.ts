@@ -1123,16 +1123,26 @@ describe('docs/deploy.md — what an operator is told at 3am', () => {
    * written as "here is how you watch the bot" makes `journalctl` the day-to-day
    * answer and quietly settles a question that is still open.
    *
-   * TWO DIFFERENT THINGS SHARE ONE CHANNEL NAME, AND ONLY ONE OF THEM EXISTS.
-   * Removals reaching `#bot-status` is `BLITZ_LOG_CHANNEL_ID`, which is built
-   * and is what the smoke test exercises. The bot's OWN faults reaching a
-   * channel — a failed delete, a halt, a gateway that will not stay up — is
-   * issue #9 and is not built. Every paragraph here that names the channel has
-   * to be one or the other: an operator sent to watch a channel for faults it
-   * never receives loses the same evening as one grepping for a log line that
-   * was never emitted, which is the other half of this same review.
+   * ═══ TWO CHANNELS, TWO VARIABLES, AND THE DOCUMENT USED TO SWAP THEM ═══
+   *
+   * WHAT THIS TEST USED TO ENFORCE IS NOW FALSE, WHICH IS WHY IT WAS REWRITTEN
+   * RATHER THAN PATCHED. It required this section to say that the bot's own
+   * faults reaching a channel was "issue #9 and is not built". It shipped:
+   * `setSink(statusReporter(...))` in src/index.ts, gated on
+   * `BLITZ_STATUS_CHANNEL_ID`. A test pinning a stale claim keeps the document
+   * wrong on purpose, and this one was doing exactly that.
+   *
+   * WHAT IT ENFORCES NOW IS THE PAIRING, because that is what was actually
+   * broken. `BLITZ_LOG_CHANNEL_ID` is the MODERATION RECORD and belongs on
+   * `#moderation-notifications`; `BLITZ_STATUS_CHANNEL_ID` is the FAULTS channel
+   * and belongs on `#bot-status`. §5 of the document told the operator to point
+   * the first at the second's id, so an install done from this guide put every
+   * removal — and every incident record — in the faults channel. Neither the bot
+   * nor Discord can notice: both ids are real channels it can post to. So the
+   * rule here is that no paragraph may name a channel and the wrong variable in
+   * the same breath.
    */
-  it('frames the journal as a last resort without promising a status channel that does not exist', () => {
+  it('pairs each channel with the variable that actually routes to it', () => {
     const logs = section(deploy, /^## \d+\. Logs/m)
 
     expect(logs).toMatch(/last resort/i)
@@ -1141,25 +1151,202 @@ describe('docs/deploy.md — what an operator is told at 3am', () => {
     let faults = 0
 
     for (const paragraph of paragraphs(logs)) {
-      if (!paragraph.includes('#bot-status')) continue
-
-      // The built half says which variable puts removals there. The unbuilt
-      // half must name the issue and say it is not built. A paragraph that is
-      // neither is a promise about a channel nobody has wired up.
-      if (paragraph.includes('BLITZ_LOG_CHANNEL_ID')) {
-        removals += 1
-        expect(paragraph).toMatch(/removal/i)
-        continue
+      const names = {
+        moderation: paragraph.includes('#moderation-notifications'),
+        status: paragraph.includes('#bot-status'),
+        logVar: paragraph.includes('BLITZ_LOG_CHANNEL_ID'),
+        statusVar: paragraph.includes('BLITZ_STATUS_CHANNEL_ID'),
       }
 
-      faults += 1
-      expect(paragraph).toMatch(/issue\s+#9/)
-      expect(paragraph).toMatch(/not\s+built|does not\s+exist|until it is/i)
+      if (!names.moderation && !names.status) continue
+
+      // THE SWAP, WHICHEVER WAY ROUND. A paragraph that sends the moderation
+      // record to the faults channel, or the faults to the moderation channel,
+      // is the exact mistake §5 shipped with.
+      expect(names.moderation && names.statusVar, paragraph).toBe(false)
+      expect(names.status && names.logVar, paragraph).toBe(false)
+
+      if (names.logVar) {
+        removals += 1
+        expect(paragraph, paragraph).toMatch(/removal/i)
+      }
+
+      if (names.statusVar) {
+        faults += 1
+        expect(paragraph, paragraph).toMatch(/fault|error|warn/i)
+      }
     }
 
-    // Nothing above fires if the channel is never named, so require both halves.
+    // Nothing above fires if neither channel is named, so require both halves.
     expect(removals).toBeGreaterThan(0)
     expect(faults).toBeGreaterThan(0)
+  })
+
+  /**
+   * ═══ THE ID SWAP ITSELF, OVER THE WHOLE DOCUMENT ═══
+   *
+   * THE ONE THAT REACHED THE BOX. §5 handed the operator a heredoc reading
+   * `BLITZ_LOG_CHANNEL_ID=1543345492270915684`, and a table beside it calling
+   * that "`#bot-status`, admin-only" — but that snowflake is the STATUS channel.
+   * docs/bot-manual.md has always had it right, and nothing compared the two, so
+   * the guide quietly instructed an install that puts the moderation record in
+   * the faults room. There is no runtime symptom: both are channels the bot can
+   * post to.
+   *
+   * THE CODE SAYS WHICH VARIABLE IS WHICH, AND IT IS THE ONLY THING THAT CAN.
+   * This test used to take both snowflakes off docs/bot-manual.md and hold
+   * deploy.md against them, which made the manual the single unchecked source
+   * for both documents — and the manual hard-codes them. `renderManual`
+   * substitutes exactly one token, `exempt-channels`; every `<#…>` in that file
+   * is a literal that gets published verbatim whatever the environment says. So
+   * a deployment that pointed a variable somewhere else published a manual
+   * naming a channel nobody moderates in, and the one assertion in the repo that
+   * could have noticed was deriving its expectation FROM the file that was
+   * wrong.
+   *
+   * SO THE DERIVATION RUNS THE OTHER WAY NOW, IN THREE STEPS. src/config.ts and
+   * the two call sites say which variable carries the moderation record and
+   * which carries the faults; the `.env` heredoc — the file the operator writes
+   * and `loadConfig` reads — says what this deployment sets each of them to; and
+   * docs/bot-manual.md is CHECKED against that rather than trusted for it.
+   *
+   * WHAT IS STILL NOT CATCHABLE, SAID OUT LOUD: the two ids are a fact about the
+   * owner's guild, not about the code, and the repo holds no third copy of them.
+   * Swap them in the heredoc AND in the manual together and every assertion here
+   * still passes, because at that point nothing in this repository disagrees.
+   * What this closes is the case that actually shipped — one document saying one
+   * thing and the other saying the other, with nobody comparing them.
+   */
+  it('never hands the operator the status channel id for the moderation record', () => {
+    /**
+     * WHICH VARIABLE ROUTES WHERE, FROM THE SOURCE. Reading the field names out
+     * of the schema means renaming a variable breaks this test rather than
+     * quietly narrowing it to a string that no longer appears in either file.
+     */
+    const variableFor = (field: string): string =>
+      capture(
+        configSource,
+        new RegExp(`${field}: parsedEnv\\.(\\w+)`, 'u'),
+        `the variable behind Config.${field} in src/config.ts`,
+      )
+
+    const logVar = variableFor('logChannelId')
+    const statusVar = variableFor('statusChannelId')
+
+    expect(logVar).not.toBe(statusVar)
+
+    // And that those two fields are what the two features are actually built
+    // from, which is the half of the pairing a variable name alone cannot say.
+    expect(clientSource, 'the moderation record').toContain(
+      'announcer(client, config.logChannelId)',
+    )
+    expect(indexSource, 'the fault sink').toContain(
+      'statusReporter(client, config.statusChannelId)',
+    )
+
+    // The ids themselves, off the file the operator writes and the code reads.
+    const envFile = capture(
+      deploy,
+      /cat > \/opt\/blitz-bot\/\.env <<'EOF'\n([\s\S]*?)\nEOF/,
+      'the .env heredoc in deploy.md',
+    )
+
+    const idOf = (variable: string): string =>
+      capture(
+        envFile,
+        new RegExp(`^${variable}=(\\d+)$`, 'mu'),
+        `${variable} in the .env heredoc in deploy.md`,
+      )
+
+    const moderation = idOf(logVar)
+    const status = idOf(statusVar)
+
+    expect(moderation).not.toBe(status)
+
+    /**
+     * THE MANUAL IS NOW THE THING BEING CHECKED. Its two `<#…>` literals are
+     * published to the guild exactly as written, so they have to be the channels
+     * this deployment actually points those variables at.
+     */
+    const manual = repoFile('docs/bot-manual.md')
+
+    const mentionedUnder = (heading: string): string =>
+      capture(
+        manual,
+        new RegExp(`## ${heading}\\s*\\n+<#(\\d+)>`, 'u'),
+        `the channel id under "${heading}" in docs/bot-manual.md`,
+      )
+
+    expect(mentionedUnder('The moderation channel'), logVar).toBe(moderation)
+    expect(mentionedUnder('The status channel'), statusVar).toBe(status)
+
+    // The table beside the heredoc, which is the half of §5 that was wrong the
+    // first time: the id was right in the file and described as the other
+    // channel in the table next to it.
+    for (const [variable, id] of [
+      [logVar, moderation],
+      [statusVar, status],
+    ] as const) {
+      const row = capture(
+        deploy,
+        new RegExp(`^\\| \`${variable}\` \\| \`(\\d+)\` \\|`, 'mu'),
+        `the §5 table row for ${variable}`,
+      )
+
+      expect(row, variable).toBe(id)
+    }
+
+    /**
+     * ═══ AND NO PARAGRAPH OF deploy.md MAY PAIR ONE WITH THE OTHER'S ID ═══
+     *
+     * PARAGRAPH-SCOPED, AND THE VERSION BEFORE THIS ONE WAS NOT — IT PASSED BY
+     * LINE-WRAPPING LUCK. It compared `line.includes(variable)` against
+     * `line.includes(id)`, so the same claim was caught or missed depending on
+     * where the prose happened to wrap. §12.3 discusses this exact swap with the
+     * snowflake two lines below the sentence that introduces it; rewrap that
+     * paragraph, or let any formatter near the file, and a check that had been
+     * green for the wrong reason changes its verdict without a word of the
+     * document changing meaning.
+     *
+     * EACH ID IS READ AGAINST THE VARIABLE NEAREST BEFORE IT, rather than
+     * against every variable in the paragraph. A `toContain` over a whole
+     * paragraph cannot tell a swapped pairing from a correct table that names
+     * both — §5 has two of those, and the `.env` block itself is a third — so
+     * the association is what makes paragraph scope usable at all.
+     *
+     * A PARAGRAPH THAT QUOTES THE MISTAKE IN ORDER TO CORRECT IT IS NOT THE
+     * MISTAKE. §5's correction box has to be able to write out what the guide
+     * used to say, or an operator who installed from the old copy cannot
+     * recognise what is in his `.env`; §12.3 has to be able to say which id
+     * being in that variable means the swap. Both mark themselves, and the hatch
+     * is the marking. It is wider than the line-scoped one it replaces, and the
+     * assertions above are why that is affordable: the heredoc, the §5 table and
+     * the manual are pinned outside it, and those are where this bug shipped.
+     */
+    const historical = /used to|no longer|wrong way round|earlier copy|the swap|correction/i
+    const expected: Record<string, string> = { [logVar]: moderation, [statusVar]: status }
+    const TOKEN = new RegExp(`${logVar}|${statusVar}|${moderation}|${status}`, 'gu')
+
+    for (const paragraph of paragraphs(deploy)) {
+      if (historical.test(paragraph)) continue
+
+      let naming: string | null = null
+
+      for (const [token] of paragraph.replace(/\s+/gu, ' ').matchAll(TOKEN)) {
+        if (token === logVar || token === statusVar) {
+          naming = token
+          continue
+        }
+
+        // A snowflake with no variable ahead of it in this paragraph is a
+        // channel being talked about, not a variable being set.
+        if (naming === null) continue
+
+        if (expected[naming] !== token) {
+          expect.fail(`deploy.md points ${naming} at ${token}:\n\n${paragraph}`)
+        }
+      }
+    }
   })
 })
 
