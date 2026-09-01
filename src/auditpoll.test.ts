@@ -13,7 +13,10 @@ import {
 import { CURSOR_KEY as BAN_CURSOR_KEY, TAGS_KEY } from './banrole.ts'
 import { AUDIT_CURSOR_KEY } from './client.ts'
 import type { AuditRow, BotStateRow, DdbResult } from './ddb.ts'
-import { CURSOR_KEY as INCIDENT_CURSOR_KEY } from './incidents.ts'
+import {
+  CURSOR_KEY as INCIDENT_CURSOR_KEY,
+  OPEN_CURSOR_KEY as INCIDENT_OPEN_CURSOR_KEY,
+} from './incidents.ts'
 
 /**
  * The walk over `ringmaster-audit`, on its own.
@@ -974,9 +977,10 @@ describe('a hook that throws', () => {
  * tests. The literal has to be written out somewhere that is not the module, and
  * the names have to be compared to each other somewhere that can see both.
  *
- * A THIRD CONSUMER IS COMING — blitz-bot#19's case-opened half — so this is a
- * LIST AND A SET, not a pair of comparisons. Adding a consumer is adding one
- * line here, and forgetting to is a failing test rather than a green suite.
+ * IT IS A LIST AND A SET RATHER THAN A PAIR OF COMPARISONS, which is what made
+ * blitz-bot#19's case-opened half one line here instead of a rewrite. Adding a
+ * consumer is adding one line, and forgetting to is a failing test rather than a
+ * green suite.
  */
 describe('the rows this bot keeps in ringmaster-bot-state', () => {
   /**
@@ -988,6 +992,15 @@ describe('the rows this bot keeps in ringmaster-bot-state', () => {
   const ROWS: ReadonlyArray<readonly [name: string, key: string]> = [
     ['game-ban-audit-cursor', BAN_CURSOR_KEY],
     ['incident-resolve-audit-cursor', INCIDENT_CURSOR_KEY],
+    /**
+     * THE THIRD CONSUMER, AND THE FIRST WHOSE CURSOR IS NOT A POSITION IN
+     * `ringmaster-audit` AT ALL. It is an `openedAt` out of
+     * `ringmaster-incidents`, read through `kind-openedAt-index` — so a collision
+     * with either of the two above would not merely skip rows, it would resume a
+     * poller from a millisecond that is a valid number and means nothing in its
+     * own table.
+     */
+    ['incident-open-index-cursor', INCIDENT_OPEN_CURSOR_KEY],
     ['game-ban-role-tags', TAGS_KEY],
     ['discord-audit-cursor', AUDIT_CURSOR_KEY],
   ]

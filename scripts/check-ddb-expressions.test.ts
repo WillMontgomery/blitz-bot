@@ -354,8 +354,11 @@ describe('the check over this repo', () => {
       return findExpressionStrings(file, source).length
     })
     // The twelfth in src/ddb.ts is `incidents.get`'s `ProjectionExpression`,
-    // added when that read stopped pulling back the whole incident row.
-    expect(seen).toEqual([12, 11])
+    // added when that read stopped pulling back the whole incident row; the
+    // thirteenth is `incidents.opened`'s `KeyConditionExpression`, which is the
+    // one expression in this repo that names a secondary index's key schema
+    // rather than a table's.
+    expect(seen).toEqual([13, 11])
   })
 
   /**

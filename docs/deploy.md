@@ -606,7 +606,7 @@ finding out the expensive way.
 > beside it as "`#bot-status`, admin-only". **That snowflake is the status
 > channel**, and
 > `BLITZ_LOG_CHANNEL_ID` is the moderation record — so following this guide put
-> the removal lines, and the embed for every incident closed in the console, into
+> the removal lines, and the embed for every incident filed and closed, into
 > the channel meant for the bot's own faults. `docs/bot-manual.md` has had the
 > right pairing all along.
 >
@@ -697,7 +697,7 @@ turns something off, and for three of them blank means a value that lives in
 | Variable | Value here | Why |
 |---|---|---|
 | `DISCORD_ADMIN_ROLE_ID` | blank | Blank disables the admin exemption outright, and refuses every admin-only slash command to everybody. Leave it blank through §8 and §9 — **with a role set here, an invite you post yourself would be skipped**, and the smoke test would look like a broken bot. |
-| `BLITZ_LOG_CHANNEL_ID` | `1542603116258525185` | **`#moderation-notifications`**, admin-only. The moderation record: every removal, every dry-run would-be removal, and an embed for every incident closed in the Ringmaster console. This is what makes the dry run readable without an SSH session. |
+| `BLITZ_LOG_CHANNEL_ID` | `1542603116258525185` | **`#moderation-notifications`**, admin-only. The moderation record: every removal, every dry-run would-be removal, and an embed for every incident the game files and every incident closed in the Ringmaster console. This is what makes the dry run readable without an SSH session. |
 | `BLITZ_STATUS_CHANNEL_ID` | `1543345492270915684` | **`#bot-status`**, admin-only. The bot's OWN faults and nothing else — a delete that failed, a rate limit, a channel it cannot post in — plus the commit it came up on when that has changed. A different channel from the one above deliberately: one is a record of what the bot did to the guild, the other is a record of what went wrong with the bot. |
 | `BLITZ_DOCS_CHANNEL_ID` | blank | Where the bot keeps `docs/bot-manual.md` posted, reconciled at every start. Blank turns the manual off: the file is not read and nothing is posted. Set it when the owner wants the guild to have the manual — and give the bot **Read Message History** there (§4.2), or it cannot find the copy it posted last time. |
 | `BLITZ_MAINTENANCE_CHANNEL_ID` | blank | Where players are told the server is back up — one message, after the game server itself reports in. Blank turns the watcher off and the maintenance row is never read. Nothing else is ever posted there. |

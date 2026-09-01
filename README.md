@@ -22,8 +22,9 @@ shortener. **No word filter, no warnings, no mutes.**
 
 Around that: a ban, unban or kick in Discord is carried into the game and
 written to DynamoDB; a ban issued in the console puts the game-ban role on the
-player here and takes it off again when it is lifted or expires; the console's
-closed incidents become an embed in the moderation channel; `/sticky` keeps a
+player here and takes it off again when it is lifted or expires; an incident
+becomes an embed in the moderation channel when it is filed and again when it is
+closed in the console; `/sticky` keeps a
 message at the bottom of a channel; and `docs/bot-manual.md` is published to a
 channel and reconciled at every start.
 
@@ -35,7 +36,7 @@ authority on it. All fourteen, in the order `src/config.ts` reads them:
 | `DISCORD_BOT_TOKEN` | Required. The bot's own token. |
 | `DISCORD_GUILD_ID` | Required. Our guild — the one guild whose invites are allowed. |
 | `DISCORD_ADMIN_ROLE_ID` | The role treated as admin. Unset disables the admin exemption and refuses every admin-only command to everybody. |
-| `BLITZ_LOG_CHANNEL_ID` | The moderation record: removals, and an embed per incident closed in the console. Unset means journal only. |
+| `BLITZ_LOG_CHANNEL_ID` | The moderation record: removals, and an embed per incident filed and per incident closed. Unset means journal only. |
 | `BLITZ_STATUS_CHANNEL_ID` | The bot's own faults, and the commit it came up on when that changed. Unset means journal only. |
 | `BLITZ_DOCS_CHANNEL_ID` | Where `docs/bot-manual.md` is published. Unset turns the manual off. |
 | `BLITZ_MAINTENANCE_CHANNEL_ID` | Where players are told the server is back up. Unset turns the watcher off. |

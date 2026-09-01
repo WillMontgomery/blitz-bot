@@ -12,8 +12,10 @@ import type {
 } from '@aws-sdk/lib-dynamodb'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { MAX_INDEX_ROWS } from './incidents.ts'
 import {
   createDdb,
+  INCIDENT_KIND_INDEX,
   createDocument,
   isBanActive,
   isMaintenanceDraining,
@@ -190,6 +192,9 @@ const EXERCISES: Array<{
   { name: 'gamePlayers.matches', run: (d) => d.gamePlayers.matches(LICENSE, 25) },
   { name: 'maintenance.current', run: (d) => d.maintenance.current() },
   { name: 'incidents.get', run: (d) => d.incidents.get(INCIDENT) },
+  // An open window, for `auditWindow.since`'s reason: a closed one is answered
+  // here without asking DynamoDB, so `(1, 1]` would exercise nothing.
+  { name: 'incidents.opened', run: (d) => d.incidents.opened('report', 1, 2, 10) },
   { name: 'audit.begin', run: (d) => d.audit.begin({ action: 'player.kick', actor: ACTOR }) },
   { name: 'audit.resolve', run: (d) => d.audit.resolve({ commandId: 'c1', ts: 1 }, 'ok') },
   { name: 'audit.recent', run: (d) => d.audit.recent(10) },
@@ -786,6 +791,7 @@ describe('reads', () => {
       'category',
       'incidentId',
       'kind',
+      'openedAt',
       'resolvedAt',
       'resolvedByName',
       'subjectLicense',
@@ -2055,5 +2061,276 @@ describe('qualifying an identifier', () => {
   it('puts the kind in front of the value, the way the index stores it', () => {
     expect(qualifyId('discord', '280')).toBe('discord:280')
     expect(qualifyId('steam', '110000')).toBe('steam:110000')
+  })
+})
+
+describe('the incident index', () => {
+  /**
+   * ═══ THE INDEX MAY NOT EXIST WHEN THE CODE THAT READS IT SHIPS ═══
+   *
+   * `kind-openedAt-index` IS CREATED BY HAND (docs/aws-notes.md) and this
+   * accessor exists before it does. A `Query` naming an index a table does not
+   * carry fails with a `ValidationException`, which lands on `error` — the same
+   * kind a throttle, a bad expression and an unrecognised exception all get — so
+   * the one consumer of this call would report "could not read the index" for
+   * something that is not a read failure at all. The owner runs this bot from
+   * Discord rather than from a terminal; being told his table is broken when what
+   * is true is that he has not created something yet costs an evening.
+   */
+  it('calls a missing index a missing index and not a read failure', async () => {
+    const ddb = createDdb({
+      document: failingDocument(
+        awsError(
+          'ValidationException',
+          'The table does not have the specified index: kind-openedAt-index',
+        ),
+      ),
+    })
+
+    const result = await ddb.incidents.opened('report', 1, 2)
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.failure.kind).toBe('no-such-index')
+      // The SDK's own words survive, so an operator sees what AWS actually said
+      // rather than only what this module decided it meant.
+      expect(result.failure.message).toContain(INCIDENT_KIND_INDEX)
+      expect(result.failure.table).toBe('ringmaster-incidents')
+      expect(result.failure.op).toBe('query')
+    }
+  })
+
+  /**
+   * ═══ AND THE SAME EXCEPTION FOR AN INDEX THAT EXISTS AND IS STILL FILLING ═══
+   *
+   * AWS REFUSES READS OF A GSI WHILE IT BACKFILLS, with a `ValidationException`
+   * whose message is `Cannot read from backfilling global secondary index:
+   * <name>` — verbatim, and see `BACKFILLING_INDEX` in src/ddb.ts for where it is
+   * quoted from. That is the state `aws dynamodb update-table` LEAVES AN OPERATOR
+   * IN for the minutes after he creates the index, so calling it `no-such-index`
+   * meant the first thing he read was the bot telling him the index he had just
+   * made does not exist. He would go looking for a typo in something that is
+   * fine.
+   */
+  it('tells an index that is still filling apart from one that is not there', async () => {
+    const ddb = createDdb({
+      document: failingDocument(
+        awsError(
+          'ValidationException',
+          `Cannot read from backfilling global secondary index: ${INCIDENT_KIND_INDEX}`,
+        ),
+      ),
+    })
+
+    const result = await ddb.incidents.opened('report', 1, 2)
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.failure.kind).toBe('index-backfilling')
+      expect(result.failure.kind).not.toBe('no-such-index')
+    }
+  })
+
+  /**
+   * AND A REWORDING AT AWS PUTS IT BACK WHERE IT WAS RATHER THAN SOMEWHERE NEW.
+   * The match is on the fixed words either side of the interpolated index name,
+   * lowercased first, so capitalisation is covered; anything further is an
+   * unrecognised `ValidationException` on an index call, which is the older of
+   * the two sentences and is the safe half of the trade.
+   */
+  it('is not fooled by the case of AWSs own message', async () => {
+    const ddb = createDdb({
+      document: failingDocument(
+        awsError(
+          'ValidationException',
+          'Cannot read from Backfilling Global Secondary Index: kind-openedAt-index',
+        ),
+      ),
+    })
+
+    const result = await ddb.incidents.opened('report', 1, 2)
+    expect(result.ok === false && result.failure.kind).toBe('index-backfilling')
+  })
+
+  /**
+   * AND ONLY A CALL THAT NAMED AN INDEX CAN PRODUCE IT. `ValidationException` is
+   * also what a malformed expression and a key condition that does not match the
+   * key schema raise, so mapping it globally would send somebody to
+   * `update-table` over a typo in a `ProjectionExpression`. The index name being
+   * on the request is what narrows it.
+   */
+  it('leaves the same exception a plain error everywhere else', async () => {
+    const ddb = createDdb({
+      document: failingDocument(awsError('ValidationException', 'ExpressionAttributeValues')),
+    })
+
+    const point = await ddb.incidents.get(INCIDENT)
+    const stream = await ddb.auditWindow.since(1, 2, 10)
+
+    expect(point.ok).toBe(false)
+    if (!point.ok) expect(point.failure.kind).toBe('error')
+    expect(stream.ok).toBe(false)
+    if (!stream.ok) expect(stream.failure.kind).toBe('error')
+  })
+
+  /**
+   * THE INDEX IS NAMED ON THE REQUEST AND THE KEY CONDITION IS ITS SCHEMA, NOT
+   * THE TABLE'S. Getting either wrong is a run-time failure on the box and
+   * nowhere earlier — which is how a bare reserved word shipped once already, and
+   * is why the expression is also read by scripts/check-ddb-expressions.ts.
+   */
+  it('queries one kind of the index over a closed window, oldest first', async () => {
+    const fake = fakeDocument({
+      query: async () => ({
+        ...META,
+        Items: [{ incidentId: INCIDENT, kind: 'report', openedAt: 1_700_000_000_100 }],
+      }),
+    })
+    const ddb = createDdb({ document: fake.doc })
+
+    const result = await ddb.incidents.opened('report', 1_700_000_000_000, 1_700_000_000_500, 25)
+
+    expect(result.ok && result.value).toEqual({
+      keys: [{ incidentId: INCIDENT, kind: 'report', openedAt: 1_700_000_000_100 }],
+      more: false,
+    })
+
+    const query = fake.calls[0]?.input as QueryCommandInput
+
+    expect(query.TableName).toBe('ringmaster-incidents')
+    expect(query.IndexName).toBe(INCIDENT_KIND_INDEX)
+    expect(query.ScanIndexForward).toBe(true)
+    expect(query.Limit).toBe(25)
+
+    /**
+     * `after + 1` BECAUSE `BETWEEN` IS INCLUSIVE AT BOTH ENDS and DynamoDB has no
+     * exclusive form. `openedAt` is a whole number of milliseconds wherever it is
+     * written, so the next key that CAN exist is the next integer — and without
+     * this the case at exactly the cursor is posted about a second time on every
+     * pass, forever.
+     */
+    expect(query.ExpressionAttributeValues).toEqual({
+      ':kind': 'report',
+      ':from': 1_700_000_000_001,
+      ':to': 1_700_000_000_500,
+    })
+  })
+
+  /**
+   * A WINDOW THAT CANNOT CONTAIN ANYTHING IS NOT SENT. A caught-up poller asks
+   * for `(t, t]` on every kind on every pass; three billed reads a half minute
+   * for a range with nothing in it is a bill rather than a check. The same rule
+   * `auditWindow.since` keeps.
+   */
+  it('answers a closed window without asking DynamoDB', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    for (const [after, until] of [
+      [5, 5],
+      [5, 4],
+    ]) {
+      const result = await ddb.incidents.opened('anticheat', after as number, until as number)
+      expect(result.ok && result.value).toEqual({ keys: [], more: false })
+    }
+
+    expect(fake.calls).toEqual([])
+  })
+
+  /**
+   * ═══ THE CAP HERE AND THE PAGE SIZE THERE HAVE TO AGREE, AND THE FAILURE IS
+   * SILENT IF THEY DO NOT ═══
+   *
+   * `MAX_INDEX_ROWS` IS ALSO HOW THE POLLER RECOGNISES A FULL PAGE — a page that
+   * came back at the limit may have stopped in the middle of a millisecond, and
+   * the walk holds that stamp back for the next pass. If this cap were the
+   * smaller of the two, every page would come back short of what the poller asked
+   * for, no page would ever look full, and a `openedAt` split across two pages
+   * would be walked as if it were complete: the second half of that millisecond
+   * behind the cursor for good, with nothing logged.
+   */
+  it('does not quietly shrink the page its one caller asks for', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    await ddb.incidents.opened('report', 1, 2, MAX_INDEX_ROWS)
+
+    expect((fake.calls[0]?.input as QueryCommandInput).Limit).toBe(MAX_INDEX_ROWS)
+  })
+
+  /** A ceiling on a number somebody else picks, as `AUDIT_QUERY_CAP` is. */
+  it('caps and floors the page size whatever it is asked for', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    for (const asked of [0, -5, 1000, 50.7]) {
+      await ddb.incidents.opened('report', 1, 2, asked)
+    }
+
+    expect(fake.calls.map((c) => (c.input as QueryCommandInput).Limit)).toEqual([1, 1, 50, 50])
+  })
+
+  /**
+   * NO `ProjectionExpression`, WHICH IS NOT AN OMISSION. The index is
+   * `KEYS_ONLY`, so the three attributes on `IncidentKey` are all it holds and
+   * all that can come back. Asking for a subset of three keys would be a second
+   * place for a projection to drift from the type — and, unlike `incidents.get`,
+   * there is nothing on the other side of it to keep out of this process.
+   */
+  it('asks for no projection, because the index carries only its keys', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    await ddb.incidents.opened('report', 1, 2)
+
+    const query = fake.calls[0]?.input as QueryCommandInput
+    expect(query.ProjectionExpression).toBeUndefined()
+    expect(query.ConsistentRead).toBeUndefined()
+  })
+
+  /**
+   * AND IT IS NOT STRONGLY CONSISTENT, BECAUSE IT CANNOT BE. DynamoDB has no
+   * consistent read of a global secondary index. That is a property of the
+   * storage rather than a choice here, and it is the reason its consumer treats
+   * an empty answer as no evidence at all — see `createIncidentOpenLog` in
+   * src/incidents.ts, which never advances a cursor over one.
+   */
+  it('answers an empty page as an empty list rather than as an absence', async () => {
+    const fake = fakeDocument({ query: async () => ({ ...META }) })
+    const ddb = createDdb({ document: fake.doc })
+
+    const result = await ddb.incidents.opened('identifier_reuse', 1, 2)
+
+    expect(result.ok).toBe(true)
+    expect(result.ok && result.value).toEqual({ keys: [], more: false })
+  })
+
+  /**
+   * ═══ THE ONLY HONEST ANSWER TO "WAS THAT THE WHOLE WINDOW" ═══
+   *
+   * A `Query` MAY RETURN FEWER ITEMS THAN `Limit` AND STILL HAVE MORE BEHIND IT,
+   * and `LastEvaluatedKey` is how DynamoDB says so. The consumer's ceiling — the
+   * thing that stops a cursor advancing through a half-read millisecond — used to
+   * be decided by counting rows against the page size, which is a different claim
+   * and is wrong on exactly this page.
+   */
+  it('forwards DynamoDBs own end-of-range signal rather than a count of rows', async () => {
+    const short = [{ incidentId: INCIDENT, kind: 'report', openedAt: 1_700_000_000_100 }]
+
+    for (const [last, more] of [
+      [{ incidentId: INCIDENT, kind: 'report', openedAt: 1_700_000_000_100 }, true],
+      [undefined, false],
+    ] as const) {
+      const fake = fakeDocument({
+        query: async () => ({ ...META, Items: short, LastEvaluatedKey: last }),
+      })
+      const ddb = createDdb({ document: fake.doc })
+
+      const result = await ddb.incidents.opened('report', 1, 2, 50)
+
+      // One row against a page size of fifty, both times. Only the signal moves.
+      expect(result.ok && result.value.keys).toHaveLength(1)
+      expect(result.ok && result.value.more, String(more)).toBe(more)
+    }
   })
 })

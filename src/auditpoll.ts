@@ -17,13 +17,31 @@ import { log } from './log.ts'
  * cursor at the end. Only the strings, the key and what happens to each row
  * differed.
  *
- * A THIRD CONSUMER IS ALREADY SPECIFIED. blitz-bot#19 wants a post when a case
- * OPENS as well, and that half arrives as soon as fivem-ringmaster#46 lands the
- * GSI it needs. Extracting after there are three copies means fixing every bug
+ * EXTRACTING AFTER THERE WERE THREE COPIES would have meant fixing every bug
  * found in this walk three times, in three files, and the two that have already
  * been found here — a cursor moved over a row nobody dealt with, and a silent
  * `break` on a row that could not be placed — are exactly the kind that get
  * fixed in one copy and left in the others.
+ *
+ * THE THIRD CONSUMER ARRIVED AND WALKS SOMETHING ELSE, WHICH IS WORTH SAYING
+ * BECAUSE THIS COMMENT PREDICTED OTHERWISE. blitz-bot#19's case-opened half —
+ * `createIncidentOpenLog` in src/incidents.ts — does not walk `ringmaster-audit`
+ * at all: there is no `incident.open` verb and there cannot be one, so it reads a
+ * GSI on `ringmaster-incidents` instead. It makes three queries rather than one,
+ * its rows are index keys rather than `AuditRow`s, and its cursor is a sort key a
+ * GSI does not require to be unique. Widening `pollAuditWindow` to take it would
+ * have meant reshaping the walk two shipped consumers depend on to serve a third
+ * that agrees with them about the bookmark and about nothing else.
+ *
+ * SO THE BOOKMARK IS THE PART THAT IS SHARED, AND IT IS SHARED RATHER THAN
+ * COPIED. `bookmark` below is the four blocks all three agree on — the read, the
+ * `cursorAt` verdict on what came back, the first-start mark, the write — and
+ * `placeable` is the range check that keeps a broken sort key out of that row.
+ * The third consumer had its own copy of all five, and the copy was already
+ * missing `placeable`: the fix this file gained after `'NaN'` and `1e18` reached
+ * `ringmaster-bot-state` in production had not reached it. That is the exact
+ * failure the paragraph above predicts, arriving through a copy of the SMALL half
+ * rather than of the walk.
  *
  * ═══ WHAT IS DELIBERATELY NOT IN HERE ═══
  *
@@ -141,13 +159,22 @@ export const MAX_STAMP = 4_102_444_800_000
  * `'NaN'` and `'1000000000000000000'` got into `ringmaster-bot-state`: refused as
  * a bookmark, admitted as a sort key, and written as a bookmark by this file.
  *
+ * EXPORTED FOR THE THIRD CONSUMER, WHICH KEEPS ITS BOOKMARK IN THE SAME ROW
+ * FAMILY AND ITS SORT KEY SOMEWHERE ELSE. `createIncidentOpenLog` in
+ * src/incidents.ts walks a GSI whose sort key is `openedAt`, writes it into
+ * `ringmaster-bot-state` and reads it back through `cursorAt` — which is the
+ * exact pairing the paragraph above is about, in another table. It shipped
+ * without this half, so a finite `openedAt` past `MAX_STAMP` was walked as a
+ * position, written out as a bookmark, and refused on the next pass by
+ * `cursorAt` — the `1e18` incident again, one table over.
+ *
  * `> 0` AND `<= MAX_STAMP` SUBSUME FINITENESS RATHER THAN LOSING IT. `NaN` is
  * neither greater than nor less than anything, `Infinity` fails the upper bound
  * and `-Infinity` fails the lower, so the `Number.isFinite` test this replaces is
  * not dropped — it is implied by both comparisons, the same way `Math.abs` covers
  * the three of them in src/incidents.ts.
  */
-function placeable(ts: unknown): ts is number {
+export function placeable(ts: unknown): ts is number {
   return typeof ts === 'number' && ts > 0 && ts <= MAX_STAMP
 }
 
@@ -245,22 +272,23 @@ export interface AuditPollDeps {
 }
 
 /**
- * The sentences one consumer says. Seven lines, in one object, per consumer —
- * six required and the seventh optional, for the reason it gives.
+ * The sentences a consumer says about its BOOKMARK. Four lines, in one object,
+ * per consumer — and every consumer that keeps a place in `ringmaster-bot-state`
+ * says all four, whether or not it walks the audit log. See `bookmark`.
  *
  * SEPARATE STRINGS RATHER THAN ONE TEMPLATED SENTENCE WITH THE CONSUMER'S NAME
- * SUBSTITUTED IN. Every one of these is grepped for verbatim by a test, and SIX
- * OF THE SEVEN reach the owner's status channel — where "the game-ban poll" and
- * "the incident poll" are the two things he actually needs told apart. A
- * generated `the ${what} poll …` would make both of those a match for neither.
+ * SUBSTITUTED IN. Every one of these is grepped for verbatim by a test, and all
+ * but one reach the owner's status channel — where "the game-ban poll", "the
+ * incident poll" and "the case-opened poll" are the three things he actually
+ * needs told apart. A generated `the ${what} poll …` would make all of those a
+ * match for none.
  *
- * SIX AND NOT THREE, WHICH IS WHAT THIS SAID AND IS CHECKABLE EITHER WAY.
- * `report` in src/log.ts is called on every level that is not `info`, so every
- * `warn` and every `error` here goes to the sink: only `noCursorYet` stays out
- * of the channel, and it is the one line that is not about something going
- * wrong.
+ * WHICH ONES REACH HIM IS CHECKABLE RATHER THAN CLAIMED. `report` in src/log.ts
+ * is called on every level that is not `info`, so every `warn` and every `error`
+ * here goes to the sink: only `noCursorYet` stays out of the channel, and it is
+ * the one line that is not about something going wrong.
  */
-export interface AuditPollMessages {
+export interface CursorMessages {
   /** The cursor row could not be read, so nothing was polled. `warn`. */
   readonly cursorUnreadable: string
   /** There is no cursor at all: the first ever start. `info`. */
@@ -276,10 +304,20 @@ export interface AuditPollMessages {
    * this change is undoing. What is rejected is a POSITION, not a numeral.
    */
   readonly cursorUnusable: string
-  /** The audit window could not be read, so this pass did nothing. `warn`. */
-  readonly windowUnreadable: string
   /** The work was done and the bookmark was not. `warn`. */
   readonly cursorUnsaved: string
+}
+
+/**
+ * The three the WALK says, on top of the four the bookmark says.
+ *
+ * THE SPLIT IS WHERE THE THIRD CONSUMER JOINS. `createIncidentOpenLog` keeps a
+ * bookmark in the same table under the same rules and does not walk this log at
+ * all, so it needs the four above and none of the three below — see `bookmark`.
+ */
+export interface AuditPollMessages extends CursorMessages {
+  /** The audit window could not be read, so this pass did nothing. `warn`. */
+  readonly windowUnreadable: string
   /** A row arrived with no sort key, so the walk stopped. `error`. */
   readonly rowWithoutSortKey: string
 
@@ -378,6 +416,138 @@ export interface AuditPollSpec {
  */
 const firstStart = new Map<string, number>()
 
+/** One consumer's place in `ringmaster-bot-state`. See `bookmark`. */
+export interface Bookmark {
+  /**
+   * Read it. A number is where to resume from; `null` means this pass is over
+   * and the reason has already been logged — either the row could not be read,
+   * or there is no usable bookmark and `until` has just been recorded as one.
+   */
+  begin(until: number): Promise<number | null>
+  /** Write it. `false` means it did not land, which ends the caller's pass. */
+  save(to: number): Promise<boolean>
+}
+
+/**
+ * ═══ THE FOUR BLOCKS EVERY CURSOR-KEEPING POLLER IN THIS REPO HAD A COPY OF ═══
+ *
+ * READ THE ROW; DECIDE WHAT AN ABSENT OR UNUSABLE VALUE MEANS; RECORD WHERE THIS
+ * PROCESS CAME IN AND RETURN WITHOUT WALKING ANYTHING; WRITE THE PLACE BACK. That
+ * is the whole of this function and it was `pollAuditWindow`'s prologue and tail
+ * until `createIncidentOpenLog` in src/incidents.ts arrived as a THIRD consumer
+ * of the same four blocks with a different key — line for line, including the
+ * `raw: unknown` and the comment explaining it.
+ *
+ * WHICH IS WHY IT IS SHARED NOW AND WAS NOT BEFORE, and the argument is the one
+ * at the top of this file rather than a new one. The WALK is not shared with that
+ * consumer, because it reads a GSI and not this log and agrees with the other two
+ * about the bookmark and about nothing else — but the bookmark is exactly what it
+ * does agree about, and a copy of it is a copy of every rule below.
+ *
+ * AND THE COPY HAD ALREADY LOST ONE OF THEM, WHICH IS THE POINT. `placeable` —
+ * the range check that stops a broken sort key becoming a stored bookmark, added
+ * here after `'NaN'` and `'1000000000000000000'` reached `ringmaster-bot-state`
+ * in production — was in this file and not in the copy. Three copies of a walk is
+ * three places for a fix like that to be missing from two of.
+ *
+ * IT TAKES THE TABLE AND NOT `AuditPollDeps`, so a consumer that has no audit
+ * window at all can hold one. `Pick<Ddb, 'botState'>` grants every row in
+ * `ringmaster-bot-state` and not one, for the reason stated at the top of this
+ * file: only this function's discipline keeps it to `cursorKey`.
+ */
+export function bookmark(
+  ddb: Pick<Ddb, 'botState'>,
+  cursorKey: string,
+  messages: CursorMessages,
+): Bookmark {
+  /**
+   * Write the bookmark. `false` means it did not land.
+   *
+   * EVERY CALLER TREATS `false` AS THE END OF THE PASS, and the one that matters
+   * is the `persist` write inside the walk. `ringmaster-bot-state` not answering
+   * does not stop either poller from posting: without this the pass carries on
+   * through all ten records with all ten bookmarks failing, and the next pass —
+   * reading a cursor that never moved — replays every one of them into the
+   * channel. That is the exact replay `persist` exists to prevent, so a bookmark
+   * that did not land ends the walk. The records already sent are already sent;
+   * going on only widens the replay.
+   */
+  async function save(to: number): Promise<boolean> {
+    const written = await ddb.botState.put(cursorKey, String(to))
+    if (!written.ok) {
+      // The work was done; only the bookmark was not. The next pass reads the
+      // same window again — which is why every consumer's decisions have to be
+      // idempotent, and is why this is reported rather than swallowed.
+      log('warn', messages.cursorUnsaved, {
+        cursor: to,
+        failure: written.failure.kind,
+        detail: written.failure.message,
+      })
+      return false
+    }
+    return true
+  }
+
+  return {
+    save,
+
+    async begin(until: number): Promise<number | null> {
+      const stored = await ddb.botState.get(cursorKey)
+      if (!stored.ok) {
+        log('warn', messages.cursorUnreadable, {
+          failure: stored.failure.kind,
+          detail: stored.failure.message,
+        })
+        return null
+      }
+
+      // `unknown`, deliberately, and the cast in src/ddb.ts is why: the attribute
+      // is typed `string` and the table is hand-made, so the type is a claim
+      // about what was written and not a check on what came back. `cursorAt` is
+      // the check.
+      const raw: unknown = stored.value?.value ?? null
+      const cursor = cursorAt(raw)
+      if (cursor !== null) return cursor
+
+      /**
+       * NO CURSOR MEANS START HERE, NOT START AT THE BEGINNING, AND THAT IS EVERY
+       * CONSUMER'S IDEMPOTENCE STORY IN ONE BRANCH. The bot restarts on every
+       * deploy and every crash; a poller that began at the start of the log would
+       * re-derive months of triggers to arrive at a state the console's own tables
+       * already hold, and — for the two that post — would re-announce every case
+       * into the moderation channel each time. The cursor is what makes a restart
+       * resume, and this branch is only ever taken ONCE, on the first start after
+       * a consumer ships, where it records where it came in and does nothing else.
+       *
+       * THE COST IS STATED RATHER THAN HIDDEN: whatever happened before that first
+       * start is never acted on. There is no backfill and there should not be one.
+       *
+       * IT IS NO LONGER ONLY REACHED ONCE, WHICH IS THE POINT OF THE REWRITE.
+       * `''`, `' '`, `'0'`, a boolean and a list all arrive here now instead of
+       * folding to a bookmark at the epoch, and each of them is a `warn` naming
+       * the value — the difference between one line in the status channel and a
+       * moderation channel filling with cases from the day the console shipped.
+       *
+       * AND THE MARK IS THE FIRST PASS'S, NOT THIS PASS'S, WHENEVER A WRITE IS
+       * STILL OUTSTANDING. See `firstStart`: this branch returns without walking
+       * anything, so getting it wrong is not a lost write but a silently skipped
+       * window.
+       */
+      const from = firstStart.get(cursorKey) ?? until
+      firstStart.set(cursorKey, from)
+
+      log(
+        raw === null ? 'info' : 'warn',
+        raw === null ? messages.noCursorYet : messages.cursorUnusable,
+        { cursor: raw, from },
+      )
+
+      if (await save(from)) firstStart.delete(cursorKey)
+      return null
+    },
+  }
+}
+
 /**
  * The walk. Never throws; every failure is a line and a return.
  *
@@ -402,18 +572,9 @@ export async function pollAuditWindow(deps: AuditPollDeps, spec: AuditPollSpec):
   const at = deps.now()
   const until = at - SETTLE_MS
 
-  /**
-   * Write the bookmark. `false` means it did not land.
-   *
-   * EVERY CALLER TREATS `false` AS THE END OF THE PASS, and the one that matters
-   * is the `persist` write inside the walk. `ringmaster-bot-state` not answering
-   * does not stop this process from posting: without this the pass carries on
-   * through all ten records with all ten bookmarks failing, and the next pass —
-   * reading a cursor that never moved — replays every one of them into the
-   * channel. That is the exact replay `persist` exists to prevent, so a bookmark
-   * that did not land ends the walk. The records already sent are already sent;
-   * going on only widens the replay.
-   */
+  /** The four blocks this file used to hold inline. See `bookmark`. */
+  const place = bookmark(deps.ddb, spec.cursorKey, spec.messages)
+
   /**
    * Run one of the consumer's hooks; answer `whenItThrows` if it threw.
    *
@@ -454,75 +615,11 @@ export async function pollAuditWindow(deps: AuditPollDeps, spec: AuditPollSpec):
     }
   }
 
-  async function saveCursor(to: number): Promise<boolean> {
-    const written = await deps.ddb.botState.put(spec.cursorKey, String(to))
-    if (!written.ok) {
-      // The work was done; only the bookmark was not. The next pass reads the
-      // same window again — which is why every consumer's decisions have to be
-      // idempotent, and is why this is reported rather than swallowed.
-      log('warn', spec.messages.cursorUnsaved, {
-        cursor: to,
-        failure: written.failure.kind,
-        detail: written.failure.message,
-      })
-      return false
-    }
-    return true
-  }
+  const cursor = await place.begin(until)
 
-  const stored = await deps.ddb.botState.get(spec.cursorKey)
-  if (!stored.ok) {
-    log('warn', spec.messages.cursorUnreadable, {
-      failure: stored.failure.kind,
-      detail: stored.failure.message,
-    })
-    return
-  }
-
-  // `unknown`, deliberately, and the cast in src/ddb.ts is why: the attribute is
-  // typed `string` and the table is hand-made, so the type is a claim about what
-  // was written and not a check on what came back. `cursorAt` is the check.
-  const raw: unknown = stored.value?.value ?? null
-  const cursor = cursorAt(raw)
-
-  if (cursor === null) {
-    /**
-     * NO CURSOR MEANS START HERE, NOT START AT THE BEGINNING, AND THAT IS BOTH
-     * CONSUMERS' IDEMPOTENCE STORY IN ONE BRANCH. The bot restarts on every
-     * deploy and every crash; a poller that began at the start of the log would
-     * re-derive months of triggers to arrive at a state the console's own tables
-     * already hold, and — for the consumer that posts — would re-announce every
-     * closed case into the moderation channel each time. The cursor is what makes
-     * a restart resume, and this branch is only ever taken ONCE, on the first
-     * start after a consumer ships, where it records where it came in and does
-     * nothing else.
-     *
-     * THE COST IS STATED RATHER THAN HIDDEN: whatever happened before that first
-     * start is never acted on. There is no backfill and there should not be one.
-     *
-     * IT IS NO LONGER ONLY REACHED ONCE, WHICH IS THE POINT OF THE REWRITE.
-     * `''`, `' '`, `'0'`, a boolean and a list all arrive here now instead of
-     * folding to a bookmark at the epoch, and each of them is a `warn` naming
-     * the value — the difference between one line in the status channel and a
-     * moderation channel filling with cases from the day the console shipped.
-     *
-     * AND THE MARK IS THE FIRST PASS'S, NOT THIS PASS'S, WHENEVER A WRITE IS
-     * STILL OUTSTANDING. See `firstStart`: this branch returns without walking
-     * anything, so getting it wrong is not a lost write but a silently skipped
-     * window.
-     */
-    const from = firstStart.get(spec.cursorKey) ?? until
-    firstStart.set(spec.cursorKey, from)
-
-    log(
-      raw === null ? 'info' : 'warn',
-      raw === null ? spec.messages.noCursorYet : spec.messages.cursorUnusable,
-      { cursor: raw, from },
-    )
-
-    if (await saveCursor(from)) firstStart.delete(spec.cursorKey)
-    return
-  }
+  // Unreadable, or no usable bookmark and one has just been recorded. Either
+  // way this pass is over and `begin` has already said which it was.
+  if (cursor === null) return
 
   /** Where the bookmark stands in the table right now. */
   let saved = cursor
@@ -561,7 +658,7 @@ export async function pollAuditWindow(deps: AuditPollDeps, spec: AuditPollSpec):
 
   let advanced = cursor
 
-  /** A `persist` bookmark that did not land. See `saveCursor`. */
+  /** A `persist` bookmark that did not land. See `bookmark`. */
   let stalled = false
 
   for (const row of rows) {
@@ -594,7 +691,7 @@ export async function pollAuditWindow(deps: AuditPollDeps, spec: AuditPollSpec):
     advanced = row.ts
 
     if (step === 'persist') {
-      if (!(await saveCursor(advanced))) {
+      if (!(await place.save(advanced))) {
         stalled = true
         break
       }
@@ -616,5 +713,5 @@ export async function pollAuditWindow(deps: AuditPollDeps, spec: AuditPollSpec):
   // `saved` rather than `cursor`, so a pass that persisted as it went does not
   // rewrite the same value at the end. It is behind `advanced` only when the
   // rows after the last `persist` were dealt with in memory alone.
-  if (advanced > saved) await saveCursor(advanced)
+  if (advanced > saved) await place.save(advanced)
 }

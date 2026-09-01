@@ -3,7 +3,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { Config } from './config.ts'
 import { CONSOLE_URL } from './console.ts'
-import type { AuditRow, BotStateRow, Ddb, DdbResult, Incident, PlayerRecord } from './ddb.ts'
+import { INCIDENT_KIND_INDEX } from './ddb.ts'
+import type {
+  AuditRow,
+  BotStateRow,
+  Ddb,
+  DdbFailureKind,
+  DdbResult,
+  Incident,
+  IncidentKey,
+  IncidentKind,
+  IncidentPage,
+  PlayerRecord,
+} from './ddb.ts'
 import {
   avatarFor,
   BUTTON_URL_CAP,
@@ -11,7 +23,9 @@ import {
   closedByABan,
   COPY,
   createIncidentLog,
+  createIncidentOpenLog,
   CURSOR_KEY,
+  OPEN_CURSOR_KEY,
   FAULT_LIMIT,
   incidentEmbed,
   incidentIdOf,
@@ -21,14 +35,19 @@ import {
   isIncidentTrigger,
   KIND_LABEL,
   MAX_INCIDENT_READS,
+  MAX_INDEX_ROWS,
   MAX_POSTS,
   PENDING_HOLD_MS,
   POLL_LIMIT,
+  POLLED_KINDS,
   SETTLE_MS,
+  unqueryableKind,
   verdictText,
   type Avatars,
   type ComponentRow,
   type IncidentLog,
+  type IncidentOpenLog,
+  type IncidentOpenLogDeps,
   type IncidentLogDeps,
 } from './incidents.ts'
 
@@ -59,8 +78,10 @@ import {
  *   behind it carries `becauseOf: 'ban.issue'` and is dropped, while the case
  *   the ban was issued FROM is not;
  *
- *   an absent verdict is not "no action taken" — two kinds of resolved case
- *   carry none, and saying they were let off states a decision nobody made;
+ *   an absent verdict is not "no action taken" — a case closed with
+ *   `{ action: 'none' }` is now passed over entirely and two kinds of resolved
+ *   case carry NO verdict at all, so reading the second as the first drops a
+ *   permanent record on the strength of a decision nobody made;
  *
  *   the avatar is optional and the embed must be correct without it — the
  *   player most likely to have no Discord id is exactly the one being banned;
@@ -167,11 +188,30 @@ function incident(over: Partial<Incident> = {}): Incident {
     category: 'cheating',
     subjectLicense: LICENCE,
     subjectName: 'Nate',
+    openedAt: NOW - 600_000,
     resolvedAt: NOW - 120_000,
     resolvedByName: 'Admin One',
     verdict: { action: 'ban', expiresAt: null },
     ...over,
   }
+}
+
+/**
+ * A case as the OPENINGS poller finds it: filed ten minutes ago, nobody has
+ * looked at it, and therefore no verdict, no resolver and no `resolvedAt`.
+ *
+ * EXPLICIT `undefined` RATHER THAN A `delete`, so the three absences are visible
+ * in the fixture. `Incident` marks all three optional, which is what the console
+ * writes for a case nobody has closed.
+ */
+function openCase(over: Partial<Incident> = {}): Incident {
+  return incident({
+    state: 'pending_review',
+    resolvedAt: undefined,
+    resolvedByName: undefined,
+    verdict: undefined,
+    ...over,
+  })
 }
 
 /**
@@ -259,6 +299,8 @@ interface Harness {
    * refused write leaves the map exactly as it was seeded.
    */
   readonly writes: Array<{ key: string; value: string }>
+  /** Every index query this poller made. The resolved poller must make none. */
+  readonly indexReads: string[]
   cursor(): number | null
 }
 
@@ -310,6 +352,7 @@ function harness(
   const reads: string[] = []
   const windows: Array<{ after: number; until: number; limit: number | undefined }> = []
   const writes: Array<{ key: string; value: string }> = []
+  const indexReads: string[] = []
 
   const avatarSeam: Avatars = {
     urlFor: (discordId) => {
@@ -340,6 +383,18 @@ function harness(
             reads.push(id)
             return Promise.resolve(ok(cases[id] ?? null))
           }),
+
+        /**
+         * THE RESOLVED POLLER MUST NEVER CALL THIS, AND IT COUNTS RATHER THAN
+         * THROWS. A fake that threw would be caught by `guarded` in
+         * src/auditpoll.ts and reported as a consumer bug, so the suite would go
+         * green on a poller that had started reading an index it has no business
+         * in. `h.indexReads` is asserted instead.
+         */
+        opened: () => {
+          indexReads.push('opened')
+          return Promise.resolve(ok({ keys: [], more: false }))
+        },
       },
       players: {
         get: over.playerGet ?? ((licence) => Promise.resolve(ok(players[licence] ?? null))),
@@ -399,6 +454,7 @@ function harness(
     reads,
     windows,
     writes,
+    indexReads,
     cursor: () => {
       const raw = state.get(CURSOR_KEY)
       return raw === undefined ? null : Number(raw)
@@ -412,6 +468,19 @@ const OPEN = String(NOW - 3_600_000)
 /** Did any line carry this message? `msg=` so a field cannot match by accident. */
 function said(lines: string[], msg: string): boolean {
   return lines.some((line) => line.includes(`msg=${JSON.stringify(msg)}`))
+}
+
+/**
+ * The whole line carrying this message, so a case can read its LEVEL and its
+ * FIELDS rather than only whether the sentence was said.
+ *
+ * THE LEVEL IS THE FIRST THREE CHARACTERS — `<3>` error, `<4>` warn, `<6>` info
+ * (src/log.ts) — and both faults go to stderr, so `said(stderr, …)` cannot tell
+ * an `error` from a `warn`. Two of the cases below turn on exactly that
+ * difference, and one turns on a number in a field.
+ */
+function lineFor(lines: string[], msg: string): string | undefined {
+  return lines.find((line) => line.includes(`msg=${JSON.stringify(msg)}`))
 }
 
 /** One field off an embed, by label. */
@@ -509,12 +578,17 @@ describe('what the embed says was decided', () => {
   it('never reads an absent or null verdict as no action taken', () => {
     expect(verdictText({ verdict: undefined })).toBe(COPY.verdictUnknown)
     expect(verdictText({ verdict: null })).toBe(COPY.verdictUnknown)
-
-    expect(COPY.verdictUnknown).not.toBe(COPY.verdictNone)
   })
 
-  it('names the three verdicts a case can carry', () => {
-    expect(verdictText({ verdict: { action: 'none' } })).toBe(COPY.verdictNone)
+  /**
+   * TWO AND NOT THREE, AND THE THIRD MOVED RATHER THAN VANISHED. This case
+   * asserted `{ action: 'none' }` rendering as `COPY.verdictNone` until the
+   * owner answered open question 1 on blitz-bot#19 — nothing is posted if no
+   * action was taken — which took the string with it. What that verdict now
+   * gets is not a rendering at all: see 'posts nothing about a case an admin
+   * closed having decided nothing was warranted', in the poll.
+   */
+  it('names the two verdicts that reach a record', () => {
     expect(verdictText({ verdict: { action: 'kick' } })).toBe(COPY.verdictKick)
     expect(verdictText({ verdict: { action: 'ban', expiresAt: null } })).toBe(
       COPY.verdictBanPermanent,
@@ -596,9 +670,9 @@ describe('what the embed says was decided', () => {
 
 describe('the embed', () => {
   it('names the case, the player and the verdict, and nothing else', () => {
-    const embed = incidentEmbed(incident(), AVATAR)
+    const embed = incidentEmbed(incident(), AVATAR, 'resolved')
 
-    expect(embed.title).toBe(COPY.title)
+    expect(embed.title).toBe(COPY.resolvedTitle)
     expect(field(embed, COPY.case)).toBe(`${KIND_LABEL.report} · ${CATEGORY_LABEL.cheating}`)
     // The two names arrive in a code span, verbatim inside it. See `span`.
     expect(span(field(embed, COPY.player))).toBe('Nate')
@@ -635,7 +709,7 @@ describe('the embed', () => {
    * about the field, at a different boundary.
    */
   it('never renders the reporter, from any field, on the row the console really holds', () => {
-    const rendered = JSON.stringify(incidentEmbed(wholeRow(), AVATAR))
+    const rendered = JSON.stringify(incidentEmbed(wholeRow(), AVATAR, 'resolved'))
 
     for (const secret of [
       REPORTER,
@@ -663,7 +737,7 @@ describe('the embed', () => {
    * own strings, none of them comes off the row.
    */
   it('says what the case was from the two enums and never from the row s prose', () => {
-    const said = field(incidentEmbed(wholeRow(), null), COPY.case) ?? ''
+    const said = field(incidentEmbed(wholeRow(), null, 'resolved'), COPY.case) ?? ''
 
     expect(said).toBe(`${KIND_LABEL.report} · ${CATEGORY_LABEL.cheating}`)
     expect(Object.values({ ...KIND_LABEL, ...CATEGORY_LABEL })).toContain(KIND_LABEL.report)
@@ -698,7 +772,7 @@ describe('the embed', () => {
       category: 'from QuietWitness' as unknown as Incident['category'],
     })
 
-    const said = field(incidentEmbed(odd, null), COPY.case) ?? ''
+    const said = field(incidentEmbed(odd, null, 'resolved'), COPY.case) ?? ''
 
     expect(said).toBe(`${COPY.kindUnknown} · ${COPY.categoryUnknown}`)
     expect(said).not.toContain(REPORTER)
@@ -715,14 +789,14 @@ describe('the embed', () => {
       category: '__proto__' as unknown as Incident['category'],
     })
 
-    expect(field(incidentEmbed(odd, null), COPY.case)).toBe(
+    expect(field(incidentEmbed(odd, null, 'resolved'), COPY.case)).toBe(
       `${COPY.kindUnknown} · ${COPY.categoryUnknown}`,
     )
   })
 
   /** The game files its own cases as `system`, and "Anticheat · System" says it twice. */
   it('does not repeat itself for a case the system filed', () => {
-    const embed = incidentEmbed(incident({ kind: 'anticheat', category: 'system' }), null)
+    const embed = incidentEmbed(incident({ kind: 'anticheat', category: 'system' }), null, 'resolved')
 
     expect(field(embed, COPY.case)).toBe(KIND_LABEL.anticheat)
   })
@@ -737,7 +811,7 @@ describe('the embed', () => {
    * and a refused message is a moderation record that does not exist.
    */
   it('omits the thumbnail key entirely when there is no avatar', () => {
-    const embed = incidentEmbed(incident(), null)
+    const embed = incidentEmbed(incident(), null, 'resolved')
 
     expect(embed.thumbnail).toBeUndefined()
     expect('thumbnail' in embed).toBe(false)
@@ -754,7 +828,7 @@ describe('the embed', () => {
    * and has no license — so `''` is "not known" and is never an identity.
    */
   it('names the resolver and never renders the licence that can be empty', () => {
-    const embed = incidentEmbed(wholeRow(), null)
+    const embed = incidentEmbed(wholeRow(), null, 'resolved')
 
     expect(span(field(embed, COPY.resolvedBy))).toBe('Admin One')
     expect(JSON.stringify(embed)).not.toContain('license:admin1')
@@ -765,7 +839,7 @@ describe('the embed', () => {
    * which is a different claim from a fact nobody recorded.
    */
   it('leaves the resolver out rather than printing an empty identity', () => {
-    const embed = incidentEmbed(incident({ resolvedByName: '' }), null)
+    const embed = incidentEmbed(incident({ resolvedByName: '' }), null, 'resolved')
 
     expect(field(embed, COPY.resolvedBy)).toBeUndefined()
     expect(field(embed, COPY.verdict)).toBe(COPY.verdictBanPermanent)
@@ -777,7 +851,7 @@ describe('the embed', () => {
    * decision off the string, because a player could be called it.
    */
   it("renders the game's placeholder name as the name it is", () => {
-    expect(span(field(incidentEmbed(incident({ subjectName: 'Unknown' }), null), COPY.player))).toBe(
+    expect(span(field(incidentEmbed(incident({ subjectName: 'Unknown' }), null, 'resolved'), COPY.player))).toBe(
       'Unknown',
     )
   })
@@ -822,8 +896,8 @@ describe('the embed', () => {
       // BOTH FIELDS, because `resolvedByName` has the same exposure from a
       // friendlier source and a fix applied to one of them is not a fix.
       for (const [label, embed] of [
-        [COPY.player, incidentEmbed(incident({ subjectName: nasty }), null)],
-        [COPY.resolvedBy, incidentEmbed(incident({ resolvedByName: nasty }), null)],
+        [COPY.player, incidentEmbed(incident({ subjectName: nasty }), null, 'resolved')],
+        [COPY.resolvedBy, incidentEmbed(incident({ resolvedByName: nasty }), null, 'resolved')],
       ] as const) {
         const value = field(embed, label) ?? ''
 
@@ -847,13 +921,13 @@ describe('the embed', () => {
    * a label reads as a fact that failed to load — so the field is dropped whole.
    */
   it('cannot let a name close the span it is rendered in', () => {
-    const value = field(incidentEmbed(incident({ subjectName: '`x` **y**' }), null), COPY.player)
+    const value = field(incidentEmbed(incident({ subjectName: '`x` **y**' }), null, 'resolved'), COPY.player)
 
     expect(value?.match(/`/gu) ?? []).toHaveLength(2)
     expect(span(value)).toBe('x **y**')
 
     expect(
-      field(incidentEmbed(incident({ subjectName: '``````' }), null), COPY.player),
+      field(incidentEmbed(incident({ subjectName: '``````' }), null, 'resolved'), COPY.player),
     ).toBeUndefined()
   })
 
@@ -865,7 +939,7 @@ describe('the embed', () => {
    */
   it('strips what is invisible, so the record reads the way it is stored', () => {
     const value = field(
-      incidentEmbed(incident({ subjectName: 'Na‮te​' }), null),
+      incidentEmbed(incident({ subjectName: 'Na‮te​' }), null, 'resolved'),
       COPY.player,
     )
 
@@ -881,6 +955,7 @@ describe('the embed', () => {
     const embed = incidentEmbed(
       incident({ subjectName: `first line\nsecond line ${'x'.repeat(2000)}` }),
       null,
+      'resolved',
     )
 
     const value = field(embed, COPY.player) ?? ''
@@ -912,7 +987,7 @@ describe('the embed', () => {
       resolvedByName: { toString: () => 'nope' } as unknown as string,
     })
 
-    const embed = incidentEmbed(odd, null)
+    const embed = incidentEmbed(odd, null, 'resolved')
 
     expect(field(embed, COPY.player)).toBeUndefined()
     expect(field(embed, COPY.resolvedBy)).toBeUndefined()
@@ -922,7 +997,7 @@ describe('the embed', () => {
   })
 
   it('is stamped with when the case was closed', () => {
-    expect(incidentEmbed(incident(), null).timestamp).toBe(
+    expect(incidentEmbed(incident(), null, 'resolved').timestamp).toBe(
       new Date(NOW - 120_000).toISOString(),
     )
   })
@@ -934,8 +1009,8 @@ describe('the embed', () => {
    * cases without it.
    */
   it('posts without a timestamp rather than with an unparseable one', () => {
-    expect(incidentEmbed(incident({ resolvedAt: null }), null).timestamp).toBeUndefined()
-    expect('timestamp' in incidentEmbed(incident({ resolvedAt: null }), null)).toBe(false)
+    expect(incidentEmbed(incident({ resolvedAt: null }), null, 'resolved').timestamp).toBeUndefined()
+    expect('timestamp' in incidentEmbed(incident({ resolvedAt: null }), null, 'resolved')).toBe(false)
   })
 
   /**
@@ -983,10 +1058,10 @@ describe('the embed', () => {
     expect(new Date(8_640_000_000_000_000).toISOString()).toBe('+275760-09-13T00:00:00.000Z')
     expect(new Date(-8_640_000_000_000_000).toISOString()).toBe('-271821-04-20T00:00:00.000Z')
 
-    expect(incidentEmbed(incident({ resolvedAt: MAX }), null).timestamp).toBe(
+    expect(incidentEmbed(incident({ resolvedAt: MAX }), null, 'resolved').timestamp).toBe(
       '3940-01-02T00:00:00.000Z',
     )
-    expect(incidentEmbed(incident({ resolvedAt: -MAX }), null).timestamp).toBe(
+    expect(incidentEmbed(incident({ resolvedAt: -MAX }), null, 'resolved').timestamp).toBe(
       '0000-01-01T00:00:00.000Z',
     )
 
@@ -1005,7 +1080,7 @@ describe('the embed', () => {
       // It is finite, which is what the old guard asked and why it let it past.
       expect(Number.isFinite(beyond), label).toBe(true)
 
-      const embed = incidentEmbed(incident({ resolvedAt: beyond }), null)
+      const embed = incidentEmbed(incident({ resolvedAt: beyond }), null, 'resolved')
 
       expect('timestamp' in embed, label).toBe(false)
       // And the record is whole: the stamp is what was dropped, not the post.
@@ -1023,7 +1098,7 @@ describe('the embed', () => {
    */
   it('still refuses the three numbers that are not instants at all', () => {
     for (const odd of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
-      expect('timestamp' in incidentEmbed(incident({ resolvedAt: odd }), null), String(odd)).toBe(
+      expect('timestamp' in incidentEmbed(incident({ resolvedAt: odd }), null, 'resolved'), String(odd)).toBe(
         false,
       )
     }
@@ -1040,7 +1115,7 @@ describe('the embed', () => {
    * other field strips, sitting under the bot's own footer.
    */
   it('flattens the one thing footer text does render', () => {
-    const embed = incidentEmbed(incident({ incidentId: `${CASE}\n@everyone  banned` }), null)
+    const embed = incidentEmbed(incident({ incidentId: `${CASE}\n@everyone  banned` }), null, 'resolved')
 
     expect(embed.footer?.text).toBe(`${CASE} @everyone banned`)
   })
@@ -1052,11 +1127,11 @@ describe('the embed', () => {
    * rather than the whole moderation record.
    */
   it('leaves the footer off rather than sending an empty one', () => {
-    expect('footer' in incidentEmbed(incident({ incidentId: '' }), null)).toBe(false)
+    expect('footer' in incidentEmbed(incident({ incidentId: '' }), null, 'resolved')).toBe(false)
     expect(
-      'footer' in incidentEmbed(incident({ incidentId: 4181 as unknown as string }), null),
+      'footer' in incidentEmbed(incident({ incidentId: 4181 as unknown as string }), null, 'resolved'),
     ).toBe(false)
-    expect(incidentEmbed(incident(), null).footer?.text).toBe(CASE)
+    expect(incidentEmbed(incident(), null, 'resolved').footer?.text).toBe(CASE)
   })
 })
 
@@ -1194,7 +1269,7 @@ describe('the poll', () => {
     await h.log.poll()
 
     expect(h.sent).toHaveLength(1)
-    expect(h.sent[0]?.embed.title).toBe(COPY.title)
+    expect(h.sent[0]?.embed.title).toBe(COPY.resolvedTitle)
     expect(h.sent[0]?.embed.thumbnail?.url).toBe(AVATAR)
     expect(h.sent[0]?.components).toHaveLength(1)
     expect(said(stdout, 'posted the record for a resolved incident')).toBe(true)
@@ -1482,6 +1557,100 @@ describe('the poll', () => {
     expect(said(stderr, 'an incident.resolve row names no incident, so nothing was posted')).toBe(
       true,
     )
+  })
+
+  /* ---------------------------------------------------------------- *
+   * A case nobody acted on.
+   * ---------------------------------------------------------------- */
+
+  /**
+   * ═══ THE OWNER'S ANSWER TO OPEN QUESTION 1 ON blitz-bot#19 ═══
+   *
+   * "We don't need anything posted if no action was taken." A case an admin
+   * closed having decided nothing was warranted is not worth a line in the
+   * moderation record.
+   *
+   * THE READ STILL HAPPENS AND THERE IS NO VERSION IN WHICH IT DOES NOT. The
+   * verdict is on the INCIDENT row and the trigger is an audit row, so the
+   * filter cannot sit where `closedByABan` sits and cannot save a round trip.
+   * `reads` is asserted so that a later "optimisation" that tries to decide this
+   * from `detail.verdict` — a field the console writes for its own reasons and
+   * this repo does not trust — fails here.
+   */
+  it('posts nothing about a case an admin closed having decided nothing was warranted', async () => {
+    const h = harness({
+      state: { [CURSOR_KEY]: OPEN },
+      audit: [row()],
+      cases: { [CASE]: incident({ verdict: { action: 'none' } }) },
+    })
+
+    await h.log.poll()
+
+    expect(h.sent).toHaveLength(0)
+    expect(h.reads).toEqual([CASE])
+    expect(said(stdout, 'a case was closed with no action taken, so no record was posted')).toBe(
+      true,
+    )
+
+    /**
+     * ═══ AND THE CURSOR MOVED, WHICH IS HALF OF WHAT THIS CASE IS FOR ═══
+     *
+     * SKIPPING IS A DECISION AND NOT A FAILURE. `settle` has one step for each —
+     * `'quiet'` moves the cursor, `'stop'` holds the walk behind the row — and
+     * answering with the failure step here would park an ordered walk behind the
+     * first no-action case for the life of the process. Nothing after it would
+     * ever be posted and no line anywhere would say so.
+     */
+    expect(h.cursor()).toBe(NOW - 60_000)
+  })
+
+  /** The other half: a halted feed is only visible from the row behind it. */
+  it('posts the case behind one it passed over', async () => {
+    const h = harness({
+      state: { [CURSOR_KEY]: OPEN },
+      audit: [row(), row({ ts: NOW - 50_000, detail: { incidentId: OTHER_CASE } })],
+      cases: {
+        [CASE]: incident({ verdict: { action: 'none' } }),
+        [OTHER_CASE]: incident({ incidentId: OTHER_CASE }),
+      },
+    })
+
+    await h.log.poll()
+
+    expect(h.sent).toHaveLength(1)
+    expect(h.sent[0]?.embed.footer?.text).toBe(OTHER_CASE)
+    expect(h.cursor()).toBe(NOW - 50_000)
+  })
+
+  /**
+   * ═══ THE TRAP THE SKIP IS ONE MISTAKE AWAY FROM ═══
+   *
+   * ABSENT AND `null` ARE NOT `{ action: 'none' }`. A case resolved before the
+   * field existed carries no attribute and one auto-resolved at open carries an
+   * explicit `null`, and on neither did anybody record a decision. A filter that
+   * read them as "an admin decided nothing was needed" would drop a permanent
+   * record on the strength of a decision nobody made — the same conflation
+   * `verdictText` has always refused, now with a record rather than a field
+   * riding on it.
+   */
+  it('still posts a case whose row records no verdict at all', async () => {
+    const h = harness({
+      state: { [CURSOR_KEY]: OPEN },
+      audit: [row(), row({ ts: NOW - 50_000, detail: { incidentId: OTHER_CASE } })],
+      cases: {
+        [CASE]: incident({ verdict: undefined }),
+        [OTHER_CASE]: incident({ incidentId: OTHER_CASE, verdict: null }),
+      },
+    })
+
+    await h.log.poll()
+
+    expect(h.sent).toHaveLength(2)
+    expect(h.sent.map((s) => s.embed.footer?.text)).toEqual([CASE, OTHER_CASE])
+    expect(h.sent.map((s) => field(s.embed, COPY.verdict))).toEqual([
+      COPY.verdictUnknown,
+      COPY.verdictUnknown,
+    ])
   })
 
   /* ---------------------------------------------------------------- *
@@ -2325,14 +2494,36 @@ describe('wired to the gateway', () => {
     return { client, ready }
   }
 
-  function fakeWatcher(): { watcher: IncidentLog; polls: number[] } {
-    const polls: number[] = []
+  /**
+   * BOTH WATCHERS, ALWAYS, AND THE `polls` LIST RECORDS WHICH ONE RAN.
+   *
+   * IT USED TO HAND BACK ONE, AND THAT STOPPED BEING SAFE THE MOMENT
+   * `installIncidentLog` STARTED TWO POLLERS. A case that injects only the
+   * resolved watcher gets a REAL openings poller built over whatever `ddb` it
+   * passed — `{}` in most of these — which then throws `TypeError` out of the
+   * tick on every pass. The suite stayed green, because the throw lands in the
+   * `catch` the tick exists to have; what it cost was a case asserting
+   * 'the incident poll threw' that would have passed with the poller under test
+   * deleted.
+   */
+  function fakeWatcher(): {
+    watcher: IncidentLog
+    openWatcher: IncidentOpenLog
+    polls: string[]
+  } {
+    const polls: string[] = []
 
     return {
       polls,
       watcher: {
         poll: () => {
-          polls.push(Date.now())
+          polls.push('resolved')
+          return Promise.resolve()
+        },
+      },
+      openWatcher: {
+        poll: () => {
+          polls.push('filed')
           return Promise.resolve()
         },
       },
@@ -2353,14 +2544,37 @@ describe('wired to the gateway', () => {
   const noDdb = {} as unknown as IncidentLogDeps['ddb']
 
   /**
-   * A DynamoDB layer with one closed case in it, for the one case below that
-   * injects no watcher and therefore makes a real pass.
+   * A DynamoDB layer with one closed case and one freshly filed one, for the one
+   * case below that injects no watcher and therefore makes a real pass of BOTH
+   * pollers.
+   *
+   * BOTH CURSORS ARE SEEDED, which is what makes the second pass do any work.
+   * Without `OPEN_CURSOR_KEY` the openings poller takes its first-start branch,
+   * writes where it came in and returns without querying anything — correct
+   * behaviour, and it would have silently made the loopback assertion below cover
+   * one of the two `consoleOrigin` assignments instead of both.
    */
   function wiredDdb(): IncidentLogDeps['ddb'] {
-    const state = new Map<string, string>([[CURSOR_KEY, OPEN]])
+    const state = new Map<string, string>([
+      [CURSOR_KEY, OPEN],
+      [OPEN_CURSOR_KEY, OPEN],
+    ])
 
     return {
-      incidents: { get: (id) => Promise.resolve(ok(id === CASE ? incident() : null)) },
+      incidents: {
+        get: (id) =>
+          Promise.resolve(
+            ok(id === CASE ? incident() : id === OTHER_CASE ? openCase({ incidentId: id }) : null),
+          ),
+        opened: (kind) =>
+          Promise.resolve(
+            ok({
+              keys:
+                kind === 'report' ? [{ incidentId: OTHER_CASE, kind, openedAt: NOW - 60_000 }] : [],
+              more: false,
+            }),
+          ),
+      },
       players: { get: () => Promise.resolve(ok(record())) },
       botState: {
         get: (key) => {
@@ -2380,15 +2594,25 @@ describe('wired to the gateway', () => {
     }
   }
 
-  it('polls once as soon as the gateway is up', async () => {
+  /**
+   * BOTH POLLERS, ONCE EACH, IN ORDER. The order is asserted because it is a
+   * decision rather than an accident: they run one after the other on one tick so
+   * that a catch-up does not put two bursts on the same Discord channel route at
+   * once, and a `Promise.all` here would be the version of this that looks
+   * identical and behaves differently under load.
+   */
+  it('polls both halves once as soon as the gateway is up', async () => {
     const { client, ready } = fakeClient()
     const fake = fakeWatcher()
 
-    installIncidentLog(client, cfg(), noDdb, { watcher: fake.watcher })
+    installIncidentLog(client, cfg(), noDdb, {
+      watcher: fake.watcher,
+      openWatcher: fake.openWatcher,
+    })
     ready[0]?.()
     await settle()
 
-    expect(fake.polls).toHaveLength(1)
+    expect(fake.polls).toEqual(['resolved', 'filed'])
   })
 
   /**
@@ -2401,7 +2625,7 @@ describe('wired to the gateway', () => {
     const { client, ready } = fakeClient()
     const fake = fakeWatcher()
 
-    installIncidentLog(client, cfg({ logChannelId: null }), noDdb, { watcher: fake.watcher })
+    installIncidentLog(client, cfg({ logChannelId: null }), noDdb, { watcher: fake.watcher, openWatcher: fake.openWatcher })
 
     expect(ready).toHaveLength(0)
     await settle()
@@ -2432,11 +2656,24 @@ describe('wired to the gateway', () => {
     ready[0]?.()
     await settle()
 
-    expect(wired.fetched).toEqual(['111111111111111111'])
-    expect(wired.sent).toHaveLength(1)
+    expect(wired.fetched).toEqual(['111111111111111111', '111111111111111111'])
 
-    const url = JSON.stringify(wired.sent[0]?.components)
+    /**
+     * TWO RECORDS AND TWO BUTTONS, WHICH IS WHY THIS CASE IS WORTH KEEPING NOW
+     * THAT THERE ARE TWO POLLERS. `consoleOrigin: CONSOLE_URL` is assigned twice
+     * in `installIncidentLog`, and every other case in this file injects a
+     * watcher and skips both assignments — so a `?? config.ringmasterUrl` added
+     * to either one would leave the whole suite green while half the buttons in
+     * the moderation channel pointed at the clicker's own machine.
+     */
+    expect(wired.sent.map((m) => m.embeds[0]?.title)).toEqual([
+      COPY.resolvedTitle,
+      COPY.filedTitle,
+    ])
+
+    const url = JSON.stringify(wired.sent.map((m) => m.components))
     expect(url).toContain(`${CONSOLE_URL}/incidents/${CASE}`)
+    expect(url).toContain(`${CONSOLE_URL}/incidents/${OTHER_CASE}`)
     expect(url).not.toContain(LOOPBACK)
     expect(url).not.toContain('127.0.0.1')
     expect(url).not.toContain('localhost')
@@ -2450,6 +2687,7 @@ describe('wired to the gateway', () => {
    */
   it('survives a pass that throws and polls again', async () => {
     const { client, ready } = fakeClient()
+    const fake = fakeWatcher()
 
     let calls = 0
     const watcher: IncidentLog = {
@@ -2459,11 +2697,1570 @@ describe('wired to the gateway', () => {
       },
     }
 
-    installIncidentLog(client, cfg(), noDdb, { watcher, pollMs: 1 })
+    installIncidentLog(client, cfg(), noDdb, {
+      watcher,
+      openWatcher: fake.openWatcher,
+      pollMs: 1,
+    })
     ready[0]?.()
     await new Promise((resolve) => setTimeout(resolve, 20))
 
     expect(said(stderr, 'the incident poll threw')).toBe(true)
     expect(calls).toBeGreaterThan(1)
+  })
+
+  /**
+   * ONE HALF THROWING MUST NOT TAKE THE OTHER DOWN WITH IT FOREVER. The two run
+   * in sequence inside one `try`, so a throw from the first ends that TICK for
+   * both — which is the price of the sequence and is fine, because the tick
+   * repeats. What must not happen is the loop latching off: `running` is cleared
+   * in a `finally`, and this is what says so about the half that did not throw.
+   */
+  it('goes on polling the other half after one of them throws', async () => {
+    const { client, ready } = fakeClient()
+
+    let filed = 0
+    let calls = 0
+
+    installIncidentLog(client, cfg(), noDdb, {
+      watcher: {
+        poll: () => {
+          calls++
+          return calls === 1 ? Promise.reject(new Error('boom')) : Promise.resolve()
+        },
+      },
+      openWatcher: {
+        poll: () => {
+          filed++
+          return Promise.resolve()
+        },
+      },
+      pollMs: 1,
+    })
+    ready[0]?.()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    // Not on the first tick — the throw ended it before the openings poll — and
+    // on every one after it.
+    expect(filed).toBeGreaterThan(0)
+    expect(filed).toBe(calls - 1)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * The other half: the record for a case that was FILED.
+ * ------------------------------------------------------------------ */
+
+/**
+ * ═══ WHAT THIS SECTION IS REALLY FOR ═══
+ *
+ * Each of these is a way for the openings feature to be wrong while every log
+ * line and every return value still looks right, and they are the reasons the
+ * poller has the shape it has:
+ *
+ *   THE INDEX MAY NOT EXIST WHEN THIS SHIPS, and it is created by hand. A
+ *   `Query` against a missing index fails with a `ValidationException`, which
+ *   without `no-such-index` is a generic read failure indistinguishable from a
+ *   timeout — and the owner runs this from Discord, not a terminal, so a feature
+ *   that quietly does nothing looks exactly like a quiet server;
+ *
+ *   AN EMPTY ANSWER IS NOT PROOF THAT NOTHING HAPPENED while a new index is
+ *   backfilling, so nothing empty may ever move the cursor and the first-start
+ *   mark must be written before any query exists;
+ *
+ *   A KIND NOBODY NAMES IS INVISIBLE, with no error and no empty page — the
+ *   index's partition key is `kind`, so the query list is a correctness
+ *   constraint and there is a check that fails when it goes stale;
+ *
+ *   `openedAt` IS A GSI SORT KEY AND GSI SORT KEYS ARE NOT UNIQUE, unlike the
+ *   audit log's `ts`, so a cursor advanced to a stamp the pass has not finished
+ *   drops the rest of that millisecond for good;
+ *
+ *   ONE FAILING KIND MUST ABANDON THE WHOLE PASS, because the cursor is one
+ *   number across all of them and advancing it past a window one kind was never
+ *   asked about loses every case of that kind in it;
+ *
+ *   and A FILED CASE HAS NO VERDICT AND NO RESOLVER, so those fields must be
+ *   absent rather than rendered as an absence of a decision nobody was due to
+ *   make.
+ */
+
+/** An index row, as `kind-openedAt-index` answers with `KEYS_ONLY`. */
+function key(over: Partial<IncidentKey> = {}): IncidentKey {
+  return { incidentId: CASE, kind: 'report', openedAt: NOW - 60_000, ...over }
+}
+
+interface OpenHarness {
+  readonly log: IncidentOpenLog
+  readonly state: Map<string, string>
+  readonly sent: Sent[]
+  /** Every incident row read, in order — the read budget is asserted from this. */
+  readonly reads: string[]
+  /** Every index query, in order, so the kinds and the window can be asserted. */
+  readonly queries: Array<{
+    kind: IncidentKind
+    after: number
+    until: number
+    limit: number | undefined
+  }>
+  readonly writes: Array<{ key: string; value: string }>
+  cursor(): number | null
+}
+
+function openHarness(
+  over: {
+    cases?: Record<string, Incident>
+    players?: Record<string, PlayerRecord>
+    /** Index rows per kind. Filtered against the window, as DynamoDB would. */
+    index?: Partial<Record<IncidentKind, IncidentKey[]>>
+    /**
+     * Stop this kind's page after N rows and report `LastEvaluatedKey` — the
+     * short page that is NOT the end of the range. See the fake below.
+     */
+    pageCut?: Partial<Record<IncidentKind, number>>
+    /**
+     * A whole page handed back exactly as given: no window filter, and `more`
+     * as stated rather than derived.
+     *
+     * WHAT IT EXERCISES IS THE CAST AND NOT THE TABLE. `opened` in src/ddb.ts
+     * ends `res.Items as IncidentKey[]`, over an index on a table this repo does
+     * not write, so `openedAt: number` is a claim about another repository's row
+     * in exactly the way `AuditRow.ts` is. The window filter in the fake is the
+     * ACCESSOR's behaviour; it is not a guarantee about what the attribute holds,
+     * and a case about a value that is not a position in the index cannot be
+     * written through a fake that only ever answers with positions. `more` is
+     * stated for the same reason: DynamoDB's own answer, not the fake's opinion.
+     */
+    rawIndex?: Partial<Record<IncidentKind, IncidentPage>>
+    state?: Record<string, string>
+    origin?: string
+    avatars?: Record<string, string>
+    sendFails?: unknown
+    afterSend?: (state: Map<string, string>) => void
+    caseGet?: (id: string) => Promise<DdbResult<Incident | null>>
+    /** The index read failing, for every kind or for one of them. */
+    indexFails?: { kind: DdbFailureKind; onlyFor?: IncidentKind }
+    statePut?: (key: string, value: string) => Promise<DdbResult<BotStateRow>>
+    stateGet?: (key: string) => Promise<DdbResult<BotStateRow | null>>
+    now?: () => number
+  } = {},
+): OpenHarness {
+  const cases = over.cases ?? { [CASE]: openCase() }
+  const players = over.players ?? { [LICENCE]: record() }
+  const index = over.index ?? {}
+  const avatars = over.avatars ?? { [MEMBER]: AVATAR }
+
+  const state = new Map<string, string>(Object.entries(over.state ?? {}))
+  const sent: Sent[] = []
+  const reads: string[] = []
+  const queries: OpenHarness['queries'] = []
+  const writes: Array<{ key: string; value: string }> = []
+
+  const deps: IncidentOpenLogDeps = {
+    now: over.now ?? (() => NOW),
+    consoleOrigin: over.origin ?? ORIGIN,
+    avatars: {
+      urlFor: (discordId) => {
+        const url = avatars[discordId]
+        if (url === undefined) return Promise.reject(new Error('Unknown User'))
+        return Promise.resolve(url)
+      },
+    },
+    posts: {
+      send: (embed, components) => {
+        if (over.sendFails !== undefined) return Promise.reject(over.sendFails)
+        sent.push({ embed, components })
+        over.afterSend?.(state)
+        return Promise.resolve()
+      },
+    },
+    ddb: {
+      incidents: {
+        get:
+          over.caseGet ??
+          ((id) => {
+            reads.push(id)
+            return Promise.resolve(ok(cases[id] ?? null))
+          }),
+
+        opened: (kind, after, until, limit) => {
+          queries.push({ kind, after, until, limit })
+
+          const fails = over.indexFails
+          if (fails !== undefined && (fails.onlyFor === undefined || fails.onlyFor === kind)) {
+            return Promise.resolve({
+              ok: false as const,
+              failure: {
+                kind: fails.kind,
+                op: 'query' as const,
+                table: 'ringmaster-incidents',
+                message: 'from the fake',
+              },
+            })
+          }
+
+          const raw = over.rawIndex?.[kind]
+          if (raw !== undefined) return Promise.resolve(ok(raw))
+
+          // The window the real accessor applies, so a test cannot assert a
+          // cursor that only holds because the fake ignored the bounds.
+          const rows = (index[kind] ?? []).filter((r) => r.openedAt > after && r.openedAt <= until)
+
+          /**
+           * ═══ `LastEvaluatedKey` THE WAY DYNAMODB ACTUALLY RETURNS IT ═══
+           *
+           * IT COMES BACK WHENEVER THE QUERY STOPPED EARLY, AND REACHING `Limit`
+           * IS STOPPING EARLY. DynamoDB does not look ahead to see whether
+           * anything is left, so a page that is exactly full reports more even
+           * when the range is exhausted — which is why `more` reads as "this may
+           * have been cut short" rather than "there is definitely another row".
+           *
+           * AND `pageCut` IS THE OTHER HALF, WHICH NO COUNT OF ROWS CAN IMITATE.
+           * A `Query` may stop below `Limit` — a megabyte of scanned data — and
+           * still have more behind it. That page is the one the walk used to read
+           * as a whole window, so a fake that could not produce it could not test
+           * the fix.
+           */
+          const cap = Math.min(limit ?? MAX_INDEX_ROWS, over.pageCut?.[kind] ?? Infinity)
+          const keys = rows.slice(0, cap)
+          const more = keys.length < rows.length || keys.length >= (limit ?? MAX_INDEX_ROWS)
+
+          return Promise.resolve(ok({ keys, more }))
+        },
+      },
+      players: { get: (licence) => Promise.resolve(ok(players[licence] ?? null)) },
+      botState: {
+        get:
+          over.stateGet ??
+          ((k) => {
+            const value = state.get(k)
+            return Promise.resolve(
+              ok(value === undefined ? null : { id: k, value, updatedAt: NOW - 1 }),
+            )
+          }),
+        // The map follows the answer, whoever gives it. See the resolved
+        // harness, where the reason this is not simply replaced is argued.
+        put: async (k, value) => {
+          writes.push({ key: k, value })
+
+          const written = over.statePut
+            ? await over.statePut(k, value)
+            : ok<BotStateRow>({ id: k, value, updatedAt: NOW })
+
+          if (written.ok) state.set(k, value)
+          return written
+        },
+      },
+    },
+  }
+
+  return {
+    log: createIncidentOpenLog(deps),
+    state,
+    sent,
+    reads,
+    queries,
+    writes,
+    cursor: () => {
+      const raw = state.get(OPEN_CURSOR_KEY)
+      return raw === undefined ? null : Number(raw)
+    },
+  }
+}
+
+describe('the kinds the case-opened poll asks about', () => {
+  /**
+   * ═══ THE CHECK THAT FAILS WHEN THE GAME CAN EMIT A KIND THIS BOT DOES NOT
+   * QUERY ═══
+   *
+   * THE COMPILER ALREADY REFUSES A FOURTH `IncidentKind` that is missing from
+   * `INCIDENT_KINDS`, because that constant is a `Record<IncidentKind, true>`.
+   * What it cannot refuse is the list going stale in the other direction — a kind
+   * declared and worded and then not queried — because `KIND_LABEL` and the query
+   * list are two objects and only one of them decides what the poller asks for.
+   */
+  it('asks about every kind it has a word for', () => {
+    expect([...POLLED_KINDS].sort()).toEqual(Object.keys(KIND_LABEL).sort())
+  })
+
+  /**
+   * THE TWO KINDS THE GAME'S BUILDERS ACTUALLY WRITE, AS LITERALS, because the
+   * union is this repo's copy of another repo's vocabulary and a copy can drift
+   * from what is really emitted. From
+   * fivem-royale-m9/resources/[fivem-royale]/br_lib/shared/incident_build.lua:
+   * `fromRefusal`, `fromChat`, `fromStrip` and `fromVehicle` all write
+   * `kind = 'anticheat'`, and `fromReport` writes `kind = 'report'`.
+   *
+   * `identifier_reuse` IS DELIBERATELY NOT ON THIS LIST AND IS STILL QUERIED. No
+   * writer of it exists in either repository today — the console declares it and
+   * renders it and nothing files one — so this case would pass without it. The
+   * case above is what keeps it queried, and `INCIDENT_KINDS` says why asking
+   * about a kind nobody writes is the cheap error and not asking is the quiet one.
+   */
+  it('asks about both kinds the game files today', () => {
+    for (const emitted of ['anticheat', 'report'] as const) {
+      expect(POLLED_KINDS).toContain(emitted)
+    }
+  })
+
+  it('names each kind once', () => {
+    expect(new Set(POLLED_KINDS).size).toBe(POLLED_KINDS.length)
+  })
+
+  /**
+   * A KIND FROM OUTSIDE BOTH UNIONS IS POSSIBLE AND IS WHAT THE RUNTIME HALF OF
+   * THE CHECK IS FOR. `buildIncidentItem` writes `str(payload.kind, 32)`, so the
+   * attribute is a thirty-two character string as far as its writer is concerned.
+   */
+  it('recognises a kind the poll could not have found', () => {
+    expect(unqueryableKind({ kind: 'report' })).toBeNull()
+    expect(unqueryableKind({ kind: 'anticheat' })).toBeNull()
+
+    expect(unqueryableKind({ kind: 'griefing_v2' as IncidentKind })).toBe('griefing_v2')
+    expect(unqueryableKind({ kind: undefined as unknown as IncidentKind })).toBe('undefined')
+
+    // Through the prototype chain rather than on the object: `Object.hasOwn` is
+    // what keeps `constructor` and `toString` from reading as known kinds.
+    expect(unqueryableKind({ kind: 'constructor' as IncidentKind })).toBe('constructor')
+  })
+
+  /**
+   * ═══ THE ALARM IS RAISED BY THE POLLER THAT DOES NOT USE THE INDEX ═══
+   *
+   * THE RESOLVED POLL IS THE ONLY READER THAT SEES A CASE WITHOUT NAMING ITS
+   * KIND: it is handed an id by an audit row. The openings poll finds cases BY
+   * kind, so it can never be the thing that notices a kind it does not query.
+   */
+  it('says so, loudly, when a closed case carries a kind the openings poll cannot find', async () => {
+    const odd = incident({ kind: 'griefing_v2' as IncidentKind })
+    const h = harness({ state: { [CURSOR_KEY]: OPEN }, audit: [row()], cases: { [CASE]: odd } })
+
+    await h.log.poll()
+
+    expect(
+      said(
+        stderr,
+        'a case carries a kind the case-opened poll does not query, so cases of that kind are never posted when they are filed',
+      ),
+    ).toBe(true)
+    expect(stderr.join('')).toContain('kind="griefing_v2"')
+    expect(stderr.join('')).toContain(`index=${JSON.stringify(INCIDENT_KIND_INDEX)}`)
+
+    // The record it is about still posts: what is broken is another poller's
+    // coverage, not this case.
+    expect(h.sent).toHaveLength(1)
+  })
+
+  it('says nothing about a kind it does query', async () => {
+    const h = harness({ state: { [CURSOR_KEY]: OPEN }, audit: [row()] })
+
+    await h.log.poll()
+
+    expect(
+      said(
+        stderr,
+        'a case carries a kind the case-opened poll does not query, so cases of that kind are never posted when they are filed',
+      ),
+    ).toBe(false)
+  })
+
+  /**
+   * THE RESOLVED POLL MUST NOT READ THE INDEX AT ALL. It has an id from the audit
+   * log and a strongly consistent `GetItem` to spend it on; a query here would be
+   * a second, weaker way of answering a question it has already answered.
+   */
+  it('is not read by the resolved poll', async () => {
+    const h = harness({ state: { [CURSOR_KEY]: OPEN }, audit: [row()] })
+
+    await h.log.poll()
+
+    expect(h.indexReads).toEqual([])
+  })
+})
+
+describe('the record for a filed case', () => {
+  it('says the case was filed and not that anything was decided', () => {
+    const embed = incidentEmbed(openCase(), AVATAR, 'filed')
+
+    expect(embed.title).toBe(COPY.filedTitle)
+    expect(embed.title).not.toBe(COPY.resolvedTitle)
+
+    expect(field(embed, COPY.case)).toBe(`${KIND_LABEL.report} · ${CATEGORY_LABEL.cheating}`)
+    expect(span(field(embed, COPY.player))).toBe('Nate')
+  })
+
+  /**
+   * ═══ AN OPEN CASE HAS NO VERDICT AND NO RESOLVER, AND BOTH FIELDS GO ═══
+   *
+   * `COPY.verdictUnknown` ('No verdict recorded') IS THE WRONG ANSWER HERE AND IS
+   * THE RIGHT ONE ON A CLOSED CASE, which is the whole reason this is not simply
+   * `verdictText`. On a closure it reports that nobody wrote a decision down; on
+   * a case filed thirty seconds ago it reports the absence of a decision that was
+   * never due, which is a claim about an admin who has not looked yet.
+   */
+  it('leaves the verdict and the resolver off a case nobody has looked at', () => {
+    const embed = incidentEmbed(openCase(), null, 'filed')
+
+    expect(field(embed, COPY.verdict)).toBeUndefined()
+    expect(field(embed, COPY.resolvedBy)).toBeUndefined()
+
+    // And not merely blank: a label with an empty value beside it reads as a fact
+    // that failed to load.
+    expect(JSON.stringify(embed)).not.toContain(COPY.verdictUnknown)
+    expect(embed.fields?.map((f) => f.name)).toEqual([COPY.case, COPY.player])
+  })
+
+  it('stamps the post with when the case was filed and never with a closure', () => {
+    const embed = incidentEmbed(openCase({ openedAt: NOW - 600_000 }), null, 'filed')
+    expect(embed.timestamp).toBe(new Date(NOW - 600_000).toISOString())
+
+    // The auto-resolved case carries both stamps. The filed post takes the one
+    // the post is about.
+    const both = incidentEmbed(
+      incident({ openedAt: NOW - 600_000, resolvedAt: NOW - 120_000 }),
+      null,
+      'filed',
+    )
+    expect(both.timestamp).toBe(new Date(NOW - 600_000).toISOString())
+    expect(both.timestamp).not.toBe(new Date(NOW - 120_000).toISOString())
+  })
+
+  /** The same range rule `resolvedAt` has: the value is another repo's. */
+  it('leaves the timestamp off an openedAt no receiver would parse', () => {
+    for (const odd of [NaN, Infinity, -Infinity, 1e18, 8.64e15, undefined]) {
+      expect(
+        'timestamp' in incidentEmbed(openCase({ openedAt: odd as number }), null, 'filed'),
+        String(odd),
+      ).toBe(false)
+    }
+  })
+
+  /**
+   * ═══ THE LEAK ASSERTION, OVER THE OTHER POST ═══
+   *
+   * THE REPORTER'S NAME IS ON THE ROW AND MUST NOT BE ON THIS EMBED EITHER. The
+   * filed post is the one a player-filed report produces FIRST, so it is the post
+   * the reporter's name is nearest to: `summary` on that row is
+   * `Reported for <category> by <reporterName>`, built by the game.
+   */
+  it('never carries the reporter into the channel', () => {
+    const rendered = JSON.stringify(
+      incidentEmbed(wholeRow({ state: 'pending_review' }), AVATAR, 'filed'),
+    )
+
+    expect(rendered).not.toContain(REPORTER)
+    expect(rendered).not.toContain('Reported for')
+    expect(rendered).not.toContain('license:reporter')
+    expect(rendered).not.toContain('aimbot')
+  })
+
+  /**
+   * ═══ A CASE FILED ALREADY CLOSED ═══
+   *
+   * br_ddb WRITES `state: 'resolved'`, `resolvedAt: openedAt` AND
+   * `resolvedByName: 'System'` IN THE PutItem THAT CREATES THE ROW when the game
+   * handled something itself, and writes NO `incident.resolve` audit row for it —
+   * so the resolved poll never sees that case and this post is the only one it
+   * will ever get. The verdict field keys off `state` rather than off which post
+   * this is, so the closure shows up on the post that mentions it.
+   */
+  it('shows the closure on a case the game filed and closed in one write', () => {
+    const auto = incident({
+      state: 'resolved',
+      resolvedByName: 'System',
+      resolvedAt: NOW - 600_000,
+      openedAt: NOW - 600_000,
+      verdict: undefined,
+    })
+
+    const embed = incidentEmbed(auto, null, 'filed')
+
+    expect(embed.title).toBe(COPY.filedTitle)
+    expect(span(field(embed, COPY.resolvedBy))).toBe('System')
+    expect(field(embed, COPY.verdict)).toBe(COPY.verdictUnknown)
+  })
+
+  /**
+   * ═══ A FILED POST MUST NOT CLAIM SOMEBODY RESOLVED A CASE THAT IS OPEN ═══
+   *
+   * `Verdict` AND `Resolved by` ARE ONE FACT AND WERE GATED SEPARATELY. The
+   * verdict was rendered only for a `resolved` case; the resolver two lines below
+   * it was gated on nothing, and left to fall out of the empty-field filter on
+   * the argument that an open case has no `resolvedByName`. That is a claim about
+   * a row in ANOTHER REPOSITORY, and it is the same claim `settle`'s own state
+   * gate exists because this repo cannot make: a row that is `pending_review` and
+   * carries a resolver rendered a post saying somebody had resolved a case that
+   * is still open, with no verdict beside it to qualify it.
+   *
+   * DRIFT IS NOT HYPOTHETICAL ON THIS PAIR. `settle` holds a case whose `state`
+   * still says `pending_review` after an `incident.resolve` row was written for
+   * it, which is that exact half-written row — the console sets the fields and
+   * the state in one update, and this poller reads the table while it happens.
+   */
+  it('never names a resolver on a case whose state says nobody has closed it', () => {
+    const drifted = openCase({ resolvedByName: 'Admin One', resolvedAt: NOW - 120_000 })
+
+    for (const about of ['filed', 'resolved'] as const) {
+      const embed = incidentEmbed(drifted, null, about)
+
+      expect(field(embed, COPY.resolvedBy), about).toBeUndefined()
+      expect(field(embed, COPY.verdict), about).toBeUndefined()
+      expect(JSON.stringify(embed), about).not.toContain('Admin One')
+
+      // The two that are always there, and nothing else.
+      expect(
+        embed.fields?.map((f) => f.name),
+        about,
+      ).toEqual([COPY.case, COPY.player])
+    }
+  })
+})
+
+describe('the case-opened poll', () => {
+  /** The window every pass asks for, given the seeded cursor. */
+  const UNTIL = NOW - SETTLE_MS
+
+  /**
+   * What the four index sentences say, rebuilt from the constant the request
+   * carries. Spelled out here rather than imported, so a reworded line is a
+   * failing case and not a case that quietly asserts the new wording.
+   */
+  const MISSING = `the ${INCIDENT_KIND_INDEX} index on ringmaster-incidents does not exist, so no record is posted when a case is filed`
+  const FILLING = `the ${INCIDENT_KIND_INDEX} index on ringmaster-incidents is still filling, so records for filed cases start once it is ready`
+  const DENIED = `the bot is not allowed to Query the ${INCIDENT_KIND_INDEX} index on ringmaster-incidents, so no record is posted when a case is filed — dynamodb:Query has to be granted on the table arn AND on that arn with /index/${INCIDENT_KIND_INDEX} on the end, which IAM treats as a separate resource`
+  const UNPLACEABLE =
+    'the incident index answered with an openedAt that is not a position in it, so the case-opened poll stopped and posted nothing'
+  const UNREAD =
+    'the incident index stopped short of its window without returning a row, so the case-opened poll waits for the next pass'
+  const BUDGET =
+    'the case-opened poll spent its budget with cases still waiting, so the rest are posted on later passes'
+
+  it('posts the record for a case the index says was filed', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: { report: [key()] },
+    })
+
+    await h.log.poll()
+
+    expect(h.sent).toHaveLength(1)
+    expect(h.sent[0]?.embed.title).toBe(COPY.filedTitle)
+    expect(h.sent[0]?.embed.thumbnail?.url).toBe(AVATAR)
+    expect(h.sent[0]?.components).toHaveLength(1)
+    expect(said(stdout, 'posted the record for a newly filed incident')).toBe(true)
+
+    // The cursor is the index's sort key and not the wall clock: a restart
+    // resumes at the case, not at the moment the pass happened to run.
+    expect(h.cursor()).toBe(NOW - 60_000)
+  })
+
+  /**
+   * ONE QUERY PER KIND, EVERY KIND, OVER `(cursor, until]`. The list is asserted
+   * against `POLLED_KINDS` rather than against three literals, because the
+   * constant is what the poller reads and a case that hard-coded the kinds would
+   * pass while the poller queried a different set.
+   */
+  it('asks the index about every kind it knows, over the cursor window', async () => {
+    const h = openHarness({ state: { [OPEN_CURSOR_KEY]: OPEN } })
+
+    await h.log.poll()
+
+    expect(h.queries.map((q) => q.kind)).toEqual([...POLLED_KINDS])
+
+    for (const query of h.queries) {
+      expect(query.after).toBe(Number(OPEN))
+      expect(query.until).toBe(UNTIL)
+      expect(query.limit).toBe(MAX_INDEX_ROWS)
+    }
+  })
+
+  /* ---------------------------------------------------------------- *
+   * The index may not exist yet.
+   * ---------------------------------------------------------------- */
+
+  /**
+   * ═══ THE LOUDEST LINE IN THE FEATURE, AND THE ONE MOST LIKELY TO BE NEEDED ═══
+   *
+   * The index is created by hand and this code ships before it does. Every pass
+   * until somebody runs `update-table` fails on the first query, and what the
+   * owner is told about that decides whether the feature ever starts working.
+   */
+  it('says the index is missing, and names it, rather than reporting a read failure', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: { report: [key()] },
+      indexFails: { kind: 'no-such-index' },
+    })
+
+    await h.log.poll()
+
+    expect(said(stderr, MISSING)).toBe(true)
+    expect(MISSING).toContain(INCIDENT_KIND_INDEX)
+
+    /**
+     * AT `error` AND NOT AT `warn`. Both reach the owner's status channel, so
+     * this is not the noise decision — it is `journalctl -p err`, and which of
+     * two lines is read first. The rule in src/log.ts is that `error` means the
+     * bot has stopped doing something it is for and a person has to act, which
+     * is exactly this: nothing is posted when a case is filed until somebody
+     * creates an index.
+     */
+    expect(
+      stderr.find((line) => line.includes(`msg=${JSON.stringify(MISSING)}`)),
+    ).toContain('level=error')
+
+    // NOT the sentence a table that did not answer gets. An operator sent to the
+    // wrong page spends the evening on a table that is fine.
+    expect(said(stderr, 'could not read the incident index, so no case was posted this pass')).toBe(
+      false,
+    )
+  })
+
+  /**
+   * ONE LINE PER PASS AND NOT ONE PER KIND. Three would be three messages in the
+   * status channel every half minute about one missing index, and a channel that
+   * repeats itself three times is a channel that stops being read.
+   */
+  it('says it once per pass, not once per kind', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      indexFails: { kind: 'no-such-index' },
+    })
+
+    await h.log.poll()
+
+    expect(stderr.filter((line) => line.includes(`msg=${JSON.stringify(MISSING)}`))).toHaveLength(1)
+    // It stopped at the first kind rather than asking the other two the question
+    // it already has the answer to.
+    expect(h.queries).toHaveLength(1)
+  })
+
+  /**
+   * NOTHING IS POSTED AND THE CURSOR DOES NOT MOVE. A missing index that
+   * advanced the bookmark would mean every case filed between shipping this and
+   * creating the index is behind it forever — the feature would start working and
+   * still never mention the backlog it was switched on for.
+   */
+  it('posts nothing and moves nothing while the index is missing', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: { report: [key()] },
+      indexFails: { kind: 'no-such-index' },
+    })
+
+    await h.log.poll()
+
+    expect(h.sent).toEqual([])
+    expect(h.writes).toEqual([])
+    expect(h.cursor()).toBe(Number(OPEN))
+  })
+
+  it('reports any other index failure as a read that did not answer', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      indexFails: { kind: 'timeout' },
+    })
+
+    await h.log.poll()
+
+    expect(said(stderr, 'could not read the incident index, so no case was posted this pass')).toBe(
+      true,
+    )
+    expect(said(stderr, MISSING)).toBe(false)
+    expect(h.cursor()).toBe(Number(OPEN))
+  })
+
+  /**
+   * ═══ THE MINUTES AFTER `update-table`, WHICH IS THE STATE THE OWNER WILL
+   * ACTUALLY BE IN ═══
+   *
+   * AWS REFUSES READS OF A GSI WHILE IT BACKFILLS — a `ValidationException`, the
+   * same exception name a missing index raises. So the first thing the owner saw
+   * after running the command in docs/aws-notes.md was this bot telling him the
+   * index does not exist, in the exact state that command puts him in, and the
+   * next thing he would do is go looking for a typo in something that is fine.
+   * src/ddb.ts is where the two are told apart and where AWS's own wording is
+   * quoted from.
+   */
+  it('says the index is filling rather than that it is not there', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: { report: [key()] },
+      indexFails: { kind: 'index-backfilling' },
+    })
+
+    await h.log.poll()
+
+    expect(said(stdout, FILLING)).toBe(true)
+    expect(FILLING).toContain(INCIDENT_KIND_INDEX)
+
+    // The sentence that is not true in this state, and the one that would send
+    // him to the wrong page.
+    expect(said(stderr, MISSING)).toBe(false)
+    expect(said(stderr, 'could not read the incident index, so no case was posted this pass')).toBe(
+      false,
+    )
+
+    /**
+     * AND IT IS `info`, WHICH IS THE ONE LINE IN THIS GROUP THAT REACHES NOBODY.
+     * The rule in src/log.ts is one question — does this need a human — and the
+     * answer is no twice over: the backfill finishes on its own, and nothing is
+     * lost while it runs because a failed read never moves the cursor. A `warn`
+     * would put it in the status channel twice a minute for the whole backfill.
+     */
+    expect(lineFor(stdout, FILLING)?.startsWith('<6>')).toBe(true)
+    expect(stderr).toEqual([])
+
+    // Nothing is lost by waiting: the cursor has not moved, so the next pass
+    // asks about a window with the same lower bound.
+    expect(h.writes).toEqual([])
+    expect(h.cursor()).toBe(Number(OPEN))
+  })
+
+  /**
+   * ═══ A DENIAL IS PERMANENT AND WAS LOGGED AS IF IT WERE A TIMEOUT ═══
+   *
+   * IAM TREATS A TABLE AND ITS INDEXES AS SEPARATE RESOURCES, so a policy naming
+   * only `…:table/ringmaster-incidents` allows the `GetItem` and refuses the
+   * `Query` — which docs/aws-notes.md predicts by name, along with what it costs.
+   * That refusal classified as `denied` and fell into the generic branch at
+   * `warn`, in the same bucket as a read that did not answer, on every pass
+   * forever until a human edits a policy. src/log.ts states the rule it breaks:
+   * `error` rather than `warn` when the bot has stopped doing something it is
+   * for.
+   */
+  it('calls a denial on the index read an error and names the arn to grant', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: { report: [key()] },
+      indexFails: { kind: 'denied' },
+    })
+
+    await h.log.poll()
+
+    expect(said(stderr, DENIED)).toBe(true)
+    expect(lineFor(stderr, DENIED)?.startsWith('<3>')).toBe(true)
+    expect(lineFor(stderr, DENIED)).toContain('level=error')
+
+    // NOT the transient sentence, which is the one the next pass fixes.
+    expect(said(stderr, 'could not read the incident index, so no case was posted this pass')).toBe(
+      false,
+    )
+
+    /**
+     * AND THE SENTENCE NAMES THE RESOURCE THAT IS MISSING FROM THE POLICY. A line
+     * that said "denied" and stopped sends somebody to a policy that already
+     * names this table; the thing to grant is the index arn, which is the table
+     * arn with `/index/<name>` on the end.
+     */
+    expect(DENIED).toContain(`/index/${INCIDENT_KIND_INDEX}`)
+    expect(DENIED).toContain('dynamodb:Query')
+  })
+
+  /**
+   * ═══ ONE FAILING KIND ABANDONS THE WHOLE PASS ═══
+   *
+   * THE CURSOR IS ONE NUMBER ACROSS ALL THREE PARTITIONS. Posting the kinds that
+   * answered and advancing past their stamps would carry the bookmark over a
+   * window the failed kind was never asked about — so every case of that kind in
+   * it is gone, permanently, with one `warn` that says a read failed and nothing
+   * that says a window was skipped.
+   */
+  it('posts nothing at all when one kind could not be read', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: { report: [key()] },
+      // Not the first kind asked, so the pass really does abandon work it had
+      // already been handed rather than never starting.
+      indexFails: { kind: 'timeout', onlyFor: 'report' },
+      cases: { [CASE]: openCase() },
+    })
+
+    await h.log.poll()
+
+    expect(h.sent).toEqual([])
+    expect(h.writes).toEqual([])
+    expect(h.cursor()).toBe(Number(OPEN))
+  })
+
+  /* ---------------------------------------------------------------- *
+   * The index may be backfilling.
+   * ---------------------------------------------------------------- */
+
+  /**
+   * ═══ AN EMPTY ANSWER IS NOT PROOF THAT NOTHING HAPPENED ═══
+   *
+   * A NEW GSI ANSWERS NOTHING UNTIL IT HAS POPULATED, so "no rows" and "no cases"
+   * are the same page from here for as long as the backfill takes. The cursor
+   * staying put is what makes that safe: the next pass asks about a WIDER window
+   * with the SAME lower bound, and a superset cannot skip anything.
+   */
+  it('never moves the cursor over an empty answer', async () => {
+    const h = openHarness({ state: { [OPEN_CURSOR_KEY]: OPEN }, index: {} })
+
+    await h.log.poll()
+
+    expect(h.queries).toHaveLength(POLLED_KINDS.length)
+    expect(h.writes).toEqual([])
+    expect(h.cursor()).toBe(Number(OPEN))
+  })
+
+  /**
+   * AND THE BACKLOG IS STILL THERE WHEN THE INDEX FINISHES FILLING. Driven: two
+   * passes against one harness, the first while the index answers nothing and the
+   * second after a case that was filed BEFORE the first pass has appeared in it.
+   * If the empty pass had bookmarked anything, this case would be filed behind it.
+   */
+  it('posts what the backfill reveals about a window it already looked at', async () => {
+    const index: Partial<Record<IncidentKind, IncidentKey[]>> = {}
+    const filed = key({ openedAt: NOW - 900_000 })
+
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index,
+      cases: { [CASE]: openCase() },
+    })
+
+    await h.log.poll()
+    expect(h.sent).toEqual([])
+
+    // The backfill lands, and the row it copies is older than the pass above.
+    index.report = [filed]
+
+    await h.log.poll()
+
+    expect(h.sent).toHaveLength(1)
+    expect(h.cursor()).toBe(NOW - 900_000)
+  })
+
+  /**
+   * ═══ THE FIRST-START MARK IS WRITTEN BEFORE ANY QUERY EXISTS ═══
+   *
+   * THIS IS THE OTHER HALF OF THE BACKFILL ARGUMENT AND IT IS THE EASY ONE TO GET
+   * WRONG. A no-cursor branch that queried first and then recorded "now" would,
+   * against an index that had not populated, bookmark the present on the strength
+   * of a table that was still being built — and every case filed while it filled
+   * would be behind the mark forever. Asking nothing cannot be wrong about the
+   * index.
+   */
+  it('records where it came in without asking the index anything', async () => {
+    const h = openHarness({ index: { report: [key()] } })
+
+    await h.log.poll()
+
+    expect(h.queries).toEqual([])
+    expect(h.sent).toEqual([])
+    expect(h.cursor()).toBe(UNTIL)
+    expect(
+      said(
+        stdout,
+        'no case-opened poll cursor yet, so cases filed from now on will be posted and earlier ones will not',
+      ),
+    ).toBe(true)
+  })
+
+  it('restarts from now when the stored cursor is not a position in the index', async () => {
+    for (const stored of ['', ' ', '0', 'later', '-1', String(Number.MAX_SAFE_INTEGER)]) {
+      stderr.length = 0
+
+      const h = openHarness({ state: { [OPEN_CURSOR_KEY]: stored }, index: { report: [key()] } })
+      await h.log.poll()
+
+      expect(h.queries, stored).toEqual([])
+      expect(h.cursor(), stored).toBe(UNTIL)
+      expect(
+        said(
+          stderr,
+          'the case-opened poll cursor is not a position in the index, so polling restarts from now',
+        ),
+        stored,
+      ).toBe(true)
+    }
+  })
+
+  /**
+   * A FIRST-START WRITE THAT FAILS MUST NOT SLIDE THE MARK FORWARD. The branch
+   * returns without walking anything, so getting this wrong is not a lost write —
+   * it is a silently skipped window, and the only line in the journal says a
+   * bookmark did not land rather than that cases were dropped.
+   */
+  it('writes the first pass mark rather than a fresh one after a failed write', async () => {
+    let attempts = 0
+    let clock = NOW
+
+    const h = openHarness({
+      now: () => clock,
+      statePut: (id, value) => {
+        attempts++
+        return Promise.resolve(
+          attempts === 1
+            ? { ok: false as const, failure: { kind: 'timeout' as const, op: 'put' as const, table: 'ringmaster-bot-state', message: 'from the fake' } }
+            : ok<BotStateRow>({ id, value, updatedAt: clock }),
+        )
+      },
+    })
+
+    await h.log.poll()
+    expect(h.cursor()).toBeNull()
+
+    // Ten minutes later, and a window of cases in between.
+    clock = NOW + 600_000
+    await h.log.poll()
+
+    expect(h.cursor()).toBe(UNTIL)
+    expect(h.writes.map((w) => w.value)).toEqual([String(UNTIL), String(UNTIL)])
+  })
+
+  /* ---------------------------------------------------------------- *
+   * The walk.
+   * ---------------------------------------------------------------- */
+
+  it('merges the kinds and posts oldest first', async () => {
+    const a = '6f1c9a2e-0000-4000-8000-00000000000a'
+    const b = '6f1c9a2e-0000-4000-8000-00000000000b'
+    const c = '6f1c9a2e-0000-4000-8000-00000000000c'
+
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: {
+        report: [key({ incidentId: a, openedAt: NOW - 300_000 })],
+        anticheat: [
+          key({ incidentId: b, kind: 'anticheat', openedAt: NOW - 400_000 }),
+          key({ incidentId: c, kind: 'anticheat', openedAt: NOW - 200_000 }),
+        ],
+      },
+      cases: {
+        [a]: openCase({ incidentId: a }),
+        [b]: openCase({ incidentId: b }),
+        [c]: openCase({ incidentId: c }),
+      },
+    })
+
+    await h.log.poll()
+
+    expect(h.reads).toEqual([b, a, c])
+    expect(h.sent.map((s) => s.embed.footer?.text)).toEqual([b, a, c])
+    expect(h.cursor()).toBe(NOW - 200_000)
+  })
+
+  /**
+   * ═══ `openedAt` IS NOT UNIQUE, WHICH IS WHERE THIS WALK CANNOT COPY THE AUDIT
+   * ONE ═══
+   *
+   * `ts` IS HALF THE AUDIT TABLE'S PRIMARY KEY, so a cursor written at a row's
+   * `ts` provably has that row and everything before it behind it. A GSI sort key
+   * has no such guarantee: two cases of one kind filed in the same millisecond
+   * are two entries at one stamp, and a cursor advanced to that stamp after the
+   * first of them would put the second permanently behind the bookmark.
+   */
+  it('posts every case sharing one openedAt before the cursor passes it', async () => {
+    const a = '6f1c9a2e-0000-4000-8000-00000000000a'
+    const b = '6f1c9a2e-0000-4000-8000-00000000000b'
+
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: {
+        report: [
+          key({ incidentId: a, openedAt: NOW - 300_000 }),
+          key({ incidentId: b, openedAt: NOW - 300_000 }),
+        ],
+      },
+      cases: { [a]: openCase({ incidentId: a }), [b]: openCase({ incidentId: b }) },
+    })
+
+    await h.log.poll()
+
+    expect(h.sent.map((s) => s.embed.footer?.text)).toEqual([a, b])
+    expect(h.cursor()).toBe(NOW - 300_000)
+
+    // And the next pass, reading `> cursor`, finds neither of them again.
+    await h.log.poll()
+    expect(h.sent).toHaveLength(2)
+  })
+
+  /**
+   * A FULL PAGE MAY HAVE STOPPED IN THE MIDDLE OF A MILLISECOND, so its last
+   * stamp is one this pass cannot claim to have seen the whole of — and rows of
+   * OTHER kinds at or above it wait too, because the cursor is one number across
+   * all three.
+   */
+  it('leaves a stamp a full page may have cut in half for the next pass', async () => {
+    const tied = Array.from({ length: MAX_INDEX_ROWS }, (_, n) =>
+      key({
+        incidentId: `6f1c9a2e-0000-4000-8000-0000000${String(100 + n)}`,
+        kind: 'anticheat',
+        openedAt: NOW - 200_000,
+      }),
+    )
+
+    const early = '6f1c9a2e-0000-4000-8000-00000000000a'
+
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: {
+        anticheat: tied,
+        report: [key({ incidentId: early, openedAt: NOW - 300_000 })],
+      },
+      cases: { [early]: openCase({ incidentId: early }) },
+    })
+
+    await h.log.poll()
+
+    // Only the case below the ceiling. The fifty at one stamp are not touched,
+    // and nor is the read budget spent on them.
+    expect(h.sent.map((s) => s.embed.footer?.text)).toEqual([early])
+    expect(h.reads).toEqual([early])
+    expect(h.cursor()).toBe(NOW - 300_000)
+
+    expect(
+      said(
+        stderr,
+        'more cases share one openedAt than the case-opened poll can read in a pass, so some of them may never be posted',
+      ),
+    ).toBe(false)
+  })
+
+  /**
+   * ═══ A SHORT PAGE IS NOT THE SAME CLAIM AS THE END OF THE RANGE ═══
+   *
+   * THE WALK INFERRED COMPLETENESS FROM `rows.length < MAX_INDEX_ROWS`, AND A
+   * `Query` CAN RETURN FEWER ITEMS THAN `Limit` WITH MORE STILL IN THE RANGE —
+   * a megabyte of scanned data is the documented reason. On that page the test
+   * said "complete": the ceiling that exists to protect a half-read millisecond
+   * stayed at infinity, every returned row was walked as the whole window, and
+   * the cursor advanced to the last stamp returned. The rest of that millisecond
+   * is then behind the bookmark for good. Never posted, and nothing saying so.
+   *
+   * THE CASE IS THE ONE THAT IS WRONG TODAY AND NOT THE FULL PAGE ABOVE IT. Two
+   * rows come back out of a page of fifty — short, by a mile — and DynamoDB says
+   * there is more. One of the two shares a millisecond with a case that did NOT
+   * come back, which is the row the old cursor sailed over.
+   */
+  it('holds back a stamp a SHORT page cut in half, and does not sail past it', async () => {
+    const early = '6f1c9a2e-0000-4000-8000-00000000000a'
+    const tiedA = '6f1c9a2e-0000-4000-8000-00000000000b'
+    const tiedB = '6f1c9a2e-0000-4000-8000-00000000000c'
+
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: {
+        report: [
+          key({ incidentId: early, openedAt: NOW - 300_000 }),
+          key({ incidentId: tiedA, openedAt: NOW - 200_000 }),
+          key({ incidentId: tiedB, openedAt: NOW - 200_000 }),
+        ],
+      },
+      // Two rows of the three, and `LastEvaluatedKey` with them.
+      pageCut: { report: 2 },
+      cases: Object.fromEntries(
+        [early, tiedA, tiedB].map((id) => [id, openCase({ incidentId: id })]),
+      ),
+    })
+
+    await h.log.poll()
+
+    // The stamp the page may have stopped inside is held back WHOLE, so the half
+    // of it that did come back is not posted either.
+    expect(h.sent.map((s) => s.embed.footer?.text)).toEqual([early])
+    expect(h.cursor()).toBe(NOW - 300_000)
+
+    /**
+     * AND THE UNREAD REMAINDER IS STILL IN FRONT OF THE CURSOR. This is the
+     * assertion the old test could not make: with the cursor at `NOW - 200_000`
+     * the next pass asks for `> NOW - 200_000` and `tiedB` — which was never
+     * returned and never read — is behind it permanently.
+     */
+    await h.log.poll()
+
+    expect(h.sent.map((s) => s.embed.footer?.text)).toEqual([early, tiedA, tiedB])
+    expect(h.cursor()).toBe(NOW - 200_000)
+  })
+
+  /**
+   * ═══ AND THE STALL THAT WOULD BE, SAID OUT LOUD AND THEN TAKEN ═══
+   *
+   * A FULL PAGE IN WHICH EVERY ROW SHARES ONE STAMP has no row below the ceiling,
+   * so holding would park this walk at that millisecond for the life of the
+   * process — the quiet halt the whole feature is written against. They are taken
+   * instead, and the line names the stamp, because a bounded loss that says so
+   * beats a feed that stops with nothing to show for it.
+   */
+  it('takes a whole page at one stamp rather than stalling on it forever', async () => {
+    const ids = Array.from(
+      { length: MAX_INDEX_ROWS },
+      (_, n) => `6f1c9a2e-0000-4000-8000-0000000${String(100 + n)}`,
+    )
+
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: {
+        anticheat: ids.map((id) =>
+          key({ incidentId: id, kind: 'anticheat', openedAt: NOW - 200_000 }),
+        ),
+      },
+      cases: Object.fromEntries(ids.map((id) => [id, openCase({ incidentId: id })])),
+    })
+
+    await h.log.poll()
+
+    expect(
+      said(
+        stderr,
+        'more cases share one openedAt than the case-opened poll can read in a pass, so some of them may never be posted',
+      ),
+    ).toBe(true)
+
+    // The group is indivisible, so `MAX_POSTS` is overrun rather than the stamp
+    // being left half done — which would replay whatever was posted of it.
+    expect(h.sent).toHaveLength(MAX_INDEX_ROWS)
+    expect(h.cursor()).toBe(NOW - 200_000)
+  })
+
+  /**
+   * ═══ AND THE NUMBER IN THAT SENTENCE IS THE NUMBER THE SENTENCE IS ABOUT ═══
+   *
+   * IT REPORTED `merged.length` — EVERY KIND'S ROWS IN THE PASS — under a line
+   * about how many cases share ONE `openedAt`. The two differ by whatever else
+   * the pass pulled back, which on the row this is diagnosed from is exactly the
+   * context that makes it look like more cases collided than did. Fifty at one
+   * millisecond, and one more of another kind above the ceiling, so the pass's
+   * haul is fifty-one and the answer is fifty.
+   */
+  it('counts the cases at the stamp it names, and not every row in the pass', async () => {
+    const tied = Array.from({ length: MAX_INDEX_ROWS }, (_, n) =>
+      key({
+        incidentId: `6f1c9a2e-0000-4000-8000-0000000${String(100 + n)}`,
+        kind: 'anticheat',
+        openedAt: NOW - 200_000,
+      }),
+    )
+
+    const later = '6f1c9a2e-0000-4000-8000-00000000000f'
+
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: {
+        anticheat: tied,
+        // Above the ceiling, so it is excluded too and `usable` is still empty.
+        report: [key({ incidentId: later, openedAt: NOW - 100_000 })],
+      },
+      cases: Object.fromEntries(
+        [...tied.map((t) => t.incidentId), later].map((id) => [id, openCase({ incidentId: id })]),
+      ),
+    })
+
+    await h.log.poll()
+
+    const line = lineFor(
+      stderr,
+      'more cases share one openedAt than the case-opened poll can read in a pass, so some of them may never be posted',
+    )
+
+    expect(line).toContain(`rows=${String(MAX_INDEX_ROWS)}`)
+    expect(line).not.toContain(`rows=${String(MAX_INDEX_ROWS + 1)}`)
+    expect(line).toContain(`openedAt=${String(NOW - 200_000)}`)
+  })
+
+  /**
+   * ═══ THE PROTECTION THE COPY OF THIS WALK DID NOT INHERIT ═══
+   *
+   * `placeable` IS src/auditpoll.ts's AND WAS ADDED THERE AFTER A PRODUCTION
+   * INCIDENT: a sort key that is a broken number was walked as a position and
+   * written back out as the bookmark `'NaN'`, and `1e18` was written out as one
+   * that `cursorAt` then either refuses — restarting the walk from now and
+   * skipping every case in between — or, before the horizon existed, accepted
+   * forever as a lower bound past the clock. This walk is the same pairing one
+   * table over: `openedAt` is a sort key off another repository's row that this
+   * file writes into `ringmaster-bot-state` and reads back through `cursorAt`.
+   * It shipped without the guard.
+   *
+   * `1e15` IS THE VALUE THAT MATTERS AND IT IS WHY A TYPE CHECK IS NOT ENOUGH.
+   * It is a number, it is finite, it is positive, and it is past `MAX_STAMP` —
+   * so it sorted, it was walked, and it was written as a bookmark that this
+   * poller's own reader refuses on the very next pass.
+   */
+  it('refuses an openedAt that is not a position in the index, and writes nothing', async () => {
+    for (const odd of [NaN, Infinity, -Infinity, 1e15, 0, -1, undefined]) {
+      stderr.length = 0
+
+      const h = openHarness({
+        state: { [OPEN_CURSOR_KEY]: OPEN },
+        rawIndex: { report: { keys: [key({ openedAt: odd as number })], more: false } },
+        cases: { [CASE]: openCase() },
+      })
+
+      await h.log.poll()
+
+      expect(said(stderr, UNPLACEABLE), String(odd)).toBe(true)
+      expect(lineFor(stderr, UNPLACEABLE)?.startsWith('<3>'), String(odd)).toBe(true)
+
+      // Nothing posted, nothing written, and above all no bookmark carrying it.
+      expect(h.sent, String(odd)).toEqual([])
+      expect(h.writes, String(odd)).toEqual([])
+      expect(h.cursor(), String(odd)).toBe(Number(OPEN))
+    }
+  })
+
+  /**
+   * AND IT IS NOT THE TIE LINE, WHICH IS WHAT IT USED TO COME OUT AS. A
+   * non-numeric `openedAt` failed `< Infinity`, emptied `usable`, and reached the
+   * give-up branch with the ceiling still infinite — logging `openedAt=Infinity`
+   * under a sentence about a millisecond, matching nothing, on every pass forever
+   * while the cursor stood still.
+   */
+  it('does not report a broken stamp as a millisecond too many cases share', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      rawIndex: { report: { keys: [key({ openedAt: undefined as unknown as number })], more: false } },
+    })
+
+    await h.log.poll()
+
+    expect(
+      said(
+        stderr,
+        'more cases share one openedAt than the case-opened poll can read in a pass, so some of them may never be posted',
+      ),
+    ).toBe(false)
+    expect(stderr.some((l) => l.includes('openedAt=Infinity'))).toBe(false)
+  })
+
+  /**
+   * A PAGE THAT SAYS "THERE IS MORE" AND HANDS BACK NOTHING. DynamoDB can stop a
+   * `Query` at a megabyte of scanned data rather than at a row; it is not
+   * reachable through this query today — no filter expression, a `KEYS_ONLY`
+   * index — and it is one branch rather than a shape to reason about again later.
+   * Such a page proves nothing about the window, so the pass claims nothing about
+   * it either: the cursor stays put and the next pass asks the same lower bound.
+   */
+  it('claims nothing from a page that stopped early and returned no row', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      rawIndex: { report: { keys: [], more: true } },
+      index: { anticheat: [key({ kind: 'anticheat' })] },
+      cases: { [CASE]: openCase() },
+    })
+
+    await h.log.poll()
+
+    expect(said(stderr, UNREAD)).toBe(true)
+    expect(h.sent).toEqual([])
+    expect(h.writes).toEqual([])
+    expect(h.cursor()).toBe(Number(OPEN))
+  })
+
+  /**
+   * THE POST BUDGET IS CHECKED BETWEEN GROUPS. A pass that stopped mid-stamp
+   * would leave the cursor behind that stamp — it cannot go past a case it did
+   * not deal with — so everything already posted at it would be posted again on
+   * the next pass.
+   */
+  it('spends its budget in whole stamps and leaves the rest for the next pass', async () => {
+    const ids = Array.from(
+      { length: MAX_POSTS + 4 },
+      (_, n) => `6f1c9a2e-0000-4000-8000-0000000${String(200 + n)}`,
+    )
+
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: {
+        report: ids.map((id, n) => key({ incidentId: id, openedAt: NOW - 400_000 + n })),
+      },
+      cases: Object.fromEntries(ids.map((id) => [id, openCase({ incidentId: id })])),
+    })
+
+    await h.log.poll()
+
+    expect(h.sent).toHaveLength(MAX_POSTS)
+    expect(h.cursor()).toBe(NOW - 400_000 + (MAX_POSTS - 1))
+
+    await h.log.poll()
+
+    // The rest, and none of the first ten a second time.
+    expect(h.sent).toHaveLength(ids.length)
+    expect(new Set(h.sent.map((s) => s.embed.footer?.text)).size).toBe(ids.length)
+  })
+
+  /**
+   * ═══ A POLLER AN HOUR BEHIND LOOKED EXACTLY LIKE A QUIET NIGHT ═══
+   *
+   * EVERY OTHER PLACE THIS WALK STOPS EARLY SAYS SO — the tie overflow, the
+   * strike give-up, the missing index — and the budget break, which is the one
+   * that fires on the night a backlog actually matters, exited with no line at
+   * any level. Fourteen cases, ten posts of budget, and nothing anywhere saying
+   * four were left.
+   */
+  it('says a pass stopped early with cases still waiting', async () => {
+    const ids = Array.from(
+      { length: MAX_POSTS + 4 },
+      (_, n) => `6f1c9a2e-0000-4000-8000-0000000${String(300 + n)}`,
+    )
+
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: {
+        report: ids.map((id, n) => key({ incidentId: id, openedAt: NOW - 400_000 + n })),
+      },
+      cases: Object.fromEntries(ids.map((id) => [id, openCase({ incidentId: id })])),
+    })
+
+    await h.log.poll()
+
+    expect(said(stdout, BUDGET)).toBe(true)
+    expect(lineFor(stdout, BUDGET)).toContain('waiting=4')
+
+    /**
+     * ONCE, AND NOT ONCE PER STAMP. Ten groups were walked and four were left; a
+     * line per group would make the log somebody reads to measure a backlog the
+     * thing that hides it.
+     */
+    expect(stdout.filter((l) => l.includes(`msg=${JSON.stringify(BUDGET)}`))).toHaveLength(1)
+
+    /**
+     * AND IT IS `info`, WHICH IS THE RULE IN src/log.ts APPLIED RATHER THAN
+     * DODGED. Nobody has to act: the next pass drains it, and the cursor has
+     * already moved over what was dealt with. A `warn` would copy this into the
+     * owner's status channel twice a minute for as long as the catch-up lasts —
+     * making the busy night into the flood.
+     */
+    expect(lineFor(stdout, BUDGET)?.startsWith('<6>')).toBe(true)
+    expect(said(stderr, BUDGET)).toBe(false)
+  })
+
+  /** And a pass that finished its work says nothing, which is most of them. */
+  it('says nothing about a budget it did not spend', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: { report: [key()] },
+    })
+
+    await h.log.poll()
+
+    expect(h.sent).toHaveLength(1)
+    expect(said(stdout, BUDGET)).toBe(false)
+  })
+
+  /* ---------------------------------------------------------------- *
+   * What goes wrong.
+   * ---------------------------------------------------------------- */
+
+  it('keeps the cursor behind a case it could not read', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: { report: [key()] },
+      caseGet: () => Promise.resolve(failed()),
+    })
+
+    await h.log.poll()
+
+    expect(said(stderr, 'could not read a newly filed incident, so nothing was posted about it')).toBe(
+      true,
+    )
+    expect(h.sent).toEqual([])
+    expect(h.cursor()).toBe(Number(OPEN))
+  })
+
+  it('keeps the cursor behind a record it could not send', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: { report: [key()] },
+      sendFails: new Error('Missing Permissions'),
+    })
+
+    await h.log.poll()
+
+    expect(said(stderr, 'could not post the record for a newly filed incident')).toBe(true)
+    expect(h.cursor()).toBe(Number(OPEN))
+  })
+
+  /**
+   * AND THE RETRY IS BOUNDED, for `FAULT_LIMIT`'s reasons: a channel the bot has
+   * lost Send Messages in is a `stop` on this case on every pass forever, and the
+   * whole feed behind it goes quiet with nothing but a status line that stops
+   * repeating. One record dropped loudly beats every later record lost silently.
+   */
+  it('gives up on one case after enough passes and posts the ones behind it', async () => {
+    const stuck = '6f1c9a2e-0000-4000-8000-00000000000a'
+    const next = '6f1c9a2e-0000-4000-8000-00000000000b'
+
+    let refuse = true
+
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: {
+        report: [
+          key({ incidentId: stuck, openedAt: NOW - 400_000 }),
+          key({ incidentId: next, openedAt: NOW - 300_000 }),
+        ],
+      },
+      cases: { [stuck]: openCase({ incidentId: stuck }), [next]: openCase({ incidentId: next }) },
+      caseGet: (id) =>
+        Promise.resolve(
+          refuse && id === stuck ? failed() : ok(openCase({ incidentId: id })),
+        ),
+    })
+
+    for (let pass = 0; pass < FAULT_LIMIT; pass++) await h.log.poll()
+
+    expect(
+      said(
+        stderr,
+        'the case-opened poll failed on the same case every pass, so it moved past it and no record was posted',
+      ),
+    ).toBe(true)
+
+    refuse = false
+
+    // The case behind the stuck one is posted rather than lost with it.
+    expect(h.sent.map((s) => s.embed.footer?.text)).toEqual([next])
+    expect(h.cursor()).toBe(NOW - 300_000)
+  })
+
+  it('moves past an index entry for a case the table does not have', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: { report: [key()] },
+      cases: {},
+    })
+
+    await h.log.poll()
+
+    expect(said(stderr, 'the incident index names a case that is not in the table')).toBe(true)
+    expect(h.sent).toEqual([])
+    expect(h.cursor()).toBe(NOW - 60_000)
+  })
+
+  /**
+   * ═══ A RESTART RESUMES AFTER THE LAST RECORD ACTUALLY POSTED ═══
+   *
+   * NOT AFTER THE LAST COMPLETED PASS. A post cannot be undone, and a pass may
+   * post ten: one write at the end of the pass would replay every one of them
+   * into the moderation channel on the next start. The bookmark is written as
+   * soon as a stamp has posted something, so a crash costs at most the record it
+   * was in the middle of.
+   *
+   * ONE DUPLICATE IS THE ACCEPTED COST AND IT IS NOT ZERO. The write happens
+   * after the send returns, so a crash between the two repeats that record —
+   * the alternative loses one instead, and a moderation record that never
+   * existed with nothing saying so is the worse failure.
+   */
+  it('resumes after the last record it actually posted, not the last completed pass', async () => {
+    const ids = Array.from(
+      { length: 5 },
+      (_, n) => `6f1c9a2e-0000-4000-8000-0000000${String(300 + n)}`,
+    )
+
+    const index = {
+      report: ids.map((id, n) => key({ incidentId: id, openedAt: NOW - 400_000 + n })),
+    }
+    const cases = Object.fromEntries(ids.map((id) => [id, openCase({ incidentId: id })]))
+
+    // What was on the table the instant each record landed in the channel.
+    const snapshots: Array<Record<string, string>> = []
+
+    const first = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index,
+      cases,
+      afterSend: (state) => snapshots.push(Object.fromEntries(state)),
+    })
+
+    await first.log.poll()
+    expect(first.sent).toHaveLength(5)
+
+    // The crash: the process dies just after the third record is posted.
+    const resumed = openHarness({ state: snapshots[2] ?? {}, index, cases })
+    await resumed.log.poll()
+
+    expect(resumed.sent.map((s) => s.embed.footer?.text)).toEqual([ids[2], ids[3], ids[4]])
+  })
+
+  /**
+   * A CASE THE GAME FILED AND CLOSED IN ONE WRITE IS STILL POSTED, and this
+   * poller is the only thing that will ever mention it: br_ddb writes no
+   * `incident.resolve` audit row for an auto-resolved case, so the resolved half
+   * never sees one. See the open question on blitz-bot#19.
+   */
+  it('posts a case that was filed already resolved', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: { anticheat: [key({ kind: 'anticheat' })] },
+      cases: {
+        [CASE]: incident({
+          kind: 'anticheat',
+          category: 'system',
+          state: 'resolved',
+          resolvedByName: 'System',
+          resolvedAt: NOW - 60_000,
+          openedAt: NOW - 60_000,
+          verdict: undefined,
+        }),
+      },
+    })
+
+    await h.log.poll()
+
+    expect(h.sent).toHaveLength(1)
+    expect(h.sent[0]?.embed.title).toBe(COPY.filedTitle)
+    expect(span(field(h.sent[0]?.embed as APIEmbed, COPY.resolvedBy))).toBe('System')
+    expect(stdout.join('')).toContain('alreadyResolved=true')
+  })
+
+  /**
+   * THE LEAK ASSERTION OVER A WHOLE PASS, not over one call to the embed builder.
+   * The row the console really holds carries `summary`, the reporter's name and
+   * license, and the moderator's prose; the only thing keeping any of it out of
+   * the channel is what this poller renders.
+   */
+  it('never posts anything the reporter wrote or is named in', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: { report: [key()] },
+      cases: { [CASE]: wholeRow({ state: 'pending_review' }) },
+    })
+
+    await h.log.poll()
+
+    const rendered = JSON.stringify(h.sent)
+    expect(rendered).not.toContain(REPORTER)
+    expect(rendered).not.toContain('Reported for')
+    expect(rendered).not.toContain('license:reporter')
+    expect(rendered).not.toContain('aimbot')
+  })
+
+  /**
+   * THE BUTTON IS BUILT FROM THE ID THE INDEX WAS READ BY, never from the row's
+   * own copy of it — the same rule `settle` keeps, and for the same reason: the
+   * attribute is another repository's and `encodeURIComponent` coerces rather
+   * than refusing, so a numeric one posted a live-looking button at a case that
+   * does not exist.
+   */
+  it('builds the button from the key it read the case by', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      index: { report: [key()] },
+      cases: { [CASE]: openCase({ incidentId: 42 as unknown as string }) },
+    })
+
+    await h.log.poll()
+
+    expect(JSON.stringify(h.sent[0]?.components)).toContain(`${ORIGIN}/incidents/${CASE}`)
+    expect(said(stderr, 'an incident row carries an id that is not the key it was read by')).toBe(
+      true,
+    )
+  })
+
+  it('says nothing and reads nothing when the cursor row cannot be read', async () => {
+    const h = openHarness({
+      index: { report: [key()] },
+      stateGet: () => Promise.resolve(failed()),
+    })
+
+    await h.log.poll()
+
+    expect(said(stderr, 'could not read the case-opened poll cursor, so nothing was polled')).toBe(
+      true,
+    )
+    expect(h.queries).toEqual([])
   })
 })

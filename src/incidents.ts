@@ -10,57 +10,77 @@ import {
 } from 'discord.js'
 
 import {
+  bookmark,
+  placeable,
   POLL_LIMIT,
   POLL_MS,
   pollAuditWindow,
   SETTLE_MS,
   type AuditPollMessages,
+  type CursorMessages,
   type RowStep,
 } from './auditpoll.ts'
 import { discordIdFor } from './banrole.ts'
 import type { Config } from './config.ts'
 import { CONSOLE_URL } from './console.ts'
-import type {
-  AuditAction,
-  AuditRow,
-  Ddb,
-  DdbWithAuditWindow,
-  Incident,
-  IncidentCategory,
-  IncidentKind,
+import {
+  INCIDENT_KIND_INDEX,
+  type AuditAction,
+  type AuditRow,
+  type Ddb,
+  type DdbWithAuditWindow,
+  type Incident,
+  type IncidentCategory,
+  type IncidentKey,
+  type IncidentKind,
+  type IncidentPage,
 } from './ddb.ts'
 import { log } from './log.ts'
 
 /* ------------------------------------------------------------------ *
  * THE MODERATION RECORD FOR AN INCIDENT — blitz-bot#19.
  *
- * A case is closed in the console; an embed about it lands in the moderation
- * channel, carrying the offender's avatar and a button that opens the case.
+ * A case is filed by the game or closed in the console; an embed about it lands
+ * in the moderation channel, carrying the subject's avatar and a button that
+ * opens the case.
  * ------------------------------------------------------------------ */
 
 /**
  * ═══ WHAT THIS IS AND WHAT IT IS DELIBERATELY NOT ═══
  *
  * IT IS THE BAN-ROLE POLLER WITH A DIFFERENT VERB, AND NOW LITERALLY SO.
- * src/banrole.ts watches the console's audit log for `ban.issue`/`ban.lift`; this
- * watches it for `incident.resolve`. The walk itself — the cursor, the settle
- * window, the page, the row loop — is ONE implementation in src/auditpoll.ts that
- * both files drive; what is left here is what a resolved case means. Every trap
- * written down in banrole.ts's header applies unchanged and is not restated at
- * length. The two that decide the shape of this file are named again where they
- * bite.
+ * src/banrole.ts watches the console's audit log for `ban.issue`/`ban.lift`; the
+ * RESOLVED half here watches it for `incident.resolve`. The walk itself — the
+ * cursor, the settle window, the page, the row loop — is ONE implementation in
+ * src/auditpoll.ts that both files drive; what is left here is what a resolved
+ * case means. Every trap written down in banrole.ts's header applies unchanged
+ * and is not restated at length. The two that decide the shape of this file are
+ * named again where they bite.
  *
- * IT IS ONLY THE RESOLVED HALF. blitz-bot#19 asks for a post when a case OPENS as
- * well, and that half is not buildable today: there is no `incident.open` verb in
- * `AuditAction`, the game files cases straight into `ringmaster-incidents` without
- * touching the log, and finding them needs a GSI on `state` that does not exist
- * (fivem-ringmaster#46). Everything here that is not specifically about a
- * RESOLUTION — the avatar lookup, the button, the poster, and the walk itself — is
- * at module scope or in src/auditpoll.ts so that half arrives as a second caller.
- * Nothing here is PARAMETERISED for it: `incidentEmbed` renders a closed case and
- * says so, because a headline argument with one caller and an unreachable branch
- * for the other is scaffolding, and this repo has a habit of landing scaffolding
- * before its wiring. It is cheap to re-add beside the caller that needs it.
+ * ═══ AND THERE ARE TWO HALVES NOW, READING TWO DIFFERENT TABLES ═══
+ *
+ * blitz-bot#19 ASKS FOR A POST WHEN A CASE OPENS AS WELL, AND THAT ONE CANNOT
+ * WATCH THE AUDIT LOG AT ALL. There is no `incident.open` verb in `AuditAction`
+ * and there cannot be one from where the write happens: the game files cases
+ * straight into `ringmaster-incidents` through br_ddb, the game box has no access
+ * to `ringmaster-audit`, and the doorbell at the console's `/api/ingest`
+ * persists nothing. The incidents table is the only record there is, and it is
+ * keyed on a random UUID with no ordering — so the openings half reads a GSI
+ * instead of a log. See `createIncidentOpenLog`, and `INCIDENT_KIND_INDEX` in
+ * src/ddb.ts for the index and what it costs.
+ *
+ * WHAT THE TWO SHARE IS EVERYTHING THAT IS NOT ABOUT WHICH EVENT HAPPENED: the
+ * avatar lookup, the markdown neutralising, the two label maps, the button, the
+ * poster, the strike bound, and the embed. What they do NOT share is a cursor,
+ * a table, a budget or a walk. See `OPEN_CURSOR_KEY`.
+ *
+ * `incidentEmbed` TAKES ITS HEADLINE BACK, DELIBERATELY AND WITH A CALLER THIS
+ * TIME. It used to; the parameter was deleted as scaffolding when the second
+ * caller could not be written, on the argument that this repo lands scaffolding
+ * before its wiring and that re-adding it beside the caller that needs it is
+ * cheaper than maintaining an unreachable branch. That is what this is. See
+ * `IncidentPost`, which is one parameter rather than a title string, because
+ * three things about the post move together with it.
  *
  * ═══ THE AUDIT ROW IS THE TRIGGER AND THE INCIDENT ROW IS THE FACT ═══
  *
@@ -156,18 +176,40 @@ import { log } from './log.ts'
  * `events`, the reporter's name and license, and the moderator's written
  * resolution. The button is how somebody sees the rest. That is not a rule this
  * file keeps by remembering it — `incidents.get` in src/ddb.ts reads this table
- * with a `ProjectionExpression` naming nine attributes, so none of the others is
- * in this process at all, and `Incident` names exactly what is projected.
+ * with a `ProjectionExpression` naming ten attributes, so none of the others is
+ * in this process at all, and `Incident` names exactly what is projected. The
+ * openings half adds NOTHING to that list: the index it reads is `KEYS_ONLY`, so
+ * what it learns is an id, and the case still comes back through the same
+ * projection.
  *
  * ═══ THE PARTITION MOVING IS SOMEBODY ELSE'S ALARM ═══
  *
  * banrole.ts's trap 5 — `pk = 'AUDIT'` is documented as becoming
  * `AUDIT#<yyyy-mm>`, and a reader pointed at the old key returns an empty page
- * forever with no error — applies to this poller identically, and there is
- * deliberately NO second probe here. Both consumers read one partition through one
- * `AUDIT_PK` in src/ddb.ts, so the fault is one fault; a second alarm for it would
- * be a second message in the status channel about the same thing, which is how a
- * channel stops being read.
+ * forever with no error — applies to the RESOLVED poller identically, and there
+ * is deliberately NO second probe here. Both consumers of the audit log read one
+ * partition through one `AUDIT_PK` in src/ddb.ts, so the fault is one fault; a
+ * second alarm for it would be a second message in the status channel about the
+ * same thing, which is how a channel stops being read.
+ *
+ * ═══ AND THE OPENINGS HALF HAS TRAP 5 OF ITS OWN, WHICH IS ITS ALARM TO RAISE ═══
+ *
+ * A `Query` NAMES ONE PARTITION OF `INCIDENT_KIND_INDEX`, AND ITS PARTITION KEY
+ * IS `kind`. So the same silence arrives by the same door for a reason nobody has
+ * to migrate anything to cause: the game writes `kind` as
+ * `str(payload.kind, 32) ?? 'anticheat'` (br_ddb's `buildIncidentItem`), a
+ * thirty-two character string as far as its writer is concerned, and a kind this
+ * file does not NAME is a partition this file never asks about. No error, no
+ * empty page even — the queries it does make come back full of other cases while
+ * a whole class of them is invisible.
+ *
+ * TWO THINGS GUARD IT, AND THEY ARE THE TWO banrole.ts's trap 5 USES. The list is
+ * a `Record<IncidentKind, true>` (`INCIDENT_KINDS`), so a kind added to the union
+ * in src/ddb.ts is a compile error here rather than a query nobody writes; and
+ * blindness is CHECKED rather than assumed, by the one reader that sees cases
+ * WITHOUT going through the index — see `unqueryableKind`, called from the
+ * resolved poller, which learns its ids from the audit log and therefore sees
+ * every kind there is.
  */
 
 /**
@@ -180,6 +222,33 @@ import { log } from './log.ts'
  * cursors, two names, and the name says which verb it is a position in.
  */
 export const CURSOR_KEY = 'incident-resolve-audit-cursor'
+
+/**
+ * Where the OPENINGS poller's place in `INCIDENT_KIND_INDEX` is kept.
+ *
+ * A THIRD ROW, FOR THE REASON THE SECOND ONE EXISTS AND THEN SOME. The two audit
+ * cursors are positions in one log that two consumers walk at different speeds;
+ * this one is not a position in that log at all. It is an `openedAt` out of
+ * `ringmaster-incidents`, and putting it in either audit cursor's row — or
+ * theirs in this one — would be a poller resuming from a number that is a valid
+ * millisecond and means nothing in its own table. There is a test in
+ * src/auditpoll.test.ts over every row this bot keeps, and this one is on it.
+ *
+ * THE NAME SAYS THE TABLE AND NOT THE VERB, WHICH IS WHERE IT DEPARTS FROM
+ * `incident-resolve-audit-cursor`. There is no verb: nothing anywhere records
+ * that a case was opened, which is the whole reason this half reads an index.
+ *
+ * ═══ WHAT MAY WRITE IT, WHICH IS THE ONE RULE THAT MATTERS WHILE THE INDEX IS
+ * NEW ═══
+ *
+ * EXACTLY TWO THINGS: the first-ever start, which writes where it came in BEFORE
+ * it has queried anything at all; and a record that was actually posted, whose
+ * `openedAt` it advances to. Nothing else. In particular an EMPTY answer from
+ * the index never moves it, and neither does a failed one — see `pollOpen`,
+ * where that rule is what stops a backfilling index from being read as an empty
+ * table.
+ */
+export const OPEN_CURSOR_KEY = 'incident-open-index-cursor'
 
 /**
  * The two numbers that describe the WALK rather than this consumer, re-exported
@@ -459,10 +528,40 @@ function renderable(at: unknown): at is number {
  * gets — resolved before the field existed, or auto-resolved at open — and it must
  * never be worded as "no action was taken", because that states a decision nobody
  * made. See `verdictText`.
+ *
+ * THE TWO TITLES ARE THE ONLY THING THE TWO POSTS DO NOT SHARE, AND ONE OF THEM
+ * HAS NOT BEEN PUT TO THE OWNER. `resolvedTitle` is wording he has seen;
+ * `filedTitle` is this file's own minimum factual version and has not been
+ * approved by anybody. Both are marked, and the labels below are deliberately
+ * NOT doubled — they are structure, and a filed case and a closed one have the
+ * same structure.
  */
 export const COPY = {
-  /** PLACEHOLDER — the embed's title, and the only place the post says what happened. */
-  title: 'Incident resolved',
+  /**
+   * PLACEHOLDER — the closed post's title, and the only place it says which of
+   * the two events it is about.
+   *
+   * IT WAS `title` UNTIL THERE WERE TWO. A bare `COPY.title` beside a
+   * `COPY.filedTitle` reads as "the title" and "the other title", which is
+   * exactly the shape of name somebody reaches for the wrong one of.
+   */
+  resolvedTitle: 'Incident resolved',
+
+  /**
+   * PLACEHOLDER, AND UNLIKE EVERY OTHER LINE IN THIS OBJECT IT HAS NOT BEEN PUT
+   * TO THE OWNER AT ALL.
+   *
+   * WHAT IT HAS TO SAY IS THAT A CASE EXISTS, AND NOT THAT ANYBODY DID ANYTHING.
+   * A filed case is a thing the GAME noticed or a player reported; nobody has
+   * looked at it, no decision has been taken, and wording that implies one —
+   * "flagged", "caught", "action required" — would put a claim in a permanent
+   * moderation record that this bot has no basis for. It is also the one post
+   * whose subject may turn out to have done nothing wrong at all.
+   *
+   * THE FACTUAL MINIMUM IS THEREFORE THE WHOLE BRIEF, and this is it until the
+   * owner says otherwise. See the open question on blitz-bot#19.
+   */
+  filedTitle: 'Incident filed',
 
   case: 'Case',
   player: 'Player',
@@ -491,11 +590,18 @@ export const COPY = {
   verdictBanPermanent: 'Banned permanently',
   /** PLACEHOLDER */
   verdictKick: 'Kicked',
-  /** PLACEHOLDER — an admin looked and decided nothing was needed. */
-  verdictNone: 'No action taken',
   /**
-   * PLACEHOLDER — and NOT a synonym for `verdictNone`. The row carries no
-   * verdict, so this says exactly that and claims nothing about what was decided.
+   * PLACEHOLDER — the row carries NO verdict, so this says exactly that and
+   * claims nothing about what was decided.
+   *
+   * THERE IS NO STRING BESIDE IT FOR `{ action: 'none' }` ANY MORE, AND THAT IS
+   * THE ONE ABSENCE HERE WORTH A LINE. `verdictNone` ('No action taken') stood
+   * next to this until a case carrying that verdict stopped being posted about
+   * at all — see the skip in `settle`, which is where the two come back
+   * together if the owner changes his mind. What it existed to be told apart
+   * from is this string, and that distinction is untouched: a case with no
+   * verdict is still posted, under these words, because nobody recorded a
+   * decision on it.
    */
   verdictUnknown: 'No verdict recorded',
 
@@ -745,6 +851,105 @@ export const KIND_LABEL: Record<IncidentKind, string> = {
   anticheat: 'Anticheat',
 }
 
+/**
+ * ═══ EVERY KIND THE OPENINGS POLLER ASKS THE INDEX ABOUT ═══
+ *
+ * A KIND THAT IS NOT ON THIS LIST IS INVISIBLE, WITH NO ERROR ANYWHERE. The
+ * index's partition key is `kind` (see `INCIDENT_KIND_INDEX` in src/ddb.ts) and a
+ * `Query` addresses one partition, so the poller makes one call per entry here
+ * and learns nothing whatsoever about a kind it did not name. The other queries
+ * come back full of cases; there is no empty page to notice and nothing to time
+ * out. It is banrole.ts's trap 5 with a different key, and it is the reason this
+ * is a named constant with a compile-time shape rather than an array literal
+ * inside the poll.
+ *
+ * `Record<IncidentKind, true>` IS THE COMPILE-TIME HALF, and it is the same
+ * device `KIND_LABEL` above uses for the same class of mistake: a fourth kind
+ * added to the union in src/ddb.ts fails to build here rather than quietly
+ * halving the feed. `true` because the value carries nothing — the KEYS are the
+ * list, and a `readonly IncidentKind[]` would let a kind be dropped from it
+ * without the compiler having an opinion.
+ *
+ * ═══ WHAT THE GAME ACTUALLY EMITS TODAY, CHECKED RATHER THAN ASSUMED ═══
+ *
+ * TWO OF THE THREE, and the file to check is
+ * fivem-royale-m9/resources/[fivem-royale]/br_lib/shared/incident_build.lua. Its
+ * five builders are `fromRefusal`, `fromChat`, `fromStrip` and `fromVehicle` —
+ * all four `kind = 'anticheat'` — and `fromReport`, `kind = 'report'`. There is
+ * no live writer of `identifier_reuse` anywhere in either repository: the
+ * console declares it on its `IncidentKind` and renders it in the queue and on a
+ * profile, and nothing files one.
+ *
+ * IT IS QUERIED ANYWAY, AND THAT IS THE DECISION THIS COMMENT EXISTS FOR. Asking
+ * about a kind nobody writes costs one key-range read per pass that matches
+ * nothing — a seek, not a scan — and not asking costs the whole feature, silently,
+ * on the day the console starts filing them. The two errors are not the same
+ * size, and the cheap one is not the quiet one.
+ *
+ * ═══ AND A FOURTH KIND FROM OUTSIDE BOTH UNIONS IS STILL POSSIBLE ═══
+ *
+ * `buildIncidentItem` WRITES `str(payload.kind, 32) ?? 'anticheat'`
+ * (fivem-royale-m9/js-src/br_ddb/src/incident.js), so the attribute is a
+ * thirty-two character string as far as its writer is concerned and neither
+ * union is enforced at the write. The compile-time half above cannot see that;
+ * `unqueryableKind` is the half that can, and it is checked by the one poller
+ * that finds cases WITHOUT the index.
+ */
+const INCIDENT_KINDS: Record<IncidentKind, true> = {
+  report: true,
+  identifier_reuse: true,
+  anticheat: true,
+}
+
+/**
+ * The kinds to query, in a fixed order.
+ *
+ * SORTED, SO THE ORDER IS THE LIST'S AND NOT THE OBJECT LITERAL'S. `Object.keys`
+ * answers in insertion order, which makes a reordering of the braces above a
+ * silent change to which kind a bounded pass spends its budget on first — and to
+ * which of three failing queries is the one that reports. Alphabetical is
+ * arbitrary and stable, which is the whole requirement.
+ */
+export const POLLED_KINDS: readonly IncidentKind[] = (
+  Object.keys(INCIDENT_KINDS) as IncidentKind[]
+).sort()
+
+/**
+ * A case whose `kind` the openings poller could not have found. `null` when it
+ * could have.
+ *
+ * ═══ THE CHECK THAT MAKES A SILENT BLIND SPOT LOUD ═══
+ *
+ * IT IS CALLED FROM THE RESOLVED POLLER AND NOT FROM THE OPENINGS ONE, WHICH IS
+ * THE ONLY PLACEMENT THAT SAYS ANYTHING. The openings poller finds a case BY
+ * querying its kind, so every case it holds is a case whose kind it queried and
+ * the check there is a tautology. The resolved poller learns its ids from
+ * `incident.resolve` rows and reads the case by id, so it sees every kind that
+ * exists — including one neither repository declares. That is the independent
+ * observer, and this is banrole.ts's trap 5 answered the way trap 5 is answered:
+ * the silence is probed by something that is not the thing going silent.
+ *
+ * `error` AND NOT `warn` AT THE CALL SITE, because what it means is that a whole
+ * class of case is never posted when it opens and nothing else will ever say so.
+ *
+ * WHAT IT CANNOT SEE, STATED SO NOBODY TRUSTS IT FURTHER THAN IT GOES. A case
+ * that is auto-resolved at the moment it is filed writes NO `incident.resolve`
+ * row (br_ddb's open path stamps `state: 'resolved'` itself), so the resolved
+ * poller never sees one — and a kind emitted only on that path stays invisible
+ * to this check as well as to the index. There is no reader in this repository
+ * that would catch that one, and saying so is better than implying otherwise.
+ */
+export function unqueryableKind(incident: Pick<Incident, 'kind'>): string | null {
+  const kind = incident.kind
+  if (typeof kind === 'string' && Object.hasOwn(INCIDENT_KINDS, kind)) return null
+
+  // The raw value, and ONLY into the journal and the status channel — never into
+  // an embed. `COPY.kindUnknown` is what a reader in Discord gets for the same
+  // value, and `labelled` is where that rule is kept. An operator diagnosing this
+  // needs the string the table actually holds.
+  return typeof kind === 'string' ? kind : String(kind)
+}
+
 /** Why, per `category`. PLACEHOLDERS, and the console's own words again. */
 export const CATEGORY_LABEL: Record<IncidentCategory, string> = {
   cheating: 'Cheating',
@@ -830,6 +1035,14 @@ export function caseText(incident: Pick<Incident, 'kind' | 'category'>): string 
  * AN ACTION THIS DOES NOT RECOGNISE FALLS THROUGH TO THE SAME ANSWER. The union
  * says it cannot happen; the row is written by another repository, so it can.
  *
+ * `none` FALLS THROUGH THERE TOO NOW, AND THAT IS NOT THIS FUNCTION READING IT
+ * AS "NO VERDICT". A case whose verdict is `{ action: 'none' }` never reaches an
+ * embed at all — the skip in `settle` passes it over before one is built — so
+ * the words it used to get, `COPY.verdictNone` ('No action taken'), were deleted
+ * with the last caller that could reach them and the branch went with the
+ * string. The two come back together, here and in `COPY`, if that skip ever
+ * does.
+ *
  * `expiresAt` IS RANGE-CHECKED AND NOT MERELY CHECKED FOR FINITENESS, WHICH IS
  * THE SAME RULE `resolvedAt` HAS ALWAYS HAD. This line was
  * `typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)`, and `1e18` is a
@@ -851,23 +1064,48 @@ export function verdictText(incident: Pick<Incident, 'verdict'>): string {
   }
 
   if (verdict.action === 'kick') return COPY.verdictKick
-  if (verdict.action === 'none') return COPY.verdictNone
 
   return COPY.verdictUnknown
 }
 
 /**
- * The moderation record for one CLOSED case.
+ * Which of the two things happened to this case. The one thing `incidentEmbed`
+ * cannot work out from the row.
  *
- * IT BUILDS ONE POST AND TAKES NO HEADLINE, WHICH IS A DELIBERATE NARROWING. It
- * used to take the title as an argument and render the verdict only when
- * `state === 'resolved'`, so that the other half of blitz-bot#19 could reuse it
- * — but `settle` refuses every case that is not resolved and no production call
- * passes a title, so both of those were an unreachable branch and an unused
- * parameter maintained against a caller that cannot be written until
- * fivem-ringmaster#46 lands. This repo has a documented habit of landing
- * scaffolding before its wiring; re-adding a parameter beside the call that needs
- * it is a smaller change than keeping a branch nothing can execute.
+ * A DISCRIMINATOR AND NOT A TITLE STRING, BECAUSE THREE THINGS MOVE WITH IT AND
+ * ONLY ONE OF THEM IS WORDS. The headline, the instant the embed is stamped with
+ * (`openedAt` against `resolvedAt`), and whether a verdict is a thing to say
+ * anything about at all. A `title: string` parameter would have carried the
+ * first and left the other two to be worked out at each call site, which is two
+ * chances for a post about an opening to be stamped with the moment somebody
+ * closed it.
+ *
+ * IT IS NOT DERIVABLE FROM `state`, WHICH IS THE MISTAKE TO NOT MAKE HERE. A
+ * case can be filed ALREADY `resolved` — br_ddb writes `state: 'resolved'`,
+ * `resolvedAt: openedAt` and `resolvedByName: 'System'` in one PutItem when the
+ * game auto-handles something — so `state` says what the case IS and this says
+ * which event the post announces. On that one row they disagree, and it is the
+ * openings poller that has to be right about it.
+ *
+ * NOT EXPORTED. `incidentEmbed` is exported and takes one, so a caller writes
+ * the literal `'filed'` or `'resolved'` and the compiler checks it against this
+ * union either way — which is what every call site in this repo and its tests
+ * actually does. An `export` nothing imports is a claim that something outside
+ * this module depends on the name.
+ */
+type IncidentPost = 'filed' | 'resolved'
+
+/**
+ * The moderation record for one case, filed or closed.
+ *
+ * IT TAKES ITS HEADLINE BACK, AND THIS TIME THE OTHER CALLER EXISTS. It used to
+ * take a title and render the verdict only when `state === 'resolved'`; both
+ * were deleted as scaffolding when the openings half could not be written, on
+ * the argument that this repo lands scaffolding before its wiring and that
+ * re-adding a parameter beside the call that needs it is smaller than
+ * maintaining an unreachable branch. `createIncidentOpenLog` is that call. What
+ * comes back is `IncidentPost` rather than the title string, for the reason
+ * given there.
  *
  * WHAT IT SAYS ABOUT THE CASE COMES FROM `caseText`, WHICH IS THE PRIVACY
  * BOUNDARY OF THIS WHOLE FEATURE. Read its comment before adding a field: the
@@ -899,8 +1137,39 @@ export function verdictText(incident: Pick<Incident, 'verdict'>): string {
  * A FIELD IS OMITTED RATHER THAN LEFT BLANK when it has nothing in it. A label
  * with an empty value beside it reads as a fact that failed to load, which is a
  * different claim from a fact nobody recorded.
+ *
+ * ═══ TWO OF THE FOUR FIELDS ARE ABOUT A CLOSURE, AND THEY ARE ONE FACT ═══
+ *
+ * `Verdict` AND `Resolved by` ARE GATED TOGETHER, ON `state`. Both are answers
+ * to "what happened when this case was closed", so a post that renders one and
+ * not the other is a post making half a claim — and it was reachable: the gate
+ * was on `verdictText` alone, and `Resolved by` was left to fall out of the
+ * empty-field filter at the bottom on the argument that an open case has no
+ * `resolvedByName`. That is a claim about ANOTHER REPOSITORY'S ROW, which is the
+ * one kind of claim nothing in this file is allowed to make. A row that is
+ * `pending_review` and carries a `resolvedByName` — the same two-repository
+ * drift `settle`'s own state gate exists to guard against — rendered a filed
+ * post saying somebody resolved a case that is still open, with no verdict
+ * beside it to qualify it. Reproduced by rendering one.
+ *
+ * `verdictText` IS ALSO WHY THE GATE HAS TO EXIST AT ALL. An absent verdict is
+ * `COPY.verdictUnknown` there, deliberately and rightly, and putting "No verdict
+ * recorded" on a case nobody has looked at yet would be this bot reporting the
+ * absence of a decision that was never due.
+ *
+ * AND IT IS `state` RATHER THAN WHICH POST THIS IS. Those come apart on exactly
+ * one row and it is a row this feature will see: a case the game auto-handled at
+ * open is filed and closed in one write, so its FILED post carries
+ * `Resolved by: System` and a verdict field saying nobody recorded one — which
+ * is the whole truth about that case, said with the two labels that were already
+ * there. Keying it off `about` instead would have hidden the closure on the one
+ * post that mentions it.
  */
-export function incidentEmbed(incident: Incident, avatarUrl: string | null): APIEmbed {
+export function incidentEmbed(
+  incident: Incident,
+  avatarUrl: string | null,
+  about: IncidentPost,
+): APIEmbed {
   /**
    * `inert` ON THE TWO VALUES THIS REPO DID NOT WRITE, AND `short` ON THE ONE IT
    * DID. `subjectName` is the offender's own in-game name and `resolvedByName`
@@ -909,19 +1178,31 @@ export function incidentEmbed(incident: Incident, avatarUrl: string | null): API
    * in this record before it existed. `caseText` is this module's own two labels
    * and `verdictText` is this module's own words plus a timestamp built from a
    * number it range-checks, so neither can carry anybody's markup.
+   *
+   * `''` IS HOW THE VERDICT FIELD IS DROPPED, rather than a conditional push,
+   * because that is the mechanism the other three already use and the filter at
+   * the bottom is the one place a field's absence is decided.
    */
+  const closed = incident.state === 'resolved'
+
   const fields: APIEmbedField[] = [
     { name: COPY.case, value: short(caseText(incident)) },
     { name: COPY.player, value: inert(incident.subjectName), inline: true },
-    { name: COPY.verdict, value: verdictText(incident), inline: true },
-    { name: COPY.resolvedBy, value: inert(incident.resolvedByName), inline: true },
+    { name: COPY.verdict, value: closed ? verdictText(incident) : '', inline: true },
+    { name: COPY.resolvedBy, value: closed ? inert(incident.resolvedByName) : '', inline: true },
   ]
 
   /**
-   * The instant the embed is about: when the case was closed. A field Discord
-   * cannot parse is left off rather than allowed to make the whole message
-   * invalid — and that is now true of the ONE value that could stop it being
-   * built at all.
+   * The instant the embed is about, which is the event and NOT the row's newest
+   * stamp. A field Discord cannot parse is left off rather than allowed to make
+   * the whole message invalid — and that is true of the ONE value that could
+   * stop it being built at all.
+   *
+   * `openedAt` ON A FILED POST EVEN WHEN `resolvedAt` IS SITTING RIGHT THERE.
+   * The auto-resolved case carries both, and both are the same number on it
+   * today — but a record stamped with a closure it is not announcing is wrong in
+   * a way nobody would ever catch by reading the channel, and `about` exists so
+   * that this line does not have to guess.
    *
    * A RANGE CHECK AND NOT A FINITENESS CHECK. This line read
    * `Number.isFinite(at)` and `MAX_PARSEABLE_MS` says what that missed: a stamp
@@ -930,9 +1211,10 @@ export function incidentEmbed(incident: Incident, avatarUrl: string | null): API
    * its own — neither is `<=` anything — so the finiteness test it replaces is
    * not lost, it is subsumed. The range itself now stops one step short of
    * `Date`'s own, and `MAX_PARSEABLE_MS` says why; `renderable` is the one place
-   * that rule is written down.
+   * that rule is written down. It covers `openedAt` for the same reason it
+   * covers `resolvedAt`: the type is a claim about another repository's row.
    */
-  const at = incident.resolvedAt
+  const at = about === 'filed' ? incident.openedAt : incident.resolvedAt
 
   /**
    * The id is the one thing that makes the record traceable when the button is
@@ -963,7 +1245,7 @@ export function incidentEmbed(incident: Incident, avatarUrl: string | null): API
   const footer = short(incident.incidentId, FOOTER_TEXT_CAP)
 
   return {
-    title: COPY.title,
+    title: about === 'filed' ? COPY.filedTitle : COPY.resolvedTitle,
     color: COLOUR,
     fields: fields.filter((field) => field.value !== ''),
     ...(avatarUrl === null ? {} : { thumbnail: { url: avatarUrl } }),
@@ -1222,6 +1504,60 @@ export async function avatarFor(
 /** What one decision did, so a pass can budget and a test can assert. */
 type Step = 'posted' | 'quiet' | 'stop'
 
+/** How many passes have failed on each case, and what to do about it. */
+interface Strikes {
+  /** A pass failed outright on this case: hold the walk behind it, or give up. */
+  hit(incidentId: string, fault: string): Step
+  /** This case is finished with, however it ended. */
+  clear(incidentId: string): void
+}
+
+/**
+ * The strike bound, as a thing each poller owns one of.
+ *
+ * ═══ SHARED BECAUSE IT IS THE SAME BOUND, AND SEPARATE INSTANCES BECAUSE IT IS
+ * NOT THE SAME BUDGET ═══
+ *
+ * BOTH POLLERS CAN JAM THE FEED THE SAME WAY. Each walks an ordered stream and
+ * answers `stop` on a case it could not read or could not post, which is what
+ * makes a timeout a retry rather than a hole in a permanent record — and neither
+ * can tell that apart from a channel the bot has lost Send Messages in, or an
+ * embed Discord will refuse every time it is offered. `FAULT_LIMIT` is the
+ * argument, in full, for why that has to end somewhere.
+ *
+ * ONE COUNTER PER POLLER, THOUGH, AND NOT ONE PER CASE ACROSS BOTH. The two see
+ * the same case at two different moments through two different tables, and a
+ * filed post Discord refused says nothing about whether the resolved post will
+ * be. A shared map would spend one poller's budget on the other's failures and
+ * drop a record neither had actually given up on.
+ *
+ * THE GIVE-UP SENTENCE IS A PARAMETER FOR THE REASON `AuditPollMessages` EXISTS.
+ * It reaches the owner's status channel, where "the incident poll" and "the
+ * case-opened poll" are the two things he needs told apart, and a templated line
+ * with the consumer's name substituted in would make both a match for neither.
+ */
+function strikeBound(giveUp: string): Strikes {
+  const strikes = new Map<string, number>()
+
+  return {
+    clear(incidentId) {
+      strikes.delete(incidentId)
+    },
+
+    hit(incidentId, fault) {
+      const count = (strikes.get(incidentId) ?? 0) + 1
+      strikes.set(incidentId, count)
+
+      if (count < FAULT_LIMIT) return 'stop'
+
+      log('error', giveUp, { incident: incidentId, fault, attempts: count, limit: FAULT_LIMIT })
+
+      strikes.delete(incidentId)
+      return 'quiet'
+    },
+  }
+}
+
 export function createIncidentLog(deps: IncidentLogDeps): IncidentLog {
   const now = deps.now ?? Date.now
 
@@ -1249,7 +1585,15 @@ export function createIncidentLog(deps: IncidentLogDeps): IncidentLog {
    * process restarts.
    */
   const heldSince = new Map<string, number>()
-  const strikes = new Map<string, number>()
+
+  /**
+   * The other bound, `FAULT_LIMIT`'s, which the openings poller keeps one of too.
+   * See `strikeBound` for why that is one bound in two instances rather than one
+   * shared counter.
+   */
+  const strikes = strikeBound(
+    'the incident poll failed on the same case every pass, so it moved past it and no record was posted',
+  )
 
   /**
    * This case is finished with, however it ended. Forget both bounds for it.
@@ -1265,7 +1609,7 @@ export function createIncidentLog(deps: IncidentLogDeps): IncidentLog {
    */
   function settled(incidentId: string): void {
     heldSince.delete(incidentId)
-    strikes.delete(incidentId)
+    strikes.clear(incidentId)
   }
 
   /**
@@ -1276,21 +1620,15 @@ export function createIncidentLog(deps: IncidentLogDeps): IncidentLog {
    * from nowhere else. The `pending_review` branch does NOT come through here:
    * that is not a fault, it is two tables disagreeing, and it has its own bound
    * in its own unit. See `FAULT_LIMIT`.
+   *
+   * IT STILL CLEARS `heldSince` ON THE GIVE-UP, which `strikeBound` cannot do for
+   * it: the pending hold is this poller's alone, and a case bounded out on
+   * strikes has left this walk exactly as finally as one that posted.
    */
   function faulted(incidentId: string, fault: string): Step {
-    const count = (strikes.get(incidentId) ?? 0) + 1
-    strikes.set(incidentId, count)
-
-    if (count < FAULT_LIMIT) return 'stop'
-
-    log(
-      'error',
-      'the incident poll failed on the same case every pass, so it moved past it and no record was posted',
-      { incident: incidentId, fault, attempts: count, limit: FAULT_LIMIT },
-    )
-
-    settled(incidentId)
-    return 'quiet'
+    const step = strikes.hit(incidentId, fault)
+    if (step !== 'stop') heldSince.delete(incidentId)
+    return step
   }
 
   /**
@@ -1397,6 +1735,85 @@ export function createIncidentLog(deps: IncidentLogDeps): IncidentLog {
       return 'quiet'
     }
 
+    /**
+     * ═══ THE OPENINGS POLLER'S TRAP 5, RAISED FROM THE ONE PLACE IT IS VISIBLE ═══
+     *
+     * THIS POLLER IS THE ONLY READER IN THE BOT THAT FINDS A CASE WITHOUT NAMING
+     * ITS KIND. It is handed an id by an audit row and reads the case by key, so
+     * whatever `kind` the row carries arrives here — including a value neither
+     * this repo's union nor the console's declares, which `buildIncidentItem`
+     * permits outright (`str(payload.kind, 32) ?? 'anticheat'`). The openings
+     * poller queries one index partition per kind it knows, so a kind nobody
+     * names is a class of case that is never announced when it is filed, with no
+     * error and no empty page anywhere. See `unqueryableKind`.
+     *
+     * IT IS CHECKED HERE AND ACTED ON NOWHERE. The case in hand is closed and
+     * this record posts exactly as it would have; what is broken is a different
+     * poller's coverage, and the fix is a person adding the kind to
+     * `INCIDENT_KINDS` and to `IncidentKind` in src/ddb.ts. `error` because
+     * nothing else in this process will ever mention it.
+     */
+    const blind = unqueryableKind(incident)
+    if (blind !== null) {
+      log(
+        'error',
+        'a case carries a kind the case-opened poll does not query, so cases of that kind are never posted when they are filed',
+        { incident: incidentId, kind: blind, index: INCIDENT_KIND_INDEX, queried: [...POLLED_KINDS] },
+      )
+    }
+
+    if (incident.verdict?.action === 'none') {
+      /**
+       * ═══ AN ADMIN LOOKED AND DECIDED NOTHING WAS WARRANTED ═══
+       *
+       * THE OWNER'S ANSWER TO OPEN QUESTION 1 ON blitz-bot#19: nothing is posted
+       * if no action was taken. A closure that changed nothing about anybody is
+       * not worth a line in the moderation record, and the console's own
+       * `/audit` holds it either way.
+       *
+       * `{ action: 'none' }` AND NOTHING ELSE, WHICH IS THE WHOLE CARE IN THIS
+       * BRANCH. `verdict` is ABSENT on a case resolved before the field existed
+       * and `null` on one the system auto-resolved at open — and on both of
+       * those NOBODY RECORDED A DECISION. Reading either as this one would drop
+       * a permanent record on the strength of a decision that was never made,
+       * which is the conflation `verdictText`, `COPY.verdictUnknown` and the
+       * console's own `IncidentVerdict` comment are all written against. They
+       * keep posting, under `COPY.verdictUnknown`. `?.` is what holds the line:
+       * `undefined?.action` and `null?.action` are both `undefined`, and neither
+       * is `'none'`.
+       *
+       * `'quiet'` AND NEVER `'stop'`, WHICH IS THE OTHER HALF. Skipping is a
+       * DECISION this poller made, not a failure it is retrying, so the cursor
+       * has to move over the row exactly as it moves over one that posted.
+       * `'stop'` here would park an ordered walk behind the first no-action case
+       * for the life of the process and take every record behind it down with
+       * it — the loss `PENDING_HOLD_MS` is bounded against, with no bound.
+       *
+       * IT SAVES NO READ AND COULD NOT SIT ANY EARLIER. The verdict is on the
+       * INCIDENT row and never on the audit row, so there is nothing to filter
+       * on until `incidents.get` has answered. That is what separates it from
+       * `closedByABan`, which drops the ban sweep in `onRow` before a read is
+       * made at all.
+       *
+       * `COPY.verdictNone` ('No action taken') WENT WITH THIS AND COMES BACK
+       * WITH IT. It was the wording for exactly the case this branch now passes
+       * over, so with the skip in place nothing could reach it — and a string
+       * with no live caller is scaffolding, which this file argues against twice
+       * before it gets here. Reverting the owner's answer means restoring the
+       * string, its branch in `verdictText`, and this filter, together.
+       */
+
+      // `info`, so it stays out of the status channel: nothing went wrong. It is
+      // a line at all because this is the only place that says why the channel
+      // stayed quiet about a closure the audit log plainly named.
+      log('info', 'a case was closed with no action taken, so no record was posted', {
+        incident: incidentId,
+      })
+
+      settled(incidentId)
+      return 'quiet'
+    }
+
     const avatarUrl = await avatarFor(deps.ddb.players, deps.avatars, incident.subjectLicense)
 
     /**
@@ -1435,7 +1852,10 @@ export function createIncidentLog(deps: IncidentLogDeps): IncidentLog {
     const row = incidentRow(deps.consoleOrigin, incidentId)
 
     try {
-      await deps.posts.send(incidentEmbed(incident, avatarUrl), row === null ? [] : [row])
+      await deps.posts.send(
+        incidentEmbed(incident, avatarUrl, 'resolved'),
+        row === null ? [] : [row],
+      )
     } catch (error) {
       /**
        * THE CURSOR STAYS BEHIND THIS ROW, which is what makes a failed send a
@@ -1591,17 +2011,729 @@ export function createIncidentLog(deps: IncidentLogDeps): IncidentLog {
 }
 
 /* ------------------------------------------------------------------ *
+ * The other half: the record for a case that was FILED.
+ * ------------------------------------------------------------------ */
+
+/**
+ * How many index rows one pass may pull back PER KIND.
+ *
+ * IT IS A BOUND AND NOT A CAPACITY, exactly as `POLL_LIMIT` is for the audit
+ * walk: a caught-up poller sees a handful a day and this number only matters
+ * after an outage, where it is the answer to "how much are we willing to spend
+ * catching up in one pass". Passes repeat every `POLL_MS` and the cursor advances
+ * over what was actually dealt with, so a backlog drains across passes.
+ *
+ * IT IS NOT THE TIE RULE'S TEST, WHICH IT USED TO BE AND SHOULD NOT HAVE BEEN.
+ * The walk compared `rows.length` against this number to decide whether a page
+ * might have stopped in the middle of a millisecond; DynamoDB answers that
+ * question itself, with `LastEvaluatedKey`, and the two are not the same claim —
+ * a `Query` can return fewer rows than `Limit` with more still in the range. What
+ * this number does is bound the spend, and it is still not `POLL_LIMIT` reused
+ * for the reason `POLL_LIMIT`'s own comment gives. Fifty is `INCIDENT_QUERY_CAP`
+ * in src/ddb.ts, which is where the ceiling on it is enforced — and the two still
+ * have to agree, because a cap smaller than this would silently shrink every page
+ * the walk asks for.
+ */
+export const MAX_INDEX_ROWS = 50
+
+/**
+ * What the openings poller says when the index is not there.
+ *
+ * ═══ THIS IS THE MOST IMPORTANT LINE IN THE FEATURE AND IT IS A CONSTANT FOR
+ * THAT REASON ═══
+ *
+ * THE INDEX IS CREATED BY HAND AND THIS CODE SHIPS BEFORE IT EXISTS. Every pass
+ * until somebody runs `aws dynamodb update-table` fails on the first query, and
+ * what the owner is told about that decides whether the feature ever starts
+ * working: he operates this bot from Discord and not from a terminal, so a
+ * feature that quietly does nothing is indistinguishable from a quiet server.
+ *
+ * SO IT NAMES THE INDEX, THE TABLE AND THE CONSEQUENCE, IN THE SENTENCE ITSELF
+ * rather than only in the structured fields. `statusReporter` folds a repeating
+ * fault by its MESSAGE, so this being one constant string is also what turns two
+ * a minute into one post — and interpolating the index name is safe because
+ * `INCIDENT_KIND_INDEX` is a constant of this program and not a borrowed value.
+ *
+ * IT IS `error` AND NOT `warn`. The bot has stopped doing a thing it is for and
+ * a person has to act; that is the rule in src/log.ts, stated there.
+ */
+const MISSING_INDEX = `the ${INCIDENT_KIND_INDEX} index on ringmaster-incidents does not exist, so no record is posted when a case is filed`
+
+/**
+ * What it says while the index is being built — the minutes right after the
+ * `update-table` in docs/aws-notes.md.
+ *
+ * ═══ THIS IS THE SENTENCE `MISSING_INDEX` USED TO SAY IN THIS STATE, AND IT WAS
+ * NOT TRUE ═══
+ *
+ * AWS REFUSES READS OF A GSI WHILE IT BACKFILLS, with a `ValidationException` —
+ * the SAME exception name a missing index raises. So the first thing the owner
+ * saw after creating the index was this bot telling him the index does not
+ * exist, in the exact state the command he had just run puts him in, and the
+ * next thing he would do is go looking for a typo in something that is fine.
+ * `classify` in src/ddb.ts is where the two are told apart and where AWS's own
+ * wording is quoted from.
+ *
+ * IT IS `info` AND EVERY OTHER LINE IN THIS GROUP IS NOT. The rule in src/log.ts
+ * is one question — does this need a human — and the answer here is no twice
+ * over: the backfill finishes on its own in minutes, and nothing is lost while
+ * it runs, because a failed read never moves the cursor. A `warn` would put this
+ * in the owner's status channel twice a minute for the whole backfill, which is
+ * the `gateway reconnecting` mistake that file names by name.
+ */
+const FILLING_INDEX = `the ${INCIDENT_KIND_INDEX} index on ringmaster-incidents is still filling, so records for filed cases start once it is ready`
+
+/**
+ * What it says when IAM refuses the query.
+ *
+ * ═══ A PERMANENT FAILURE, AND IT USED TO BE LOGGED AS IF IT WERE A TIMEOUT ═══
+ *
+ * `AccessDeniedException` CLASSIFIES AS `denied` AND FELL INTO THE GENERIC
+ * BRANCH AT `warn` — the same bucket as a read that did not answer, on every
+ * pass, forever, until a human edits an IAM policy. src/log.ts states the rule
+ * this breaks: `error` rather than `warn` when the bot has stopped doing
+ * something it is for. Nothing about this one gets better on the next pass.
+ *
+ * AND THE THING TO GRANT IS THE INDEX ARN, WHICH IS THE WHOLE REASON THIS IS
+ * REACHABLE AT ALL. docs/aws-notes.md predicts this exact failure: IAM treats a
+ * table and its indexes as separate resources, so a policy naming only
+ * `…:table/ringmaster-incidents` allows the `GetItem` and refuses the `Query`.
+ * A line that said "denied" and stopped would send somebody to a policy that
+ * already names this table, so the sentence names the resource that is missing
+ * from it.
+ */
+const INDEX_DENIED = `the bot is not allowed to Query the ${INCIDENT_KIND_INDEX} index on ringmaster-incidents, so no record is posted when a case is filed — dynamodb:Query has to be granted on the table arn AND on that arn with /index/${INCIDENT_KIND_INDEX} on the end, which IAM treats as a separate resource`
+
+/**
+ * What it says when the index answers with an `openedAt` that is not a position
+ * in it.
+ *
+ * ═══ THE PROTECTION THIS WALK DID NOT INHERIT ═══
+ *
+ * `placeable` IS THE AUDIT WALK'S AND IS IMPORTED RATHER THAN RESTATED. It was
+ * added to src/auditpoll.ts after `'NaN'` and `'1000000000000000000'` reached
+ * `ringmaster-bot-state` in production: a sort key that is a broken number is
+ * walked as a position, written back out as a bookmark, and then either refused
+ * by `cursorAt` on the next pass — restarting the walk from now and skipping
+ * everything in between — or accepted forever as a lower bound past the clock,
+ * which empties the feed with no line at all.
+ *
+ * THIS WALK SHIPPED WITHOUT IT AND THE SAME TWO ENDINGS ARE REACHABLE, because
+ * `openedAt` is exactly the same kind of value: a sort key off another
+ * repository's row that this file writes into that same table as a bookmark.
+ * `MAX_STAMP` is the horizon, and the reasoning for a horizon rather than a
+ * finiteness check is written down once, there.
+ *
+ * IT STOPS THE PASS RATHER THAN SKIPPING THE ROW, which is the audit walk's
+ * answer too — and here it stops it BEFORE anything is posted rather than at the
+ * row, which is the one place the two differ. There, the stream is ordered by
+ * DynamoDB and everything before the bad row provably belongs before it. Here
+ * the order is this function's own `sort`, so a key that cannot be placed is a
+ * key that cannot be placed relative to the others either: "the rows before it"
+ * is not a set this pass can name. Nothing is posted, nothing is written, and
+ * the line repeats every pass until somebody looks — loud, and not silent.
+ */
+const UNPLACEABLE_STAMP =
+  'the incident index answered with an openedAt that is not a position in it, so the case-opened poll stopped and posted nothing'
+
+/**
+ * What it says when a page stopped short of its own window without returning a
+ * row.
+ *
+ * DYNAMODB CAN SAY "THERE IS MORE" AND HAND BACK NOTHING — a page cut at a
+ * megabyte of scanned data rather than at a row. It is not reachable through
+ * this query today (no filter expression, a `KEYS_ONLY` index) and it is one
+ * line to handle rather than a shape to reason about again later. Such a page
+ * proves nothing about the window, so this pass claims nothing about it: the
+ * cursor stays where it was and the next pass asks the same lower bound.
+ *
+ * IT IS `warn` BECAUSE IT IS A STALL. One is a hiccup the next pass covers; a
+ * run of them is a feed that has stopped, and this is the only line saying so.
+ */
+const UNREAD_WINDOW =
+  'the incident index stopped short of its window without returning a row, so the case-opened poll waits for the next pass'
+
+/**
+ * What it says when a pass ran out of budget with cases still waiting.
+ *
+ * ═══ THE ONE STALL IN THIS FILE THAT USED TO BE SILENT ═══
+ *
+ * A POLLER AN HOUR BEHIND LOOKED EXACTLY LIKE A QUIET NIGHT. Every other place
+ * this walk stops early says so — the tie overflow, the strike give-up, the
+ * missing index — and the budget break, which is the one that fires on the night
+ * a backlog actually matters, exited with no line at any level.
+ *
+ * IT IS `info`, AND THAT IS THE RULE IN src/log.ts APPLIED RATHER THAN DODGED.
+ * Does it need a human? No: passes repeat every `POLL_MS`, the cursor advances
+ * over what was dealt with, and a backlog drains on its own. Making it a `warn`
+ * would copy it into the owner's status channel twice a minute for as long as
+ * the catch-up lasts — turning the busy night into the flood, which is the
+ * failure that file describes at length. The journal is where "is it behind?"
+ * is asked, and this is the line that answers it.
+ *
+ * ONCE PER PASS, WITH THE COUNT ON THE LINE. Not once per stamp and not once per
+ * case: the number that matters is how much was left, and repeating the sentence
+ * per group would make a long backlog unreadable in exactly the log somebody
+ * reads to measure it.
+ */
+const BUDGET_SPENT =
+  'the case-opened poll spent its budget with cases still waiting, so the rest are posted on later passes'
+
+/**
+ * The four sentences this poller says about its bookmark. See `bookmark` in
+ * src/auditpoll.ts, which is what says them.
+ *
+ * THEY ARE THIS POLLER'S OWN WORDS AND NOT A TEMPLATE, for that interface's
+ * reason: three of the four reach the owner's status channel, where "the game-ban
+ * poll", "the incident poll" and "the case-opened poll" are what he needs told
+ * apart.
+ */
+const OPEN_CURSOR_MESSAGES: CursorMessages = {
+  cursorUnreadable: 'could not read the case-opened poll cursor, so nothing was polled',
+  noCursorYet:
+    'no case-opened poll cursor yet, so cases filed from now on will be posted and earlier ones will not',
+  cursorUnusable:
+    'the case-opened poll cursor is not a position in the index, so polling restarts from now',
+  cursorUnsaved: 'the case-opened poll finished but its cursor could not be saved',
+}
+
+/** Everything the openings poller needs from the world. */
+export interface IncidentOpenLogDeps {
+  /**
+   * THE `Pick` IS THE ACCESS POLICY, the same as `IncidentLogDeps`'s. This one
+   * can read incidents — both ways, the point read and the index — read the
+   * player registry, and read and write the bot's own state. It cannot write an
+   * incident, cannot write or read an audit row, cannot touch a ban and cannot
+   * reach the maintenance window.
+   *
+   * NO `auditWindow`, WHICH IS THE DIFFERENCE FROM THE OTHER HALF AND IS THE
+   * WHOLE POINT OF THIS POLLER. There is no audit row for an opening to walk.
+   */
+  readonly ddb: Pick<Ddb, 'incidents' | 'players' | 'botState'>
+  readonly posts: IncidentPosts
+  readonly avatars: Avatars
+  /** Where a PERSON reaches the console. `CONSOLE_URL` — see `incidentRow`. */
+  readonly consoleOrigin: string
+  readonly now?: () => number
+}
+
+export interface IncidentOpenLog {
+  /** One pass over the index. */
+  poll(): Promise<void>
+}
+
+/**
+ * The moderation record for a case that was FILED — blitz-bot#19's second half.
+ *
+ * ═══ WHY IT DOES NOT DRIVE `pollAuditWindow` ═══
+ *
+ * THAT WALK IS OVER `ringmaster-audit` AND THIS ONE IS NOT OVER A LOG AT ALL.
+ * Its deps take an `AuditWindow`, its rows are `AuditRow`s and its cursor is a
+ * `ts` that is half a primary key. Every one of those is false here: three
+ * queries rather than one, `IncidentKey`s rather than rows, and an `openedAt`
+ * that a GSI does not require to be unique. Making that file generic enough to
+ * take both would have meant reshaping the walk two shipped consumers depend on
+ * in order to serve a third that agrees with them about the cursor and about
+ * nothing else.
+ *
+ * SO WHAT IS SHARED IS SHARED PIECE BY PIECE RATHER THAN AS A FRAME, AND THE
+ * BOOKMARK IS ONE OF THE PIECES. `bookmark` is imported from there and keeps
+ * this poller's place: the read, `cursorAt`'s verdict on what came back — the
+ * guard that `''`, `' '`, `'0'`, a boolean and a one-element list are not
+ * bookmarks, every one of which was a real production fault — the first-start
+ * mark, and the write. This function held its own copy of all four and the copy
+ * had already fallen a fix behind; see `place` below. `placeable` comes with it,
+ * for `openedAt`. `SETTLE_MS` is the same hold-back for the same reason. Below
+ * that, the embed, the button, the avatar lookup, the poster, the two label maps
+ * and the strike bound are all the resolved half's, called rather than copied.
+ *
+ * ═══ THE THREE THINGS THAT DECIDE THIS FUNCTION'S SHAPE ═══
+ *
+ * THE INDEX MAY NOT EXIST, AND SILENCE IS THE ONE FORBIDDEN ANSWER. See
+ * `MISSING_INDEX`.
+ *
+ * AN EMPTY ANSWER IS NOT EVIDENCE, WHILE THE INDEX IS FILLING. A new GSI answers
+ * nothing until it has populated, so "no rows" and "no cases" look identical
+ * from here for as long as the backfill takes. The rule that makes that safe is
+ * that an empty answer never moves the cursor — the pass returns having written
+ * nothing, the next pass asks about a WIDER window with the SAME lower bound,
+ * and a superset cannot skip anything. That is `pollAuditWindow`'s rule about an
+ * empty page, and it is load-bearing here in a way it never was there.
+ *
+ * AND THE FIRST-START MARK IS WRITTEN BEFORE ANY QUERY EXISTS, which is the
+ * other half of the same argument and is the part that is easy to get wrong. If
+ * the no-cursor branch queried first and recorded "now" on the strength of an
+ * empty answer, then a first start against a backfilling index would bookmark
+ * the present and every case filed while it filled would be behind the mark
+ * forever. So that branch reads the cursor, finds none, writes where it came in,
+ * and returns WITHOUT asking the index anything — and from then on the only
+ * thing that moves the mark is a record that was actually posted.
+ *
+ * WHAT THAT COSTS, STATED RATHER THAN HIDDEN: cases filed before the first start
+ * are never posted about. That is the same no-backfill policy the resolved half
+ * keeps, for the same reason — a poller that began at the beginning would empty
+ * months of the incidents table into the moderation channel on every deploy.
+ */
+export function createIncidentOpenLog(deps: IncidentOpenLogDeps): IncidentOpenLog {
+  const now = deps.now ?? Date.now
+
+  const strikes = strikeBound(
+    'the case-opened poll failed on the same case every pass, so it moved past it and no record was posted',
+  )
+
+  /**
+   * THIS POLLER'S PLACE IN `ringmaster-bot-state`, KEPT BY THE SAME CODE THE
+   * OTHER TWO USE.
+   *
+   * ═══ IT WAS FOUR BLOCKS COPIED OUT OF src/auditpoll.ts AND ONE OF THEM HAD
+   * ALREADY GONE STALE ═══
+   *
+   * THE READ, THE `cursorAt` VERDICT, THE FIRST-START MARK AND THE WRITE were
+   * this function's own copies, line for line with the key swapped — including
+   * the `raw: unknown` and the comment explaining why it is `unknown`. The walk
+   * below genuinely is not the audit walk (three queries, index keys, a sort key
+   * a GSI does not require to be unique), and that argument is still in this
+   * function's own comment; the BOOKMARK is not part of what differs, and the
+   * copy proved it by falling behind. `placeable` — the range check src/auditpoll
+   * gained after `'NaN'` and `1e18` reached that table in production — was never
+   * copied across, so this walk could write a stamp its own reader would then
+   * refuse. See `UNPLACEABLE_STAMP`, which is where it is inherited.
+   *
+   * `firstStart` COMES WITH IT AND IS KEYED BY `OPEN_CURSOR_KEY` THERE. Per
+   * process, per consumer, deliberately not surviving a restart — the same three
+   * properties this file's own copy had, argued once instead of twice.
+   */
+  const place = bookmark(deps.ddb, OPEN_CURSOR_KEY, OPEN_CURSOR_MESSAGES)
+
+  /**
+   * One case, read and posted. The openings twin of `settle`.
+   *
+   * IT IS MUCH SHORTER THAN `settle` AND THE MISSING PARTS ARE THE POINT. There
+   * is no trigger to disagree with the row, so there is no `state` check and no
+   * `PENDING_HOLD_MS`: the index entry IS the fact, and a case is filed whatever
+   * has happened to it since. There is no `closedByABan` sweep, because nothing
+   * files fifty cases at once. And `verdict` is not consulted — the skip in
+   * `settle` is about a CLOSURE that changed nothing, which is not a statement
+   * anybody has made about a case that has only just been opened.
+   *
+   * A CASE THAT IS ALREADY `resolved` IS POSTED, WHICH IS A DECISION AND NOT AN
+   * OVERSIGHT. br_ddb writes `state: 'resolved'` in the same PutItem that creates
+   * the row when the game handled something itself, and NO `incident.resolve`
+   * audit row is ever written for it — so the resolved half cannot see it and
+   * this poller is the only thing in the bot that ever will. Skipping it would
+   * make that class of case invisible in Discord permanently; posting it puts one
+   * record in the channel that says, in the fields that were already there, that
+   * the case was filed and that `System` closed it. See `incidentEmbed`, which is
+   * where the verdict field's rule for exactly this row is argued.
+   */
+  async function filed(key: IncidentKey): Promise<Step> {
+    const incidentId = key.incidentId
+
+    const read = await deps.ddb.incidents.get(incidentId)
+
+    if (!read.ok) {
+      log('warn', 'could not read a newly filed incident, so nothing was posted about it', {
+        incident: incidentId,
+        failure: read.failure.kind,
+        detail: read.failure.message,
+      })
+
+      return strikes.hit(incidentId, read.failure.kind)
+    }
+
+    const incident = read.value
+
+    if (incident === null) {
+      /**
+       * AN INDEX ENTRY FOR A ROW THE TABLE DOES NOT HAVE. A GSI entry is written
+       * from the item, so this is not the index running ahead of the table —
+       * `incidents.get` is strongly consistent and the index is not, which makes
+       * this direction the impossible one. What is left is a row deleted by hand,
+       * or an index entry left behind by one. Moving on is therefore safe for the
+       * reason it is safe in `settle`: no number of retries turns a missing item
+       * into one.
+       */
+      log('warn', 'the incident index names a case that is not in the table', {
+        incident: incidentId,
+        kind: key.kind,
+      })
+
+      strikes.clear(incidentId)
+      return 'quiet'
+    }
+
+    const avatarUrl = await avatarFor(deps.ddb.players, deps.avatars, incident.subjectLicense)
+
+    if (incident.incidentId !== incidentId) {
+      // The same disagreement `settle` reports, from the other direction: the key
+      // is the index entry's and the button is built from it, so the record is
+      // right either way and this is the only place the drift is visible.
+      log('warn', 'an incident row carries an id that is not the key it was read by', {
+        incident: incidentId,
+        carried: incident.incidentId,
+      })
+    }
+
+    const row = incidentRow(deps.consoleOrigin, incidentId)
+
+    try {
+      await deps.posts.send(incidentEmbed(incident, avatarUrl, 'filed'), row === null ? [] : [row])
+    } catch (error) {
+      // The cursor stays behind this case, bounded, for `settle`'s reasons: one
+      // duplicate beats a moderation record that never existed, and a fault that
+      // survives `FAULT_LIMIT` attempts is not the kind the next attempt fixes.
+      log('warn', 'could not post the record for a newly filed incident', {
+        incident: incidentId,
+        error,
+      })
+
+      return strikes.hit(incidentId, 'send')
+    }
+
+    log('info', 'posted the record for a newly filed incident', {
+      incident: incidentId,
+      kind: key.kind,
+      licence: incident.subjectLicense,
+      avatar: avatarUrl !== null,
+      button: row !== null,
+      alreadyResolved: incident.state === 'resolved',
+    })
+
+    strikes.clear(incidentId)
+    return 'posted'
+  }
+
+  async function poll(): Promise<void> {
+    const at = now()
+    const until = at - SETTLE_MS
+
+    /**
+     * NO CURSOR MEANS START HERE, AND NOTHING IS QUERIED ON THIS PASS. That
+     * second half is not tidiness and it is why this read comes first: an index
+     * that is backfilling answers nothing, and a branch that recorded "now" after
+     * looking at an empty answer would bookmark the present on the strength of a
+     * table that had not finished being built. Reading the mark, writing it and
+     * returning cannot be wrong about the index because it never asks it
+     * anything. `begin` has already said which of the two `null`s this is.
+     */
+    const cursor = await place.begin(until)
+    if (cursor === null) return
+
+    /**
+     * ═══ ONE QUERY PER KIND, AND ANY FAILURE ENDS THE WHOLE PASS ═══
+     *
+     * A `Query` ADDRESSES ONE PARTITION AND THE PARTITION KEY IS `kind`, so there
+     * is no single call that answers for all of them and no `IN` short of a Scan.
+     * See `INCIDENT_KINDS` for what depends on this list being complete.
+     *
+     * ABANDONING THE PASS ON ANY FAILURE IS THE PART THAT IS NOT OBVIOUS. Posting
+     * the kinds that answered and advancing the cursor past their stamps would
+     * carry the bookmark over the window the FAILED kind was never asked about —
+     * so a single timeout on one query would silently drop every case of that
+     * kind in that window, permanently. Nothing is written unless every kind
+     * answered.
+     */
+    const pages: IncidentPage[] = []
+
+    for (const kind of POLLED_KINDS) {
+      const page = await deps.ddb.incidents.opened(kind, cursor, until, MAX_INDEX_ROWS)
+
+      if (!page.ok) {
+        /**
+         * ═══ FOUR ANSWERS, AND THREE OF THEM ARE NOT "A READ DID NOT ANSWER" ═══
+         *
+         * THE GENERIC BRANCH IS FOR THE TRANSIENT ONES AND ONLY FOR THEM — a
+         * throttle, a timeout, a table under load — where the next pass makes the
+         * same read and it works. `warn` is right for those and wrong for
+         * everything above them, and putting a permanent failure in that bucket
+         * is how a policy that will never fix itself gets logged at the same
+         * level as a slow network. See `MISSING_INDEX`, `FILLING_INDEX` and
+         * `INDEX_DENIED` for each one's own argument.
+         */
+        const failure = page.failure
+
+        if (failure.kind === 'no-such-index') {
+          log('error', MISSING_INDEX, {
+            index: INCIDENT_KIND_INDEX,
+            table: failure.table,
+            detail: failure.message,
+          })
+        } else if (failure.kind === 'index-backfilling') {
+          log('info', FILLING_INDEX, {
+            index: INCIDENT_KIND_INDEX,
+            table: failure.table,
+            detail: failure.message,
+          })
+        } else if (failure.kind === 'denied') {
+          log('error', INDEX_DENIED, {
+            index: INCIDENT_KIND_INDEX,
+            table: failure.table,
+            detail: failure.message,
+          })
+        } else {
+          log('warn', 'could not read the incident index, so no case was posted this pass', {
+            index: INCIDENT_KIND_INDEX,
+            kind,
+            failure: failure.kind,
+            detail: failure.message,
+          })
+        }
+        return
+      }
+
+      pages.push(page.value)
+    }
+
+    /**
+     * ═══ THE STAMP THE PASS CAN PROVE IT SAW ALL OF ═══
+     *
+     * `openedAt` IS A GSI SORT KEY AND GSI SORT KEYS ARE NOT UNIQUE, which is the
+     * one place this walk cannot copy the audit walk. There, `ts` is half a
+     * primary key, so a cursor written at a row's `ts` provably has that row and
+     * everything before it behind it. Here two cases of one kind filed in the
+     * same millisecond are two entries at one stamp — and a page that came back
+     * FULL may have stopped between them, so its last stamp is one this pass
+     * cannot claim to have seen the whole of.
+     *
+     * SO A CUT-SHORT PAGE LOWERS THE CEILING TO ITS LAST STAMP AND EVERYTHING AT
+     * OR ABOVE IT WAITS FOR THE NEXT PASS. Rows of OTHER kinds above the ceiling
+     * wait too: the cursor is one number across all three, so advancing past the
+     * ceiling for one kind would advance past it for the kind with the gap.
+     *
+     * ═══ AND "CUT SHORT" IS DYNAMODB'S ANSWER AND NOT A COUNT OF ROWS ═══
+     *
+     * IT WAS `rows.length < MAX_INDEX_ROWS`, WHICH IS A DIFFERENT CLAIM. A
+     * `Query` may return FEWER items than `Limit` and still have more behind it
+     * in the key range — a megabyte of scanned data is the documented reason, and
+     * `LastEvaluatedKey` is what DynamoDB says it with. On a short page that was
+     * not the end, that test read every row back as the whole window: the ceiling
+     * that exists to protect a half-read millisecond stayed at infinity, and the
+     * cursor advanced past the last stamp returned — over the rest of that
+     * millisecond, which is then behind the bookmark for good. Never posted, and
+     * nothing anywhere saying so.
+     *
+     * `page.more` IS THAT SIGNAL AND IT SUBSUMES THE OLD TEST RATHER THAN SITTING
+     * BESIDE IT. DynamoDB returns a `LastEvaluatedKey` whenever it stopped early,
+     * INCLUDING because it reached `Limit` — so a full page still lowers the
+     * ceiling, exactly as before, and a short one now does too when it has to.
+     * See `IncidentPage` in src/ddb.ts.
+     */
+    let ceiling = Number.POSITIVE_INFINITY
+    const merged: IncidentKey[] = []
+
+    // `entries`, so the kind is on the line when a page has something to say
+    // about itself: `pages` is filled in `POLLED_KINDS` order above.
+    for (const [n, page] of pages.entries()) {
+      for (const key of page.keys) {
+        // The audit walk's guard on the audit walk's kind of value. A stamp that
+        // is not a position cannot be ordered against the others and must never
+        // reach `saveCursor`. See `UNPLACEABLE_STAMP`.
+        if (!placeable(key.openedAt)) {
+          log('error', UNPLACEABLE_STAMP, {
+            incident: key.incidentId,
+            kind: key.kind,
+            openedAt: key.openedAt,
+          })
+          return
+        }
+
+        merged.push(key)
+      }
+
+      if (!page.more) continue
+
+      const last = page.keys[page.keys.length - 1]
+
+      if (last === undefined) {
+        // Stopped early and returned nothing: this page is evidence of nothing,
+        // so the pass claims nothing. See `UNREAD_WINDOW`.
+        log('warn', UNREAD_WINDOW, { kind: POLLED_KINDS[n], rows: merged.length })
+        return
+      }
+
+      ceiling = Math.min(ceiling, last.openedAt)
+    }
+
+    /**
+     * NOTHING IN THE WINDOW, AND THE CURSOR IS DELIBERATELY NOT MOVED OVER IT.
+     * This is the line that makes a backfilling index safe: an empty answer is
+     * indistinguishable from an index that has not populated, and the next pass
+     * asks about a wider window with the same lower bound, which is a superset.
+     * Advancing here would be both a DynamoDB write every `POLL_MS` for an idle
+     * bot and, on the day the index is new, the loss of every case filed while it
+     * was filling.
+     */
+    if (merged.length === 0) return
+
+    // By stamp, then by id: the stamp is the walk's order and the id is only
+    // there so that a tie is walked the same way twice, which is what makes a
+    // group's contents a property of the data rather than of query timing.
+    merged.sort((a, b) => a.openedAt - b.openedAt || (a.incidentId < b.incidentId ? -1 : 1))
+
+    let usable = merged.filter((key) => key.openedAt < ceiling)
+
+    if (usable.length === 0) {
+      /**
+       * A FULL PAGE IN WHICH EVERY ROW SHARES ONE STAMP — fifty cases of one kind
+       * filed in the same millisecond. The ceiling excludes all of them, which
+       * would stall this walk at that stamp for the life of the process: the
+       * quiet halt everything else here is written against.
+       *
+       * SO THEY ARE TAKEN, LOUDLY, AND THE COST IS STATED. Whatever else sits at
+       * that stamp beyond the page is passed over when the cursor advances, and
+       * that is a real loss — bounded to one millisecond, reported at `error`
+       * naming the stamp, and chosen over a feed that stops forever with nothing
+       * to show for it. It is the same trade `FAULT_LIMIT` makes.
+       *
+       * `rows` IS THE COUNT AT THAT STAMP AND NOT THE PASS'S WHOLE HAUL. It was
+       * `merged.length` — every kind's rows in the pass — under a sentence about
+       * how many cases share ONE `openedAt`, so the number was not what the
+       * sentence said it was. On the row it is diagnosed from, the two differ by
+       * however much else the pass pulled back.
+       *
+       * AND IT CANNOT BE REACHED WITH THE CEILING STILL INFINITE ANY MORE. It
+       * could: an `openedAt` that was not a number failed `< Infinity`, emptied
+       * `usable`, and logged `openedAt=Infinity` — a stamp matching nothing,
+       * under a sentence about a millisecond, on every pass forever while the
+       * cursor stood still. That value is refused above now, where it is a fault
+       * of its own with its own line. See `UNPLACEABLE_STAMP`.
+       */
+      const tied = merged.filter((key) => key.openedAt === ceiling)
+
+      log(
+        'error',
+        'more cases share one openedAt than the case-opened poll can read in a pass, so some of them may never be posted',
+        { openedAt: ceiling, rows: tied.length, limit: MAX_INDEX_ROWS },
+      )
+
+      usable = tied
+    }
+
+    /** Where the bookmark stands in the table right now. */
+    let saved = cursor
+    let advanced = cursor
+
+    let posts = 0
+    let reads = 0
+
+    /**
+     * ═══ THE WALK IS BY STAMP AND NOT BY ROW ═══
+     *
+     * THE BUDGETS ARE CHECKED BETWEEN GROUPS AND A GROUP IS INDIVISIBLE, which is
+     * the whole reason this is not a plain `for` over `usable`. Stopping in the
+     * middle of a millisecond leaves the cursor behind the stamp — it cannot go
+     * past a case that was not dealt with — so the cases already posted at that
+     * stamp would be posted a second time on the next pass. A group may therefore
+     * overrun `MAX_POSTS`, which is a bounded overrun of a soft limit rather than
+     * a duplicate in a permanent record.
+     */
+    /** How many cases this pass never got to. See `BUDGET_SPENT`. */
+    let waiting = 0
+
+    for (let i = 0; i < usable.length; ) {
+      if (posts >= MAX_POSTS || reads >= MAX_INCIDENT_READS) {
+        waiting = usable.length - i
+        break
+      }
+
+      const stamp = usable[i]?.openedAt
+      if (stamp === undefined) break
+
+      let end = i
+      while (end < usable.length && usable[end]?.openedAt === stamp) end++
+
+      let whole = true
+      let posted = 0
+
+      for (let k = i; k < end; k++) {
+        const key = usable[k]
+        if (key === undefined) continue
+
+        reads++
+        const step = await filed(key)
+
+        if (step === 'stop') {
+          whole = false
+          break
+        }
+
+        if (step === 'posted') posted++
+      }
+
+      // A case this pass could not deal with: the cursor stays behind its whole
+      // group and the next pass asks about that stamp again.
+      if (!whole) break
+
+      advanced = stamp
+      posts += posted
+
+      /**
+       * THE BOOKMARK IS WRITTEN AS SOON AS A GROUP HAS POSTED SOMETHING, for the
+       * reason `RowStep`'s `persist` exists: a post cannot be undone, and a crash
+       * between the last send and one write at the end of the pass would replay
+       * every record of the pass into the channel. A group that posted NOTHING —
+       * every case in it missing from the table — is idempotent, so it rides the
+       * single write at the end.
+       *
+       * AND A WRITE THAT DID NOT LAND ENDS THE PASS. Carrying on would post more
+       * records behind a bookmark that is not moving, which widens exactly the
+       * replay this is here to prevent.
+       */
+      if (posted > 0) {
+        if (!(await place.save(advanced))) return
+        saved = advanced
+      }
+
+      i = end
+    }
+
+    // `saved` rather than `cursor`, so a pass that wrote as it went does not
+    // rewrite the same value at the end.
+    if (advanced > saved) await place.save(advanced)
+
+    /**
+     * AFTER THE WRITE, SO THE LINE DESCRIBES A PASS THAT IS OVER. What was left
+     * is behind a bookmark that has already moved, which is the fact worth
+     * recording: those cases are waiting, not lost. Once, with the count.
+     */
+    if (waiting > 0) {
+      log('info', BUDGET_SPENT, { waiting, posts, reads, cursor: advanced })
+    }
+  }
+
+  return { poll }
+}
+
+/* ------------------------------------------------------------------ *
  * Wiring.
  * ------------------------------------------------------------------ */
 
 /**
- * Watch the console's audit log and post the moderation record for closed cases.
+ * Post the moderation record for a case: the audit log for closures, the index
+ * for openings.
+ *
+ * ONE INSTALLER FOR BOTH POLLERS, AND THE ALTERNATIVE WAS TWO. They share the
+ * channel guard, the config read, the poster, the avatar lookup, the origin
+ * assignment below, the unref'd timer and the re-entry latch — so a second
+ * installer would be that list copied, with one `client.once(ClientReady)` per
+ * copy and two places for the loopback mistake to be made instead of one.
+ *
+ * THE TWO PASSES RUN ONE AFTER THE OTHER ON ONE TICK, NOT CONCURRENTLY. They
+ * post to the same channel, so running them side by side would double the burst
+ * a catch-up produces on one Discord route; running them in sequence means the
+ * second starts after the first has finished spending its budget. Neither
+ * `poll` throws, so the sequence cannot be broken by the first one failing.
+ *
+ * WHICH MEANS ONE TICK MAY POST `MAX_POSTS` TWICE, stated because it is the one
+ * number this arrangement changes: up to twenty records a pass into one channel
+ * rather than ten. That is well inside what Discord accepts on a channel route,
+ * and both halves drain across passes rather than in one.
  *
  * NOTHING AT ALL WHEN `BLITZ_LOG_CHANNEL_ID` IS UNSET, which is the rule every
  * optional channel in this bot follows and matters most here: with nowhere to post
- * there is nothing to poll for, so `ringmaster-audit` is not read at all and this
- * process makes no AWS call it would otherwise make twice a minute. Null is not a
- * degraded mode.
+ * there is nothing to poll for, so neither `ringmaster-audit` nor the incident
+ * index is read at all and this process makes no AWS call it would otherwise make
+ * twice a minute. Null is not a degraded mode.
  *
  * ═══ THE ONE LINE THIS FUNCTION EXISTS TO GET RIGHT ═══
  *
@@ -1630,19 +2762,23 @@ export function installIncidentLog(
   client: Client,
   config: Config,
   ddb: IncidentLogDeps['ddb'],
-  options: { pollMs?: number; watcher?: IncidentLog } = {},
+  options: { pollMs?: number; watcher?: IncidentLog; openWatcher?: IncidentOpenLog } = {},
 ): void {
   const channelId = config.logChannelId
   if (channelId === null) return
 
+  // Built once and shared by both pollers. `logChannelPosts` fetches the channel
+  // per send (cache first), so one poster is not a handle captured at boot.
+  const posts = logChannelPosts(client, channelId)
+  const avatars = clientAvatars(client)
+
   const watcher =
     options.watcher ??
-    createIncidentLog({
-      ddb,
-      posts: logChannelPosts(client, channelId),
-      avatars: clientAvatars(client),
-      consoleOrigin: CONSOLE_URL,
-    })
+    createIncidentLog({ ddb, posts, avatars, consoleOrigin: CONSOLE_URL })
+
+  const openWatcher =
+    options.openWatcher ??
+    createIncidentOpenLog({ ddb, posts, avatars, consoleOrigin: CONSOLE_URL })
 
   client.once(Events.ClientReady, () => {
     let running = false
@@ -1651,12 +2787,16 @@ export function installIncidentLog(
       if (running) return
       running = true
 
-      void watcher
-        .poll()
+      void (async () => {
+        // Sequential, and each one's own failures are already its own. Neither
+        // `poll` throws; the `catch` below is the structural guarantee that an
+        // edit which makes one of them throw costs a pass rather than the loop.
+        await watcher.poll()
+        await openWatcher.poll()
+      })()
         .catch((error: unknown) => {
-          // `poll` is written not to throw. The `finally` is the structural
-          // guarantee that an edit which makes it throw cannot latch `running`
-          // on and stop the loop for the life of the process.
+          // The `finally` is what stops a throw from latching `running` on and
+          // stopping the loop for the life of the process.
           log('error', 'the incident poll threw', { error })
         })
         .finally(() => {

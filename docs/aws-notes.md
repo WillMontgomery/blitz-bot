@@ -52,7 +52,7 @@ use either — its document-client interface exposes `get`, `put`, `update` and
 | Action | Resource |
 |---|---|
 | `dynamodb:GetItem` | `ringmaster-bans`, `ringmaster-players`, `ringmaster-player-ids`, `ringmaster-maintenance`, `ringmaster-bot-state`, **`ringmaster-incidents`**, `br-players` |
-| `dynamodb:Query` | `ringmaster-audit` |
+| `dynamodb:Query` | `ringmaster-audit`, **`ringmaster-incidents` — the table AND `…/index/kind-openedAt-index`** |
 | `dynamodb:PutItem` | `ringmaster-audit`, `ringmaster-bot-state`, **`ringmaster-bans`** |
 | `dynamodb:UpdateItem` | `ringmaster-audit`, **`ringmaster-bans`** |
 
@@ -65,12 +65,34 @@ What this row is, is a line the policy in **blitz-bot#4** will need when the bot
 is scoped to an identity of its own; without it, the moderation record for a
 closed incident stops posting and every pass says `denied` in the journal.
 
-**It is a read and it must stay one.** The bot learns an incident id from an
-`incident.resolve` audit row and asks for that one case; the console's own module
-scans this table for its queue and says in its comment what that costs and which
-two GSIs replace it. There is no `PutItem` and no `UpdateItem` here and there
-should never be: closing a case is the console's decision, and a bot that could
-write this table could close one nobody closed.
+**`dynamodb:Query` on `ringmaster-incidents` is newer still, and the index ARN is
+a separate resource.** The openings half of blitz-bot#19 reads
+`kind-openedAt-index`, and IAM treats a table and its indexes as different
+resources: a policy naming only
+`arn:aws:dynamodb:us-east-2:…:table/ringmaster-incidents` allows the `GetItem`
+and refuses the `Query`, and a moderation channel never mentions a filed case
+again. The index ARN is that same string with `/index/kind-openedAt-index` on the
+end, and **blitz-bot#4**'s policy needs both.
+
+That refusal is an `error` in the status channel and not a `warn`, because
+nothing about it gets better on the next pass — it is the bot having stopped
+doing a thing it is for until a person edits a policy, which is the rule in
+`src/log.ts`. The line names the resource to grant rather than only saying
+`denied`, so it does not send you to a policy that already names this table:
+
+> the bot is not allowed to Query the kind-openedAt-index index on
+> ringmaster-incidents, so no record is posted when a case is filed —
+> dynamodb:Query has to be granted on the table arn AND on that arn with
+> /index/kind-openedAt-index on the end, which IAM treats as a separate resource
+Nothing is missing at runtime today, for the reason above: the shared instance
+role grants `ringmaster-*`.
+
+**They are reads and they must stay reads.** The bot learns an incident id from an
+`incident.resolve` audit row or from that index, and asks for that one case; the
+console's own module scans this table for its queue and says in its comment what
+that costs. There is no `PutItem` and no `UpdateItem` here and there should never
+be: closing a case is the console's decision, and a bot that could write this
+table could close one nobody closed.
 
 **The two bold entries are new in blitz-bot#16 and they widen the bot's AWS
 grant.** Not the grant it *runs* with — that has been `ringmaster-*` with every
@@ -137,7 +159,7 @@ game's from `DDB_GAME_TABLE_PREFIX` (`br-`).
 | `ringmaster-maintenance` | `id` (S), one row, `id = "current"` | read | `lib/maintenance.ts` |
 | `ringmaster-audit` | `pk` (S) + `ts` (N) | read **and write** | `lib/audit.ts` |
 | `ringmaster-bot-state` | `id` (S) | read **and write** | this repo |
-| `ringmaster-incidents` | `incidentId` (S) | read | `lib/incidents.ts` |
+| `ringmaster-incidents` | `incidentId` (S), GSI `kind-openedAt-index` | read | `lib/incidents.ts` |
 | `br-players` | `pk` (S) + `sk` (S), `sk = "profile"` | read | `lib/gameProfile.ts` |
 
 Three of those are worth reading twice.
@@ -148,13 +170,86 @@ match. A `GetItem` with the wrong key shape returns no row rather than an error,
 which reads as "this player has never played".
 
 **`ringmaster-incidents` is keyed on `incidentId` and on nothing else**, which is
-what makes the bot's one read of it a `GetItem` rather than a Scan. Every other
+what makes the bot's point read of it a `GetItem` rather than a Scan. Every other
 question about that table — the queue, the count, a player's cases — is a Scan on
-the console's side, and this repo asks none of them: the audit log hands it the id
-of the one case it wants. The two GSIs the console's own comment names (`state`
-for the queue, `subjectLicense` for the profile) are also what the OTHER half of
-blitz-bot#19 waits on — posting when a case *opens* needs an index that does not
-exist, which is why only the resolved half is built.
+the console's side, and this repo asks none of them: for a closure, the audit log
+hands it the id of the one case it wants.
+
+**And for an opening there is no audit row to hand it anything**, which is the
+whole reason the index below exists. The game writes incidents straight into this
+table through `br_ddb`, the game box has no access to `ringmaster-audit` at all,
+and the console's `/api/ingest` doorbell persists nothing — so nothing anywhere
+records that a case was *opened*. See `createIncidentOpenLog` in
+`src/incidents.ts`.
+
+### `kind-openedAt-index`, and it is created by hand
+
+| | |
+|---|---|
+| Table | `ringmaster-incidents` |
+| Partition key | `kind` (S) |
+| Sort key | `openedAt` (N) |
+| Projection | `KEYS_ONLY` |
+
+```bash
+aws dynamodb update-table \
+  --region us-east-2 \
+  --table-name ringmaster-incidents \
+  --attribute-definitions \
+      AttributeName=kind,AttributeType=S \
+      AttributeName=openedAt,AttributeType=N \
+  --global-secondary-index-updates '[{"Create":{
+      "IndexName":"kind-openedAt-index",
+      "KeySchema":[
+        {"AttributeName":"kind","KeyType":"HASH"},
+        {"AttributeName":"openedAt","KeyType":"RANGE"}],
+      "Projection":{"ProjectionType":"KEYS_ONLY"}}}]'
+```
+
+**The symptom of its absence is one line, and the line names it.** A `Query`
+against an index a table does not carry fails with a `ValidationException`, which
+without help lands in the same bucket as a timeout — so the bot classifies it as
+`no-such-index` and says, at `error` in the status channel:
+
+> the kind-openedAt-index index on ringmaster-incidents does not exist, so no
+> record is posted when a case is filed
+
+Nothing else about the bot changes while it is missing: closures are still posted,
+because that half reads the audit log. Nothing is skipped either — the poller
+never moves its cursor over a failed or an empty read, so every case filed between
+this shipping and the index going live is posted once the index is there.
+
+**And for the first minutes after you run that command it says something else,
+which is the point.** AWS refuses reads of a global secondary index while it
+backfills, with the *same* `ValidationException` — the message is `Cannot read
+from backfilling global secondary index: kind-openedAt-index`. That is not the
+index missing, so it does not get the sentence above; it is an `info` line in the
+journal only, and nothing reaches the status channel:
+
+> the kind-openedAt-index index on ringmaster-incidents is still filling, so
+> records for filed cases start once it is ready
+
+Nobody needs to do anything about it. Wait, and records start appearing; nothing
+filed in the meantime is lost, for the cursor reason above. `OnlineIndexPercentage
+Progress` in CloudWatch is where the backfill's progress actually is, if you want
+a number.
+
+**`KEYS_ONLY` is deliberate and costs a `GetItem` per case.** The index cannot
+carry `subjectName`, `category`, `state` or `verdict`, so nothing on it is
+renderable and the case is read through the same ten-attribute projection either
+way. `ALL` would put the evidence, the match timeline and the reporter's name in a
+second copy of every row, in an index a bot reads on a timer.
+
+**`kind` is the partition key, and that is the sharp edge.** A `Query` addresses
+one partition, so the bot makes one call per kind it knows about and learns
+nothing at all about a kind it does not name — no error, not even an empty page.
+`INCIDENT_KINDS` in `src/incidents.ts` is that list, typed so a fourth kind is a
+compile error, and the resolved poller (which finds cases by id and therefore sees
+every kind) raises an `error` if it ever meets one the index list does not cover.
+
+The two GSIs the console's own comment names — `state` for the queue,
+`subjectLicense` for the profile — are still not created and this repo still needs
+neither.
 
 **`ringmaster-bot-state` exists on the live box** and was created by hand. The
 bot will not create it for you, so a second environment needs this. The symptom

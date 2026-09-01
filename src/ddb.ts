@@ -228,10 +228,27 @@ export type DdbOp = 'get' | 'put' | 'update' | 'query'
  * operator's problem, not the admin's; `denied` and `credentials` are the
  * instance role, which is blitz-bot#4's territory; `conflict` is a write that
  * refused to clobber something and is the interesting one — see `begin`.
+ *
+ * `no-such-index` IS THE NEWEST AND IS THE ONLY ONE ABOUT A THING THAT DOES NOT
+ * EXIST YET RATHER THAN A THING THAT BROKE. A `Query` naming an index the table
+ * does not carry fails with a `ValidationException`, which without this lands on
+ * `error` beside a timeout and a bad expression — and the difference matters more
+ * here than anywhere else in this list, because the only consumer of an index in
+ * this repo is a poller whose whole failure mode is going quiet. See `opened`.
+ *
+ * `index-backfilling` IS ITS TWIN AND IS THE ONLY ONE ON THIS LIST THAT NEEDS
+ * NOBODY. AWS raises the SAME `ValidationException` for the minutes after an
+ * index is created, while it populates — so without it the sentence the owner
+ * reads in the exact state `aws dynamodb update-table` puts him in is that the
+ * index he just created does not exist, and he goes looking for a typo in
+ * something that is fine. It is a wait, not a fault: nothing is lost while it
+ * lasts, because the poller never moves its cursor over a failed read.
  */
 export type DdbFailureKind =
   | 'timeout'
   | 'no-such-table'
+  | 'no-such-index'
+  | 'index-backfilling'
   | 'denied'
   | 'credentials'
   | 'conflict'
@@ -291,9 +308,72 @@ const FAILURE_KINDS: Record<string, DdbFailureKind> = {
   RequestAbortedException: 'timeout',
 }
 
-function classify(error: unknown, op: DdbOp, table: string): DdbFailure {
+/**
+ * The exception AWS raises for a `Query` against an index a table does not
+ * carry — AND for one against an index that exists and is still filling. See
+ * `classify`, which is where the two are told apart.
+ */
+const MISSING_INDEX_EXCEPTION = 'ValidationException'
+
+/**
+ * The words in AWS's own message for the second of those.
+ *
+ * ═══ WHERE THIS STRING CAME FROM, BECAUSE GUESSING AT IT IS THE FAILURE MODE ═══
+ *
+ * IT IS AWS'S VERBATIM WORDING AND NOT A PARAPHRASE. The full message is
+ * `Cannot read from backfilling global secondary index: <index-name>`, read off
+ * a real SDK failure pasted into aws/aws-cli issue 4845 on GitHub, and worded
+ * the same way in AWS's own "Managing global secondary indexes" page
+ * (GSI.OnlineOps in the DynamoDB developer guide). No link, because this module
+ * names no URL and there is a test on that. The index NAME is interpolated into
+ * the message, so the match is on the fixed phrase and not on the sentence.
+ *
+ * LOWERCASED BEFORE THE TEST, so a capitalisation change at AWS does not put the
+ * owner back in front of the wrong sentence. A bigger rewording would, and the
+ * fallback direction is the safe half of that trade: an unrecognised
+ * `ValidationException` on an index call stays `no-such-index`, which is what
+ * this code said about both states before, and the SDK's own message is on the
+ * log line either way.
+ */
+const BACKFILLING_INDEX = 'backfilling global secondary index'
+
+/**
+ * `index` IS THE ONLY THING THAT UNLOCKS `no-such-index`, AND IT IS AN EXACT NAME
+ * MATCH LIKE EVERY OTHER ENTRY IN `FAILURE_KINDS`.
+ *
+ * `ValidationException` IS NOT ON THAT LIST AND MUST NOT GO ON IT. It is what AWS
+ * raises for a missing index AND for a malformed expression, a key condition that
+ * does not match the key schema, and half a dozen other things — so mapping it
+ * globally would send an operator to `aws dynamodb update-table` over a typo in a
+ * `ProjectionExpression`. Naming an index is what narrows it: a caller that passed
+ * one is asking a question that has an index-shaped way of being wrong, and every
+ * caller that did not is unaffected.
+ *
+ * WHAT IT CAN STILL OVER-CLAIM, STATED RATHER THAN GLOSSED. The one caller today
+ * (`opened`) builds its request from a `kind` out of a closed vocabulary and two
+ * numbers, so there is nothing in it left to be invalid except the index — but
+ * that is a property of that call site and not of this function. A later index
+ * query with a filter expression on it could produce a `ValidationException` this
+ * would call a missing index. The failure's `message` is the SDK's own and goes
+ * on the log line, so an operator reading it sees what AWS actually said either
+ * way; the classification decides which sentence he is shown first.
+ *
+ * AND THE ONE `ValidationException` THAT IS NOT A FAULT IS SPLIT OFF FIRST. AWS
+ * refuses reads of a global secondary index for the minutes it spends filling,
+ * with the same exception name and a different message — so the state that
+ * `aws dynamodb update-table` PUTS AN OPERATOR IN would otherwise be reported to
+ * him as the index not existing, which is both wrong and the one sentence
+ * guaranteed to send him looking in the wrong place. See `BACKFILLING_INDEX` for
+ * where the words come from.
+ */
+function classify(error: unknown, op: DdbOp, table: string, index?: string): DdbFailure {
   const name = error instanceof Error ? error.name : ''
   const message = error instanceof Error ? error.message : String(error)
+
+  if (index !== undefined && name === MISSING_INDEX_EXCEPTION) {
+    const filling = message.toLowerCase().includes(BACKFILLING_INDEX)
+    return { kind: filling ? 'index-backfilling' : 'no-such-index', op, table, message }
+  }
 
   return { kind: FAILURE_KINDS[name] ?? 'error', op, table, message }
 }
@@ -330,14 +410,23 @@ export interface TableNames {
    */
   botState: string
   /**
-   * Read only. One case, by `incidentId`.
+   * Read only. One case by `incidentId`, and one kind's openings by `openedAt`.
    *
-   * A `GetItem` AND NOTHING ELSE, WHICH IS THE ONLY THING THIS TABLE OFFERS
-   * CHEAPLY. It is keyed on `incidentId` alone (the console's lib/incidents.ts
-   * says so, and its own queue pays for it with a Scan), so the one question
-   * this repo may ask is "the case with this id". The bot learns the id from an
-   * `incident.resolve` audit row and never has to find a case any other way —
-   * see src/incidents.ts, which is the only reader.
+   * A `GetItem` AND A `Query` ON ONE INDEX, AND NEVER A SCAN. The table is keyed
+   * on `incidentId` alone (the console's lib/incidents.ts says so, and its own
+   * queue pays for that with a Scan), so a point read is all the base table
+   * offers cheaply — which was the whole of this comment until the openings half
+   * of blitz-bot#19 needed to find cases nothing had handed it an id for.
+   *
+   * SO THE SECOND QUESTION IS ASKED OF AN INDEX RATHER THAN OF THE TABLE, which
+   * is the difference between a bounded key-range read and a Scan of every case
+   * ever filed. `INCIDENT_KIND_INDEX` is where that index and its shape are
+   * described; `DocumentClient` above still has no `scan` and must not gain one.
+   *
+   * BOTH READS ARE src/incidents.ts's, and it is still the only reader. The
+   * resolved half learns an id from an `incident.resolve` audit row; the openings
+   * half has no audit row to learn from, because the game writes these cases
+   * without touching the log at all.
    */
   incidents: string
   /** Read only, and a different prefix: the GAME's row. `{pk, sk}` keyed. */
@@ -899,11 +988,83 @@ export interface Incident {
   subjectLicense: string
   subjectName: string
 
+  /**
+   * When the case was filed. The sort key of `INCIDENT_KIND_INDEX`, and the
+   * instant the case-opened record is about.
+   *
+   * PROJECTED RATHER THAN CARRIED OVER FROM THE INDEX ROW, which the poller also
+   * holds and which is the same number by construction. The embed is built from
+   * an `Incident` and from nothing else, so a second source for one of its
+   * fields would be a parameter that exists only because of how the case was
+   * found — and the resolved half, which never touches the index, would then
+   * have no way to render it at all.
+   *
+   * NOT OPTIONAL, UNLIKE THE TWO BELOW. `buildIncidentItem` writes
+   * `int(payload.openedAt) ?? now` on every row it creates
+   * (fivem-royale-m9/js-src/br_ddb/src/incident.js), so there is no case shape
+   * that lacks it — and `renderable` in src/incidents.ts guards the value
+   * anyway, because that is a claim about another repository's row.
+   */
+  openedAt: number
+
   resolvedAt?: number | null
   resolvedByName?: string | null
 
   /** See `IncidentVerdict`. Absent and null are the same answer: no verdict. */
   verdict?: IncidentVerdict | null
+}
+
+/**
+ * One row of `INCIDENT_KIND_INDEX`, which is everything a `KEYS_ONLY`
+ * projection can carry: the table's key plus the index's two.
+ *
+ * IT IS A POINTER AND NOT A CASE, WHICH IS WHY THE POLLER STILL PAYS FOR A
+ * `GetItem` PER ROW. `KEYS_ONLY` cannot carry `subjectName`, `category`,
+ * `state` or `verdict`, so nothing on this type can be rendered — and that is
+ * the projection anybody would want anyway: the alternative, `ALL`, would put
+ * the evidence, the match timeline and the reporter's name in a second copy of
+ * the row, in an index this bot reads on a timer.
+ */
+export interface IncidentKey {
+  /** The table's own key. What `incidents.get` is then called with. */
+  incidentId: string
+  /** The index's partition key. */
+  kind: IncidentKind
+  /** The index's sort key, and this poller's cursor. */
+  openedAt: number
+}
+
+/**
+ * One `Query` of that index: the keys, and whether DynamoDB stopped early.
+ *
+ * ═══ `more` IS THE ONLY HONEST ANSWER TO "DID I SEE THE WHOLE WINDOW" ═══
+ *
+ * A SHORT PAGE IS NOT THE SAME CLAIM AS THE END OF THE RANGE, and the caller
+ * cannot tell them apart from `keys.length` alone. A `Query` may return FEWER
+ * items than `Limit` and still have more behind it — a megabyte of scanned data
+ * is the documented reason and it does not need a filter expression to happen —
+ * so a consumer that inferred "short page, therefore complete" would advance a
+ * cursor over rows it never read. `LastEvaluatedKey` is DynamoDB's own signal
+ * for exactly this and it is not a heuristic: absent means the key range is
+ * exhausted, present means it is not.
+ *
+ * IT IS A BOOLEAN AND NOT THE KEY ITSELF, because nothing here paginates. The
+ * consumer is a cursor walk with a budget: it stops at the last stamp it can
+ * prove it saw whole and asks again on the next pass, which is a smaller and
+ * more interruptible thing than draining a range in one call. Handing it the
+ * key would offer a `ExclusiveStartKey` loop this deliberately does not have.
+ *
+ * A FULL PAGE REPORTS `more` TOO, AND THAT IS DYNAMODB'S BEHAVIOUR RATHER THAN
+ * A ROUNDING UP. A `Query` that stops because it reached `Limit` returns a
+ * `LastEvaluatedKey` whether or not anything is actually left, so `more` is
+ * "this page may have been cut short" and never "there is definitely another
+ * row". The caller wants exactly that reading — see the walk in
+ * src/incidents.ts, which holds one millisecond back on it.
+ */
+export interface IncidentPage {
+  readonly keys: readonly IncidentKey[]
+  /** `LastEvaluatedKey` came back: this page may not be the whole window. */
+  readonly more: boolean
 }
 
 /**
@@ -1059,6 +1220,44 @@ const AUDIT_PK = 'AUDIT'
  */
 const AUDIT_QUERY_CAP = 200
 
+/**
+ * The global secondary index on `ringmaster-incidents` that makes a case's
+ * OPENING findable — blitz-bot#19's second half.
+ *
+ * ═══ WHY AN INDEX AND NOT THE AUDIT LOG ═══
+ *
+ * THERE IS NO `incident.open` VERB AND THERE CANNOT BE ONE FROM WHERE THE WRITE
+ * HAPPENS. The game files cases straight into this table through br_ddb and the
+ * game box has no access to `ringmaster-audit` at all, so the trigger the
+ * resolved half walks simply does not exist for an opening. This table is the
+ * only record, and it is keyed on a random UUID with no ordering — hence an
+ * index, hence a poller that reads one.
+ *
+ * `kind` (S) + `openedAt` (N), PROJECTION `KEYS_ONLY`. The partition key has to
+ * be a low-cardinality attribute every row carries, and `kind` is the only one
+ * on this row that is both: `state` moves under the reader, `subjectLicense` is
+ * one partition per player. That choice is what makes `INCIDENT_KINDS` in
+ * src/incidents.ts a correctness constraint rather than a list — a query names
+ * ONE partition, so a `kind` nobody names is invisible with no error anywhere.
+ *
+ * IT MAY NOT EXIST YET, AND THAT IS THE INTERESTING STATE RATHER THAN AN EDGE.
+ * See `opened` and `no-such-index`.
+ */
+export const INCIDENT_KIND_INDEX = 'kind-openedAt-index'
+
+/**
+ * How many index rows one `opened` may return, whatever the caller asks for. The
+ * ceiling `AUDIT_QUERY_CAP` is for the other stream, and it is a separate number
+ * for that constant's own reason: they bound reads of two different tables
+ * through two different accessors, and agreeing today would be a coincidence.
+ *
+ * SMALLER THAN THE AUDIT CAP BECAUSE THE CALLER READS EVERY ROW IT KEEPS. An
+ * audit page is mostly rows its consumer throws away on `action`; every row this
+ * returns is a case the poller then spends a `GetItem` on, so a page it cannot
+ * process in one pass is a page it should not have asked for.
+ */
+const INCIDENT_QUERY_CAP = 50
+
 /* ------------------------------------------------------------------ */
 
 /**
@@ -1145,13 +1344,17 @@ export interface Ddb {
 
   incidents: {
     /**
-     * One case by id, or null. The only cheap read this table has.
+     * One case by id, or null. The only cheap read the BASE TABLE has.
      *
      * A `GetItem` AND NEVER A SCAN, which is not a preference here but the
      * shape of the interface: `DocumentClient` above has no `scan` and must not
      * gain one. The console's own module scans this table for its queue and
      * says in its comment what that costs and which two GSIs replace it; the
-     * bot never needs the queue, because the audit log hands it the id.
+     * bot never needs the queue.
+     *
+     * IT IS ALSO WHAT `opened` BELOW IS FOLLOWED BY, EVERY TIME. That query
+     * answers in index keys, so the case still has to be read here before
+     * anything about it can be rendered — see `IncidentKey`.
      *
      * STRONGLY CONSISTENT, ALONE AMONG THE READS IN THIS FILE. Its `state` is
      * what decides whether a permanent moderation record is posted, and the
@@ -1159,6 +1362,47 @@ export interface Ddb {
      * request.
      */
     get(incidentId: string): Promise<DdbResult<Incident | null>>
+
+    /**
+     * The cases of ONE kind opened in a closed window of `openedAt`, OLDEST
+     * FIRST, as index keys. See `INCIDENT_KIND_INDEX` and `IncidentKey`.
+     *
+     * A WINDOW WITH THE SAME TWO BOUNDS `AuditWindow.since` HAS, and the same
+     * meaning: `after` is exclusive, `until` is inclusive, so consecutive passes
+     * over `(cursor, until]` see every stamp exactly once. What it does NOT
+     * inherit is uniqueness — `ts` is half the audit table's primary key and
+     * `openedAt` is a GSI sort key, which DynamoDB does not require to be
+     * distinct. Two cases of one kind filed in the same millisecond are two rows
+     * at one stamp, and a caller that advances a cursor to a stamp it has not
+     * finished loses the rest of it. See the walk in src/incidents.ts.
+     *
+     * ONE KIND PER CALL, DELIBERATELY, BECAUSE THAT IS WHAT A GSI PARTITION IS.
+     * A `Query` addresses one partition key; there is no "any of these three"
+     * form short of a Scan, which this module does not have and must not gain.
+     * So the caller makes one call per kind and merges — and the fact that
+     * naming a kind is how you see it, and that not naming one is silent, is
+     * that caller's central problem rather than a detail of this signature.
+     *
+     * A FAILURE MAY BE `no-such-index`, WHICH IS THE STATE THIS SHIPPED IN. The
+     * index is created by hand (docs/aws-notes.md) and this code exists before
+     * it does; a caller that reports that as a generic read failure has told the
+     * owner his table is broken when what is actually true is that he has not
+     * created something yet. It may also be `index-backfilling`, which is the
+     * state the command that creates it leaves him in for a few minutes and is
+     * not a fault at all.
+     *
+     * AND WHAT COMES BACK IS AN `IncidentPage` RATHER THAN A LIST, so that the
+     * caller reads completeness off DynamoDB's own `LastEvaluatedKey` instead of
+     * inferring it from how many rows arrived. The two are different claims and
+     * a walk that confuses them advances its cursor over rows it never saw — see
+     * `IncidentPage`.
+     */
+    opened(
+      kind: IncidentKind,
+      after: number,
+      until: number,
+      limit?: number,
+    ): Promise<DdbResult<IncidentPage>>
   }
 
   audit: {
@@ -1291,6 +1535,8 @@ export function createDdb(options: DdbOptions = {}): DdbWithAuditWindow {
     op: DdbOp,
     table: string,
     run: (options: RequestOptions) => Promise<T>,
+    /** The index this call names, if it names one. See `classify`. */
+    index?: string,
   ): Promise<DdbResult<T>> {
     const controller = new AbortController()
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -1320,7 +1566,9 @@ export function createDdb(options: DdbOptions = {}): DdbWithAuditWindow {
         }
       }
 
-      if (settled.kind === 'error') return { ok: false, failure: classify(settled.error, op, table) }
+      if (settled.kind === 'error') {
+        return { ok: false, failure: classify(settled.error, op, table, index) }
+      }
       return { ok: true, value: settled.value }
     } finally {
       // Or a process that answered in two milliseconds keeps an event-loop
@@ -1799,7 +2047,7 @@ export function createDdb(options: DdbOptions = {}): DdbWithAuditWindow {
            * is the check that now catches this class before a deploy.
            *
            * THE CAST IS STILL A CAST, and it is now a narrower claim: that the
-           * console writes these nine attributes with these types. A field
+           * console writes these ten attributes with these types. A field
            * arriving missing is drift between two repositories, which is the
            * same bet every other console row in this file makes.
            */
@@ -1840,13 +2088,79 @@ export function createDdb(options: DdbOptions = {}): DdbWithAuditWindow {
                */
               ConsistentRead: true,
               ProjectionExpression:
-                'incidentId, #state, kind, category, subjectLicense, subjectName, resolvedAt, resolvedByName, verdict',
+                'incidentId, #state, kind, category, subjectLicense, subjectName, openedAt, resolvedAt, resolvedByName, verdict',
               ExpressionAttributeNames: { '#state': 'state' },
             },
             o,
           )
           return (res.Item as Incident | undefined) ?? null
         })
+      },
+
+      /**
+       * One kind's window of `INCIDENT_KIND_INDEX`. See `Ddb.incidents.opened`.
+       *
+       * `BETWEEN` AND `after + 1` FOR `AuditWindow.since`'S REASON: DynamoDB's
+       * `BETWEEN` is inclusive at both ends and has no exclusive form, and
+       * `openedAt` is a whole number of milliseconds wherever it is written
+       * (`int(payload.openedAt) ?? now` in br_ddb), so `after + 1` is the next
+       * key that CAN exist rather than an approximation of one.
+       *
+       * AN EMPTY WINDOW IS NOT SENT TO DYNAMODB, also for that function's reason:
+       * a caught-up poller asks for `(t, t]` on every kind on every pass, and
+       * three billed reads a half-minute for a range that cannot contain
+       * anything is a bill rather than a check.
+       *
+       * NO `ProjectionExpression`, WHICH IS NOT AN OMISSION. The index is
+       * `KEYS_ONLY`, so the three attributes on `IncidentKey` are all it holds
+       * and all that can come back; asking for a subset of three keys would be a
+       * second place for the projection to drift from the type.
+       *
+       * NEITHER `kind` NOR `openedAt` IS A DYNAMODB RESERVED WORD, so neither
+       * needs a `#` placeholder — checked against the list of 573 in
+       * scripts/check-ddb-expressions.ts, which is also what checks this string
+       * on every `verify.sh`.
+       *
+       * THE INDEX NAME IS PASSED TO `call` AS WELL AS TO THE REQUEST. That is
+       * what turns AWS's `ValidationException` for an index that does not exist
+       * into `no-such-index` — and the one for an index that is still filling
+       * into `index-backfilling` — instead of a generic `error`. See `classify`.
+       *
+       * `LastEvaluatedKey` IS FORWARDED AS `more` AND IS NOT LOOPED ON HERE. It
+       * is the only thing that says whether this page is the whole window, and
+       * the caller needs the answer rather than the pagination — see
+       * `IncidentPage`.
+       */
+      opened(kind, after, until, limit = INCIDENT_QUERY_CAP) {
+        if (until <= after) {
+          // Nothing was asked, so nothing was cut short: `more` is false rather
+          // than unknown. See `IncidentPage`.
+          return Promise.resolve({ ok: true as const, value: { keys: [], more: false } })
+        }
+
+        return call(
+          'query',
+          tables.incidents,
+          async (o) => {
+            const res = await doc.query(
+              {
+                TableName: tables.incidents,
+                IndexName: INCIDENT_KIND_INDEX,
+                KeyConditionExpression: 'kind = :kind AND openedAt BETWEEN :from AND :to',
+                ExpressionAttributeValues: { ':kind': kind, ':from': after + 1, ':to': until },
+                // Forwards, because a cursor is only ever advanced in order.
+                ScanIndexForward: true,
+                Limit: Math.max(1, Math.min(Math.floor(limit), INCIDENT_QUERY_CAP)),
+              },
+              o,
+            )
+            return {
+              keys: (res.Items ?? []) as IncidentKey[],
+              more: res.LastEvaluatedKey !== undefined,
+            }
+          },
+          INCIDENT_KIND_INDEX,
+        )
       },
     },
 
