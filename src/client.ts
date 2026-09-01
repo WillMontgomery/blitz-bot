@@ -2168,9 +2168,43 @@ export function createClient(config: Config): Client {
    * exemptions are actually running — see `renderManual`. `ManualConfig` is a
    * `Pick` of the three fields that decides, so this call hands over the whole
    * `Config` and the renderer can still only read those three.
+   *
+   * ═══ AND ONE LINE WHEN THE ID IS UNSET, WHICH IS WHAT THIS FEATURE GOT WRONG ═══
+   *
+   * "Nothing at all" used to include saying nothing at all, and that is the one
+   * silent way this bot could decide not to publish the manual. Every other way
+   * speaks: a file that is not there is a `warn`, a template that does not render
+   * and a document that does not parse or does not fit are `error`s, a channel
+   * that cannot be read is an `error`. An unset id was the only branch that left
+   * no trace anywhere, and it is the branch an operator lands on by ACCIDENT —
+   * docs/deploy.md's `.env` block omitted `BLITZ_DOCS_CHANNEL_ID` entirely until
+   * d5696c5, so an install done from that guide has the manual switched off and
+   * nothing on the box, in the journal or in the status channel says so. The
+   * channel members actually read can then be stale for a week while every
+   * signal this bot produces agrees that it is fine.
+   *
+   * `info`, DELIBERATELY, AND THE SECOND REASON IS THE BINDING ONE. An id nobody
+   * set is a configuration and not a fault — the bot is live today with several
+   * of these unset — so `warn` would put a line in the status channel on every
+   * restart about something nobody is going to do anything about, which is how
+   * `gateway reconnecting` taught this owner that the channel can be scrolled
+   * past. AND IT COULD NOT REACH HIM ANYWAY: this runs inside `createClient`, and
+   * index.ts installs the sink AFTER `createClient` returns, so `report` in
+   * src/log.ts has no sink to hand it to and drops the copy. A `warn` here would
+   * read like it went to Discord and would have gone to the journal alone.
+   *
+   * WHAT IT BUYS IS THAT THE SILENCE NOW MEANS SOMETHING. After this line, a
+   * start says either "no docs channel" or what went wrong with the manual, so a
+   * start that says nothing about the manual is a manual that is published and
+   * current. That is exactly the rule the quiet restart depends on, and until now
+   * there was no way to tell it apart from a feature that was never switched on.
    */
   if (config.docsChannelId !== null) {
     syncDocsChannel(client, config.docsChannelId, config)
+  } else {
+    log('info', 'no docs channel is configured, so the manual will not be published', {
+      variable: 'BLITZ_DOCS_CHANNEL_ID',
+    })
   }
 
   /**
@@ -3561,22 +3595,36 @@ export interface ManualEmbed {
  * gave back, verbatim. Comparing anything that had been through a renderer would
  * make every start a diff of two formattings and every restart an edit.
  *
- * NEITHER HALF OF THE `updated` STAMP IS HERE — not the word and not the time —
- * and the time is the half that matters. `stampedAt` is a fresh instant on every
- * start, so reading it back and comparing it would make every start differ from
- * the last one and rewrite the channel forever. It goes out only on a write,
- * which is what makes it a last-CHANGED stamp rather than a last-checked one.
+ * THE FOOTER TEXT IS HERE AND THE INSTANT BESIDE IT IS NOT, AND THAT SPLIT IS
+ * THE WHOLE OF THE RULE. `stampedAt` is a fresh moment on every start, so reading
+ * it back and comparing it would make every start differ from the last one and
+ * rewrite the channel forever. It goes out only on a write, which is what makes
+ * it a last-CHANGED stamp rather than a last-checked one. `footer` moves only
+ * when somebody edits the word, so it is compared like the title and the colour.
  *
- * THE WORD IS LEFT OUT ON THE SAME GROUNDS RATHER THAN BECAUSE IT MOVES. It is a
- * constant now and comparing it would be harmless today, which is exactly the
- * kind of harmless that stops being true the moment the footer carries anything
- * built per start again. The rule is that the stamp is not compared.
+ * THE WORD USED TO BE EXCLUDED AND THAT WAS RIGHT UNTIL IT WAS NOT. The footer
+ * was `updated ${new Date().toISOString()}` — the time lived IN the text, so it
+ * was different on every start and comparing it would have reposted the manual
+ * on every deploy and every crash. The instant moved to `stampedAt`, the text
+ * became the constant word, and the reason went with the ISO string.
+ *
+ * LEAVING IT OUT AFTER THAT COST A REAL DEFECT. The footer's wording changed and
+ * the owner's channel kept the old one — silently, and forever, because nothing
+ * in the comparison could see the difference. A published message that says
+ * something the code no longer says is exactly the drift this feature exists to
+ * prevent, and the footer was the one line of it nobody was watching.
+ *
+ * WHICH IS ALSO THE CONDITION ON ANY FOOTER AFTER THIS ONE. A per-start value put
+ * back into this text puts the channel back to rewriting itself on every restart;
+ * a value that moves per start belongs on `stampedAt`, which is not read back at
+ * all. Compare what the file decides, never what the clock does.
  */
 export interface PostedManual {
   readonly id: string
   readonly title: string
   readonly description: string
   readonly colour: number | null
+  readonly footer: string
 }
 
 /**
@@ -4391,9 +4439,14 @@ export function parseManual(markdown: string): Manual | null {
  * THE STAMP IS BUILT HERE AND ONLY REACHES DISCORD ON A WRITE. That is what
  * makes it a last-CHANGED stamp rather than a last-checked one: an unchanged
  * manual returns before this embed is ever handed to `post` or `edit`, so the
- * message keeps the moment of the edit that really happened. It is also why the
- * stamp is not part of the comparison — comparing it would make every start
- * differ from the last one and rewrite the channel forever.
+ * message keeps the moment of the edit that really happened. It is also why
+ * `stampedAt` is not part of the comparison — comparing it would make every
+ * start differ from the last one and rewrite the channel forever.
+ *
+ * THE FOOTER TEXT BESIDE IT *IS* COMPARED, and the two are not the same rule.
+ * The word below moves only when this line is edited, so a channel showing an
+ * older wording is a difference `unchanged` can see and one edit puts right. It
+ * is only the moment that has to stay out.
  *
  * THE TIME IS TAKEN HERE, AND HERE IS THE RIGHT PLACE ONLY BECAUSE OF THAT RULE.
  * `new Date()` in a builder means "whenever this object was constructed", which
@@ -4429,12 +4482,25 @@ export function manualEmbed(manual: Manual): ManualEmbed {
  * as the text. Leaving it out would let the code and the channel disagree about
  * how the manual looks, silently and forever, which is the drift this feature
  * exists to prevent.
+ *
+ * AND SO IS THE FOOTER TEXT, WHICH IS THE SAME ARGUMENT AND WAS THE EXCEPTION.
+ * It is a line of the published message like any other and it changes only when
+ * somebody edits the word, so a footer that no longer matches the code is a
+ * difference and is written. It was left out while the text carried the instant
+ * — `updated <ISO string>`, rebuilt every start — and comparing it then would
+ * have reposted the manual on every deploy; the instant is `stampedAt` now.
+ *
+ * `stampedAt` IS STILL NOT HERE AND CANNOT BE. It is a fresh moment on every
+ * start, so comparing it would make every start differ from the last one. That
+ * is the whole distinction: the footer's WORDING is compared, the moment drawn
+ * beside it is not, and a stamp that moves on every restart still writes nothing.
  */
 function unchanged(posted: PostedManual, embed: ManualEmbed): boolean {
   return (
     posted.title === embed.title &&
     posted.description === embed.description &&
-    posted.colour === embed.colour
+    posted.colour === embed.colour &&
+    posted.footer === embed.footer
   )
 }
 
@@ -4677,6 +4743,14 @@ interface DocsMessage {
 
     /** discord.js's spelling, at the one boundary that has to use it. */
     readonly color: number | null
+
+    /**
+     * The footer TEXT, and there is no `timestamp` beside it here on purpose:
+     * the instant is not read back and not compared (see `PostedManual`), so
+     * naming it at this boundary is the first step of the bug that comparison
+     * would be.
+     */
+    readonly footer: { readonly text: string } | null
   }[]
 
   readonly createdTimestamp: number
@@ -4795,13 +4869,27 @@ export function ours(messages: readonly DocsMessage[], selfId: string): PostedMa
 
       colour: embed.color,
 
+      // NULL IS WHAT DISCORD RETURNS FOR AN EMBED WITH NO FOOTER AT ALL, and it
+      // has to be a string here for the same reason the description does: the
+      // comparison is a plain equality and '' is never what `manualEmbed`
+      // builds. A message of ours carrying no footer is therefore a difference,
+      // which is right — it is a leftover, or a manual published before the
+      // footer existed, and either way the channel is out of date.
+      footer: embed.footer?.text ?? '',
+
       at: message.createdTimestamp,
     })
   }
 
   return mine
     .sort((a, b) => a.at - b.at)
-    .map(({ id, title, description, colour }) => ({ id, title, description, colour }))
+    .map(({ id, title, description, colour, footer }) => ({
+      id,
+      title,
+      description,
+      colour,
+      footer,
+    }))
 }
 
 /**

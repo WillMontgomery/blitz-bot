@@ -5,6 +5,7 @@ import {
   type APIEmbed,
   type ChatInputApplicationCommandData,
   type Client,
+  type MessageMentionOptions,
 } from 'discord.js'
 
 import type { Config } from '../config.ts'
@@ -484,9 +485,57 @@ export interface ReplyTarget {
     content?: string
     embeds?: readonly APIEmbed[]
     components?: readonly CommandComponentRow[]
+    allowedMentions?: MessageMentionOptions
   }) => Promise<unknown>
 
-  reply: (options: { content: string; flags?: MessageFlags.Ephemeral }) => Promise<unknown>
+  reply: (options: {
+    content: string
+    flags?: MessageFlags.Ephemeral
+    allowedMentions?: MessageMentionOptions
+  }) => Promise<unknown>
+}
+
+/**
+ * NOTHING A COMMAND ANSWERS WITH NOTIFIES ANYBODY, SAID AT THE SEND.
+ *
+ * ═══ A CODE SPAN IS NOT THE GUARD PEOPLE ASSUME IT IS ═══
+ *
+ * `/drain`'s reply carries an admin's note — somebody else's typed text, landing
+ * inside a sentence a reader takes to be the bot speaking — and `inert` in
+ * ./drain.ts wraps it in `` ` ` `` so that a link, a `<t:…>` or a `> quote` in
+ * it renders as characters instead of as markup. THAT IS A RENDERING RULE AND
+ * NOT A NOTIFICATION RULE. Discord decides who a message pings from the
+ * `allowed_mentions` field on the REQUEST, before any markdown is looked at:
+ * `@everyone` inside a code span is displayed literally AND still notifies the
+ * guild, exactly as it would bare. The span makes the note look inert, which is
+ * the reason to be explicit here rather than to rely on how it reads.
+ *
+ * ═══ AND THE CLIENT-WIDE DEFAULT IS BORROWED, NOT STATED ═══
+ *
+ * `createClient` in ../client.ts sets `allowedMentions: { parse: [] }` on the
+ * client and its own comment says what that is worth: a default is SILENTLY
+ * REPLACED by any call that passes an `allowedMentions` of its own, so what it
+ * guarantees is the sends that say nothing. A reader of this function cannot see
+ * whether it holds, and neither can a test of it — which is why ../maintenance.ts
+ * restates the same option at its own `send`, and why ../incidents.ts and
+ * ../sticky.ts do. This is the third such restatement and the argument has not
+ * changed: the guard belongs beside the thing it guards.
+ *
+ * ON BOTH SENDS, BECAUSE BOTH CARRY TEXT. `edit` is where every handler's answer
+ * goes out, `/drain`'s among them; `reply` is the refusal path, whose strings are
+ * this repo's own today and whose safety should not depend on that staying true.
+ *
+ * A FUNCTION RATHER THAN A SHARED CONSTANT, for the reason `payload` copies the
+ * embed array: nothing this bot hands discord.js is an object a later send also
+ * holds. It is two words of allocation on a path that is already making an HTTP
+ * request.
+ *
+ * `{ parse: [] }` AND NOT `escapeMarkdown` ANYWHERE NEAR IT. Suppression is the
+ * only thing that stops a notification; rewriting the text would change words an
+ * admin has to be able to compare against the console's copy of the same note.
+ */
+function noMentions(): MessageMentionOptions {
+  return { parse: [] }
 }
 
 /**
@@ -554,6 +603,12 @@ function visibility(onlyInvoker: boolean): { flags?: MessageFlags.Ephemeral } {
  * `BotCommand.onlyInvoker` is asked before the handler runs. `editReply` has no
  * flags of its own: whatever `deferReply` was told is what the finished reply
  * is, and passing `flags` to the edit would be ignored rather than honoured.
+ *
+ * THE TWO THAT CARRY TEXT ALSO CARRY `allowedMentions`, STATED HERE RATHER THAN
+ * INHERITED. See `noMentions` for why the client-wide default is not something
+ * this function may lean on, and for why `/drain`'s code span is not the thing
+ * that stops an `@everyone` in an admin's note. The defer carries no text and
+ * takes none.
  */
 export function responderFor(interaction: ReplyTarget): Responder {
   return {
@@ -562,11 +617,15 @@ export function responderFor(interaction: ReplyTarget): Responder {
     },
 
     edit: async (reply) => {
-      await interaction.editReply(payload(reply))
+      await interaction.editReply({ ...payload(reply), allowedMentions: noMentions() })
     },
 
     reply: async (content, onlyInvoker) => {
-      await interaction.reply({ content, ...visibility(onlyInvoker) })
+      await interaction.reply({
+        content,
+        ...visibility(onlyInvoker),
+        allowedMentions: noMentions(),
+      })
     },
   }
 }

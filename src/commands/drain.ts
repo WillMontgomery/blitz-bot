@@ -108,26 +108,84 @@ export interface DrainFields {
 }
 
 /**
+ * The console's own reason, closed off so the sentence carrying it ends.
+ *
+ * THE TWO REFUSAL FRAMES THAT QUOTE THE ROUTE PUT ITS WORDS LAST, which is the
+ * one thing that makes them different from every other frame in this file:
+ * `Nothing was scheduled. The console said: …` finishes on a string this repo
+ * did not write, and the route writes it both ways. `A maintenance window is
+ * already scheduled. Cancel it first.` arrives with its own full stop, and
+ * `nothing is scheduled` arrives with none — so a frame that only interpolates
+ * ships an unfinished sentence whenever the route happens to send the second
+ * kind, which is what an admin read.
+ *
+ * THE FULL STOP IS THE BOT'S AND IS ADDED ONLY WHERE THE REASON DID NOT BRING
+ * ONE. Nothing else is touched: not a word of it, not its opening capital or
+ * lack of one, and not a `.` `!` `?` or `…` it already ends with. That is the
+ * same rule the frames themselves follow — this command cannot see what the
+ * route looked at and must not paraphrase it — narrowed to the single character
+ * that decides whether the BOT's sentence is finished.
+ *
+ * `trimEnd` SO THE STOP LANDS AGAINST THE LAST WORD rather than after a space.
+ * `detail` reaches here through `str` in ../ringmaster.ts, which trims and
+ * refuses an empty string, so this is belt on a value that is already clean.
+ */
+function ended(reason: string): string {
+  const said = reason.trimEnd()
+
+  return /[.!?…]$/u.test(said) ? said : `${said}.`
+}
+
+/**
  * EVERY STRING `/drain` CAN SAY, IN ONE RECORD, under the rule ./command.ts
  * sets: a member-visible sentence lives here so that changing one is one edit
  * to one object.
  *
- * ═══ THE `PLACEHOLDER:` MARKER IS GONE, AND THE SENTENCES ARE THE OWNER'S ═══
+ * ═══ REMOVING THE MARKER WAS NOT THE SAME AS SUPPLYING THE WORDS ═══
  *
  * These were written as marked stand-ins, each one led by a literal
  * `PLACEHOLDER:` so that shipping one by accident was obvious in the channel
  * rather than invisible. He then ran the command and read them: "remove
  * PLACEHOLDER: from all text please. The verbiage otherwise looks great."
  *
- * SO THE MARKER WAS DELETED AND NOTHING ELSE WAS. Not a word after the colon
- * moved, and none was recapitalised — he approved the sentences AS THEY READ,
- * and an "improvement" made while removing a prefix is an edit he did not ask
- * for and cannot see in a diff he reviewed as a deletion.
+ * THE MARKER WAS DELETED FROM STRINGS THAT WERE STILL STAND-INS, and two of
+ * them said so in their own words. `scheduledLead` read "no wording supplied
+ * yet for a window that was scheduled." and `cancelled` read "no wording
+ * supplied yet for a window that was called off." Stripping the prefix did not
+ * make those sentences his — it only stopped them announcing what they were,
+ * and the first line a real admin saw on a real `/drain start` was a stand-in
+ * telling him no wording had been supplied. The lesson is that the marker was
+ * the alarm and not the fault: a string with no owner's words in it is unshipped
+ * whether or not it is labelled.
+ *
+ * SO THE SENTENCES BELOW ARE HIS, SUPPLIED AFTER HE READ THAT REPLY. The lead
+ * is GONE rather than reworded — he wrote the start reply as three sentences
+ * and none of them introduces the other two — and `cancelled` is his sentence.
+ * The two fallbacks he named, for a console that did not say when the door
+ * closes or what the note is, are kept and put into the same voice.
+ *
+ * TWO STRINGS HERE ARE NEITHER HIS NEW WORDING NOR STAND-INS: `deployAtTime`
+ * and `deployModeUnknown`. He gave one restart sentence, for the mode this
+ * command asks for, and the other two branches keep the words he approved
+ * before with nothing changed but the capital they now need mid-paragraph. They
+ * are flagged where they are declared, because a sentence he has not read in
+ * its new company is a thing to ask about rather than to rewrite.
  *
  * THE FACTS INSIDE THE FRAMES WERE ALWAYS REAL. `scheduled` and the refusals
  * interpolate the drain time the console returned and the console's own reason,
  * because the one thing this command must do is state plainly what is about to
  * happen and when.
+ *
+ * AND THE REFUSALS ARE SENTENCES TOO, WHICH THEY WERE NOT WHEN THE FOUR SUCCESS
+ * FRAMES WERE FIXED. They were written when the reply had a lead in front of it,
+ * so each one opened lowercase and ran on from a clause that no longer exists —
+ * `nothing was scheduled. The console said: a window is already open`, sent to
+ * an admin as the whole message. That is the same fault the four lines had, in
+ * the branch nobody re-read, and it is the second screenshot of unfinished-
+ * looking text the owner has sent. What they SAY is unchanged; they open with a
+ * capital and they close with a full stop, which for the two that end on the
+ * console's own words means `ended` rather than a period glued onto somebody
+ * else's sentence. See there.
  *
  * THE DESCRIPTIONS ARE MINE RATHER THAN HIS, for the reason /sticky's are:
  * Discord requires a description on a command, on a subcommand and on an
@@ -152,36 +210,81 @@ export const COPY = {
    */
   startPlaceholderName: DRAIN_START_SUBCOMMAND,
 
-  /** The reply's frames. */
-  scheduledLead: 'no wording supplied yet for a window that was scheduled.',
-  doorClosesAt: (at: string) => `the server stops accepting players ${at}.`,
-  doorClosesUnknown: 'the console did not say when the server stops accepting players.',
+  /**
+   * The three sentences of the start reply, in the order they are spoken.
+   *
+   * ONE PARAGRAPH AND NOT FOUR LINES. `scheduledReply` joins these with a
+   * SPACE, and the reason is his, said three times: multi-line replies "look so
+   * weird" and he asked for flowing sentences. So each of these is a whole
+   * sentence — capital at the front, full stop at the back — because a fragment
+   * that only worked as its own line reads as a stumble once the newline is
+   * gone. The one that ended without a full stop was `doorNote`, which is why
+   * its period is now inside the frame rather than left to the layout.
+   */
+  doorClosesAt: (at: string) => `The server stops accepting players at ${at}.`,
+  doorClosesUnknown: 'The console did not say when the server stops accepting players.',
   deployWhenEmpty:
-    'it restarts on its own once the last match finishes, and everybody still playing is dropped then.',
-  deployAtTime: (at: string) => `it restarts at ${at}, ending any match still running.`,
-  deployModeUnknown: 'the console did not say what triggers the restart. Check the console.',
-  doorNote: (note: string) => `players who try to join are told: ${note}`,
-  doorNoteUnknown: 'the console did not say what players at the door are told.',
+    'It restarts on its own once the last match finishes, and anyone still playing is dropped then.',
 
-  cancelled: 'no wording supplied yet for a window that was called off.',
+  /**
+   * THE OTHER TWO RESTART BRANCHES, AND HE HAS NOT WORDED THESE TWO. He supplied
+   * the `when-empty` sentence above, which is the mode this command asks for and
+   * the only one he has ever been shown. These keep the words he approved
+   * before, recapitalised for their place in the paragraph and not otherwise
+   * touched — see the head of this record. They are not stand-ins and they must
+   * not be marked as any: they are real sentences awaiting a second opinion,
+   * and a `PLACEHOLDER:` on them would ship the marker to an admin the day the
+   * console answers `at-time`.
+   */
+  deployAtTime: (at: string) => `It restarts at ${at}, ending any match still running.`,
+  deployModeUnknown: 'The console did not say what triggers the restart. Check the console.',
 
-  /** The refusals. The console's own words follow each of these, unedited. */
-  refused: (reason: string) => `nothing was scheduled. The console said: ${reason}`,
-  cancelRefused: (reason: string) => `nothing was cancelled. The console said: ${reason}`,
+  doorNote: (note: string) => `Players who try to join are told: ${note}.`,
+  doorNoteUnknown: 'The console did not say what players at the door are told.',
+
+  cancelled: 'The maintenance window has been called off. The server is accepting players again.',
+
+  /**
+   * The refusals. The console's own words follow each of these, unedited.
+   *
+   * EVERY ONE OF THEM IS A WHOLE SENTENCE, for the reason the three start
+   * sentences are — see the head of this record. There is no lead in front of
+   * them and there has not been one for two changes now, so a lowercase opening
+   * is not a continuation of anything: it is the first character an admin reads.
+   *
+   * THE TWO THAT QUOTE THE ROUTE END ON WORDS THIS FILE DID NOT WRITE, which is
+   * why their full stop goes through `ended` instead of being typed into the
+   * frame. `A maintenance window is already scheduled. Cancel it first.` brings
+   * its own; `nothing is scheduled` does not, and a template that assumed either
+   * way is wrong half the time. The other five end on this file's own clause and
+   * need nothing.
+   */
+  refused: (reason: string) => `Nothing was scheduled. The console said: ${ended(reason)}`,
+  cancelRefused: (reason: string) => `Nothing was cancelled. The console said: ${ended(reason)}`,
   denied: (code: string) =>
-    `the console would not accept this call and answered "${code}". An operator has to look at this.`,
+    `The console would not accept this call and answered "${code}". An operator has to look at this.`,
   notConfigured:
-    'the console has no command credential set, so it cannot take this. An operator has to look at this.',
+    'The console has no command credential set, so it cannot take this. An operator has to look at this.',
   unreachable: (detail: string) =>
-    `the console did not answer, so nothing is known to have happened: ${detail}. Run this again.`,
+    `The console did not answer, so nothing is known to have happened: ${detail}. Run this again.`,
   unavailable: (detail: string) =>
-    `the console answered but could not do this: ${detail}. Run this again in a moment.`,
-  unknown: (detail: string) => `the console's answer could not be read: ${detail}. Check the console.`,
+    `The console answered but could not do this: ${detail}. Run this again in a moment.`,
+  unknown: (detail: string) => `The console's answer could not be read: ${detail}. Check the console.`,
 
   /** And the two ways this command can fail before it asks anything. */
-  noCredential: 'this bot has no command credential, so it cannot ask the console for anything.',
-  noSubcommand: `it is not clear whether you meant \`/drain ${DRAIN_START_SUBCOMMAND}\` or \`/drain ${DRAIN_CANCEL_SUBCOMMAND}\`, so nothing was done.`,
+  noCredential: 'This bot has no command credential, so it cannot ask the console for anything.',
+  noSubcommand: `It is not clear whether you meant \`/drain ${DRAIN_START_SUBCOMMAND}\` or \`/drain ${DRAIN_CANCEL_SUBCOMMAND}\`, so nothing was done.`,
 }
+
+/**
+ * The Discord timestamp style every instant in this reply is rendered with.
+ *
+ * ONE CONSTANT SO THE DOOR AND THE RESTART CANNOT DRIFT INTO TWO STYLES. They
+ * are two instants in one paragraph, and a relative one standing beside an
+ * absolute one reads as two different kinds of fact. See `at` for why it is
+ * this letter and not `R`.
+ */
+const TIMESTAMP_STYLE = 't'
 
 /**
  * An instant as Discord renders one, or null.
@@ -197,13 +300,132 @@ export const COPY = {
  * milliseconds renders a date fifty thousand years out, which looks like a bug
  * in the server rather than in the message.
  *
- * `R` — RELATIVE — BECAUSE "in 3 minutes" IS THE THING BEING ASKED. `/drain`
- * closes the door immediately, so an absolute clock time reads as a schedule
- * for later; the relative form says "now" when it is now.
+ * ═══ `t` — SHORT TIME — AND `R` WAS A BUG RATHER THAN A TASTE ═══
+ *
+ * IT USED TO BE `R`, RELATIVE, ON THE ARGUMENT THAT "in 3 minutes" IS THE THING
+ * BEING ASKED. What an admin actually read was `The server stops accepting
+ * players a minute ago.` — A PRESENT-TENSE VERB WELDED TO A PAST-TENSE STAMP,
+ * in one sentence, contradicting itself.
+ *
+ * AND IT WAS NOT A RACE THAT NEEDED LOSING. `/drain` closes the door
+ * immediately, so `drainStartsAt` is at most seconds in the future when the
+ * reply is composed and is in the PAST for the entire rest of the message's
+ * life. Discord re-renders `R` live, in the reader's client, forever: this
+ * reply is ephemeral but it sits on screen as long as the admin leaves it
+ * there, and every second of that it reads more wrongly than the last. A stamp
+ * whose truth expires cannot go in a sentence whose tense does not.
+ *
+ * `t` IS A CLOCK TIME — `16:20` — AND NOT A DATE. Of the styles Discord has,
+ * `d`/`D` are dates with no time on them, `f`/`F` are a full date AND time, and
+ * `T` is a clock time with the seconds shown. `t` is the one that says what
+ * hour and minute the door shuts and nothing else, which is what the sentence
+ * around it needs: the window is minutes away, so naming the day would be
+ * saying something nobody asked and the seconds would be false precision on a
+ * value the console rounds anyway.
+ *
+ * IT IS STILL RENDERED IN THE READER'S OWN TIMEZONE, which is the whole reason
+ * this is markup rather than a formatted date — see above. Absolute here means
+ * "a fixed instant", not "in the bot's timezone".
  */
 function at(ms: number | null): string | null {
   if (ms === null) return null
-  return `<t:${Math.floor(ms / 1000)}:R>`
+  return `<t:${Math.floor(ms / 1000)}:${TIMESTAMP_STYLE}>`
+}
+
+/**
+ * A string cut to a budget without splitting a character in half.
+ *
+ * CUT ON CODE POINTS, because a UTF-16 slice can land in the middle of a
+ * surrogate pair and leave half a character in the reply. Lifted, with its
+ * reason, from `cut` in ../incidents.ts.
+ */
+function cut(line: string, cap: number): string {
+  if (line.length <= cap) return line
+
+  const room = Math.max(1, cap - 1)
+  let kept = ''
+  for (const point of line) {
+    if (kept.length + point.length > room) break
+    kept += point
+  }
+
+  return `${kept}…`
+}
+
+/**
+ * THE NOTE, RENDERED AS ITSELF AND AS NOTHING ELSE.
+ *
+ * ═══ THIS IS ../incidents.ts's `inert`, AND IT IS COPIED RATHER THAN CALLED ═══
+ *
+ * NOT A THIRD OPINION ABOUT ESCAPING — THE SAME ONE. `inert` in ../incidents.ts
+ * is module-private, and that file is not this agent's to edit, so it cannot be
+ * imported today. Everything below is its construction and its reasoning, and
+ * the day one of the two is exported the other should be deleted into it. READ
+ * THAT ONE FOR THE FULL ARGUMENT; the short version follows, because a copy
+ * that does not say why it is shaped this way gets "simplified" back into a
+ * hole.
+ *
+ * ═══ WHAT THE NOTE IS ═══
+ *
+ * IT IS THE ONLY PART OF THIS REPLY THIS REPO DID NOT WRITE. It is typed by an
+ * admin, or generated by the console, and it lands inside a sentence — `Players
+ * who try to join are told: …` — which a reader takes to be the bot speaking.
+ * A note of `[Appeal your ban here](https://not-the-console.example)` puts a
+ * live, official-looking link in a bot message; `<t:0:t>` forges a second
+ * timestamp beside the real one; `> quoted`, `||spoilers||` and a backtick
+ * restructure the paragraph the previous four lines were just flattened into;
+ * and a bare `https://…` needs no markup at all, because Discord linkifies a
+ * url on sight.
+ *
+ * A CODE SPAN AND NOT `escapeMarkdown`, WHICH IS A MEASUREMENT AND NOT A TASTE.
+ * discord.js's escaper leaves `> quoted`, `<t:…>` and every other entity form,
+ * `@everyone`, and a bare url exactly as it found them — see ../incidents.ts.
+ * Inside `` ` ` `` Discord renders all of those literally and linkifies
+ * nothing, and it does it without spraying backslashes through words an admin
+ * has to compare against the console's copy of the same note.
+ *
+ * AND IT IS ALSO WHAT KEEPS THE REPLY ON ONE LINE. `\s+` → one space runs over
+ * newlines, so a note with a line break in it cannot put the last third of this
+ * paragraph on a second line — which is the shape he has asked three times not
+ * to be sent. The whole-reply guarantee is asserted in ./drain.test.ts and this
+ * is the only place a newline could enter.
+ *
+ * A BACKTICK IS REMOVED BECAUSE IT WOULD CLOSE THE SPAN and let the rest out as
+ * markup. `\p{C}` — control codes, zero-width joiners, the bidi overrides that
+ * reorder what a human reads without changing a stored byte — goes with it.
+ * `@` AND `<` ARE KEPT: they are inert inside the span, they are ordinary
+ * characters in a sentence a person wrote for players, and this string is shown
+ * beside the console's own copy of the same note.
+ *
+ * `DRAIN_NOTE_CAP` IS THE BUDGET, WHICH IS THE CONSOLE'S OWN LIMIT ON THIS
+ * FIELD — so a note that passed its schema is never cut here, and a console
+ * answering with something far longer cannot spend a Discord message on it. The
+ * two backticks sit OUTSIDE the budget rather than inside it, which is the one
+ * way this differs from ../incidents.ts: there the cap is an embed field's
+ * 1024 and the backticks count against it, here the message's 2000 is nowhere
+ * near binding.
+ *
+ * EMPTY IS THE SAME ANSWER AS ABSENT, and the caller says "the console did not
+ * say" instead. A note that is nothing but backticks leaves nothing to put in a
+ * span, and an empty pair of them reads as a fact that failed to load.
+ *
+ * IT TAKES `unknown` AND REFUSES ANYTHING THAT IS NOT A STRING. The note comes
+ * off a JSON body another service writes, so `string | null` is a claim rather
+ * than a fact, and a numeric one would otherwise throw `.replace is not a
+ * function` in the middle of composing a reply about a server that is going
+ * down.
+ */
+function inert(text: unknown): string | null {
+  if (typeof text !== 'string') return null
+
+  const flattened = text
+    .replace(/\s+/gu, ' ')
+    .replace(/[`\p{C}]/gu, '')
+    .trim()
+
+  if (flattened === '') return null
+
+  return `\`${cut(flattened, DRAIN_NOTE_CAP)}\``
 }
 
 /**
@@ -232,23 +454,40 @@ function scheduledReply(window: DrainWindow): string {
         ? COPY.deployAtTime(deployAt)
         : COPY.deployModeUnknown
 
+  /**
+   * THE NOTE IS ECHOED BACK SO THE ADMIN SEES WHAT PLAYERS WILL SEE, which is
+   * the one thing about this window they cannot check anywhere else without
+   * opening the console. It is their own text, or the console's generated one,
+   * and not a word of it is rewritten.
+   *
+   * IT IS THE ONE VALUE HERE THIS REPO DID NOT WRITE, so it goes through
+   * `inert` — which renders it exactly as it was typed and renders it as
+   * nothing else. An unreadable or empty one is named rather than printed as an
+   * empty pair of backticks. See `inert`.
+   */
+  const note = inert(window.note)
+
+  /**
+   * ONE PARAGRAPH. JOINED WITH A SPACE, AND THERE IS NO NEWLINE IN THIS FILE.
+   *
+   * THIS USED TO BE `join('\n')` AND IT SHIPPED AS FOUR LINES. He has said
+   * three times that multi-line replies "look so weird" and asked for flowing
+   * sentences, so the separator is the one thing here that is not negotiable —
+   * and it is the reason `inert` flattens the note's own whitespace, because
+   * the only newline that could still reach this string would arrive inside
+   * somebody else's text. ./drain.test.ts asserts the absence over the whole
+   * reply rather than over this line, so a newline smuggled into any frame
+   * fails there.
+   *
+   * AND THE LEAD IS GONE RATHER THAN REWORDED. The four lines opened with a
+   * stand-in that told a real admin no wording had been supplied; the reply he
+   * then wrote is these three sentences and it introduces itself.
+   */
   return [
-    COPY.scheduledLead,
     closes === null ? COPY.doorClosesUnknown : COPY.doorClosesAt(closes),
     restart,
-    /**
-     * THE NOTE IS ECHOED BACK SO THE ADMIN SEES WHAT PLAYERS WILL SEE, which is
-     * the one thing about this window they cannot check anywhere else without
-     * opening the console. It is their own text, or the console's generated
-     * one, and it is not re-wrapped or trimmed here.
-     *
-     * MARKDOWN IN IT REACHES NOBODY ELSE. This reply is ephemeral — only the
-     * person who ran the command is shown it — so a note containing a mention
-     * or a code fence is a formatting oddity in one private message rather than
-     * a thing the guild sees.
-     */
-    window.note === null ? COPY.doorNoteUnknown : COPY.doorNote(window.note),
-  ].join('\n')
+    note === null ? COPY.doorNoteUnknown : COPY.doorNote(note),
+  ].join(' ')
 }
 
 /**

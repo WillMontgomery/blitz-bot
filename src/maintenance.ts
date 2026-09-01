@@ -279,6 +279,11 @@ function parseMark(raw: string): Mark | null {
  * row and an address off the allowlist, and the one frame that has no wording
  * from him yet says so in the string itself; see `NOT_BACK`.
  *
+ * HIS LAST CLAUSE IS THE ADDRESS ITSELF AND NOT HIS LINK TEXT, which is the one
+ * place the post departs from the quote above — "Click here to connect" is not in
+ * the message. Discord printed his markdown as literal brackets in a live cycle;
+ * see `connectLink`, which carries what was seen.
+ *
  * ═══ ONE FLOWING PARAGRAPH. THE NEWLINES ARE NOT TO BE PUT BACK ═══
  *
  * He asked twice why the old notices were "wrapped on multiple lines. That looks
@@ -302,25 +307,35 @@ function parseMark(raw: string): Mark | null {
 const BACK = 'The game server is back up and maintenance is complete.'
 
 /**
- * The connect link, in his markdown as well as his words.
+ * The connect link, as a bare url.
  *
- * ═══ THE ONE THING IN THIS NOTICE NOBODY CAN SETTLE OFFLINE ═══
+ * ═══ THE MASKED FORM SHIPPED FOR ONE CYCLE AND DID NOT RENDER ═══
  *
  * HE WROTE IT AS A MASKED LINK — "[Click here to connect](fivem:// hyperlink)" —
- * AND IT SHIPS THAT WAY ON PURPOSE. Discord documents the masked-link scheme
- * allowlist as http, https and discord, and rejects a custom scheme in an EMBED
- * and in a BUTTON COMPONENT. Whether `fivem://` behind `[text](…)` renders in
- * PLAIN MESSAGE CONTENT, which is what this is, is documented neither way. An
- * earlier version of this file asserted flatly that it does not and cited the
- * embed rule as the proof, which is a rule about a different surface.
+ * SO THAT IS WHAT WENT OUT, AND THIS IS WHAT CAME BACK. The owner posted the
+ * live message:
  *
- * SO THE FIRST CYCLE ANSWERS THE QUESTION AND THE FALLBACK IS ONE EXPRESSION.
- * If it renders as literal brackets he sees it in the channel immediately, and
- * the whole fix is the return below becoming `fivem://connect/${serverIp}` — a
- * bare url, which IS clickable in message content and does launch the game.
- * Nothing else in the notice moves. That is the reason the link is a function of
- * its own rather than spelled into the sentence: the change has to be small
- * enough to make on the evidence of one post.
+ *   The game server is back up and maintenance is complete. The server is now
+ *   running 2e880268. [Click here to connect](fivem://connect/3.130.92.28).
+ *
+ * The brackets and the parentheses were printed as characters a player reads.
+ * AND `2e880268` IN THE SAME SENTENCE WAS A WORKING LINK — `commitLink` built it
+ * the same way, out of the same `[text](url)` — which is what makes the reading
+ * unambiguous rather than a guess about one bad post. Markdown itself is fine in
+ * plain message content; the only thing separating the two links in that message
+ * is the scheme.
+ *
+ * SO DISCORD'S MASKED-LINK ALLOWLIST — http, https and discord — IS NOT A RULE
+ * ABOUT EMBEDS AND BUTTON COMPONENTS. It applies to plain message content too.
+ * This file used to call that documented neither way, and an earlier version of
+ * it asserted the outcome while citing the embed rule as its proof — the right
+ * answer resting on a rule about a different surface. It is settled by
+ * observation now, and that is the point of writing the message down here:
+ * nobody has to run the experiment again to change this line back.
+ *
+ * A BARE URL IS CLICKABLE IN MESSAGE CONTENT AND DOES LAUNCH THE GAME, which is
+ * the whole of the fix — the link text becomes the address and nothing else in
+ * the notice moves. That is what the link being a function of its own was for.
  *
  * THE ADDRESS COMES FROM THE ALLOWLIST AND NOT FROM A LITERAL HERE. `connectIp`
  * reads the head of `BLITZ_SERVER_IPS`, which links.ts already uses to decide
@@ -328,7 +343,7 @@ const BACK = 'The game server is back up and maintenance is complete.'
  * the copy that does not get updated the day the community moves boxes.
  */
 function connectLink(serverIp: string): string {
-  return `[Click here to connect](fivem://connect/${serverIp})`
+  return `fivem://connect/${serverIp}`
 }
 
 function backUp(window: MaintenanceWindow, serverIp: string): string {
@@ -487,8 +502,10 @@ const GAME_REPO_URL = 'https://github.com/WillMontgomery/fivem-br-gamemode'
  *
  * "SAME FOR THE BUILD HASH BEING A HYPERLINK", which is a standing rule rather
  * than a request about one notice. A MASKED LINK WORKS HERE BECAUSE THE SCHEME IS
- * https: Discord's own allowlist covers it, so unlike the connect link two
- * functions up there is nothing uncertain about this one rendering.
+ * https: Discord's own allowlist covers it, and this one has been seen rendering
+ * as a link in a real message — the same message in which the connect link two
+ * functions up printed as literal brackets. See `connectLink`: the scheme is the
+ * whole of the difference between them.
  *
  * ONLY A VALUE THAT IS CERTAINLY A COMMIT IS LINKED, and everything else is
  * printed exactly as `shortSha` would print it. `runningSha` can return a value

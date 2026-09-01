@@ -185,7 +185,7 @@ function confirmedRow(overrides: Partial<MaintenanceWindow> & RowExtras = {}): M
  * happened to say, including a version somebody rephrased.
  */
 const BACK = 'The game server is back up and maintenance is complete.'
-const connectTo = (ip: string): string => `[Click here to connect](fivem://connect/${ip})`
+const connectTo = (ip: string): string => `fivem://connect/${ip}`
 const BACK_UP = `${BACK} ${connectTo('3.130.92.28')}.`
 
 /** Where a commit in a maintenance notice has to point. NOT this bot's repo. */
@@ -385,7 +385,7 @@ describe('the outage — the one thing this bot says', () => {
     expect(at(watch.post, 0)).toBe(
       'The game server is back up and maintenance is complete. ' +
         `The server is now running [a1b2c3d4](${GAME_COMMIT}${LANDED}). ` +
-        '[Click here to connect](fivem://connect/3.130.92.28).',
+        'fivem://connect/3.130.92.28.',
     )
   })
 
@@ -409,27 +409,32 @@ describe('the outage — the one thing this bot says', () => {
   })
 
   /**
-   * ═══ THE CONNECT LINK IS A MASKED LINK, WHICH IS THE ONE OPEN QUESTION ═══
+   * ═══ THE CONNECT LINK IS A BARE URL, AND A REAL MESSAGE IS WHY ═══
    *
-   * HE WROTE IT THAT WAY — "[Click here to connect](fivem:// hyperlink)" — AND IT
-   * SHIPS THAT WAY. Discord documents the masked-link scheme allowlist as http,
-   * https and discord, and rejects a custom scheme in an EMBED and in a BUTTON
-   * COMPONENT; whether it renders in PLAIN MESSAGE CONTENT, which is what this
-   * is, is documented neither way. An earlier version of this file asserted the
-   * opposite — that the markdown form cannot work — and cited the embed rule for
-   * it, which is a rule about a different surface.
+   * HE WROTE IT AS A MASKED LINK — "[Click here to connect](fivem:// hyperlink)"
+   * — so that is what shipped, and the owner posted what came out of it:
    *
-   * IF IT COMES OUT AS LITERAL BRACKETS HE SEES IT ON THE FIRST CYCLE, and the
-   * fix is `connectLink` returning `fivem://connect/${serverIp}` instead: a bare
-   * url, which is clickable in message content. That is one expression, and this
-   * assertion and the constant above it are what would change with it.
+   *   The game server is back up and maintenance is complete. The server is now
+   *   running 2e880268. [Click here to connect](fivem://connect/3.130.92.28).
+   *
+   * The brackets and parentheses printed as characters. `2e880268` in the same
+   * sentence was a working link, built the same `[text](url)` way by
+   * `commitLink` — so markdown is fine in plain message content and the scheme
+   * is the whole of the difference. Discord's masked-link allowlist is not a
+   * rule about embeds and buttons only; it covers message content too.
+   *
+   * SO THIS PINS THE BARE FORM AND FAILS IF ANYONE WRAPS IT BACK UP. The second
+   * assertion is a shape and not the old label: a re-wrap under any text at all
+   * is the same mistake, and it is one nobody should have to learn from a second
+   * live cycle.
    */
-  it('offers the connect link as the masked link he wrote', async () => {
+  it('offers the connect link as a bare url, never masked', async () => {
     const watch = watcher([ok(confirmedRow())], { seen: mark('deploying') })
 
     await watch.check()
 
-    expect(at(watch.post, 0)).toContain('[Click here to connect](fivem://connect/3.130.92.28)')
+    expect(at(watch.post, 0)).toContain('fivem://connect/3.130.92.28')
+    expect(at(watch.post, 0)).not.toMatch(/\[[^\]]*\]\(fivem:/u)
   })
 
   /**

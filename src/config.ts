@@ -276,26 +276,73 @@ const required = z
   .min(1, 'set but empty')
 
 /**
+ * A Discord snowflake.
+ *
+ * COPIED FROM THE CONSOLE'S `SNOWFLAKE` IN lib/service.ts, DIGIT RULE AND ALL —
+ * `[0-9]{1,32}` rather than the seventeen-to-nineteen ids are today. That file
+ * explains why at length and the reasoning carries over unchanged: the format is
+ * documented to grow, and a second, stricter opinion about the same value in the
+ * same system is a bug waiting for the year the digit count changes.
+ *
+ * IT NOW APPLIES TO EVERY ID IN THIS FILE, AND USED TO APPLY TO ONE.
+ * `idWithDefault` ran it; `optionalId` and `idList` took any non-empty string. So
+ * `BLITZ_DOCS_CHANNEL_ID=#bot-docs` — or the same id with a stray space around it,
+ * or a smart quote picked up somewhere between a phone and an SSH session — loaded
+ * as a perfectly good non-null value and failed much later at `channels.fetch`, as
+ * an error about a channel that cannot be read. That sends the operator into
+ * Discord's permission settings for a fault that is in his own `.env`.
+ *
+ * THE HAND-TYPED VALUE IS THE ORDINARY CASE HERE, NOT THE EXOTIC ONE. The `.env`
+ * on the box is filled in by hand: docs/deploy.md ships a heredoc that a person
+ * copies and then completes by reading ids off a Discord client, and it leaves
+ * most of these lines blank for him to do exactly that. A mention, a stray space
+ * or a smart quote is what a value typed or pasted that way looks like when it
+ * goes wrong — not a fault an operator has to be unlucky to hit.
+ *
+ * `DISCORD_GUILD_ID` IS STILL CHECKED ONLY FOR PRESENCE, and that is a different
+ * case rather than the one this misses. A guild id that is wrong already stops the
+ * bot moderating with the variable's own name in the message — `haltModeration`
+ * in src/client.ts — which is the outcome the check below exists to produce.
+ */
+const SNOWFLAKE = /^[0-9]{1,32}$/
+
+/**
  * An optional snowflake id.
  *
  * NULL RATHER THAN UNDEFINED OR '' because the interface says `string | null`
  * and callers should have exactly one absent value to test. Empty and
- * whitespace-only collapse to the same null for the reason above.
+ * whitespace-only collapse to the same null for `required`'s reason above:
+ * whitespace is never what anyone meant.
+ *
+ * SET-BUT-MISSHAPEN IS NOT ABSENT, AND IT IS NOT A VALUE EITHER. It stops the
+ * process with the variable named, for the reason `SNOWFLAKE` above gives: a
+ * config fault that names the variable beats a runtime error that blames Discord.
  */
 const optionalId = z
   .string()
-  .trim()
   .optional()
-  .transform((value) => (value === undefined || value === '' ? null : value))
+  .transform((raw, ctx) => {
+    const value = raw?.trim()
+    if (value === undefined || value === '') return null
+    if (SNOWFLAKE.test(value)) return value
+
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `must be a Discord id, got "${value}"`,
+    })
+    return z.NEVER
+  })
 
 /**
  * An optional shared secret.
  *
- * THE SAME TRANSFORM AS `optionalId` AND A DIFFERENT NAME, which is the whole
- * of the reason it exists. `optionalId: optionalId` reads as "this is a
- * snowflake" to the next person editing the schema, and the one thing that must
- * never happen to this value is somebody deciding it can be shape-checked and
- * putting a fragment of it in an error message.
+ * IT USED TO BE `optionalId`'S TRANSFORM UNDER A SECOND NAME, AND THE SEPARATION
+ * IS WHAT MADE THE DIVERGENCE SAFE. The name existed because `optionalId:
+ * optionalId` reads as "this is a snowflake" to the next person editing the
+ * schema, and the one thing that must never happen to this value is somebody
+ * deciding it can be shape-checked and putting a fragment of it in an error
+ * message. `optionalId` has since been shape-checked, exactly as feared, and this
+ * one did not follow it there because it was already a separate declaration.
  *
  * NO `.min()`, NO PATTERN, NOTHING THAT COULD ECHO IT. `loadConfig`'s failure
  * message is written to stderr and to `systemctl status`; a zod issue that
@@ -315,16 +362,32 @@ const optionalSecret = z
  * across a wrapped line, is a formatting accident and not a request to exempt
  * a channel whose id is the empty string — which would match nothing anyway
  * but would sit in the config looking like it did something.
+ *
+ * A MISSHAPEN ENTRY IS NOT A FORMATTING ACCIDENT AND STOPS THE PROCESS, the same
+ * split `ipList` makes below. `#general` in this list is the quietest of all the
+ * ids here when it is wrong: nothing ever fetches an exempt channel, so there is
+ * no later error at all — the scanner simply compares it against a real
+ * `channelId`, never matches, and moderates the channel the operator believed he
+ * had exempted. See `SNOWFLAKE`.
  */
 const idList = z
   .string()
   .optional()
-  .transform((raw) =>
-    (raw ?? '')
+  .transform((raw, ctx) => {
+    const entries = (raw ?? '')
       .split(',')
       .map((entry) => entry.trim())
-      .filter((entry) => entry.length > 0),
-  )
+      .filter((entry) => entry.length > 0)
+
+    const malformed = entries.filter((entry) => !SNOWFLAKE.test(entry))
+    if (malformed.length === 0) return entries
+
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `must be comma-separated Discord ids, got "${malformed.join('", "')}"`,
+    })
+    return z.NEVER
+  })
 
 /**
  * The address the community connects to, and the head of the allowlist.
@@ -358,12 +421,19 @@ export const DEFAULT_SERVER_IPS = [PRIMARY_SERVER_IP, '18.222.244.205']
  * WHICH ADDRESS A PLAYER IS TOLD TO CONNECT TO.
  *
  * THE FIRST ENTRY OF THE ALLOWLIST, AND NOT A CONSTANT OF ITS OWN. The owner's
- * back-up notice ends by naming an address — "[Click here to connect](fivem://
- * connect/3.130.92.28)" — and the allowlist already holds that string because
- * links.ts needs it to know which `fivem://connect/` target is this community's
- * own. A second literal in the notice would be a copy that nothing keeps in
- * step: move the server, update `BLITZ_SERVER_IPS`, and the announcement that
- * follows the next restart sends every player to the old box.
+ * back-up notice ends by naming an address — "fivem://connect/3.130.92.28" — and
+ * the allowlist already holds that string because links.ts needs it to know which
+ * `fivem://connect/` target is this community's own. A second literal in the
+ * notice would be a copy that nothing keeps in step: move the server, update
+ * `BLITZ_SERVER_IPS`, and the announcement that follows the next restart sends
+ * every player to the old box.
+ *
+ * THE BARE URL IS THE NOTICE'S REAL ENDING AND THE MASKED FORM IS NOT. The
+ * `[Click here to connect](…)` spelling shipped for one cycle and printed as
+ * literal brackets; `connectLink` in src/maintenance.ts holds the live message
+ * that settled it and the reading taken from it. Nothing here depends on which
+ * form it is — the address is the address — which is exactly why this quote sat
+ * a cycle out of date without anything failing.
  *
  * FIRST RATHER THAN ANY OTHER RULE, because the allowlist is ordered and the
  * documented order is the community's own: the head is the address people are
@@ -479,24 +549,6 @@ const DEFAULT_RINGMASTER_URL = 'http://127.0.0.1:3000'
  * rule the owner wrote down.
  */
 const DEFAULT_GAME_BAN_ROLE_ID = '1542596612306505808'
-
-/**
- * A Discord snowflake.
- *
- * COPIED FROM THE CONSOLE'S `SNOWFLAKE` IN lib/service.ts, DIGIT RULE AND ALL —
- * `[0-9]{1,32}` rather than the seventeen-to-nineteen ids are today. That file
- * explains why at length and the reasoning carries over unchanged: the format is
- * documented to grow, and a second, stricter opinion about the same value in the
- * same system is a bug waiting for the year the digit count changes.
- *
- * NOT APPLIED TO THE OTHER IDS HERE, and that asymmetry is deliberate rather
- * than an omission. A wrong channel id makes the bot post nowhere and say so; a
- * wrong role id makes it try to take a role off somebody and fail loudly. This
- * one is checked because it has a default that the operator may not know is
- * there, so "I set it and nothing happened" has to be a boot failure naming the
- * variable rather than a silent fallback.
- */
-const SNOWFLAKE = /^[0-9]{1,32}$/
 
 /**
  * `BLITZ_RINGMASTER_URL`: scheme, host, port, and nothing after them.

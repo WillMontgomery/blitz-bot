@@ -3,7 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { Config } from '../config.ts'
 import { setSink } from '../log.ts'
-import { DRAIN_NOTE_CAP, type CancelResult, type Drainer, type DrainResult } from '../ringmaster.ts'
+import {
+  DRAIN_NOTE_CAP,
+  type CancelResult,
+  type Drainer,
+  type DrainFailure,
+  type DrainResult,
+} from '../ringmaster.ts'
 import { refusalFor, runCommand, type Invocation, type Responder } from './command.ts'
 import {
   COPY,
@@ -16,6 +22,7 @@ import {
   replyForSchedule,
   type DrainFields,
 } from './drain.ts'
+import { responderFor, type ReplyTarget } from './index.ts'
 
 /**
  * `/drain`, offline.
@@ -125,6 +132,68 @@ const WINDOW = {
 }
 
 const SCHEDULED: DrainResult = { outcome: 'scheduled', status: 201, window: WINDOW }
+
+/** A window the console cannot be read off at all. Still a window; still an outage. */
+const UNREADABLE = { state: null, note: null, drainStartsAt: null, deployMode: null, deployAt: null }
+
+/**
+ * EVERY STRING THIS COMMAND CAN PUT IN FRONT OF AN ADMIN, in one list.
+ *
+ * THE WHOLE-REPLY RULES ARE ASSERTED OVER THIS AND NOT OVER THE HAPPY PATH.
+ * "No line break", "no stand-in", "no relative timestamp" are claims about the
+ * command and not about its best case — and the four faults that reached him
+ * reached him through the ONE branch anybody had looked at. A rule checked on
+ * one frame is a rule the other fifteen are exempt from.
+ *
+ * IT IS BUILT FROM THE EXPORTED REPLY FUNCTIONS rather than from `COPY`, so a
+ * frame that is composed — the paragraph, with its separators and its
+ * interpolations — is checked as the admin will actually read it. `COPY` is
+ * swept separately, for the marker, in its own case.
+ */
+function everyFrame(): string[] {
+  const failures: DrainFailure[] = [
+    'refused',
+    'denied',
+    'not-configured',
+    'unreachable',
+    'unavailable',
+    'unknown',
+  ]
+
+  return [
+    replyForSchedule(SCHEDULED),
+    replyForSchedule({ outcome: 'scheduled', status: 201, window: UNREADABLE }),
+    replyForSchedule({
+      outcome: 'scheduled',
+      status: 201,
+      window: { ...WINDOW, deployMode: 'at-time', deployAt: 1_700_000_600_000 },
+    }),
+    replyForSchedule({
+      outcome: 'scheduled',
+      status: 201,
+      window: { ...WINDOW, deployMode: 'at-time', deployAt: null },
+    }),
+    replyForCancel({ outcome: 'cancelled', status: 200 }),
+
+    ...failures.flatMap((failure) => [
+      replyForSchedule({
+        outcome: 'refused',
+        failure,
+        detail: 'the console said something',
+        status: 409,
+      }),
+      replyForCancel({
+        outcome: 'refused',
+        failure,
+        detail: 'the console said something',
+        status: 409,
+      }),
+    ]),
+
+    COPY.noCredential,
+    COPY.noSubcommand,
+  ]
+}
 
 /** What the relay was asked to do, in order. */
 interface RelayCall {
@@ -378,7 +447,56 @@ describe('/drain — what the console is asked for, and by whom', () => {
 
 describe('/drain — the reply says what is happening and when, not that it asked', () => {
   /**
-   * THE DISCORD TIMESTAMP IS MARKUP AND NOT A WORDING CHOICE. `<t:SECONDS:R>`
+   * ═══ THE REPLY, WHOLE, IN THE WORDS HE APPROVED ═══
+   *
+   * PINNED AS ONE EXACT STRING AND NOT AS FRAGMENTS. Every fault the previous
+   * version shipped was invisible to a `toContain` — a stand-in lead, a tense
+   * that contradicted its own timestamp, four lines where he asked for one, a
+   * missing full stop — because each of those is a property of the SENTENCE and
+   * not of any substring in it. This is the sentence. An edit that changes a
+   * word of it fails here, which is what he asked for when he approved the
+   * wording rather than the shape.
+   */
+  it('reads as the one paragraph he approved, word for word', () => {
+    expect(replyForSchedule(SCHEDULED)).toBe(
+      'The server stops accepting players at <t:1700000000:t>. ' +
+        'It restarts on its own once the last match finishes, and anyone still playing is dropped then. ' +
+        'Players who try to join are told: `a server update`.',
+    )
+  })
+
+  /** And the other half, which was the second stand-in that shipped. */
+  it('says the window is off and the server is open again, word for word', () => {
+    expect(replyForCancel({ outcome: 'cancelled', status: 200 })).toBe(
+      'The maintenance window has been called off. The server is accepting players again.',
+    )
+  })
+
+  /**
+   * ═══ ONE FLOWING PARAGRAPH. NO NEWLINE, ANYWHERE, EVER ═══
+   *
+   * HE HAS SAID IT THREE TIMES — multi-line replies "look so weird" — and the
+   * reply he was sent had FOUR LINES in it. So this is asserted over every
+   * frame this command can produce and not only over the happy path, because
+   * the next newline will arrive in whichever one nobody was looking at: a
+   * refusal carrying the console's own multi-line reason, or a note somebody
+   * typed with a line break in it.
+   *
+   * `\r` AND `\u2028` TOO, not just `\n`. Discord breaks a line on a carriage
+   * return and on the Unicode line separator exactly as it does on a newline,
+   * so a check for `\n` alone would pass over a reply that is visibly two
+   * lines. The note goes through `inert`, which flattens all of them.
+   */
+  it('never puts a line break in any reply, however it was reached', () => {
+    const breaks = /[\n\r\u2028\u2029\v\f]/u
+
+    for (const shown of everyFrame()) {
+      expect(shown, shown).not.toMatch(breaks)
+    }
+  })
+
+  /**
+   * THE DISCORD TIMESTAMP IS MARKUP AND NOT A WORDING CHOICE. `<t:SECONDS:t>`
    * renders in the READER's timezone, so the bot never has to decide whose
    * clock a maintenance window is stated in — which, decided wrongly, is the
    * bug the console fixed in this very route.
@@ -386,19 +504,54 @@ describe('/drain — the reply says what is happening and when, not that it aske
    * SECONDS AND NOT MILLISECONDS, which is the one way to get this wrong: the
    * millisecond form renders a date fifty thousand years out and reads as a
    * broken server rather than a broken message.
+   *
+   * ═══ AND `t` RATHER THAN `R`, WHICH IS THE FAULT HE READ ═══
+   *
+   * IT USED TO BE `R` AND THE SENTENCE CONTRADICTED ITSELF: `The server stops
+   * accepting players a minute ago.` — present tense welded to a relative stamp
+   * that had already flipped into the past, because the door closes
+   * immediately and Discord re-renders `R` live for as long as the message is
+   * on screen. `t` is a fixed instant, so the tense stays true however long the
+   * reply sits there.
+   *
+   * `t` AND NOT `T`, `f`, `F`, `d` OR `D`. Those are, in order, a clock time
+   * WITH seconds, a full date and time, a long date and time, and two dates
+   * with no time at all. The window is minutes away: the hour and minute are
+   * the fact, the day is noise and the seconds are false precision.
+   *
+   * THE STYLE LETTER IS SPELLED OUT HERE RATHER THAN IMPORTED. A test that
+   * asserted against the constant would pass on the day somebody sets the
+   * constant back to `R`, which is precisely the change this case exists to
+   * catch.
    */
-  it('states when the door closes, in the reader`s own clock', () => {
+  it('states when the door closes as a clock time and never as a relative one', () => {
     const shown = replyForSchedule(SCHEDULED)
 
-    expect(shown).toContain(`<t:${WINDOW.drainStartsAt / 1000}:R>`)
+    expect(shown).toContain(`<t:${WINDOW.drainStartsAt / 1000}:t>`)
     expect(shown).not.toContain(String(WINDOW.drainStartsAt))
+
+    // Not one instant in any frame is relative, or a date, or seconds-precise.
+    for (const frame of everyFrame()) {
+      for (const stamp of frame.match(/<t:\d+:.>/gu) ?? []) {
+        expect(stamp, frame).toMatch(/^<t:\d+:t>$/u)
+      }
+    }
   })
 
   it('states that the restart waits for the last match, and takes it', () => {
     expect(replyForSchedule(SCHEDULED)).toContain(COPY.deployWhenEmpty)
   })
 
-  /** The other mode the console has. It ends matches that are still running. */
+  /**
+   * The other mode the console has. It ends matches that are still running.
+   *
+   * THE WORDS HERE ARE NOT HIS AND THE TEST SAYS SO. He supplied one restart
+   * sentence, for `when-empty`, which is the only mode this command ever asks
+   * for and the only one he has been shown. This branch keeps the sentence he
+   * approved before, capitalised for its place in the paragraph — see the head
+   * of `COPY` — and it is pinned so that whatever he says about it lands as a
+   * deliberate edit rather than a drift.
+   */
   it('states the time instead when the console named one', () => {
     const shown = replyForSchedule({
       outcome: 'scheduled',
@@ -406,12 +559,110 @@ describe('/drain — the reply says what is happening and when, not that it aske
       window: { ...WINDOW, deployMode: 'at-time', deployAt: 1_700_000_600_000 },
     })
 
-    expect(shown).toContain('<t:1700000600:R>')
+    expect(shown).toContain('<t:1700000600:t>')
+    expect(shown).toContain('It restarts at <t:1700000600:t>, ending any match still running.')
   })
 
-  /** So the admin sees what players will see without opening the console. */
+  /**
+   * So the admin sees what players will see without opening the console.
+   *
+   * IT IS SHOWN IN A CODE SPAN, WHICH IS THE POINT OF THE NEXT CASE and is
+   * asserted here as the ordinary shape rather than as a special one — a note
+   * this dull renders inert exactly as a hostile one does, so there is no
+   * "escaped" path that only the attack takes.
+   */
   it('shows the note players at the door are given', () => {
-    expect(replyForSchedule(SCHEDULED)).toContain('a server update')
+    expect(replyForSchedule(SCHEDULED)).toContain('Players who try to join are told: `a server update`.')
+  })
+
+  /**
+   * ═══ THE NOTE IS SOMEBODY ELSE'S TEXT INSIDE THE BOT'S OWN SENTENCE ═══
+   *
+   * IT ARRIVES OFF THE CONSOLE'S JSON AND IT IS THE ONE PART OF THIS REPLY THIS
+   * REPO DID NOT WRITE — typed by an admin, or generated over there — and it
+   * lands after a colon in a paragraph a reader takes to be the bot speaking. A
+   * masked link in it is a live, official-looking link in a bot message; a
+   * `<t:…>` forges a second timestamp beside the real one; a backtick, a quote
+   * or a spoiler restructures the paragraph; and a bare url needs no markup at
+   * all because Discord linkifies one on sight.
+   *
+   * ASSERTED AS "THE SPAN IS INTACT" RATHER THAN AS "THE ATTACK IS GONE". The
+   * markup is deliberately still THERE, character for character — inside
+   * `` ` ` `` Discord renders every one of these literally, and the admin needs
+   * the note to match the console's copy of it. So what this pins is that the
+   * value sits in exactly one code span and closes it exactly once, which is
+   * the property a backtick in the input would break. See `inert` in ./drain.ts
+   * and the original in ../incidents.ts.
+   */
+  it('renders a note carrying markup inert instead of letting it out', () => {
+    const attacks = [
+      '[Appeal your ban here](https://not-the-console.example)',
+      'https://not-the-console.example',
+      '@everyone the server is fine',
+      '<t:0:t> <@444444444444444444> <#555555555555555555>',
+      '> quoted ||spoilered|| **bold**',
+      'a `code` fence ``` and more',
+      'line one\nline two\r\nline three',
+    ]
+
+    for (const note of attacks) {
+      const shown = replyForSchedule({
+        outcome: 'scheduled',
+        status: 201,
+        window: { ...WINDOW, note },
+      })
+
+      // The note is in a span, and the sentence around it is unbroken: exactly
+      // two backticks in the whole reply, opening and closing one span, with
+      // the reply's own full stop after the close.
+      expect(shown.match(/`/gu), note).toHaveLength(2)
+      expect(shown, note).toContain('Players who try to join are told: `')
+      expect(shown, note).toMatch(/`\.$/u)
+
+      // Nothing the note carried escaped the span to become markup of its own,
+      // and nothing it carried put the reply on a second line.
+      expect(shown, note).not.toMatch(/[\n\r\u2028\u2029]/u)
+      expect(shown.startsWith('The server stops accepting players at <t:1700000000:t>.'), note).toBe(
+        true,
+      )
+    }
+  })
+
+  /**
+   * A NOTE THAT IS NOTHING BUT MARKUP IS THE SAME AS NO NOTE. Backticks are the
+   * one character `inert` removes rather than renders, so a note of nothing but
+   * backticks leaves an empty span — and a label followed by an empty pair of
+   * them reads as a fact that failed to load, which is worse than saying
+   * plainly that there was nothing to show.
+   */
+  it('says the note is unknown rather than printing an empty pair of backticks', () => {
+    for (const note of ['```', '   ', '\u200b\u200b', '\u0000']) {
+      const shown = replyForSchedule({
+        outcome: 'scheduled',
+        status: 201,
+        window: { ...WINDOW, note },
+      })
+
+      expect(shown, note).toContain(COPY.doorNoteUnknown)
+      expect(shown, note).not.toContain('``')
+    }
+  })
+
+  /**
+   * AND A NOTE THAT IS NOT A STRING DOES NOT THROW MID-REPLY. `note` comes off
+   * another service's JSON body, so `string | null` is a claim rather than a
+   * fact; the old code would have run `.replace` on a number while composing a
+   * message about a server that is going down.
+   */
+  it('names an unreadable note rather than coming apart on it', () => {
+    const shown = replyForSchedule({
+      outcome: 'scheduled',
+      status: 201,
+      window: { ...WINDOW, note: 7 as unknown as string },
+    })
+
+    expect(shown).toContain(COPY.doorNoteUnknown)
+    expect(shown).not.toContain('told:')
   })
 
   /**
@@ -446,44 +697,129 @@ describe('/drain — the reply says what is happening and when, not that it aske
   })
 
   /**
-   * NOT ONE STRING THE ADMIN CAN SEE STILL CARRIES THE MARKER.
+   * ═══ NOT ONE STAND-IN REACHES AN ADMIN, LABELLED OR NOT ═══
    *
-   * THIS ASSERTION WAS INVERTED RATHER THAN DELETED, and the inversion is the
-   * whole record of the owner's instruction: "remove PLACEHOLDER: from all text
-   * please. The verbiage otherwise looks great." It used to require the marker
-   * on every frame; it now refuses it on every one, so a later edit that
-   * reintroduces the prefix — by copying a neighbouring stand-in, or by
-   * reverting this change — fails here instead of shipping the word to a
-   * channel he has already asked to have it out of.
+   * THE MARKER WAS THE ALARM AND NOT THE FAULT, WHICH IS WHY THIS CASE NOW
+   * REFUSES TWO THINGS. Every string here once carried a literal `PLACEHOLDER:`
+   * prefix, he asked for the prefix to come out, and it came out of two
+   * sentences that were STILL stand-ins underneath it — `scheduledLead` and
+   * `cancelled`, both of which then went to a real admin reading, in the bot's
+   * own voice, that no wording had been supplied for them. A test that only
+   * looked for the word passed on the day that shipped.
    *
-   * THE FACTS INSIDE THE FRAMES ARE REAL AND ALWAYS WERE, which is what the
-   * cases above check.
+   * SO IT ALSO REFUSES THE GIVEAWAY PHRASE. "no wording supplied yet" is the
+   * sentence a stand-in in this repo writes about itself — the same shape is in
+   * ../../commands/sticky.ts and ../command.ts — and it is the one thing an
+   * unmarked stand-in cannot say without being caught. A frame that needs
+   * wording nobody has supplied has to fail here rather than reach a channel.
+   *
+   * SWEPT OVER `everyFrame`, so a stand-in hiding in the branch nobody reads —
+   * a restart mode, a refusal — is caught with the happy path.
    */
-  it('carries no PLACEHOLDER marker in any frame of the reply', () => {
-    const frames = [
-      replyForSchedule(SCHEDULED),
-      replyForCancel({ outcome: 'cancelled', status: 200 }),
-      replyForSchedule({ outcome: 'refused', failure: 'refused', detail: 'x', status: 409 }),
-      replyForSchedule({ outcome: 'refused', failure: 'denied', detail: 'auth', status: 401 }),
-      replyForSchedule({ outcome: 'refused', failure: 'not-configured', detail: 'x', status: 503 }),
-      replyForSchedule({ outcome: 'refused', failure: 'unreachable', detail: 'x', status: null }),
-      replyForSchedule({ outcome: 'refused', failure: 'unavailable', detail: 'x', status: 503 }),
-      replyForSchedule({ outcome: 'refused', failure: 'unknown', detail: 'x', status: 502 }),
-      COPY.noCredential,
-      COPY.noSubcommand,
-    ]
+  it('reaches an admin with no stand-in in it, marked or unmarked', () => {
+    const frames = everyFrame()
 
-    // Not a vacuous pass: the frames are non-empty sentences, and none of them
-    // says the word.
+    // Not a vacuous pass: there are frames, they are non-empty sentences, and
+    // none of them says either thing.
+    expect(frames.length).toBeGreaterThan(10)
+
     for (const frame of frames) {
       expect(frame.length).toBeGreaterThan(0)
-      expect(frame).not.toContain('PLACEHOLDER')
+      expect(frame, frame).not.toContain('PLACEHOLDER')
+      expect(frame.toLowerCase(), frame).not.toContain('no wording supplied')
     }
 
     // And the whole record, including the strings Discord is registered with,
     // so a description or a subcommand name cannot carry it either.
     for (const [key, value] of Object.entries(COPY)) {
-      if (typeof value === 'string') expect(value, key).not.toContain('PLACEHOLDER')
+      if (typeof value !== 'string') continue
+
+      expect(value, key).not.toContain('PLACEHOLDER')
+      expect(value.toLowerCase(), key).not.toContain('no wording supplied')
+    }
+  })
+
+  /**
+   * AND EVERY SENTENCE IN EVERY REPLY IS A SENTENCE. Capital at the front, full
+   * stop at the back, both of which the four lines he was sent got wrong: each
+   * began lowercase, because each had been written as its own line, and the last
+   * one ended with no full stop at all. Once they flow together in one paragraph
+   * a missing capital reads as a stumble mid-line rather than as a style, so
+   * this is checked on the composed reply and not on the frames.
+   *
+   * ═══ THIS USED TO SWEEP THE FOUR SUCCESSES AND THAT SCOPING IS WHY IT SHIPPED
+   * AGAIN ═══
+   *
+   * THE SAME FAULT WAS SITTING IN THE REFUSALS THE WHOLE TIME. `nothing was
+   * scheduled. The console said: a window is already open` — lowercase opening,
+   * no closing stop, written for a lead that was removed two changes ago — went
+   * to the owner as a screenshot of text that looks unfinished, for the second
+   * time. A rule asserted on the branch somebody happened to be looking at is a
+   * rule the other fifteen frames are exempt from, so this now runs over
+   * `everyFrame` exactly as the line-break and stand-in sweeps do.
+   *
+   * THE INTERIOR RULE THEREFORE RUNS OVER THE CONSOLE'S OWN REASON TOO, which is
+   * deliberate and is the reason `ended` in ./drain.ts exists: `everyFrame`
+   * hands the refusals a detail with NO full stop on it, so a frame that just
+   * interpolated the route's words would fail the closing-stop assertion here
+   * rather than in a channel.
+   */
+  it('opens every sentence with a capital and closes it with a full stop', () => {
+    const frames = everyFrame()
+
+    // Not a vacuous pass: the successes, the twelve refusals and the two
+    // pre-flight failures are all in here.
+    expect(frames.length).toBeGreaterThan(10)
+
+    for (const shown of frames) {
+      expect(shown, shown).toMatch(/^[A-Z]/u)
+      expect(shown, shown).toMatch(/\.$/u)
+
+      // Every full stop inside it is followed by one space and a capital, so
+      // the sentences read as sentences rather than as four lines run together.
+      for (const [, next] of shown.matchAll(/\.(.)/gu)) {
+        if (next !== undefined) expect(next, shown).toBe(' ')
+      }
+
+      for (const [, next] of shown.matchAll(/\. (.)/gu)) {
+        if (next !== undefined) expect(next, shown).toMatch(/[A-Z]/u)
+      }
+    }
+  })
+
+  /**
+   * AND THE CONSOLE'S WORDS ARE NOT REWRITTEN TO GET THERE. `ended` adds the one
+   * character the bot's own sentence needs and nothing else — so a reason that
+   * already closed itself is untouched, and one that did not is closed WITHOUT
+   * its wording, its capital or its punctuation being second-guessed. Both of
+   * the route's real 409s are checked, because those are the two an admin
+   * actually reads.
+   */
+  it('closes the sentence around the console`s reason without editing it', () => {
+    expect(replyForSchedule({ outcome: 'refused', failure: 'refused', detail: ALREADY, status: 409 })).toBe(
+      `Nothing was scheduled. The console said: ${ALREADY}`,
+    )
+
+    expect(
+      replyForSchedule({
+        outcome: 'refused',
+        failure: 'refused',
+        detail: NOTHING_TO_DEPLOY,
+        status: 409,
+      }),
+    ).toBe(`Nothing was scheduled. The console said: ${NOTHING_TO_DEPLOY}`)
+
+    // A reason with no stop of its own gets one, and keeps its own lower case.
+    expect(
+      replyForCancel({ outcome: 'refused', failure: 'refused', detail: 'nothing is scheduled', status: 409 }),
+    ).toBe('Nothing was cancelled. The console said: nothing is scheduled.')
+
+    // A question mark or an ellipsis is an ending too, and is left alone.
+    for (const detail of ['is the console up?', 'the deploy is still going…']) {
+      const shown = replyForCancel({ outcome: 'refused', failure: 'refused', detail, status: 409 })
+
+      expect(shown, detail).toContain(detail)
+      expect(shown, detail).not.toContain(`${detail}.`)
     }
   })
 
@@ -633,6 +969,20 @@ describe('/drain — through runCommand, the way Discord reaches it', () => {
    * A HANDLER THAT THROWS STILL ANSWERS. Without `runCommand`'s catch the admin
    * is left looking at "The application did not respond" over a game server
    * whose state they now cannot guess at.
+   *
+   * ═══ AND THIS ONE FRAME IS STILL A MARKED STAND-IN, IN ../command.ts ═══
+   *
+   * IT IS NOT `/drain`'s STRING AND NOT THIS FILE'S TO FIX. `COPY.failed` in
+   * ./command.ts is the sentence every command's crash reaches an admin with,
+   * and it still reads `PLACEHOLDER: no wording supplied yet for a command that
+   * failed.` So a `/drain start` that throws DOES put the marker in front of an
+   * admin — which is exactly the shape of the fault the owner just read, one
+   * file over and owned by somebody else.
+   *
+   * THE ASSERTION IS KEPT AS-IS SO THE GAP IS VISIBLE RATHER THAN QUIET. It
+   * pins today's behaviour, it will fail the moment that string is given real
+   * wording, and the failure is how whoever supplies it finds this case. The
+   * sweep above deliberately covers only the frames `/drain` composes itself.
    */
   it('answers even when the relay itself comes apart', async () => {
     const respond = responder()
@@ -647,5 +997,92 @@ describe('/drain — through runCommand, the way Discord reaches it', () => {
     expect(respond.edited).toHaveLength(1)
     expect(respond.edited[0]).toContain('PLACEHOLDER')
     expect(stderr.join('')).toContain('level=error')
+  })
+})
+
+/**
+ * ═══ THE NOTE IS ADMIN-TYPED TEXT AND IT NOTIFIES NOBODY ═══
+ *
+ * THE CODE SPAN IS NOT THE GUARD, WHICH IS THE WHOLE REASON THIS DESCRIBE
+ * EXISTS. `inert` in ./drain.ts wraps the note in `` ` ` `` and the case above
+ * pins that the span stays intact around an `@everyone` — but that is a
+ * RENDERING rule. Discord decides who a message pings from `allowed_mentions` on
+ * the request, before a character of markdown is looked at: `@everyone` inside a
+ * code span is displayed literally AND still notifies the guild. A reader of the
+ * reply cannot tell those two apart, which is exactly how a note-shaped ping
+ * ships.
+ *
+ * SO WHAT IS DRIVEN HERE IS THE REAL `responderFor`, against a `ReplyTarget`
+ * THAT HAS NO CLIENT ON IT. `createClient` in ../client.ts sets
+ * `allowedMentions: { parse: [] }` client-wide and its own comment warns that
+ * the default "is silently replaced by any call that passes `allowedMentions` of
+ * its own" — so a test that leaned on it would be asserting a property of
+ * ../client.ts from a file that does not build one. The fake below inherits
+ * nothing at all: if the option is not on the payload this command's own seam
+ * built, it is not on the payload, and this case says so.
+ *
+ * EPHEMERAL LIMITS THE BLAST RADIUS AND IS NOT WHY IT IS SAFE. Ephemeral is a
+ * property of who SEES the message; `@everyone` resolving is a property of who
+ * gets NOTIFIED, and the two are decided by different fields. Nothing below
+ * depends on the reply staying invisible to the channel.
+ */
+describe('/drain — a note that says @everyone pings nobody', () => {
+  /** The interaction reduced to the one thing that matters here: what was sent. */
+  function target(): ReplyTarget & { sent: Parameters<ReplyTarget['editReply']>[0][] } {
+    const sent: Parameters<ReplyTarget['editReply']>[0][] = []
+
+    return {
+      sent,
+      deferReply: () => Promise.resolve(null),
+      editReply: (options) => {
+        sent.push(options)
+        return Promise.resolve(null)
+      },
+      reply: () => Promise.resolve(null),
+    }
+  }
+
+  /** Every shape of mention Discord resolves, in one note an admin could type. */
+  const SHOUTED = `@everyone @here <@&${ADMIN_ROLE}> <@${MEMBER}> back in ten`
+
+  it('sends the note unedited and suppresses every mention in it', async () => {
+    const interaction = target()
+
+    await runCommand(invocation({ note: SHOUTED }), cfg(), responderFor(interaction), [
+      drainCommand(() =>
+        relay({ outcome: 'scheduled', status: 201, window: { ...WINDOW, note: SHOUTED } }),
+      ),
+    ])
+
+    const sent = interaction.sent[0]
+    if (sent === undefined) throw new Error('the admin was shown nothing at all')
+
+    // The admin's words are still there, character for character, inside the one
+    // span — because the reply's job is to show what players will be shown and
+    // the note has to match the console's copy of itself.
+    expect(sent.content).toContain(`\`${SHOUTED}\``)
+    expect(sent.content).toContain('@everyone')
+
+    // AND THIS IS THE THING THAT MAKES THEM INERT. Not the backticks above it.
+    expect(sent.allowedMentions).toEqual({ parse: [] })
+  })
+
+  /**
+   * THE SAME OPTION ON A REPLY THAT CARRIES NO NOTE AT ALL, so the suppression
+   * is a property of the seam rather than of the one command that needed it.
+   * `/drain cancel` says one fixed sentence and still goes out suppressed.
+   */
+  it('suppresses mentions on a reply with nothing borrowed in it', async () => {
+    const interaction = target()
+
+    await runCommand(
+      invocation({ subcommand: DRAIN_CANCEL_SUBCOMMAND }),
+      cfg(),
+      responderFor(interaction),
+      [drainCommand(() => relay())],
+    )
+
+    expect(interaction.sent[0]?.content).toBe(COPY.cancelled)
+    expect(interaction.sent[0]?.allowedMentions).toEqual({ parse: [] })
   })
 })

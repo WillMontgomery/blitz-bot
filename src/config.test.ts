@@ -5,7 +5,7 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { connectIp, DEFAULT_SERVER_IPS, loadConfig } from './config.ts'
+import { connectIp, type Config, DEFAULT_SERVER_IPS, loadConfig } from './config.ts'
 import { CONSOLE_URL } from './console.ts'
 
 /**
@@ -559,10 +559,16 @@ describe('BLITZ_SERVER_IPS', () => {
  * WHICH ADDRESS A PLAYER IS TOLD TO CONNECT TO.
  *
  * THE MAINTENANCE NOTICE ENDS WITH ONE — "The game server is back up and
- * maintenance is complete. … [Click here to connect](fivem://connect/
- * 3.130.92.28)." — and the owner's instruction was that it "should come from the
- * server-ip allowlist already in config rather than being a second copy of a
- * constant". This is where the two are one thing.
+ * maintenance is complete. … fivem://connect/3.130.92.28." — and the owner's
+ * instruction was that it "should come from the server-ip allowlist already in
+ * config rather than being a second copy of a constant". This is where the two
+ * are one thing.
+ *
+ * THE ADDRESS IS BARE IN THAT SENTENCE AND IS NOT A MASKED LINK. The
+ * `[Click here to connect](…)` form shipped for one cycle and printed as literal
+ * brackets; `connectLink` in src/maintenance.ts holds the live message and what
+ * was read off it. Quoted here only so that the sentence this function feeds is
+ * recognisable — nothing below asserts on the wording.
  */
 describe('connectIp', () => {
   const base = { DISCORD_BOT_TOKEN: 'token', DISCORD_GUILD_ID: 'guild' }
@@ -765,10 +771,11 @@ describe('loadConfig, on the console relay', () => {
   })
 
   /**
-   * A SET-BUT-WRONG ROLE ID STOPS THE PROCESS, and it is the one id here that is
-   * shape-checked. The others fail loudly at use; this one has a default that an
-   * operator may not know is there, so "I set it and nothing happened" has to be
-   * a boot failure naming the variable rather than a silent fallback.
+   * A SET-BUT-WRONG ROLE ID STOPS THE PROCESS. It was once the only id here that
+   * was shape-checked — because it has a default an operator may not know is
+   * there, so "I set it and nothing happened" had to be a boot failure naming the
+   * variable rather than a silent fallback. Every other id now gets the same
+   * check for a related reason; see `the shape of an id` below.
    */
   it('refuses a role id that is not a Discord id', () => {
     let message = ''
@@ -822,6 +829,152 @@ describe('loadConfig, on the console relay', () => {
     expect(template).toContain('Manage Roles')
     expect(template).toContain('Server Members Intent')
     expect(template).toContain('4014')
+  })
+})
+
+/**
+ * ═══ AN ID THAT IS SET AND MISSHAPEN, WHICH USED TO BOOT ═══
+ *
+ * `optionalId` TOOK ANY NON-EMPTY STRING WHILE ITS NEIGHBOUR RAN A REGEX. The
+ * shape check on `BLITZ_GAME_BAN_ROLE_ID` above is the same one, and every other
+ * optional id in the schema had none — so a `BLITZ_DOCS_CHANNEL_ID` of `#bot-docs`
+ * loaded as a perfectly good non-null value, the feature switched itself on, and
+ * the fault surfaced much later at `channels.fetch` as an error about a channel
+ * that cannot be read. That phrasing sends an operator into Discord's permission
+ * settings for a fault that is in his own `.env`.
+ *
+ * `DISCORD_GUILD_ID` IS LEFT OUT OF THIS AND IS NOT AN OVERSIGHT. It is required
+ * rather than optional, and a wrong one already halts moderation with the
+ * variable's own name in the message — `haltModeration` in src/client.ts — which
+ * is the outcome every case below is asking for.
+ *
+ * THE VALUES BELOW ARE HOW A HAND-FILLED `.env` ACTUALLY GOES WRONG, which is the
+ * only kind this box has: docs/deploy.md ships a heredoc that a person copies and
+ * then completes by reading ids off a Discord client, and it leaves most of these
+ * lines blank for him to do exactly that. A mention instead of an id, a smart
+ * quote carried in by a copy-paste, a whole channel URL — none of those need an
+ * unlucky operator.
+ *
+ * `BLITZ_EXEMPT_CHANNEL_IDS` IS THE QUIETEST ONE AND IS CHECKED HERE TOO. Nothing
+ * ever fetches an exempt channel, so a misshapen entry there produces no later
+ * error at all — it is compared against a real `channelId`, never matches, and
+ * the channel the operator believed he had exempted goes on being moderated.
+ */
+describe('the shape of an id', () => {
+  const base = { DISCORD_BOT_TOKEN: 'token', DISCORD_GUILD_ID: 'guild' }
+
+  /**
+   * Every optional id in the schema, with the field it becomes.
+   *
+   * READ BACK OUT OF THE SOURCE BY THE LAST CASE IN THIS BLOCK, so that a sixth
+   * optional id added to the schema fails here rather than joining quietly as the
+   * one variable nothing checks.
+   */
+  const idVariables: [variable: string, read: (config: Config) => string | null][] = [
+    ['DISCORD_ADMIN_ROLE_ID', (config) => config.adminRoleId],
+    ['BLITZ_LOG_CHANNEL_ID', (config) => config.logChannelId],
+    ['BLITZ_STATUS_CHANNEL_ID', (config) => config.statusChannelId],
+    ['BLITZ_DOCS_CHANNEL_ID', (config) => config.docsChannelId],
+    ['BLITZ_MAINTENANCE_CHANNEL_ID', (config) => config.maintenanceChannelId],
+  ]
+
+  /** The ways a value gets into `.env` looking like an id and not being one. */
+  const handFilled: [what: string, value: string][] = [
+    ['a channel mention', '#bot-docs'],
+    ['a channel link', '<#1542603116258525185>'],
+    ['a space inside the digits', '1542603 116258525185'],
+    ['a smart-quoted id', '“1542603116258525185”'],
+    ['a trailing smart apostrophe', '1542603116258525185’'],
+    ['a URL pasted instead of an id', 'https://discord.com/channels/1/1542603116258525185'],
+  ]
+
+  const failureFor = (env: Record<string, string>): string => {
+    try {
+      loadConfig({ ...base, ...env })
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error)
+    }
+
+    return ''
+  }
+
+  /**
+   * THE VARIABLE'S NAME IS THE WHOLE POINT. A config fault that stops the process
+   * naming the line to edit beats a runtime error that blames Discord, and the
+   * value is quoted back so that an invisible difference — the smart quote, the
+   * space — is visible in `systemctl status` rather than needing a hex dump.
+   */
+  it.each(idVariables)('%s refuses a value that is not an id, and names itself', (variable) => {
+    for (const [what, value] of handFilled) {
+      const message = failureFor({ [variable]: value })
+
+      expect(message, what).toContain(`${variable}: must be a Discord id`)
+      expect(message, what).toContain(value)
+    }
+  })
+
+  /**
+   * SURROUNDING WHITESPACE IS STILL FORGIVEN RATHER THAN REFUSED, which is the
+   * one hand-filling accident that is not ambiguous. A systemd `Environment=`
+   * line with a trailing space, or an operator who typed one after the `=`, meant
+   * the id — every other variable in this file has trimmed since it was written,
+   * and a boot failure over an invisible character at the end of a correct value
+   * would be the fault this check exists to prevent, wearing the other hat.
+   */
+  it.each(idVariables)('%s still trims the space around a good id', (variable, read) => {
+    expect(read(loadConfig({ ...base, [variable]: '  1542603116258525185  ' }))).toBe(
+      '1542603116258525185',
+    )
+  })
+
+  /**
+   * BLANK IS STILL UNSET, AND THAT IS THE HIGH-STAKES HALF OF THIS CHANGE. The
+   * bot is live, and the `.env` on the box came from docs/deploy.md's heredoc,
+   * which ships three of these five blank and the exempt list with them. A shape
+   * check that treated an empty value as a malformed one would not be a stricter
+   * config — it would be the next deploy refusing to boot.
+   */
+  it('leaves every optional id null when it is blank, so the live box still boots', () => {
+    const blanked = Object.fromEntries(idVariables.map(([variable]) => [variable, '']))
+    const config = loadConfig({ ...base, ...blanked, BLITZ_EXEMPT_CHANNEL_IDS: '' })
+
+    for (const [variable, read] of idVariables) expect(read(config), variable).toBeNull()
+    expect(config.exemptChannelIds).toEqual([])
+  })
+
+  /**
+   * A MISSHAPEN ENTRY IN THE LIST STOPS THE PROCESS, naming every bad one at once
+   * the way `BLITZ_SERVER_IPS` does. This is the variable with no later error to
+   * fall back on: an exempt id is never fetched, only compared.
+   */
+  it('refuses a malformed entry in the exempt-channel list, and names them all', () => {
+    const message = failureFor({ BLITZ_EXEMPT_CHANNEL_IDS: '#general,111,<#222>' })
+
+    expect(message).toContain('BLITZ_EXEMPT_CHANNEL_IDS: must be comma-separated Discord ids')
+    expect(message).toContain('#general')
+    expect(message).toContain('<#222>')
+  })
+
+  /** The formatting accidents it has always dropped are still not malformed. */
+  it('still reads a trailing comma and a wrapped line as formatting, not as a fault', () => {
+    expect(loadConfig({ ...base, BLITZ_EXEMPT_CHANNEL_IDS: '111,,\n222,' }).exemptChannelIds).toEqual([
+      '111',
+      '222',
+    ])
+  })
+
+  /**
+   * THE LIST ABOVE IS EVERY OPTIONAL ID IN THE SCHEMA, READ OUT OF THE SCHEMA.
+   * The bug being fixed here was one variable quietly missing a check its
+   * neighbour had; a hand-maintained list of which variables to test would let
+   * the sixth one arrive the same way.
+   */
+  it('covers every variable in the schema that is parsed as an optional id', () => {
+    const declared = [...repoFile('src/config.ts').matchAll(/^ {2}(\w+): optionalId,$/gmu)].map(
+      (match) => match[1] ?? '',
+    )
+
+    expect(declared).toEqual(idVariables.map(([variable]) => variable))
   })
 })
 

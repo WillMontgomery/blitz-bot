@@ -3497,6 +3497,13 @@ describe('the gateway — a reconnect is not a fault, an absence is', () => {
     const faults = watching()
     const client = createClient(cfg())
 
+    // WHAT `createClient` SAYS ON THE WAY UP IS NOT THIS CASE'S BUSINESS. This
+    // config has no docs channel, and building the client now writes one info
+    // line saying the manual is off; the two events below are what has to be
+    // silent, so the streams are cleared to the moment they are emitted.
+    stdout.length = 0
+    stderr.length = 0
+
     client.emit(Events.ShardReady, 0, undefined)
     client.emit(Events.ShardResume, 0, 1)
 
@@ -5022,13 +5029,25 @@ function published(markdown: string): {
   title: string
   description: string
   colour: number
+  footer: string
 }[] {
   const parsed = parseManual(markdown)
   if (parsed === null) throw new Error('the source in this test does not parse')
 
   const embed = manualEmbed(parsed)
 
-  return [{ title: embed.title, description: embed.description, colour: embed.colour }]
+  // EVERYTHING THE CHANNEL KEEPS, WHICH NOW INCLUDES THE FOOTER TEXT AND STILL
+  // NOT THE INSTANT. `stampedAt` is deliberately dropped here: it is not read
+  // back off a message and is not compared, and a helper that carried it would
+  // be quietly asserting the opposite of the rule these cases exist to hold.
+  return [
+    {
+      title: embed.title,
+      description: embed.description,
+      colour: embed.colour,
+      footer: embed.footer,
+    },
+  ]
 }
 
 /**
@@ -5052,6 +5071,7 @@ function docsHarness(
       title: string
       description?: string
       colour?: number | null
+      footer?: string
     }[]
     rejects?: (call: string) => unknown
   } = {},
@@ -5064,10 +5084,16 @@ function docsHarness(
   pause: () => Promise<void>
   pauses: () => number
 } {
+  // The footer defaults to the word the bot writes, for the same reason the
+  // colour defaults to the colour it writes: a fixture that leaves it unsaid is
+  // saying "not what this case is about", and a default that differed from the
+  // builder would make every such fixture look changed for a reason the case
+  // never chose.
   const state: PostedManual[] = (options.messages ?? []).map((message, index) => ({
     id: `m${String(index + 1)}`,
     description: '',
     colour: BLURPLE,
+    footer: 'updated',
     ...message,
   }))
 
@@ -5098,11 +5124,18 @@ function docsHarness(
     }
   }
 
+  /**
+   * A WRITE, AS THE CHANNEL WOULD REPORT IT BACK AFTERWARDS — the fields Discord
+   * keeps and hands to `ours`, and no `stampedAt`, because a read never carries
+   * one. A harness that stored the instant could not tell a run that compares it
+   * from one that does not.
+   */
   const stored = (id: string, embed: ManualEmbed): PostedManual => ({
     id,
     title: embed.title,
     description: embed.description,
     colour: embed.colour,
+    footer: embed.footer,
   })
 
   return {
@@ -5429,6 +5462,76 @@ describe('the manual — a change to the file is one edit', () => {
   })
 
   /**
+   * THE MIRROR OF THAT CASE, AND THE DEFECT THAT PUT IT HERE.
+   *
+   * The footer used to be `updated ${new Date().toISOString()}` and was left out
+   * of the comparison because it moved on every start. Then the instant moved to
+   * `stampedAt` and the text became the constant word — and the exclusion stayed.
+   * So the wording changed in the code and the owner's channel kept the old line
+   * FOREVER: the only thing that could ever have republished it was the prose
+   * happening to change for some unrelated reason. He restarted the bot looking
+   * for the new footer, found the old one, and reported the sync as broken. It
+   * was not broken; it could not see the field it was being judged on.
+   *
+   * EXACTLY ONCE IS THE WHOLE ASSERTION, AND IT IS TWO CLAIMS. The first restart
+   * has to write — otherwise the message never catches up — and the restart after
+   * it has to be silent, because a footer that republishes every start is the
+   * original bug the exclusion was protecting against, arriving from the other
+   * direction.
+   *
+   * AND THE CLOCK MOVES ACROSS BOTH OF THEM, so this is not quietly passing on a
+   * stamp that never differed. The second run builds a different instant from the
+   * one the first run published and still says nothing: the WORDING is compared
+   * and the moment beside it is not, which is the whole distinction the fix rests
+   * on.
+   */
+  it('republishes once when the footer wording changes, and is silent after', async () => {
+    vi.useFakeTimers()
+
+    try {
+      vi.setSystemTime(new Date('2026-08-29T09:00:00.000Z'))
+
+      const parsed = parseManual(before)
+      if (parsed === null) throw new Error('the source in this test does not parse')
+
+      // The owner's channel as it stands: the current prose, published under the
+      // footer this code used to build — the word with the machine timestamp
+      // still in the text.
+      const stale = 'updated 2026-08-24T11:32:07.914Z'
+
+      const docs = docsHarness({
+        messages: published(before).map((message) => ({ ...message, footer: stale })),
+      })
+
+      // Not vacuous: the text on the channel really is not the text the builder
+      // produces, and everything else about the message already matches.
+      const built = manualEmbed(parsed)
+      expect(at(docs.messages(), 0).footer).not.toBe(built.footer)
+      expect(at(docs.messages(), 0).description).toBe(built.description)
+
+      await syncManual(parsed, docs.channel, docs.pause)
+
+      // One edit, and it is the footer that made it one.
+      expect(docs.calls).toEqual(['read', 'edit m1'])
+      expect(at(docs.written, 0).footer).toBe('updated')
+      expect(at(docs.messages(), 0).footer).toBe('updated')
+
+      // A day later the bot restarts against the message it just repaired. The
+      // stamp it builds now is a different instant from the one it published.
+      vi.setSystemTime(new Date('2026-08-30T09:00:00.000Z'))
+      expect(manualEmbed(parsed).stampedAt).not.toEqual(at(docs.written, 0).stampedAt)
+
+      await syncManual(parsed, docs.channel, docs.pause)
+
+      // Settled. One read and nothing else, for this restart and every one after.
+      expect(docs.calls).toEqual(['read', 'edit m1', 'read'])
+      expect(docs.written).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  /**
    * THE COLOUR IS PART OF WHAT WAS PUBLISHED. A message carrying the right text
    * under the wrong colour is the code and the channel disagreeing about
    * something a reader can see — so it is a difference, and it is written.
@@ -5483,6 +5586,11 @@ describe('the changeover — eleven messages become one', () => {
         title: 'Blitz bot',
         description: body(doc(['One', 'first'])),
         colour: BLURPLE,
+
+        // The whole of what the channel keeps, and the footer text is part of
+        // it: an exact-shape assertion is where a field added to the published
+        // message and forgotten by the comparison would show up.
+        footer: 'updated',
       },
     ])
   })
@@ -5582,10 +5690,11 @@ describe('the manual — the channel is read back, never remembered', () => {
     // The process died here. A new one comes up with no memory of any of it,
     // and the channel is the only thing that carried over.
     const second = docsHarness({
-      messages: first.messages().map(({ title, description, colour }) => ({
+      messages: first.messages().map(({ title, description, colour, footer }) => ({
         title,
         description,
         colour,
+        footer,
       })),
     })
 
@@ -6223,12 +6332,14 @@ describe('the manual — whose messages are read back', () => {
     title: string | null
     description: string | null
     color: number | null
+    footer: { text: string } | null
   }
 
   const embed = (over: Partial<Embed> = {}): Embed => ({
     title: 'Blitz bot',
     description: 'lead',
     color: BLURPLE,
+    footer: { text: 'updated' },
     ...over,
   })
 
@@ -6316,6 +6427,31 @@ describe('the manual — whose messages are read back', () => {
   it('carries the colour back', () => {
     expect(at(ours([message()], SELF), 0).colour).toBe(BLURPLE)
     expect(at(ours([message({ embeds: [embed({ color: null })] })], SELF), 0).colour).toBeNull()
+  })
+
+  /**
+   * AND THE FOOTER TEXT, WHICH THIS DID NOT USED TO READ AT ALL.
+   *
+   * While the footer was `updated <ISO string>` there was nothing here worth
+   * reading: it was different on every start by construction. The instant is on
+   * the embed's own `timestamp` field now and the text is a constant, so it is
+   * a published line like the title — and one this filter has to hand back, or
+   * the comparison above it is comparing the code's footer against nothing.
+   *
+   * A MISSING FOOTER COMES BACK AS `''`, not as null, for the reason a missing
+   * description does: both sides of the equality have to be the same kind of
+   * value. That is also what makes the owner's live message repair itself — it
+   * carries the old text, which is not the word, so it is a difference.
+   */
+  it('carries the footer text back, and a missing one as an empty string', () => {
+    expect(at(ours([message()], SELF), 0).footer).toBe('updated')
+
+    expect(
+      at(ours([message({ embeds: [embed({ footer: { text: 'updated 2026-08-29' } })] })], SELF), 0)
+        .footer,
+    ).toBe('updated 2026-08-29')
+
+    expect(at(ours([message({ embeds: [embed({ footer: null })] })], SELF), 0).footer).toBe('')
   })
 })
 
@@ -6609,6 +6745,56 @@ describe('the manual — the file, and the bot carrying on without it', () => {
 
     const wired = createClient(cfg({ docsChannelId: DOCS_CHANNEL }))
     expect(wired.listenerCount(Events.ClientReady)).toBe(ALWAYS_READY + 1)
+    await wired.destroy()
+  })
+
+  /**
+   * REGISTERING NOTHING IS NOT THE SAME AS SAYING NOTHING, and that gap is what
+   * this whole group of cases was missing. An unset id was the ONE way this bot
+   * could decide against publishing the manual without a line anywhere: a
+   * missing file warns, a template that will not render or a document that will
+   * not parse or fit is an error, a channel it cannot read is an error. And it
+   * is the branch an operator reaches by accident rather than by choice —
+   * `BLITZ_DOCS_CHANNEL_ID` was absent from the `.env` block in docs/deploy.md
+   * until d5696c5, so an install done from that guide has the manual switched
+   * off — which left a stale documentation channel and a working one looking
+   * exactly alike from the journal, from the status channel and from the box.
+   */
+  it('says in the journal that the manual is off when no docs channel is configured', async () => {
+    const quiet = createClient(cfg())
+
+    expect(said('no docs channel is configured')).toBe(1)
+
+    const line = stdout
+      .join('')
+      .split('\n')
+      .find((entry) => entry.includes('no docs channel is configured'))
+
+    // `info`, so it is the journal's business rather than a post in the status
+    // channel on every restart of a bot deliberately run without a docs channel.
+    // It also could not have posted: index.ts installs the sink AFTER
+    // `createClient` returns, so a fault raised here has none to be copied to.
+    expect(line).toContain('level=info')
+    expect(stderr.join('')).not.toContain('no docs channel is configured')
+
+    // The variable, verbatim. The whole value of the line is that it names the
+    // thing somebody has to go and set, and that `journalctl -u blitz-bot |
+    // grep BLITZ_DOCS_CHANNEL_ID` answers the question on its own.
+    expect(line).toContain('BLITZ_DOCS_CHANNEL_ID')
+
+    await quiet.destroy()
+  })
+
+  /**
+   * AND NOT A WORD OF IT ON THE START THAT IS FINE. The line means "this feature
+   * is off"; saying it on a start where the manual IS wired would make the two
+   * cases indistinguishable again, in the other direction.
+   */
+  it('says nothing of the kind when the docs channel is configured', async () => {
+    const wired = createClient(cfg({ docsChannelId: DOCS_CHANNEL }))
+
+    expect(said('no docs channel is configured')).toBe(0)
+
     await wired.destroy()
   })
 
@@ -7238,7 +7424,16 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
           author: { id: DOCS_SELF },
           createdTimestamp: 1,
           embeds: [
-            { title: embed.title, description: embed.description, color: embed.colour },
+            {
+              title: embed.title,
+              description: embed.description,
+              color: embed.colour,
+
+              // The footer as Discord stores it, which is the half of the stamp
+              // that is read back. The instant is not on this object at all —
+              // `timestamp` is not part of what a restart compares.
+              footer: { text: embed.footer },
+            },
           ],
         },
       ],
@@ -7294,6 +7489,7 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
             title: before.title,
             description: before.description,
             colour: before.colour,
+            footer: before.footer,
           },
         ])
       },

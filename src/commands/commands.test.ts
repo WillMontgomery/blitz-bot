@@ -512,6 +512,7 @@ describe('responderFor — how an interaction is actually answered', () => {
     expect(interaction.reply).toHaveBeenCalledWith({
       content: 'no',
       flags: MessageFlags.Ephemeral,
+      allowedMentions: { parse: [] },
     })
     expect(interaction.reply.mock.calls.at(0)?.at(0)).not.toHaveProperty('ephemeral')
   })
@@ -521,12 +522,60 @@ describe('responderFor — how an interaction is actually answered', () => {
    * carries no flags. Passing them would be ignored rather than honoured, and
    * a reader would be entitled to think they did something.
    */
-  it('edits with the content alone', async () => {
+  it('edits with the content and no flags of its own', async () => {
     const interaction = target()
 
     await responderFor(interaction).edit('hello')
 
-    expect(interaction.editReply).toHaveBeenCalledWith({ content: 'hello' })
+    expect(interaction.editReply).toHaveBeenCalledWith({
+      content: 'hello',
+      allowedMentions: { parse: [] },
+    })
+  })
+
+  /**
+   * ═══ AND EVERY SEND THAT CARRIES TEXT SAYS SO ITSELF ═══
+   *
+   * `createClient` in ../client.ts SETS THIS CLIENT-WIDE AND THAT IS NOT ENOUGH
+   * TO LEAN ON. Its own comment says why: the default "is silently replaced by
+   * any call that passes `allowedMentions` of its own", so what it guarantees is
+   * the sends that say nothing — and a reader of `responderFor`, or a test of
+   * it, cannot see whether it holds. ../maintenance.ts, ../incidents.ts and
+   * ../sticky.ts all restate the option at their own sends for exactly this
+   * reason, and this is the fourth.
+   *
+   * THE THING IT GUARDS IS SOMEBODY ELSE'S TEXT. `/drain`'s reply echoes an
+   * admin's note and `/help`'s body carries a `<@id>`; a code span makes the
+   * first LOOK inert and does nothing about notifications, because Discord
+   * decides who is pinged from the request field and not from the markdown. See
+   * `noMentions` in ./index.ts and the `@everyone` case in ./drain.test.ts.
+   *
+   * THE FAKE HERE HAS NO CLIENT BEHIND IT, which is what makes this an assertion
+   * about this seam rather than about ../client.ts.
+   */
+  it('suppresses every mention on both of the sends that carry text', async () => {
+    const edited = target()
+    const replied = target()
+
+    await responderFor(edited).edit('@everyone the server is going down')
+    await responderFor(replied).reply('@everyone you may not run this', true)
+
+    expect(edited.editReply.mock.calls.at(0)?.at(0)?.allowedMentions).toEqual({ parse: [] })
+    expect(replied.reply.mock.calls.at(0)?.at(0)?.allowedMentions).toEqual({ parse: [] })
+
+    // The text itself is untouched: suppression is the guard, not rewriting.
+    expect(edited.editReply.mock.calls.at(0)?.at(0)?.content).toBe(
+      '@everyone the server is going down',
+    )
+  })
+
+  /** A defer carries no text, so it takes no mention policy either. */
+  it('says nothing about mentions on the defer, which has no content', async () => {
+    const interaction = target()
+
+    await responderFor(interaction).defer(true)
+
+    expect(interaction.deferReply.mock.calls.at(0)?.at(0)).not.toHaveProperty('allowedMentions')
   })
 
   /**
@@ -541,7 +590,10 @@ describe('responderFor — how an interaction is actually answered', () => {
 
     await responderFor(interaction).edit({ embeds: [embed] })
 
-    expect(interaction.editReply).toHaveBeenCalledWith({ embeds: [embed] })
+    expect(interaction.editReply).toHaveBeenCalledWith({
+      embeds: [embed],
+      allowedMentions: { parse: [] },
+    })
     expect(interaction.editReply.mock.calls.at(0)?.at(0)).not.toHaveProperty('content')
   })
 
@@ -557,7 +609,7 @@ describe('responderFor — how an interaction is actually answered', () => {
     await responderFor(interaction).edit({ embeds })
 
     const sent = interaction.editReply.mock.calls.at(0)?.at(0)
-    expect(sent).toEqual({ embeds: [{ title: 'one' }] })
+    expect(sent).toEqual({ embeds: [{ title: 'one' }], allowedMentions: { parse: [] } })
     expect((sent as { embeds?: unknown }).embeds).not.toBe(embeds)
   })
 
@@ -587,6 +639,7 @@ describe('responderFor — how an interaction is actually answered', () => {
     expect(interaction.editReply).toHaveBeenCalledWith({
       embeds: [{ title: 'Player profile' }],
       components: [row],
+      allowedMentions: { parse: [] },
     })
   })
 
