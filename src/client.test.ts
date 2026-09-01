@@ -2046,6 +2046,85 @@ describe('announcer — the mention renders and notifies nobody', () => {
     expect(send).not.toHaveBeenCalled()
     expect(stderr.join('')).toContain('log channel is missing or cannot be posted to')
   })
+
+  /**
+   * ═══ "WORTH ONE LINE EACH TIME" WAS THE OLD RULE AND IT WAS WRONG ═══
+   *
+   * A wrong id, a deleted channel or a missing permission is ended by a person
+   * editing a variable or a permission overwrite, and until they do, every
+   * removal this bot makes emits an identical error — the same sentence and the
+   * same one field. That is worse than the poller that started all this: a raid
+   * produces removals far faster than thirty seconds apart, so the moment the
+   * moderation record goes missing is the moment #bot-status becomes unreadable,
+   * and the two faults an operator most needs side by side are the two that bury
+   * each other.
+   *
+   * IT MEETS BOTH HALVES OF THE TEST IN src/latch.ts: only a person ends it, and
+   * every repeat carries the same `channel` and nothing else, so nothing is lost
+   * by saying it once. The sentence itself is untouched — it still says which of
+   * the two halves is broken, which is the reason it was a line at all.
+   */
+  const UNUSABLE = 'log channel is missing or cannot be posted to'
+  const BACK = 'the log channel can be posted to again, so removals are recorded there'
+
+  /** A channel whose sendability a case can change, the way an operator would. */
+  function clientTurning(
+    send: Mock<(payload: unknown) => Promise<unknown>>,
+    state: { sendable: boolean },
+  ): Client {
+    return {
+      channels: { fetch: () => Promise.resolve({ isSendable: () => state.sendable, send }) },
+    } as unknown as Client
+  }
+
+  const carrying = (lines: string[], msg: string): string[] =>
+    lines.filter((line) => line.includes(`msg=${JSON.stringify(msg)}`))
+
+  it('says the channel is unusable once, however many removals there are', async () => {
+    const send = sendSpy()
+    const post = announcer(clientSending(send, false), LOG_CHANNEL)
+
+    for (let n = 0; n < 50; n++) await post(`removal ${n}`)
+
+    expect(carrying(stderr, UNUSABLE)).toHaveLength(1)
+    expect(send).not.toHaveBeenCalled()
+
+    // Still an error, and still naming the channel it is about.
+    expect(carrying(stderr, UNUSABLE)[0]).toContain('level=error')
+    expect(carrying(stderr, UNUSABLE)[0]).toContain(`channel=${JSON.stringify(LOG_CHANNEL)}`)
+  })
+
+  it('says the channel is back, once, when it can post again', async () => {
+    const send = sendSpy()
+    const state = { sendable: false }
+    const post = announcer(clientTurning(send, state), LOG_CHANNEL)
+
+    await post('one')
+    await post('two')
+
+    // He fixes the id, or grants the permission.
+    state.sendable = true
+    for (let n = 0; n < 20; n++) await post(`removal ${n}`)
+
+    expect(carrying(stdout, BACK)).toHaveLength(1)
+    expect(carrying(stdout, BACK)[0]?.startsWith('<6>')).toBe(true)
+    expect(send).toHaveBeenCalledTimes(20)
+  })
+
+  /**
+   * THE COMMON CASE, WHICH HAS TO BE FREE. Every removal on a working bot goes
+   * down this path, and an all-clear for a fault that never happened would be
+   * the original problem rebuilt out of good news.
+   */
+  it('says nothing about a channel that was never broken', async () => {
+    const send = sendSpy()
+    const post = announcer(clientSending(send), LOG_CHANNEL)
+
+    for (let n = 0; n < 20; n++) await post(`removal ${n}`)
+
+    expect(carrying(stdout, BACK)).toEqual([])
+    expect(carrying(stderr, UNUSABLE)).toEqual([])
+  })
 })
 
 /** One embed, with only the parts the case under test cares about filled in. */

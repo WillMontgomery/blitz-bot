@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { DiscordAPIError, DiscordjsError, RESTJSONErrorCodes } from 'discord.js'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { log, setSink, type Level, type Sink } from './log.ts'
+import { allClear, log, setSink, type Level, type Sink } from './log.ts'
 
 /**
  * The log line, as journald and as a person read it.
@@ -381,9 +381,16 @@ const GATEWAY_DISCONNECTED = capture(
   'the gateway-disconnect log call',
 )
 
+/**
+ * `msg:` AND NOT `log('error', `, BECAUSE THIS ONE IS LATCHED. `announcer` says
+ * it through the latch in src/latch.ts now — once per run of the condition
+ * rather than once per removal — so the sentence lives in a `Held` and not in a
+ * `log()` argument. The anchor is unchanged and is still the structural thing:
+ * the `isSendable()` test that decides the channel is unusable.
+ */
 const LOG_CHANNEL_UNUSABLE = capture(
   clientSource,
-  /isSendable\(\)\)[\s\S]*?log\('error', '([^']+)'/,
+  /isSendable\(\)\)[\s\S]*?msg: '([^']+)'/,
   'the unusable-log-channel log call',
 )
 
@@ -832,6 +839,70 @@ describe('the sink — which lines are copied, and what the copy is', () => {
 
     expect(calls.map((call) => call.msg)).toEqual(['first'])
     expect(stderr).toHaveLength(2)
+  })
+})
+
+/**
+ * `allClear` — the one `info` in the process that reaches the channel.
+ *
+ * ═══ THE LEVEL AND THE DELIVERY ARE TWO QUESTIONS WITH OPPOSITE ANSWERS ═══
+ *
+ * A latched fault goes silent after one line (src/latch.ts), and the only way
+ * the owner can learn that his fix worked is a line saying so — he has no CLI
+ * path by design, and "no errors any more" is not a thing a person can watch
+ * for. But nothing is wrong when something recovers, so the line must not be a
+ * `warn`: that would put the good news into `journalctl -p warning` alongside
+ * the bad and make the level of a line stop meaning what the block above says
+ * it means. Delivered but not alarming is the combination, and no single
+ * `Level` expresses it.
+ *
+ * SO IT IS ONE NAMED FUNCTION AND NOT A LOOSENING OF `log()`. The case above —
+ * "never hands over an info" — still holds, and is what keeps `ready` and a
+ * line per deleted message out of the channel.
+ */
+describe('allClear — an info that is delivered anyway', () => {
+  it('writes an info line to stdout, priority and all', () => {
+    allClear('the widget index answers now', { since: '2026-09-01T12:00:00.000Z' })
+
+    expect(stderr).toEqual([])
+    expect(written(stdout)).toContain('<6>')
+    expect(written(stdout)).toContain('level=info')
+    expect(written(stdout)).toContain('msg="the widget index answers now"')
+    expect(written(stdout)).toContain('since="2026-09-01T12:00:00.000Z"')
+  })
+
+  it('hands the sink the same line, at info', () => {
+    const { sink, calls } = recorder()
+    setSink(sink)
+
+    allClear('the widget index answers now')
+
+    expect(only(calls).level).toBe('info')
+    expect(only(calls).msg).toBe('the widget index answers now')
+    expect(only(calls).line).toBe(written(stdout).slice('<6>'.length, -1))
+  })
+
+  it('leaves log() alone: an info through the front door still reaches nobody', () => {
+    const { sink, calls } = recorder()
+    setSink(sink)
+
+    log('info', 'ready', { guild: 'Blitz Royale' })
+    allClear('the widget index answers now')
+
+    expect(calls.map((call) => call.msg)).toEqual(['the widget index answers now'])
+  })
+
+  /**
+   * THE JOURNAL IS THE FLOOR HERE TOO. `allClear` runs on a poll's success path,
+   * so a sink that throws must not take a healthy bot down.
+   */
+  it('writes its line whether or not the sink survives', () => {
+    setSink(() => Promise.reject(new Error('send failed')))
+
+    expect(() => {
+      allClear('the widget index answers now')
+    }).not.toThrow()
+    expect(written(stdout)).toContain('msg="the widget index answers now"')
   })
 })
 

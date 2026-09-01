@@ -3457,6 +3457,197 @@ describe('the case-opened poll', () => {
     expect(DENIED).toContain('dynamodb:Query')
   })
 
+  /* ---------------------------------------------------------------- *
+   * Said once, and said again when it clears.
+   * ---------------------------------------------------------------- */
+
+  /**
+   * ═══ THE DELIVERY, WHICH WAS THE HALF THAT WAS WRONG ═══
+   *
+   * The two sentences above are right and are how the owner found out. What was
+   * wrong was that the poller said one of them every thirty seconds for forty
+   * minutes and counting: #bot-status folded it correctly — one message, "seen 10
+   * times" — and a five-minute window still means a fresh message twelve times an
+   * hour, forever, burying everything else in the one place the owner sees any of
+   * this. He has no CLI path by design, so a channel nobody can read IS the
+   * outage.
+   *
+   * NEITHER SENTENCE MOVED. What changed is that the two permanent conditions go
+   * through the latch in src/latch.ts and the two that are not permanent do not.
+   */
+
+  /** The two all-clears, rebuilt here for the reason the four faults are. */
+  const FOUND = `the ${INCIDENT_KIND_INDEX} index on ringmaster-incidents answers now, so a record is posted when a case is filed`
+  const ALLOWED = `the bot is allowed to Query the ${INCIDENT_KIND_INDEX} index on ringmaster-incidents now, so a record is posted when a case is filed`
+
+  /** The harness options, held so a case can create the index mid-run. */
+  type OpenOptions = NonNullable<Parameters<typeof openHarness>[0]>
+
+  it('says the index is missing once, not once every pass for forty minutes', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      indexFails: { kind: 'no-such-index' },
+    })
+
+    // Eighty passes is forty minutes at POLL_MS, which is what he sat in front
+    // of. Every one of them still queries: the poll never stops, because he may
+    // create the index at any moment and it has to pick that up on its own.
+    for (let n = 0; n < 80; n++) await h.log.poll()
+
+    expect(stderr.filter((line) => line.includes(`msg=${JSON.stringify(MISSING)}`))).toHaveLength(1)
+    expect(h.queries).toHaveLength(80)
+
+    // Still an error. An error that is real stays an error; it just stops
+    // repeating.
+    expect(lineFor(stderr, MISSING)).toContain('level=error')
+  })
+
+  /**
+   * ═══ THE LINE THAT TELLS HIM HIS FIX WORKED ═══
+   *
+   * WITHOUT IT, "IT IS FIXED" IS AN ABSENCE OF ERRORS AND A PERSON CANNOT WATCH
+   * FOR AN ABSENCE. He runs `aws dynamodb update-table`, waits out a backfill of
+   * unknown length, and has no way to ask this bot whether it is working.
+   */
+  it('says the index answers, exactly once, when it starts answering', async () => {
+    const options: OpenOptions = {
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      indexFails: { kind: 'no-such-index' },
+    }
+    const h = openHarness(options)
+
+    await h.log.poll()
+    await h.log.poll()
+
+    // He creates it.
+    options.indexFails = undefined
+
+    for (let n = 0; n < 20; n++) await h.log.poll()
+
+    expect(stdout.filter((line) => line.includes(`msg=${JSON.stringify(FOUND)}`))).toHaveLength(1)
+
+    /**
+     * AND IT IS `info`. Nothing is wrong when something recovers, so
+     * `journalctl -p err` must not carry the good news mixed in with the bad —
+     * and it reaches the channel anyway, through `allClear` in src/log.ts, which
+     * is the one door an `info` has.
+     */
+    expect(lineFor(stdout, FOUND)?.startsWith('<6>')).toBe(true)
+
+    // How long the feature was dead, which is the thing the sentence cannot say.
+    expect(lineFor(stdout, FOUND)).toContain('since=')
+  })
+
+  /**
+   * A HEALTHY BOT SAYS NOTHING. The clear runs on every successful pass, twice a
+   * minute for the life of the process, and an all-clear for a fault that never
+   * happened would be the original problem rebuilt out of good news.
+   */
+  it('says nothing about an index that was never broken', async () => {
+    const h = openHarness({ state: { [OPEN_CURSOR_KEY]: OPEN } })
+
+    for (let n = 0; n < 20; n++) await h.log.poll()
+
+    expect(said(stdout, FOUND)).toBe(false)
+    expect(said(stdout, ALLOWED)).toBe(false)
+  })
+
+  /**
+   * ═══ A DIFFERENT FAULT ARRIVING WHILE ONE IS LATCHED IS STILL REPORTED ═══
+   *
+   * THIS IS THE ROAD THE OWNER IS ACTUALLY ON. He creates the index and the
+   * Query is then refused, because IAM treats the index as a resource of its own
+   * and the policy names only the table — docs/aws-notes.md predicts exactly
+   * this. A latch that swallowed the second sentence would leave him believing
+   * the first fix was the whole job.
+   *
+   * AND NO ALL-CLEAR IS POSTED ON THE WAY. The index really does exist now, but
+   * the read still does not work: `FOUND` says a record is posted when a case is
+   * filed, which is false, and it would be the more reassuring of the two lines
+   * sitting next to each other in the channel.
+   */
+  it('reports a denial that arrives while the missing index is latched', async () => {
+    const options: OpenOptions = {
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      indexFails: { kind: 'no-such-index' },
+    }
+    const h = openHarness(options)
+
+    await h.log.poll()
+    await h.log.poll()
+
+    options.indexFails = { kind: 'denied' }
+    for (let n = 0; n < 20; n++) await h.log.poll()
+
+    expect(stderr.filter((line) => line.includes(`msg=${JSON.stringify(MISSING)}`))).toHaveLength(1)
+    expect(stderr.filter((line) => line.includes(`msg=${JSON.stringify(DENIED)}`))).toHaveLength(1)
+    expect(said(stdout, FOUND)).toBe(false)
+
+    // And when he fixes the policy, the all-clear is the one for the fault that
+    // was actually holding.
+    options.indexFails = undefined
+    await h.log.poll()
+
+    expect(said(stdout, ALLOWED)).toBe(true)
+    expect(said(stdout, FOUND)).toBe(false)
+  })
+
+  /**
+   * ═══ THE TRANSIENT ONE IS LEFT ALONE, AND THAT IS NOT AN OVERSIGHT ═══
+   *
+   * REPETITION IS THE INFORMATION HERE. One timeout is a hiccup the next pass
+   * covers; forty in a row is a table that has stopped answering, and the count
+   * is the only thing that says which of the two is happening. Latching it would
+   * silence the second fact entirely — and it is not a condition a person clears,
+   * which is the test in src/latch.ts.
+   */
+  it('goes on saying a read that did not answer, every pass', async () => {
+    const h = openHarness({
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      indexFails: { kind: 'timeout' },
+    })
+
+    for (let n = 0; n < 10; n++) await h.log.poll()
+
+    const transient = 'could not read the incident index, so no case was posted this pass'
+    expect(stderr.filter((line) => line.includes(`msg=${JSON.stringify(transient)}`))).toHaveLength(
+      10,
+    )
+  })
+
+  /**
+   * ═══ A BACKFILL IS NOT A RECOVERY, WHICH IS THE SUBTLE ONE ═══
+   *
+   * `update-table` PUTS HIM IN THIS EXACT STATE. The index now exists, so
+   * `MISSING` has stopped being true — but `FOUND` says a record is posted when
+   * a case is filed and during a backfill that is still false. The all-clear
+   * waits for a read that actually answered; the `info` line is what says so
+   * meanwhile, and it is the same one it always was.
+   */
+  it('does not call a backfill an all-clear', async () => {
+    const options: OpenOptions = {
+      state: { [OPEN_CURSOR_KEY]: OPEN },
+      indexFails: { kind: 'no-such-index' },
+    }
+    const h = openHarness(options)
+
+    await h.log.poll()
+
+    options.indexFails = { kind: 'index-backfilling' }
+    for (let n = 0; n < 10; n++) await h.log.poll()
+
+    expect(said(stdout, FOUND)).toBe(false)
+    expect(said(stdout, FILLING)).toBe(true)
+
+    // And the missing-index line does not come back when the backfill finishes:
+    // what comes back is the all-clear.
+    options.indexFails = undefined
+    await h.log.poll()
+
+    expect(stderr.filter((line) => line.includes(`msg=${JSON.stringify(MISSING)}`))).toHaveLength(1)
+    expect(said(stdout, FOUND)).toBe(true)
+  })
+
   /**
    * ═══ ONE FAILING KIND ABANDONS THE WHOLE PASS ═══
    *

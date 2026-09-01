@@ -35,6 +35,7 @@ import {
   type IncidentKind,
   type IncidentPage,
 } from './ddb.ts'
+import { latch } from './latch.ts'
 import { log } from './log.ts'
 
 /* ------------------------------------------------------------------ *
@@ -2056,8 +2057,39 @@ export const MAX_INDEX_ROWS = 50
  *
  * IT IS `error` AND NOT `warn`. The bot has stopped doing a thing it is for and
  * a person has to act; that is the rule in src/log.ts, stated there.
+ *
+ * AND IT IS SAID ONCE PER RUN OF THE CONDITION RATHER THAN ONCE PER PASS, WHICH
+ * IS THE ONLY THING ABOUT IT THAT CHANGED. It was every thirty seconds for as
+ * long as the index was missing — forty minutes of one sentence in #bot-status
+ * before anybody asked it to stop. See `index` in `createIncidentOpenLog` and
+ * src/latch.ts. The words are untouched: they named the index, the table and the
+ * consequence, and they are how the owner found out.
  */
 const MISSING_INDEX = `the ${INCIDENT_KIND_INDEX} index on ringmaster-incidents does not exist, so no record is posted when a case is filed`
+
+/**
+ * What it says when the index starts answering.
+ *
+ * ═══ THE HALF OF THE LATCH THAT MAKES THE SILENCE READABLE ═══
+ *
+ * WITHOUT THIS LINE, "IT IS FIXED" IS AN ABSENCE OF ERRORS, AND A PERSON CANNOT
+ * WATCH FOR AN ABSENCE. The owner creates the index by hand, waits out a
+ * backfill of unknown length, and has no CLI path to ask this bot whether it is
+ * working — so the channel saying so is the whole feedback loop for the fix.
+ *
+ * IT IS THE MIRROR OF `MISSING_INDEX` DOWN TO ITS CLAUSES — the same index, the
+ * same table, the same consequence with the negation removed — because the two
+ * are read one above the other in a channel and the only thing that should
+ * differ between them is what is true.
+ *
+ * "NOW" AND NOT "AGAIN". The usual road to this line is an index that has never
+ * existed being created for the first time, where "again" would be false.
+ *
+ * IT IS `info` AND IT REACHES THE CHANNEL ANYWAY. Nothing is wrong when
+ * something recovers; see `allClear` in src/log.ts for why those two are not in
+ * conflict.
+ */
+const INDEX_FOUND = `the ${INCIDENT_KIND_INDEX} index on ringmaster-incidents answers now, so a record is posted when a case is filed`
 
 /**
  * What it says while the index is being built — the minutes right after the
@@ -2103,6 +2135,21 @@ const FILLING_INDEX = `the ${INCIDENT_KIND_INDEX} index on ringmaster-incidents 
  * from it.
  */
 const INDEX_DENIED = `the bot is not allowed to Query the ${INCIDENT_KIND_INDEX} index on ringmaster-incidents, so no record is posted when a case is filed — dynamodb:Query has to be granted on the table arn AND on that arn with /index/${INCIDENT_KIND_INDEX} on the end, which IAM treats as a separate resource`
+
+/**
+ * What it says when the policy starts allowing the Query.
+ *
+ * A SECOND ALL-CLEAR RATHER THAN ONE SHARED WITH `INDEX_FOUND`, EVEN THOUGH BOTH
+ * MEAN "THE READ WORKS NOW". They are answers to two different questions the
+ * owner asked with two different fixes — `aws dynamodb update-table` and an IAM
+ * policy edit — and the point of the line is to tell him which of the things he
+ * did was the one that worked. A single generic sentence would be ambiguous in
+ * exactly the case where both were wrong and he fixed them one at a time.
+ *
+ * IT DOES NOT REPEAT THE ARN ADVICE. That belongs on the fault, where somebody
+ * is about to go and edit a policy; here it is over.
+ */
+const INDEX_ALLOWED = `the bot is allowed to Query the ${INCIDENT_KIND_INDEX} index on ringmaster-incidents now, so a record is posted when a case is filed`
 
 /**
  * What it says when the index answers with an `openedAt` that is not a position
@@ -2282,6 +2329,22 @@ export function createIncidentOpenLog(deps: IncidentOpenLogDeps): IncidentOpenLo
   )
 
   /**
+   * THE INDEX READ ITSELF: ONE SLOT, TWO CONDITIONS, AND EVERYTHING ELSE THIS
+   * POLL SAYS LEFT ALONE.
+   *
+   * WHY A SINGLE LATCH COVERS BOTH `no-such-index` AND `denied`. They are two
+   * states of one thing — whether this bot can read that index — and they are
+   * mutually exclusive: the index either is not there or is there and refused.
+   * A slot per FAILURE would let the pair alternate and post twice; a slot per
+   * READ makes a change of state one line, which is what a person watching a fix
+   * land actually wants to see.
+   *
+   * IT TAKES THE POLLER'S CLOCK so the restatement is on the same clock as
+   * everything else here, and so a test can move a day.
+   */
+  const index = latch(now)
+
+  /**
    * THIS POLLER'S PLACE IN `ringmaster-bot-state`, KEPT BY THE SAME CODE THE
    * OTHER TWO USE.
    *
@@ -2449,26 +2512,61 @@ export function createIncidentOpenLog(deps: IncidentOpenLogDeps): IncidentOpenLo
          * is how a policy that will never fix itself gets logged at the same
          * level as a slow network. See `MISSING_INDEX`, `FILLING_INDEX` and
          * `INDEX_DENIED` for each one's own argument.
+         *
+         * ═══ AND TWO OF THE FOUR ARE LATCHED WHILE THE OTHER TWO ARE NOT ═══
+         *
+         * THE TWO PERMANENT ONES GO THROUGH `index` AND SAY THEMSELVES ONCE. An
+         * index that does not exist and a policy that refuses the Query are
+         * identical on every pass, in the sentence and in all three fields, until
+         * somebody runs a command. Repeating them adds nothing and buries
+         * everything else in the one channel the owner reads. See src/latch.ts.
+         *
+         * THE OTHER TWO ARE DELIBERATELY LEFT PER-PASS. `FILLING_INDEX` is `info`
+         * and reaches no channel at all, and it is self-healing in minutes — the
+         * latch would be machinery around a line that already costs nothing. The
+         * generic branch is the transient bucket by construction, and repetition
+         * is the whole of its information: one timeout is a hiccup, forty in a
+         * row is a table that has stopped answering, and only the count says
+         * which. Latching it would silence the second fact entirely.
          */
         const failure = page.failure
 
         if (failure.kind === 'no-such-index') {
-          log('error', MISSING_INDEX, {
-            index: INCIDENT_KIND_INDEX,
-            table: failure.table,
-            detail: failure.message,
+          index.fault({
+            level: 'error',
+            msg: MISSING_INDEX,
+            cleared: INDEX_FOUND,
+            fields: {
+              index: INCIDENT_KIND_INDEX,
+              table: failure.table,
+              detail: failure.message,
+            },
           })
         } else if (failure.kind === 'index-backfilling') {
+          /**
+           * THE LATCH IS NOT CLEARED HERE, AND THAT IS THE SUBTLE ONE. This is
+           * the state `aws dynamodb update-table` puts the owner in, so the
+           * index now EXISTS and `MISSING_INDEX` has stopped being true — but
+           * `INDEX_FOUND` says a record is posted when a case is filed, and
+           * during a backfill that is still false. The all-clear waits for a read
+           * that actually answered, which is where it is honest; this line, at
+           * `info`, is what says so meanwhile.
+           */
           log('info', FILLING_INDEX, {
             index: INCIDENT_KIND_INDEX,
             table: failure.table,
             detail: failure.message,
           })
         } else if (failure.kind === 'denied') {
-          log('error', INDEX_DENIED, {
-            index: INCIDENT_KIND_INDEX,
-            table: failure.table,
-            detail: failure.message,
+          index.fault({
+            level: 'error',
+            msg: INDEX_DENIED,
+            cleared: INDEX_ALLOWED,
+            fields: {
+              index: INCIDENT_KIND_INDEX,
+              table: failure.table,
+              detail: failure.message,
+            },
           })
         } else {
           log('warn', 'could not read the incident index, so no case was posted this pass', {
@@ -2483,6 +2581,19 @@ export function createIncidentOpenLog(deps: IncidentOpenLogDeps): IncidentOpenLo
 
       pages.push(page.value)
     }
+
+    /**
+     * EVERY KIND ANSWERED, SO WHATEVER WAS WRONG WITH THE INDEX IS NOT WRONG NOW.
+     *
+     * HERE AND NOT AT THE END OF THE PASS, because this is the exact point at
+     * which the condition the latch holds — "this bot cannot read that index" —
+     * is known to be false. Everything below can still fail on a stamp, a short
+     * page or a send, and none of those is a statement about the index.
+     *
+     * IT COSTS NOTHING ON A HEALTHY BOT. Nothing was held, so `clear` returns
+     * without writing a line; see src/latch.ts.
+     */
+    index.clear()
 
     /**
      * ═══ THE STAMP THE PASS CAN PROVE IT SAW ALL OF ═══

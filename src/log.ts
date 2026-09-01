@@ -84,6 +84,28 @@ const PRIORITY: Record<Level, string> = {
 }
 
 export function log(level: Level, msg: string, fields?: Record<string, unknown>): void {
+  const body = write(level, msg, fields)
+
+  // Second, and only ever second. `body` and not the written line: the prefix
+  // is a thing journald eats, and a `<4>` at the front of a Discord post is
+  // noise nobody can act on.
+  if (level !== 'info') report(level, msg, body)
+}
+
+/**
+ * One line to the journal, and the body of it back.
+ *
+ * SPLIT OUT OF `log()` SO `allClear` CAN REUSE IT AND NOT REIMPLEMENT IT. There
+ * is one line format in this process and there has to go on being one: a second
+ * copy of the timestamp, the escaping and the priority prefix is a second thing
+ * to keep in step with `render`, and the one that would fall behind is the one
+ * with fewer callers.
+ *
+ * IT RETURNS THE BODY BECAUSE THE CALLERS DECIDE ABOUT THE COPY. Whether a line
+ * is handed to the sink is a question about what the line MEANS, which is
+ * `log()`'s business and `allClear`'s, and not this function's.
+ */
+function write(level: Level, msg: string, fields?: Record<string, unknown>): string {
   /**
    * ISO 8601 IN UTC EVEN THOUGH THE JOURNAL ALREADY STAMPS EVERY LINE. The
    * journal's stamp is in the box's local time and is lost the moment a line
@@ -112,10 +134,40 @@ export function log(level: Level, msg: string, fields?: Record<string, unknown>)
   if (level === 'info') process.stdout.write(line)
   else process.stderr.write(line)
 
-  // Second, and only ever second. `body` and not `line`: the prefix is a thing
-  // journald eats, and a `<4>` at the front of a Discord post is noise nobody
-  // can act on.
-  if (level !== 'info') report(level, msg, body)
+  return body
+}
+
+/**
+ * A condition that needed a person has stopped happening. `src/latch.ts` is the
+ * only caller, and this is the one line in the process that reaches the status
+ * channel WITHOUT being a fault.
+ *
+ * ═══ THE LEVEL AND THE DELIVERY ARE TWO QUESTIONS AND THEY HAVE OPPOSITE
+ * ANSWERS, WHICH IS THE WHOLE REASON THIS FUNCTION EXISTS ═══
+ *
+ * IT IS `info`, BY THE RULE ABOVE APPLIED HONESTLY. The one question is "does
+ * this need a human", and an all-clear needs nobody: nothing is broken, nothing
+ * is waiting, and the person it would be for has already done the thing. A
+ * recovery at `warn` would mean `journalctl -p warning` returns the good news
+ * mixed in with the bad, and the level of a line would stop meaning what every
+ * other line in this bot uses it to mean. That is the same lie as demoting a
+ * real error to keep it out of the channel, told in the other direction.
+ *
+ * AND IT STILL HAS TO REACH THE CHANNEL, WHICH `info` OTHERWISE NEVER DOES. The
+ * owner has no CLI path by design; the status channel is the only place he sees
+ * any of this. A latched fault that goes silent and then never says anything
+ * again leaves him watching for the ABSENCE of an error — which is not something
+ * a person can watch for — so the line that says his fix worked is the half of
+ * the latch that makes the silence readable at all. Delivered but not alarming
+ * is exactly the combination, and no single `Level` expresses it.
+ *
+ * SO THE EXCEPTION IS ONE NAMED FUNCTION RATHER THAN A LOOSENING OF `log()`.
+ * `log('info', …)` still hands the sink nothing, and there is a case in
+ * log.test.ts that says so. Everything that reaches the channel now goes through
+ * either a `Fault` or this, and there are no other doors.
+ */
+export function allClear(msg: string, fields?: Record<string, unknown>): void {
+  report('info', msg, write('info', msg, fields))
 }
 
 /**
@@ -124,8 +176,12 @@ export function log(level: Level, msg: string, fields?: Record<string, unknown>)
  * INFO IS NOT A FAULT AND THE TYPE IS WHERE THAT IS SAID. The sink exists to
  * put the things that need a human in front of one, and a channel that also
  * carries `ready` and a line per deleted message is a channel nobody reads —
- * so `info` never reaches it. Excluding it here rather than in a comment means
- * no sink can be written that expects to be handed one.
+ * so `log()` never hands it an `info`. Excluding it here rather than in a
+ * comment means no `log()` call can be written that expects to.
+ *
+ * THE ONE `info` THAT DOES REACH THE CHANNEL GOES THROUGH `allClear` AND NOT
+ * THROUGH `log()`, which is why this type still means what it says. See there
+ * for why an all-clear is not a fault and has to arrive anyway.
  *
  * SO THE RULE FOR PICKING A LEVEL IS ONE QUESTION: DOES THIS NEED A HUMAN?
  * `warn` and `error` mean yes, and mean it literally — every one of them is
@@ -169,8 +225,16 @@ export type Fault = Exclude<Level, 'info'>
  * of a fault and the rendered line is not: the same failure about two different
  * messages differs only in its fields and its timestamp. A sink that wants to
  * recognise a repeat has to compare the parts that do not move.
+ *
+ * ITS LEVEL IS `Level` AND NOT `Fault`, WHICH IS THE ONE THING THAT CHANGED WHEN
+ * THE LATCH ARRIVED. `log()` still hands it nothing but a `Fault`; `allClear` is
+ * the single caller that hands it an `info`, and it does so through its own
+ * exported function so that widening this type cannot silently open the channel
+ * to every `ready` line in the bot. A sink is free to treat the three the same —
+ * `statusReporter` does, because none of its behaviour has ever branched on the
+ * level — and a sink that wants to tell an all-clear from a fault can.
  */
-export type Sink = (level: Fault, msg: string, line: string) => Promise<void>
+export type Sink = (level: Level, msg: string, line: string) => Promise<void>
 
 /**
  * MODULE STATE, AND THE ONLY PIECE IN THIS FILE. There is exactly one journal
@@ -212,7 +276,7 @@ export function setSink(next: Sink | null): void {
  */
 const reporting = new AsyncLocalStorage<true>()
 
-function report(level: Fault, msg: string, line: string): void {
+function report(level: Level, msg: string, line: string): void {
   const current = sink
   if (current === null || reporting.getStore() !== undefined) return
 

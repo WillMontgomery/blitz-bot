@@ -32,8 +32,9 @@ import {
 } from './ddb.ts'
 import { installIncidentLog } from './incidents.ts'
 import { scanMessage, type InviteResolver, type ScanResult } from './invites.ts'
+import { latch } from './latch.ts'
 import { scanLinks, type LinkReason } from './links.ts'
-import { log, type Fault, type Sink } from './log.ts'
+import { log, type Level, type Sink } from './log.ts'
 import { watchMaintenance } from './maintenance.ts'
 import { createRingmaster, KICK_TTL_MS, type KickResult, type Ringmaster } from './ringmaster.ts'
 import { installStickies } from './sticky.ts'
@@ -2465,21 +2466,64 @@ function snapshot(message: LiveMessage, authorId: string, selfId: string | null)
  * anybody touching this file, so it is not the thing the promise rests on.
  */
 export function announcer(client: Client, channelId: string): (line: string) => Promise<void> {
+  /**
+   * ═══ "WORTH ONE LINE EACH TIME" WAS THE OLD RULE HERE AND IT WAS WRONG ═══
+   *
+   * A wrong id, a deleted channel or a missing permission is fixed by a person
+   * editing a variable or a permission overwrite, and until they do, EVERY
+   * removal this bot makes emits an identical error — same sentence, same one
+   * field, forever. That is worse than the poller that started all this: a raid
+   * produces removals far faster than thirty seconds apart, so the moment the
+   * moderation record goes missing is the moment the status channel becomes
+   * unreadable, and the two faults an operator most needs side by side are the
+   * two that bury each other.
+   *
+   * IT MEETS BOTH HALVES OF THE TEST IN src/latch.ts: only a person ends it, and
+   * every repeat carries the same `channel` and nothing else. Nothing is lost by
+   * saying it once.
+   *
+   * THE FAULT'S OWN SENTENCE IS UNTOUCHED, and it still says which of the two
+   * halves is broken — that was the reason it was a line at all, and it is still
+   * the reason.
+   */
+  const posting = latch()
+
   return async (line) => {
     const channel = await client.channels.fetch(channelId)
 
-    // A wrong id, a deleted channel, or a channel the bot cannot send in. Worth
-    // one line each time rather than a silent return: an operator who set
-    // BLITZ_LOG_CHANNEL_ID and sees nothing in the channel needs to be told
-    // which of the two halves is broken.
     if (channel === null || !channel.isSendable()) {
-      log('error', 'log channel is missing or cannot be posted to', { channel: channelId })
+      posting.fault({
+        level: 'error',
+        msg: 'log channel is missing or cannot be posted to',
+        cleared: LOG_CHANNEL_BACK,
+        fields: { channel: channelId },
+      })
       return
     }
+
+    // CLEARED ON SENDABLE AND NOT ON A SUCCESSFUL SEND. What the fault claims is
+    // that the id names nothing this bot can post in, and that claim is answered
+    // here; a `send` that then fails on a rate limit or a five-hundred is a
+    // different fault and rejects to the caller, as it always has.
+    posting.clear()
 
     await channel.send({ content: line, allowedMentions: { parse: [] } })
   }
 }
+
+/**
+ * What the status channel says when the log channel comes back.
+ *
+ * IT NAMES THE CONSEQUENCE THE FAULT NAMED, WHICH IS THE POINT OF SAYING
+ * ANYTHING. "The log channel works" is a fact about a channel; what the owner
+ * wants to know is that the moderation record is being written again, because
+ * that is what stopped.
+ *
+ * IT LANDS IN #bot-status AND NOT IN THE CHANNEL IT IS ABOUT, exactly like the
+ * fault it clears — the two are a pair and have to be read together, and the
+ * channel this is about is the one that was unreachable.
+ */
+const LOG_CHANNEL_BACK = 'the log channel can be posted to again, so removals are recorded there'
 
 /**
  * The two ways this bot reaches a poster, built on the live client.
@@ -2631,7 +2675,7 @@ export function statusReporter(client: Client, channelId: string): Sink {
    * opposite choice from `remember` below, which evicts the oldest — there, the
    * newest occurrence is the evidence that a fault is still happening.
    */
-  const early: { level: Fault; msg: string; line: string }[] = []
+  const early: { level: Level; msg: string; line: string }[] = []
 
   let usable = true
   let queued = 0
@@ -2849,7 +2893,7 @@ export function statusReporter(client: Client, channelId: string): Sink {
   }
 
   /** Put one fault on the chain, or drop it because too much is already there. */
-  function enqueue(level: Fault, msg: string, line: string): Promise<void> {
+  function enqueue(level: Level, msg: string, line: string): Promise<void> {
     /**
      * A BOUND ON WHAT IS WAITING, not only on what is remembered. Coalescing
      * happens at the front of the queue, so a burst of DISTINCT faults still
