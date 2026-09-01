@@ -5,7 +5,13 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { connectIp, type Config, DEFAULT_SERVER_IPS, loadConfig } from './config.ts'
+import {
+  channelCollisions,
+  connectIp,
+  type Config,
+  DEFAULT_SERVER_IPS,
+  loadConfig,
+} from './config.ts'
 import { CONSOLE_URL } from './console.ts'
 
 /**
@@ -1017,5 +1023,180 @@ describe('loadConfig, when neither source supplies the required variables', () =
 
     expect(message).toContain('DISCORD_BOT_TOKEN: set but empty')
     expect(message).toContain('DISCORD_GUILD_ID: set but empty')
+  })
+})
+
+/**
+ * Two channel variables set to one channel.
+ *
+ * THE BUG HAD NO SYMPTOM, WHICH IS WHY IT NEEDED A TEST RATHER THAN A FIX.
+ * docs/deploy.md put the status channel's snowflake in `BLITZ_LOG_CHANNEL_ID`
+ * and called it the moderation log. Both ids were real channels the bot could
+ * post in, so nothing threw, nothing was refused, and no line anywhere said so —
+ * the moderation record simply appeared in the wrong room, mixed in with the
+ * bot's own faults. A human found it by reading a guide against a manual.
+ *
+ * THE FOUR ARE LISTED AGAIN HERE, ON PURPOSE. This is a second, independent
+ * statement of which ids are meant to be four different rooms: drop one from
+ * `CHANNEL_VARIABLES` in src/config.ts and the pair tests below stop finding the
+ * collision they assert, rather than quietly checking three ids forever.
+ */
+const CHANNEL_FIELDS = [
+  'logChannelId',
+  'statusChannelId',
+  'docsChannelId',
+  'maintenanceChannelId',
+] as const
+
+type ChannelField = (typeof CHANNEL_FIELDS)[number]
+
+const VARIABLE: Record<ChannelField, string> = {
+  logChannelId: 'BLITZ_LOG_CHANNEL_ID',
+  statusChannelId: 'BLITZ_STATUS_CHANNEL_ID',
+  docsChannelId: 'BLITZ_DOCS_CHANNEL_ID',
+  maintenanceChannelId: 'BLITZ_MAINTENANCE_CHANNEL_ID',
+}
+
+/** The live configuration's starting point: every optional channel unset. */
+const noChannels = (): Pick<Config, ChannelField> => ({
+  logChannelId: null,
+  statusChannelId: null,
+  docsChannelId: null,
+  maintenanceChannelId: null,
+})
+
+describe('two channel variables naming one channel', () => {
+  const pairs: [ChannelField, ChannelField][] = []
+  CHANNEL_FIELDS.forEach((first, index) => {
+    for (const second of CHANNEL_FIELDS.slice(index + 1)) pairs.push([first, second])
+  })
+
+  for (const [first, second] of pairs) {
+    it(`reports ${VARIABLE[first]} and ${VARIABLE[second]} sharing an id`, () => {
+      const config = noChannels()
+      config[first] = '999'
+      config[second] = '999'
+
+      const found = channelCollisions(config)
+
+      expect(found).toHaveLength(1)
+      expect(found[0]?.channelId).toBe('999')
+
+      // Named in the order src/config.ts declares them, not in the order this
+      // test happened to set them.
+      expect(found[0]?.variables).toEqual([VARIABLE[first], VARIABLE[second]])
+      expect(found[0]?.warning).toContain(VARIABLE[first])
+      expect(found[0]?.warning).toContain(VARIABLE[second])
+    })
+  }
+
+  /**
+   * THE SENTENCE IS THE FEATURE, so it is pinned rather than pattern-matched.
+   * It is read once, in Discord, by somebody who has to know what to go and edit
+   * without opening a checkout — and this is the exact pair the deploy guide got
+   * wrong. `channel` carries the id alongside it; see src/index.ts.
+   */
+  it('names both variables in a sentence an operator can act on', () => {
+    const config = noChannels()
+    config.logChannelId = '777'
+    config.statusChannelId = '777'
+
+    expect(channelCollisions(config)[0]?.warning).toBe(
+      'BLITZ_LOG_CHANNEL_ID and BLITZ_STATUS_CHANNEL_ID are set to the same channel, ' +
+        'and each is meant to be a separate one',
+    )
+  })
+
+  /** One mistake is one line, however many variables it swept up. */
+  it('says it once when three variables share an id, naming all three', () => {
+    const config = noChannels()
+    config.logChannelId = '555'
+    config.docsChannelId = '555'
+    config.maintenanceChannelId = '555'
+
+    const found = channelCollisions(config)
+
+    expect(found).toHaveLength(1)
+    expect(found[0]?.variables).toEqual([
+      'BLITZ_LOG_CHANNEL_ID',
+      'BLITZ_DOCS_CHANNEL_ID',
+      'BLITZ_MAINTENANCE_CHANNEL_ID',
+    ])
+    expect(found[0]?.warning).toBe(
+      'BLITZ_LOG_CHANNEL_ID, BLITZ_DOCS_CHANNEL_ID and BLITZ_MAINTENANCE_CHANNEL_ID ' +
+        'are set to the same channel, and each is meant to be a separate one',
+    )
+  })
+
+  it('reports two separate collisions separately', () => {
+    const config = noChannels()
+    config.logChannelId = '111'
+    config.statusChannelId = '111'
+    config.docsChannelId = '222'
+    config.maintenanceChannelId = '222'
+
+    const found = channelCollisions(config)
+
+    expect(found).toHaveLength(2)
+    expect(found.map((collision) => collision.channelId)).toEqual(['111', '222'])
+  })
+
+  /**
+   * THE CORRECT `.env` HAS TO BE SILENT. A check that warns about a working
+   * configuration is a check the owner learns to scroll past, and then it is
+   * worth less than nothing on the day it is right.
+   */
+  it('says nothing when all four are different channels', () => {
+    const config = noChannels()
+    config.logChannelId = '111'
+    config.statusChannelId = '222'
+    config.docsChannelId = '333'
+    config.maintenanceChannelId = '444'
+
+    expect(channelCollisions(config)).toEqual([])
+  })
+
+  /**
+   * UNSET IS NOT A VALUE AND THREE BLANKS ARE NOT THREE COLLISIONS. This is the
+   * bot's live configuration today — one channel set, the rest never filled in —
+   * and it is the case a naive equality check gets loudly and permanently wrong.
+   */
+  it('does not count unset ids as colliding with each other', () => {
+    expect(channelCollisions(noChannels())).toEqual([])
+
+    const one = noChannels()
+    one.logChannelId = '111'
+    expect(channelCollisions(one)).toEqual([])
+  })
+
+  /** Straight out of `loadConfig`, so nothing between the two shapes drifts. */
+  it('finds the collision in a config the schema actually produced', () => {
+    const config = loadConfig({
+      DISCORD_BOT_TOKEN: 'token',
+      DISCORD_GUILD_ID: 'guild',
+      BLITZ_LOG_CHANNEL_ID: '888',
+      BLITZ_STATUS_CHANNEL_ID: '888',
+    })
+
+    expect(channelCollisions(config)).toHaveLength(1)
+  })
+
+  /**
+   * WHERE THE LINE IS LOGGED IS WHAT DECIDES WHETHER IT IS EVER READ, and that
+   * is a property of src/index.ts's ORDER that no other test in this repo can
+   * see. `report()` in src/log.ts returns immediately when the sink is null and
+   * buffers nothing, so a warning raised before `setSink` reaches the journal and
+   * nothing else — which for a bot the owner operates from Discord is the same
+   * as not raising it. Read as source for the reason the `--env-file-if-exists`
+   * test above reads package.json: there is nothing at the call site that a
+   * comment alone can stop a tidy-up from reordering.
+   */
+  it('is logged after the status sink is installed, in src/index.ts', () => {
+    const source = repoFile('src/index.ts')
+    const sink = source.indexOf('setSink(')
+    const check = source.indexOf('channelCollisions(config)')
+
+    expect(sink).toBeGreaterThan(-1)
+    expect(check).toBeGreaterThan(sink)
   })
 })

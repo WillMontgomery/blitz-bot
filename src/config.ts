@@ -699,3 +699,118 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     gameBanRoleId: parsedEnv.BLITZ_GAME_BAN_ROLE_ID,
   }
 }
+
+/**
+ * The four ids whose whole point is that they are four different rooms.
+ *
+ * THE FIELD COMMENTS ABOVE ARE THIS TABLE'S SPECIFICATION, not a gloss on it.
+ * `docsChannelId` is "A THIRD CHANNEL RATHER THAN A REUSE OF EITHER OTHER ONE"
+ * because the bot EDITS the document it keeps there and must not reach into a
+ * channel of evidence to do it; `maintenanceChannelId` is "A FOURTH CHANNEL,
+ * AND IT IS THE ONLY ONE PLAYERS READ". Every one of those sentences is a claim
+ * that two of these ids being equal is a misconfiguration, and until now nothing
+ * in the program checked any of them.
+ *
+ * `BLITZ_EXEMPT_CHANNEL_IDS` IS DELIBERATELY NOT IN THE COMPARISON, and it is
+ * the only other channel-shaped setting in this file. The four here are places
+ * the bot WRITES, each to its own audience. That one is a filter — a list of
+ * channels the scanner skips — and a moderation log that is also exempt from
+ * being scanned is a defensible thing for an operator to configure rather than a
+ * mistake. Including it would raise an alarm about a correct `.env`, which is
+ * the fastest way to teach somebody to ignore this warning.
+ *
+ * THE ORDER IS THE INTERFACE'S AND THE SCHEMA'S, so the sentence a collision
+ * produces names variables in the order they appear in this file and in
+ * `.env.example` rather than in whatever order a `Map` happened to fill.
+ */
+type ChannelKey = 'logChannelId' | 'statusChannelId' | 'docsChannelId' | 'maintenanceChannelId'
+
+const CHANNEL_VARIABLES: readonly (readonly [name: string, key: ChannelKey])[] = [
+  ['BLITZ_LOG_CHANNEL_ID', 'logChannelId'],
+  ['BLITZ_STATUS_CHANNEL_ID', 'statusChannelId'],
+  ['BLITZ_DOCS_CHANNEL_ID', 'docsChannelId'],
+  ['BLITZ_MAINTENANCE_CHANNEL_ID', 'maintenanceChannelId'],
+]
+
+/** Two or more channel variables found holding one id. */
+export interface ChannelCollision {
+  /** The id they share, so the reader does not have to go and diff a file. */
+  readonly channelId: string
+
+  /** The environment variable names, in `CHANNEL_VARIABLES` order. */
+  readonly variables: readonly string[]
+
+  /**
+   * The operator's sentence, finished here rather than at the call site.
+   *
+   * THE WORDING LIVES WITH THE CHECK BECAUSE THE CALL SITE CANNOT BE TESTED.
+   * src/index.ts is the file that owns the token, the signals and the shutdown,
+   * and its own header says why nothing tests it. The one thing
+   * this warning has to get right is that it names BOTH variables and the id —
+   * an operator reading it in Discord has to know what to go and edit without
+   * opening a checkout — so that sentence is built where a test can assert it.
+   */
+  readonly warning: string
+}
+
+/**
+ * Which of the four channel variables have been pointed at the same channel.
+ *
+ * THE BUG THIS EXISTS FOR LEFT NO SYMPTOM AT ALL. docs/deploy.md put the STATUS
+ * channel's snowflake in `BLITZ_LOG_CHANNEL_ID` and called it the moderation
+ * log. Both ids named real channels the bot could post to, so nothing failed,
+ * nothing was refused, and no line anywhere said so — the moderation record
+ * simply appeared in the wrong room, interleaved with the bot's own faults. It
+ * was found by a person reading a guide against a manual. That is not a
+ * detection mechanism, and this function is the one that replaces it.
+ *
+ * GROUPED BY ID RATHER THAN EMITTED PER PAIR. Four variables set to one channel
+ * is one mistake and six pairs; six warnings about it would bury the fact that
+ * there is only one thing to fix. One entry per shared id names everybody
+ * involved in it and is said once.
+ *
+ * AN UNSET ID IS NOT A VALUE AND CANNOT COLLIDE WITH ANOTHER UNSET ID. Three
+ * channels left blank is the live configuration today, not three collisions —
+ * `optionalId` collapses absent, empty and whitespace-only to one `null`
+ * precisely so that a check like this one has a single thing to skip.
+ *
+ * PURE, LIKE EVERYTHING ELSE IN THIS FILE. It reads no environment, logs
+ * nothing and decides nothing about what happens next; src/index.ts owns that
+ * and explains the choice there.
+ */
+export function channelCollisions(config: Pick<Config, ChannelKey>): ChannelCollision[] {
+  const byId = new Map<string, string[]>()
+
+  for (const [name, key] of CHANNEL_VARIABLES) {
+    const id = config[key]
+    if (id === null) continue
+
+    const named = byId.get(id)
+    if (named === undefined) byId.set(id, [name])
+    else named.push(name)
+  }
+
+  return [...byId]
+    .filter(([, variables]) => variables.length > 1)
+    .map(([channelId, variables]) => ({
+      channelId,
+      variables,
+      warning: `${andList(variables)} are set to the same channel, and each is meant to be a separate one`,
+    }))
+}
+
+/**
+ * "A and B", or "A, B and C".
+ *
+ * SPELLED OUT RATHER THAN `join(', ')` because this string is read once, in a
+ * hurry, by somebody who has just been told something is wrong. A list that
+ * reads as a sentence is the difference between skimming it and parsing it.
+ */
+function andList(names: readonly string[]): string {
+  if (names.length <= 2) return names.join(' and ')
+
+  // `at(-1)` rather than an index, because `noUncheckedIndexedAccess` makes the
+  // subscript `string | undefined` and there is nothing sensible to do with the
+  // undefined that a length check has already ruled out.
+  return `${names.slice(0, -1).join(', ')} and ${names.at(-1) ?? ''}`
+}

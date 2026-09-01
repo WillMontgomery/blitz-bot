@@ -1,6 +1,6 @@
 import { createClient, statusReporter } from './client.ts'
 import { installCommands } from './commands/index.ts'
-import { loadConfig, type Config } from './config.ts'
+import { channelCollisions, loadConfig, type Config } from './config.ts'
 import { log, setSink } from './log.ts'
 
 /**
@@ -95,6 +95,53 @@ installCommands(client, config)
  */
 if (config.statusChannelId !== null) {
   setSink(statusReporter(client, config.statusChannelId))
+}
+
+/**
+ * TWO CHANNEL VARIABLES POINTED AT ONE CHANNEL, SAID ONCE, HERE.
+ *
+ * THE FAULT IT CATCHES HAS NO OTHER SYMPTOM. docs/deploy.md shipped the status
+ * channel's snowflake as `BLITZ_LOG_CHANNEL_ID`; both ids named real channels
+ * the bot could post in, so nothing errored and nothing was refused — the
+ * moderation record just went into the wrong room, mixed in with the bot's own
+ * faults, for as long as nobody read the guide against the manual. See
+ * `channelCollisions` in src/config.ts for the four ids and why they are four.
+ *
+ * ═══ WHY IT IS A WARNING AND NOT A REFUSAL TO BOOT ═══
+ *
+ * `loadConfig` THROWS AND THIS DOES NOT, WHICH IS THE OPPOSITE CHOICE ON
+ * PURPOSE. What that throws over is a bot that cannot work at all — no token,
+ * an id that is not an id. A merged channel is a bot that works, moderates,
+ * bans and reports, and puts one of its records in the wrong room. Refusing to
+ * start over that trades a cosmetic fault for an outage, and under
+ * `Restart=always` it trades it for a restart loop: the owner operates this bot
+ * from Discord, and a process that dies before `client.login` posts nothing to
+ * Discord at all. He would lose the moderation he has AND still not be told
+ * why.
+ *
+ * ═══ WHY IT IS AFTER `setSink` AND NOT INSIDE `createClient` ═══
+ *
+ * THE LEVEL DOES NOT DECIDE WHETHER THIS REACHES A HUMAN; THE LINE NUMBER DOES.
+ * `report()` in src/log.ts returns immediately when the sink is null and
+ * BUFFERS NOTHING, and the sink is installed by the block above — so a `warn`
+ * raised anywhere before it, `createClient` included, reaches the journal and
+ * nothing else however loud it is. That is the one place this check could have
+ * been put where it would have been invisible to the only person who reads it.
+ *
+ * AFTER THE SINK BUT BEFORE THE LOGIN IS NOT TOO EARLY. `statusReporter` gates
+ * on `client.isReady()`, which is false here, and HOLDS what it cannot yet post
+ * in its `early` buffer — flushed by its own `clientReady` listener. Startup
+ * faults are the case that buffer was built for.
+ *
+ * WHEN THE COLLISION IS log-AND-status, THE WARNING LANDS IN THE ROOM IT IS
+ * COMPLAINING ABOUT. That is fine and is not worth a special case: the point is
+ * that a human sees the sentence, and a human is reading that channel either
+ * way. The one gap is `BLITZ_STATUS_CHANNEL_ID` being unset — then there is no
+ * sink to install, and this, like every other fault in the process, is a journal
+ * line only.
+ */
+for (const collision of channelCollisions(config)) {
+  log('warn', collision.warning, { channel: collision.channelId })
 }
 
 /**
