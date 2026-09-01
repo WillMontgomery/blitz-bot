@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { connectIp, DEFAULT_SERVER_IPS, loadConfig } from './config.ts'
+import { CONSOLE_URL } from './console.ts'
 
 /**
  * Where the environment comes from, and what happens when it does not come.
@@ -708,6 +709,41 @@ describe('loadConfig, on the console relay', () => {
     }
 
     expect(message).toContain('BLITZ_RINGMASTER_URL: must be')
+  })
+
+  /**
+   * ═══ WHERE A PERSON REACHES THE CONSOLE IS NOT CONFIGURATION ═══
+   *
+   * IT IS `CONSOLE_URL` IN src/console.ts, and this case is here so that the
+   * removal of `BLITZ_RINGMASTER_PUBLIC_URL` cannot be quietly undone. There is
+   * one Ringmaster console and no deployment for which a different value would be
+   * right, so a variable bought nothing, added a boot failure, and gave the owner
+   * something to set correctly or lose a button.
+   *
+   * WHAT DOES MATTER IS THAT NEITHER VALUE BECOMES THE OTHER. `ringmasterUrl` is
+   * the loopback the kick relay calls; a link built from it opens `127.0.0.1` on
+   * the clicker's own machine. The two are different facts and the config carries
+   * only the one that varies.
+   */
+  it('carries the loopback the relay calls and no public origin at all', () => {
+    const config = loadConfig({ ...base, BLITZ_RINGMASTER_URL: 'http://127.0.0.1:3000' })
+
+    expect(config.ringmasterUrl).toBe('http://127.0.0.1:3000')
+    expect(Object.keys(config)).not.toContain('ringmasterPublicUrl')
+    expect(CONSOLE_URL).not.toBe(config.ringmasterUrl)
+    expect(CONSOLE_URL.startsWith('https://')).toBe(true)
+  })
+
+  /**
+   * A VARIABLE THAT NO LONGER EXISTS IS IGNORED RATHER THAN REFUSED. An operator
+   * upgrading past this change has `BLITZ_RINGMASTER_PUBLIC_URL=` left in a
+   * `.env` or an `EnvironmentFile`, and a bot that refused to boot over a stale
+   * line would turn a tidy-up into an outage.
+   */
+  it('boots with the removed variable still set in the environment', () => {
+    expect(() =>
+      loadConfig({ ...base, BLITZ_RINGMASTER_PUBLIC_URL: 'https://ringmaster.example/console' }),
+    ).not.toThrow()
   })
 
   /**

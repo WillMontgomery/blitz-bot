@@ -640,6 +640,7 @@ describe('readsFrom', () => {
       },
 
       maintenance: { current: unused },
+      incidents: { get: unused },
       audit: { begin: unused, resolve: unused, recent: unused },
       botState: { get: unused, put: unused },
     }

@@ -44,19 +44,33 @@ a wrong grant could not have made harmless.
 
 ### What the bot's own policy needs, when #4 writes one
 
-Seven tables are read; three of those are also written. There is no `DeleteItem`
+Eight tables are read; three of those are also written. There is no `DeleteItem`
 and no `Scan` anywhere in this list, and the module has no code path that could
 use either — its document-client interface exposes `get`, `put`, `update` and
 `query` and nothing else.
 
 | Action | Resource |
 |---|---|
-| `dynamodb:GetItem` | `ringmaster-bans`, `ringmaster-players`, `ringmaster-player-ids`, `ringmaster-maintenance`, `ringmaster-bot-state`, `br-players` |
+| `dynamodb:GetItem` | `ringmaster-bans`, `ringmaster-players`, `ringmaster-player-ids`, `ringmaster-maintenance`, `ringmaster-bot-state`, **`ringmaster-incidents`**, `br-players` |
 | `dynamodb:Query` | `ringmaster-audit` |
 | `dynamodb:PutItem` | `ringmaster-audit`, `ringmaster-bot-state`, **`ringmaster-bans`** |
 | `dynamodb:UpdateItem` | `ringmaster-audit`, **`ringmaster-bans`** |
 
 All in `us-east-2`. See the region section below before writing an ARN.
+
+**`dynamodb:GetItem` on `ringmaster-incidents` is new in blitz-bot#19, and
+nothing is missing at runtime today.** The bot shares the console's instance
+role, which grants `ringmaster-*` — so this read works right now and always has.
+What this row is, is a line the policy in **blitz-bot#4** will need when the bot
+is scoped to an identity of its own; without it, the moderation record for a
+closed incident stops posting and every pass says `denied` in the journal.
+
+**It is a read and it must stay one.** The bot learns an incident id from an
+`incident.resolve` audit row and asks for that one case; the console's own module
+scans this table for its queue and says in its comment what that costs and which
+two GSIs replace it. There is no `PutItem` and no `UpdateItem` here and there
+should never be: closing a case is the console's decision, and a bot that could
+write this table could close one nobody closed.
 
 **The two bold entries are new in blitz-bot#16 and they widen the bot's AWS
 grant.** Not the grant it *runs* with — that has been `ringmaster-*` with every
@@ -123,14 +137,24 @@ game's from `DDB_GAME_TABLE_PREFIX` (`br-`).
 | `ringmaster-maintenance` | `id` (S), one row, `id = "current"` | read | `lib/maintenance.ts` |
 | `ringmaster-audit` | `pk` (S) + `ts` (N) | read **and write** | `lib/audit.ts` |
 | `ringmaster-bot-state` | `id` (S) | read **and write** | this repo |
+| `ringmaster-incidents` | `incidentId` (S) | read | `lib/incidents.ts` |
 | `br-players` | `pk` (S) + `sk` (S), `sk = "profile"` | read | `lib/gameProfile.ts` |
 
-Two of those are worth reading twice.
+Three of those are worth reading twice.
 
 **`br-players` is composite-keyed and the console's tables are not.** The game
 hangs several rows off one partition — `profile`, `purchases`, one `match#…` per
 match. A `GetItem` with the wrong key shape returns no row rather than an error,
 which reads as "this player has never played".
+
+**`ringmaster-incidents` is keyed on `incidentId` and on nothing else**, which is
+what makes the bot's one read of it a `GetItem` rather than a Scan. Every other
+question about that table — the queue, the count, a player's cases — is a Scan on
+the console's side, and this repo asks none of them: the audit log hands it the id
+of the one case it wants. The two GSIs the console's own comment names (`state`
+for the queue, `subjectLicense` for the profile) are also what the OTHER half of
+blitz-bot#19 waits on — posting when a case *opens* needs an index that does not
+exist, which is why only the resolved half is built.
 
 **`ringmaster-bot-state` exists on the live box** and was created by hand. The
 bot will not create it for you, so a second environment needs this. The symptom

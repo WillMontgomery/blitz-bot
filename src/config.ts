@@ -224,6 +224,21 @@ export interface Config {
   ringmasterUrl: string
 
   /**
+   * WHERE A PERSON REACHES THE CONSOLE IS NOT HERE, AND THAT IS THE ANSWER
+   * RATHER THAN AN OMISSION. It is `CONSOLE_URL` in src/console.ts, a module
+   * constant, for the reason `REPO_URL` in src/client.ts is one: there is one
+   * Ringmaster console and no deployment for which a different value would be
+   * right, so a variable would buy nothing and would add a way to get a
+   * moderation link wrong. A `BLITZ_RINGMASTER_PUBLIC_URL` was drafted here and
+   * dropped before it shipped, once the constant it duplicated was found.
+   *
+   * `ringmasterUrl` ABOVE IS NOT THAT ADDRESS AND NOTHING MAY BUILD A LINK FROM
+   * IT. It is the server-to-server loopback on a port closed to the internet; a
+   * button built from it opens `127.0.0.1` on the clicker's own machine, which
+   * looks like a working link and fails like a console that is down.
+   */
+
+  /**
    * The role that marks somebody as banned in the GAME but not from Discord.
    *
    * THE POLICY IT IMPLEMENTS IS THE OWNER'S AND IS ASYMMETRIC ON PURPOSE. A
@@ -484,7 +499,26 @@ const DEFAULT_GAME_BAN_ROLE_ID = '1542596612306505808'
 const SNOWFLAKE = /^[0-9]{1,32}$/
 
 /**
- * The console's origin: scheme, host, port, and nothing after them.
+ * `BLITZ_RINGMASTER_URL`: scheme, host, port, and nothing after them.
+ *
+ * ═══ IT IS ONE TRANSFORM AGAIN, AND THAT IS THE POINT ═══
+ *
+ * THE BODY BELOW WAS BRIEFLY A SEPARATE `asOrigin(value, ctx)` WITH ONE CALLER.
+ * It was pulled out so that a second variable could share it — a
+ * `BLITZ_RINGMASTER_PUBLIC_URL` for `incidentRow`'s button — and that variable
+ * was dropped before it shipped, once `CONSOLE_URL` was found already in
+ * src/commands/profile.ts: there is one Ringmaster console, so a second variable
+ * bought nothing and added a boot failure on a malformed value (see
+ * src/console.ts). Neither the helper nor the variable ever reached a commit and
+ * NEITHER IS IN THE HISTORY — a `git log -S` for either finds nothing, and that
+ * is stated here because the version of this comment that dated them to a
+ * particular week was inventing a provenance for an argument that does not need
+ * one. The argument is what survives: a function whose only caller is the next
+ * four lines is a name and an indirection with nothing on the other end of it,
+ * so it is folded back in. Pulling it out again beside a second caller is a
+ * smaller change than keeping it against one.
+ *
+ * ═══ THE CHECKS THEMSELVES ═══
  *
  * PARSED WITH `URL` RATHER THAN MATCHED WITH A REGEX, because the thing that
  * has to agree is not this file's idea of a URL but the one `fetch` will build

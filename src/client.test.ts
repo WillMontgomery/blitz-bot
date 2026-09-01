@@ -6685,6 +6685,42 @@ describe('the maintenance watcher — installed, and only when there is a channe
 })
 
 /**
+ * THE MODERATION RECORD FOR A CLOSED INCIDENT, AS FAR AS THIS FILE OWNS IT —
+ * blitz-bot#19. Everything it does once it is running is src/incidents.ts's own
+ * file; what is decided HERE is whether it is installed at all, and against
+ * which of four channel ids.
+ */
+describe('the incident record — installed, and only when there is a channel', () => {
+  /**
+   * UNSET DOES MORE THAN "POST NOWHERE", exactly as it does for the maintenance
+   * watcher. With no channel there is nothing to record to, so `ringmaster-audit`
+   * is not polled for this feature at all and the bot makes no AWS call it would
+   * otherwise make twice a minute.
+   */
+  it('registers nothing at all when no log channel is configured', async () => {
+    const quiet = createClient(cfg())
+    expect(quiet.listenerCount(Events.ClientReady)).toBe(ALWAYS_READY)
+    await quiet.destroy()
+
+    const wired = createClient(cfg({ logChannelId: LOG_CHANNEL }))
+    expect(wired.listenerCount(Events.ClientReady)).toBe(ALWAYS_READY + 1)
+    await wired.destroy()
+  })
+
+  /**
+   * A SOURCE ASSERTION, for the reason the other three have one: the channel id
+   * is read off the config inside `installIncidentLog`, so no fake client here
+   * can tell that the whole config was handed over rather than one field — and
+   * this is the call that decides the feature exists at all.
+   */
+  it('is wired, with a Ddb of its own', async () => {
+    const source = await readFile(new URL('./client.ts', import.meta.url), 'utf8')
+
+    expect(source).toContain('installIncidentLog(client, config, createDdb())')
+  })
+})
+
+/**
  * THE DOCUMENT IS A TEMPLATE, AND THIS IS THE HALF THAT TURNS IT INTO A
  * DOCUMENT.
  *

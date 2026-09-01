@@ -30,6 +30,7 @@ import {
   type DdbFailure,
   type DdbResult,
 } from './ddb.ts'
+import { installIncidentLog } from './incidents.ts'
 import { scanMessage, type InviteResolver, type ScanResult } from './invites.ts'
 import { scanLinks, type LinkReason } from './links.ts'
 import { log, type Fault, type Sink } from './log.ts'
@@ -2215,6 +2216,31 @@ export function createClient(config: Config): Client {
    * config rather than anything it discovered in the guild.
    */
   installGameBanRole(client, config, createDdb())
+
+  /**
+   * THE MODERATION RECORD FOR A CLOSED INCIDENT — blitz-bot#19.
+   *
+   * The same audit log the ban role polls, read for a different verb: a case
+   * closed in the console becomes an embed in `logChannelId`, which is the
+   * channel that already carries what was removed and why.
+   *
+   * NOTHING AT ALL WITH NO LOG CHANNEL, and the guard is inside
+   * `installIncidentLog` rather than here — it reads the id off the config it is
+   * already given, so there is one place that decides rather than two that have
+   * to agree. With the id unset the poller is never started and `ringmaster-audit`
+   * is not read for this feature at all.
+   *
+   * A SEPARATE `Ddb` FOR THE REASONS ABOVE: `createDdb` opens no socket and
+   * resolves no credentials, and each caller gets exactly the `Pick` of it that
+   * its own module declares — this one cannot write anything except the bot's own
+   * cursor.
+   *
+   * REGISTERED AFTER THE GUILD CHECK, like everything else here, and not taken off
+   * by the halt: it posts to an id from the config and reads rows from DynamoDB,
+   * so a bot that cannot find its guild neither posts to the wrong one nor stops
+   * recording moderation that is still happening in the console.
+   */
+  installIncidentLog(client, config, createDdb())
 
   return client
 }

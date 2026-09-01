@@ -180,6 +180,16 @@ interface Harness {
   readonly windows: Array<{ after: number; until: number; limit: number | undefined }>
   /** Anything that tried to WRITE a ban. Must stay empty, on every path. */
   readonly banWrites: string[]
+  /**
+   * Every bot-state write the code ATTEMPTED, in order, landed or not.
+   *
+   * SEPARATE FROM `state` BECAUSE THE TWO ANSWER DIFFERENT QUESTIONS, and a case
+   * about durability needs both: this one is what the code tried to do, and the
+   * map is what the table came out holding. A `statePut` that refuses a write
+   * leaves the map exactly as it was seeded, which is indistinguishable from a
+   * pass that wrote nothing unless the attempts are recorded here as well.
+   */
+  readonly writes: Array<{ key: string; value: string }>
   /** The tags as they now stand in the state table. */
   tags(): TaggedBan[]
   cursor(): number | null
@@ -196,6 +206,15 @@ function harness(
     standing?: RoleReadiness
     addFails?: unknown
     removeFails?: unknown
+    /**
+     * The registry read FAILING, which is `discordIdFor`'s third answer.
+     *
+     * A HOOK RATHER THAN AN EMPTY `players` MAP, because those are two different
+     * facts and the map can only ever produce the first: `{}` is "the game has
+     * never seen this player" and this is "the table did not answer this time".
+     * See the case that uses it.
+     */
+    playerGet?: (licence: string) => Promise<DdbResult<PlayerRecord | null>>
     banGet?: (key: string) => Promise<DdbResult<Ban | null>>
     statePut?: (key: string, value: string) => Promise<DdbResult<BotStateRow>>
     stateGet?: (key: string) => Promise<DdbResult<BotStateRow | null>>
@@ -214,6 +233,7 @@ function harness(
   const reads: string[] = []
   const windows: Array<{ after: number; until: number; limit: number | undefined }> = []
   const banWrites: string[] = []
+  const writes: Array<{ key: string; value: string }> = []
 
   const roles: GameBanRoles = {
     standing: () => over.standing ?? { ok: true },
@@ -252,7 +272,7 @@ function harness(
         },
       },
       players: {
-        get: (licence) => Promise.resolve(ok(players[licence] ?? null)),
+        get: over.playerGet ?? ((licence) => Promise.resolve(ok(players[licence] ?? null))),
       },
       playerIds: {
         licensesFor: (id) => Promise.resolve(ok(licences[id] ?? [])),
@@ -266,12 +286,33 @@ function harness(
               ok(value === undefined ? null : { id: key, value, updatedAt: NOW - 1 }),
             )
           }),
-        put:
-          over.statePut ??
-          ((key, value) => {
-            state.set(key, value)
-            return Promise.resolve(ok({ id: key, value, updatedAt: NOW }))
-          }),
+        /**
+         * ═══ THE MAP FOLLOWS THE ANSWER, WHOEVER GIVES IT ═══
+         *
+         * A `statePut` OVERRIDE USED TO REPLACE THIS WHOLE FUNCTION, and that
+         * disconnected `state` from the code under test: with one supplied,
+         * nothing ever wrote to the map, so `h.cursor()` handed back the SEEDED
+         * value however the pass had actually gone and every cursor assertion in
+         * every case with an override was true before the poller ran. The
+         * durability case below — a cursor that must not move past tags that
+         * did not save — is exactly such a case, and rewriting `onFinish` to
+         * save unconditionally passed it.
+         *
+         * So the override decides the ANSWER and this decides what the answer
+         * means: a write the fake accepted lands in the map, a write it refused
+         * does not, and `cursor()` and `tags()` read what a restarted bot would
+         * find. Every attempt is recorded either way — see `writes`.
+         */
+        put: async (key, value) => {
+          writes.push({ key, value })
+
+          const written = over.statePut
+            ? await over.statePut(key, value)
+            : ok<BotStateRow>({ id: key, value, updatedAt: NOW })
+
+          if (written.ok) state.set(key, value)
+          return written
+        },
       },
       auditWindow: {
         partition: 'AUDIT',
@@ -296,6 +337,7 @@ function harness(
     reads,
     windows,
     banWrites,
+    writes,
     tags: () => {
       const read = parseTags(state.get(TAGS_KEY) ?? null)
       return read.ok ? read.tags : []
@@ -739,6 +781,62 @@ describe('a game ban issued in the console becomes a role', () => {
       true,
     )
   })
+
+  /**
+   * ═══ `discordIdFor`'s THIRD ANSWER, WHICH NOTHING IN THE REPO EXERCISED ═══
+   *
+   * It returns `string | null | 'failed'` and its own comment is emphatic that
+   * this is the whole reason it is not `string | null`: `null` is "the game has
+   * never seen a Discord account for this player", an ordinary and permanent
+   * fact, and `'failed'` is "the registry did not answer this time", which the
+   * next pass may answer differently. The case above covers the first. Until this
+   * one, nothing anywhere covered the second — the harness could only produce
+   * `null`, because `players.get` was hard-coded to resolve `ok`.
+   *
+   * THE TWO MUST NOT COLLAPSE, AND THEY FAIL IN OPPOSITE DIRECTIONS. Reading a
+   * timeout as `null` gives up on marking a banned player forever; reading a
+   * genuinely absent account as `'failed'` retries a fact that will never change
+   * and stalls the cursor behind it for good.
+   *
+   * SO A FAILED READ STOPS THE PASS AND MOVES NOTHING. No role edit, no tag, and
+   * the cursor stays behind the row so the next pass asks again.
+   */
+  it('stops the pass rather than marking nobody when the registry does not answer', async () => {
+    const h = harness({
+      state: { [CURSOR_KEY]: OPEN },
+      audit: [row()],
+      rows: { [LICENCE]: ban() },
+      playerGet: () => Promise.resolve(failed('timeout')),
+    })
+
+    await h.sync.poll()
+
+    expect(h.edits).toEqual([])
+    expect(h.tags()).toEqual([])
+    // Behind the row it could not decide, so the next pass asks again.
+    expect(h.cursor()).toBe(Number(OPEN))
+    /**
+     * ═══ THE SENTENCE ITSELF, VERBATIM, BECAUSE IT IS THE OWNER'S ═══
+     *
+     * This line is copied into the status channel he reads. Lifting
+     * `discordIdFor` out of the poller so src/incidents.ts could share it
+     * reworded it to '…so no Discord account was resolved' — accurate about the
+     * function and no longer a statement about a ban — and nothing failed,
+     * because nothing anywhere had asserted the words. So the words are the
+     * assertion now, and the other caller's sentence is asserted absent beside
+     * them: one shared line that fits both paths is a line that has stopped
+     * telling him what either failure cost.
+     */
+    expect(said(stderr, 'could not read the player registry, so this ban was not marked')).toBe(true)
+    expect(
+      said(stderr, 'could not read the player registry, so no Discord account was resolved'),
+    ).toBe(false)
+    // NOT the sentence for a player the game has never seen. That is the other
+    // answer and it means something else.
+    expect(said(stdout, 'the game has no Discord account for this player, so nothing was marked')).toBe(
+      false,
+    )
+  })
 })
 
 describe('a game ban lifted in the console takes the role off', () => {
@@ -910,9 +1008,35 @@ describe('where the poll reads from', () => {
     await h.sync.poll()
 
     expect(h.cursor()).toBe(NOW - SETTLE_MS)
-    expect(said(stderr, 'the game-ban poll cursor is not a number, so polling restarts from now')).toBe(
-      true,
-    )
+    expect(
+      said(
+        stderr,
+        'the game-ban poll cursor is not a position in the log, so polling restarts from now',
+      ),
+    ).toBe(true)
+  })
+
+  /**
+   * ═══ THE SAME GUARD, ON THIS CONSUMER, BECAUSE IT IS ONE GUARD ═══
+   *
+   * `cursorAt` LIVES IN src/auditpoll.ts SO BOTH POLLERS GET IT, and the whole
+   * value of putting it there is lost if only the one that posts embeds is ever
+   * driven through it. An empty bot-state row is not a smaller problem here — it
+   * is a walk from the epoch that re-derives months of ban triggers — it is only
+   * a quieter one, because a role added twice is a role and nobody sees it.
+   */
+  it('treats an empty, blank or zero cursor as no cursor and starts from now', async () => {
+    for (const stored of ['', ' ', '0', '  0  ', '-1']) {
+      const h = harness({ state: { [CURSOR_KEY]: stored }, audit: [row({ ts: 1 })] })
+
+      await h.sync.poll()
+
+      // The log is not read AT ALL on this branch, which is the assertion that
+      // separates the fix from the bug: before it, this pass asked
+      // `since(0, …)` and walked the whole partition.
+      expect(h.windows, stored).toEqual([])
+      expect(h.cursor(), stored).toBe(NOW - SETTLE_MS)
+    }
   })
 
   it('moves the cursor to the newest row it dealt with', async () => {
@@ -1012,14 +1136,30 @@ describe('where the poll reads from', () => {
 
     expect(h.edits).toEqual([{ do: 'add', member: MEMBER }])
     expect(said(stderr, 'the game-ban poll finished but its cursor could not be saved')).toBe(true)
+    // The tags landed and the bookmark did not, so the next pass reads the same
+    // window again and re-derives a decision it can make twice.
+    expect(h.tags()).toHaveLength(1)
+    expect(h.cursor()).toBe(Number(OPEN))
   })
 
   /**
-   * THE CURSOR MOVES ONLY OVER WORK THAT WAS ACTUALLY RECORDED. A pass's drops
-   * live in one state write; if that write did not land, the decisions behind it
-   * are not durable and a cursor moved past them would mean nothing ever
-   * re-derives them. Repeating the window is free — every decision in it is
-   * idempotent.
+   * ═══ THE CURSOR MOVES ONLY OVER WORK THAT WAS ACTUALLY RECORDED ═══
+   *
+   * A pass's drops live in one state write; if that write did not land, the
+   * decisions behind it are not durable and a cursor moved past them would mean
+   * nothing ever re-derives them. Repeating the window is free — every decision
+   * in it is idempotent.
+   *
+   * THIS CASE WAS TRUE BEFORE THE POLLER RAN, AND FOR TWO YEARS OF READERS IT
+   * LOOKED LIKE THE ONE HOLDING THAT RULE UP. Supplying `statePut` used to
+   * replace the harness's whole `put`, which disconnected the state map, so
+   * `h.cursor()` handed back the seeded `OPEN` whatever the pass did with the
+   * bookmark. Rewriting the poller's `onFinish` to save the cursor
+   * unconditionally — moving it past decisions that were never made durable,
+   * which is precisely what the rule forbids — passed this case and all 94
+   * others. The harness now lets an override decide the ANSWER while the map
+   * follows it, so `cursor()` and `writes` below are what a restarted bot would
+   * find and what the poller actually attempted.
    */
   it('does not move the cursor when the tags it changed could not be saved', async () => {
     let allowed = true
@@ -1047,6 +1187,9 @@ describe('where the poll reads from', () => {
 
     expect(h.edits).toEqual([{ do: 'remove', member: MEMBER }])
     expect(h.cursor()).toBe(NOW - 3_600_000)
+    // And the cursor was never even OFFERED to the table. The tag write failed,
+    // so the pass ended before anything wrote a bookmark over it.
+    expect(h.writes.map((w) => w.key)).toEqual([TAGS_KEY])
   })
 
   it('polls nothing at all when the cursor cannot be read', async () => {

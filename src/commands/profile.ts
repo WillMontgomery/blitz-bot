@@ -5,6 +5,7 @@ import {
   type APIEmbedField,
 } from 'discord.js'
 
+import { CONSOLE_URL } from '../console.ts'
 import {
   isBanActive,
   qualifyId,
@@ -534,32 +535,6 @@ const COLOUR = {
   normal: 0x5865f2,
   banned: 0xed4245,
 }
-
-/**
- * Where the Ringmaster console lives, so a licence can be a button.
- *
- * A MODULE CONSTANT AND DELIBERATELY NOT IN `Config`, WHICH IS THE CALL
- * `REPO_URL` IN src/client.ts ALREADY MADE and this follows without argument.
- * Everything in config.ts is a thing that DIFFERS between deployments and that
- * an operator has to supply — a token, a guild, four channel ids — and every one
- * of them is a thing they can get wrong. This is not one of those: there is one
- * Ringmaster console, it is the console that owns the very rows this reply is
- * built from, and there is no deployment for which a different value would be
- * right. Making it an environment variable would buy nothing and would
- * introduce a failure this feature cannot otherwise have — a button on a
- * moderation reply that opens somebody else's console, which reads as
- * authoritative and is not.
- *
- * IT IS EVEN MORE CLEARLY NOT CONFIG THAN THE REPO URL WAS. A wrong repo link
- * shows an operator the wrong commit; a wrong console link invites an admin to
- * act on a player record that is not this server's.
- *
- * NO TRAILING SLASH, and `consoleLink` adds its own. `/players/<license>` is
- * the console's own route — src/app/players/[license]/page.tsx over there — and
- * a Next.js dynamic segment is percent-DECODED on arrival, which is what makes
- * the encoding below the right half of the contract rather than a guess.
- */
-const CONSOLE_URL = 'https://ringmaster.blitz-royale.com'
 
 /**
  * What Discord will accept as a link button's url.

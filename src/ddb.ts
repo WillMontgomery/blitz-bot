@@ -329,6 +329,17 @@ export interface TableNames {
    * need a prefix to express "this one is the bot's".
    */
   botState: string
+  /**
+   * Read only. One case, by `incidentId`.
+   *
+   * A `GetItem` AND NOTHING ELSE, WHICH IS THE ONLY THING THIS TABLE OFFERS
+   * CHEAPLY. It is keyed on `incidentId` alone (the console's lib/incidents.ts
+   * says so, and its own queue pays for it with a Scan), so the one question
+   * this repo may ask is "the case with this id". The bot learns the id from an
+   * `incident.resolve` audit row and never has to find a case any other way —
+   * see src/incidents.ts, which is the only reader.
+   */
+  incidents: string
   /** Read only, and a different prefix: the GAME's row. `{pk, sk}` keyed. */
   gamePlayers: string
 }
@@ -341,6 +352,7 @@ export function tableNames(prefix: string, gamePrefix: string): TableNames {
     audit: `${prefix}audit`,
     maintenance: `${prefix}maintenance`,
     botState: `${prefix}bot-state`,
+    incidents: `${prefix}incidents`,
     gamePlayers: `${gamePrefix}players`,
   }
 }
@@ -720,6 +732,180 @@ export function isMaintenanceDraining(
   return now >= w.drainStartsAt
 }
 
+/* ------------------------------------------------------------------ *
+ * Incidents.
+ * ------------------------------------------------------------------ */
+
+/**
+ * From lib/incidents.ts.
+ *
+ * TWO STATES AND NO WAY BACK, which is what makes `resolved` safe for the bot
+ * to act on: a case cannot bounce back to `pending_review` after it has been
+ * closed, so a post about a resolution can never be about something that is
+ * about to be undone. Continued behaviour is a NEW case with a new id.
+ */
+export type IncidentState = 'pending_review' | 'resolved'
+
+/**
+ * WHY A CASE WAS FILED, as a closed vocabulary. From lib/incidents.ts.
+ *
+ * A CLOSED VOCABULARY IS THE WHOLE REASON THESE TWO ARE HERE, and it is a
+ * privacy property rather than a typing preference. The console's `summary` on
+ * this row is FREE TEXT built by the game, and for every player-filed report
+ * it is `('Reported for %s by %s'):format(category, reporterName)` —
+ * fivem-royale-m9/resources/[fivem-royale]/br_lib/shared/incident_build.lua,
+ * `fromReport`. That string ends in THE REPORTER'S IN-GAME NAME.
+ *
+ * AND THE REASON IT STAYS OFF THE POST IS NOT THE AUDIENCE. This comment used
+ * to say the moderation channel is one "every member of the guild can read",
+ * which docs/deploy.md, README.md and `Config.maintenanceChannelId` in
+ * src/config.ts all contradict — it is the admins' channel. Two things are true
+ * instead, and both survive being checked: who reads a Discord channel is a
+ * PERMISSION SETTING that changes retroactively over records already posted, so
+ * a boundary resting on it is not a boundary; and the reporter's name is not
+ * needed to describe a case, so it has no claim on a permanent record whoever
+ * is reading. src/incidents.ts is where that call is made and argued.
+ *
+ * `kind` AND `category` ARE VALUES THE GAME PICKS OUT OF A LIST, so neither
+ * can carry a name however the console rewords anything. That is why the bot's
+ * post is built from these two and `summary` is not on this type at all — see
+ * the note on `Incident`.
+ */
+export type IncidentKind =
+  /** A player used the in-game report flow. */
+  | 'report'
+  /** A joining player presented an identifier bound to a different license. */
+  | 'identifier_reuse'
+  /** The refusal validator escalated something it would not action itself. */
+  | 'anticheat'
+
+/** What a reporter picked in game. From lib/incidents.ts. */
+export type IncidentCategory =
+  | 'cheating'
+  | 'teaming'
+  | 'griefing'
+  | 'abusive_chat'
+  | 'exploiting'
+  | 'other'
+  /** Not a player report — the system filed it. */
+  | 'system'
+
+/**
+ * What an admin decided, in a form that is not prose. From lib/incidents.ts,
+ * whose comment on it is the contract and is worth reading before touching this.
+ *
+ * `expiresAt` EXISTS IF AND ONLY IF THE ACTION IS `ban`, so a reader has to
+ * narrow on `action` FIRST. Reaching for it without narrowing gets `undefined`
+ * on a kick, where a permanent ban would have given `null` — two falsy values
+ * meaning entirely different things. The union below is what makes that a
+ * compile error on this side.
+ */
+export type IncidentVerdict =
+  | { action: 'ban'; expiresAt: number | null }
+  | { action: 'kick' }
+  | { action: 'none' }
+
+/**
+ * From lib/incidents.ts, SUBSET — and this one is a subset on purpose rather
+ * than for brevity.
+ *
+ * IT NAMES THE PROJECTION AND THE PROJECTION NAMES IT. `incidents.get` below
+ * reads this table with a `ProjectionExpression` listing exactly these
+ * attributes, so every field here is one DynamoDB actually returns and every
+ * attribute the row carries that is NOT here never enters this process at all.
+ * Adding a field is therefore two edits in one file, and a field added to only
+ * one of them shows up immediately: named here and not projected, it is
+ * `undefined` at run time; projected and not named here, nothing can read it.
+ *
+ * THE FIELDS LEFT OUT ARE LEFT OUT AS A POLICY. The console's row also carries
+ * `evidence`, `matchTimeline`, `note`, `events`, the reporter's name and
+ * license, and the moderator's free-text `resolution`. Those stay inside the
+ * console, behind its own sign-in.
+ *
+ * `summary` IS ON THAT LIST, WHICH IS THE ONE THAT LOOKS SAFE AND IS NOT. It
+ * is the console's queue row and it is free text the GAME builds: for every
+ * player-filed report it is `Reported for <category> by <reporterName>` —
+ * fivem-royale-m9/resources/[fivem-royale]/br_lib/shared/incident_build.lua,
+ * `fromReport`, on the live path from br_core/server/players.lua. So the
+ * string ends in the reporter's in-game name.
+ *
+ * AND THE REASON IT STAYS OFF THE POST IS NOT THE AUDIENCE, WHICH IS THE LAST
+ * PLACE IN THIS CHANGE THAT SAID OTHERWISE. This paragraph used to answer the
+ * game's own comment — the summary is safe BECAUSE it is the admin-only queue
+ * row — with "that argument does not survive being posted into a channel the
+ * whole guild reads", and the log channel is not that channel: docs/deploy.md,
+ * README.md and `Config.maintenanceChannelId` in src/config.ts all call it the
+ * admins'. `IncidentKind` above already retracts exactly this wording and gives
+ * the two reasons that do survive being checked, and they are the reasons here
+ * as well: who reads a Discord channel is a PERMISSION SETTING that changes
+ * retroactively over records already posted, so a boundary resting on it is not
+ * a boundary; and the reporter's name is not needed to describe a case, so it
+ * has no claim on a permanent record whoever is reading it.
+ *
+ * `IncidentKind` and `IncidentCategory` are what the bot says instead — closed
+ * vocabularies, which cannot carry a name — and no regex over somebody else's
+ * format string is involved.
+ *
+ * THE REPORTER'S IDENTITY IS TREATED AS SENSITIVE ON THE OTHER SIDE TOO, and
+ * the citation is worth stating exactly rather than approximately.
+ * fivem-royale-m9/docs/security.md names "the reporter" among the attributes
+ * br_ddb's four-attribute projection deliberately keeps off the GAME BOX — a
+ * different boundary from this one, and the same judgment about the field.
+ * Nothing over there says anything about Discord; that call is this repo's, and
+ * it is made here.
+ *
+ * THE PRECEDENT, AND WHY THIS SUBSET IS NOT THAT ONE. `br_ddb` reads this table
+ * with a `ProjectionExpression` naming exactly four attributes — `incidentId`,
+ * `state`, `verdict`, `resolvedAt` — and its comment says why it refuses
+ * `subjectLicense` and `resolvedByName` as well: a compromised GAME BOX must not
+ * gain a way to confirm an identity it did not already hold. That argument is
+ * about the game server and does not reach this repo, which already reads
+ * `ringmaster-players` and posts to an admin-only channel — so the subject and
+ * the resolver are named here in order to say whose case it was and who closed
+ * it. What is refused is the list br_ddb refuses for the reason that DOES carry
+ * over: the prose and the evidence.
+ *
+ * `verdict` IS OPTIONAL AND MAY ALSO BE `null`, AND NEITHER MEANS "NO ACTION".
+ * A case resolved before the field existed has no attribute at all; one the
+ * system auto-resolved at open is written with an explicit `null`. Reading
+ * either as `{ action: 'none' }` states a decision nobody made.
+ *
+ * `resolvedByLicense` IS NOT HERE AND THAT IS DELIBERATE. Nothing renders it —
+ * the console writes `actor.license ?? ''` for an admin with no grants row, so
+ * `''` is a real stored value meaning "not known" and never an identity — and
+ * an attribute nothing renders is an attribute this process has no reason to
+ * hold. `resolvedByName` is what a reader wanted.
+ *
+ * `subjectName` IS A NAME-SHAPED STRING AND NOT NECESSARILY A NAME. The game's
+ * builders set it from the sighting they have (`subjectName = ev.name` in
+ * br_lib/shared/incident_build.lua) and the literal `'Unknown'` is substituted
+ * one layer later, where the row is assembled for DynamoDB:
+ * `subjectName: str(payload.subjectName) ?? 'Unknown'` in `buildIncidentItem`,
+ * fivem-royale-m9/js-src/br_ddb/src/incident.js. So a case CAN say `Unknown`,
+ * that is the honest answer, and nothing may key a decision off the string
+ * because a player could be called it.
+ */
+export interface Incident {
+  /** Partition key. A UUID, so the console's URL for it is stable. */
+  incidentId: string
+  state: IncidentState
+
+  /** See `IncidentKind`. A closed vocabulary, which is why the bot renders it. */
+  kind: IncidentKind
+  /** See `IncidentCategory`. The other half of what the post is allowed to say. */
+  category: IncidentCategory
+
+  /** Who it is about. ALREADY QUALIFIED — `license:abc…`, as the tables key it. */
+  subjectLicense: string
+  subjectName: string
+
+  resolvedAt?: number | null
+  resolvedByName?: string | null
+
+  /** See `IncidentVerdict`. Absent and null are the same answer: no verdict. */
+  verdict?: IncidentVerdict | null
+}
+
 /**
  * The bot's own durable state. The only table here the console does not own.
  *
@@ -955,6 +1141,24 @@ export interface Ddb {
 
   maintenance: {
     current(): Promise<DdbResult<MaintenanceWindow | null>>
+  }
+
+  incidents: {
+    /**
+     * One case by id, or null. The only cheap read this table has.
+     *
+     * A `GetItem` AND NEVER A SCAN, which is not a preference here but the
+     * shape of the interface: `DocumentClient` above has no `scan` and must not
+     * gain one. The console's own module scans this table for its queue and
+     * says in its comment what that costs and which two GSIs replace it; the
+     * bot never needs the queue, because the audit log hands it the id.
+     *
+     * STRONGLY CONSISTENT, ALONE AMONG THE READS IN THIS FILE. Its `state` is
+     * what decides whether a permanent moderation record is posted, and the
+     * caller has no good answer to a stale one. The reasoning is with the
+     * request.
+     */
+    get(incidentId: string): Promise<DdbResult<Incident | null>>
   }
 
   audit: {
@@ -1568,6 +1772,80 @@ export function createDdb(options: DdbOptions = {}): DdbWithAuditWindow {
           // literal string `current`.
           const res = await doc.get({ TableName: tables.maintenance, Key: { id: 'current' } }, o)
           return (res.Item as MaintenanceWindow | undefined) ?? null
+        })
+      },
+    },
+
+    incidents: {
+      get(incidentId) {
+        return call('get', tables.incidents, async (o) => {
+          /**
+           * PROJECTED, NOT CAST, AND THE DIFFERENCE IS WHAT ENTERS THIS
+           * PROCESS. Without a `ProjectionExpression` DynamoDB returns the
+           * whole row — the evidence, the match timeline, `note`, `events`,
+           * the reporter's name and license, the moderator's free-text
+           * resolution — and the only thing keeping any of it out of a Discord
+           * message is the compile-time cast below, which is erased before the
+           * program runs. `br_ddb` reads this same table with a four-attribute
+           * projection and that is the precedent followed here: the list is
+           * what the embed renders, plus `state`, which decides whether there
+           * is anything to render at all.
+           *
+           * `#state` BECAUSE `state` IS ONE OF DYNAMODB'S 573 RESERVED WORDS.
+           * Naming it bare makes the request fail at run time with "Invalid
+           * ProjectionExpression: Attribute name is a reserved keyword", on the
+           * box and nowhere earlier — which is exactly how `at` shipped and
+           * broke every ban replacement on 2026-08-30. scripts/check-ddb-expressions.ts
+           * is the check that now catches this class before a deploy.
+           *
+           * THE CAST IS STILL A CAST, and it is now a narrower claim: that the
+           * console writes these nine attributes with these types. A field
+           * arriving missing is drift between two repositories, which is the
+           * same bet every other console row in this file makes.
+           */
+          const res = await doc.get(
+            {
+              TableName: tables.incidents,
+              Key: { incidentId },
+              /**
+               * ═══ STRONGLY CONSISTENT, WHICH IS THE ONE READ IN THIS FILE
+               * THAT HAS TO BE ═══
+               *
+               * `state` DECIDES WHETHER A PERMANENT RECORD IS POSTED, and a
+               * default eventually-consistent `GetItem` may answer from a
+               * replica that has not caught up with the console's resolve. The
+               * caller then sees `pending_review` for a case that IS resolved —
+               * and everything it can do about that is bad: post nothing and
+               * move on (a moderation record lost for good, because
+               * `IncidentLog` has no reconcile to find it later), or hold the
+               * whole feed behind a row that is not actually wrong. Neither is a
+               * cost worth paying to save half a read unit.
+               *
+               * IT REPLACES AN ARGUMENT THIS REPOSITORY COULD NOT CHECK. The
+               * poller's five-second hold-back was doing this job by hoping
+               * five seconds covered replication and that the console writes the
+               * incident row before the audit row — a claim about another
+               * repository that nothing here can verify, on a window nothing
+               * here can measure. A consistent read deletes the case outright.
+               *
+               * WHAT IT COSTS: one whole read unit instead of half, on one
+               * `GetItem` per resolved case. Cases are closed by hand by a
+               * human. The volume is nothing.
+               *
+               * IT IS ON THIS READ AND NOT ON THE OTHERS. `bans`, `players` and
+               * `maintenance` are all read repeatedly by pollers that re-derive
+               * their answer every pass, so a stale read there costs a pass and
+               * corrects itself. This one is read once per case and its answer
+               * is acted on once.
+               */
+              ConsistentRead: true,
+              ProjectionExpression:
+                'incidentId, #state, kind, category, subjectLicense, subjectName, resolvedAt, resolvedByName, verdict',
+              ExpressionAttributeNames: { '#state': 'state' },
+            },
+            o,
+          )
+          return (res.Item as Incident | undefined) ?? null
         })
       },
     },

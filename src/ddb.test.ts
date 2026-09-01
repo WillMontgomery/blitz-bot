@@ -67,6 +67,9 @@ import {
 
 const LICENSE = 'license:abc123'
 
+/** An incident id: a UUID minted by the console, which is how this table is keyed. */
+const INCIDENT = '6f1c9a2e-0000-4000-8000-000000000001'
+
 const ACTOR: Actor = {
   license: 'license:admin1',
   name: 'Admin One',
@@ -186,6 +189,7 @@ const EXERCISES: Array<{
   { name: 'gamePlayers.profile', run: (d) => d.gamePlayers.profile(LICENSE) },
   { name: 'gamePlayers.matches', run: (d) => d.gamePlayers.matches(LICENSE, 25) },
   { name: 'maintenance.current', run: (d) => d.maintenance.current() },
+  { name: 'incidents.get', run: (d) => d.incidents.get(INCIDENT) },
   { name: 'audit.begin', run: (d) => d.audit.begin({ action: 'player.kick', actor: ACTOR }) },
   { name: 'audit.resolve', run: (d) => d.audit.resolve({ commandId: 'c1', ts: 1 }, 'ok') },
   { name: 'audit.recent', run: (d) => d.audit.recent(10) },
@@ -258,6 +262,7 @@ describe('table names', () => {
       audit: 'ringmaster-audit',
       maintenance: 'ringmaster-maintenance',
       botState: 'ringmaster-bot-state',
+      incidents: 'ringmaster-incidents',
       gamePlayers: 'br-players',
     })
   })
@@ -277,6 +282,7 @@ describe('table names', () => {
       tables.audit,
       tables.maintenance,
       tables.botState,
+      tables.incidents,
     ]
 
     for (const table of consoleTables) expect(table.startsWith('staging-')).toBe(true)
@@ -695,6 +701,140 @@ describe('reads', () => {
     const result = await denied.gamePlayers.matches(LICENSE, 25)
 
     expect(result).toMatchObject({ ok: false, failure: { kind: 'denied', op: 'query' } })
+  })
+
+  /**
+   * `ringmaster-incidents` IS KEYED ON `incidentId` ALONE, which is what makes
+   * this a `GetItem` at all — the console's own module scans the table for
+   * everything else and says in its comment what that costs. The bot never needs
+   * the queue, because the audit log hands it the id.
+   */
+  it('address an incident by its id', async () => {
+    const fake = fakeDocument({
+      get: async () => ({ ...META, Item: { incidentId: INCIDENT, state: 'resolved' } }),
+    })
+    const ddb = createDdb({ document: fake.doc })
+
+    const result = await ddb.incidents.get(INCIDENT)
+
+    expect(result.ok && result.value?.state).toBe('resolved')
+    expect(fake.calls[0]?.input).toMatchObject({
+      TableName: 'ringmaster-incidents',
+      Key: { incidentId: INCIDENT },
+    })
+  })
+
+  /**
+   * ═══ THE ONE READ IN THIS FILE THAT IS STRONGLY CONSISTENT ═══
+   *
+   * `state` DECIDES WHETHER A PERMANENT MODERATION RECORD IS POSTED. A default
+   * eventually-consistent `GetItem` can answer from a replica that has not
+   * caught up with the console's resolve, and every answer the caller has to
+   * that is bad: post nothing and move on loses the record for good — nothing in
+   * src/incidents.ts goes back for it — and holding the feed stalls every later
+   * record behind a row that is not actually wrong.
+   *
+   * ASSERTED HERE BECAUSE NOTHING ELSE CAN SEE IT. Every test of the poller
+   * injects a fake `incidents.get` that answers from a map, and a map is
+   * consistent by construction; the flag exists only in the request this layer
+   * builds, so this is the only place the claim can be checked at all.
+   */
+  it('read the incident row strongly consistently, because its state decides a post', async () => {
+    const fake = fakeDocument({
+      get: async () => ({ ...META, Item: { incidentId: INCIDENT, state: 'resolved' } }),
+    })
+    const ddb = createDdb({ document: fake.doc })
+
+    await ddb.incidents.get(INCIDENT)
+
+    expect((fake.calls[0]?.input as GetCommandInput).ConsistentRead).toBe(true)
+  })
+
+  /**
+   * ═══ THE ROW IS NOT READ WHOLE, AND THE COMPILE-TIME CAST IS NOT THE GUARD ═══
+   *
+   * Without a `ProjectionExpression` DynamoDB returns the entire item — the
+   * evidence, the match timeline, `note`, `events`, the reporter's name and
+   * license, the moderator's free-text resolution, and the game-built `summary`
+   * that ends in the reporter's in-game name — and the only thing keeping any of
+   * it out of a Discord message is `Incident`, a TYPE, which is erased before the
+   * program runs. `br_ddb` reads this same table with a four-attribute projection
+   * and that is the precedent this follows.
+   *
+   * ASSERTED AS A SET RATHER THAN AS A STRING, so reordering the list is not a
+   * failure and adding an attribute to it is. The list is exactly what the embed
+   * renders plus `state`, which decides whether there is anything to render.
+   */
+  it('read only the attributes the moderation record renders', async () => {
+    const fake = fakeDocument({
+      get: async () => ({ ...META, Item: { incidentId: INCIDENT, state: 'resolved' } }),
+    })
+    const ddb = createDdb({ document: fake.doc })
+
+    await ddb.incidents.get(INCIDENT)
+
+    const get = fake.calls[0]?.input as GetCommandInput
+
+    // Read out into a local first: `get.ProjectionExpression.split(',')` would
+    // make scripts/check-ddb-expressions.ts read that `','` as an expression
+    // string of its own, which is a true statement about nothing.
+    const projection = String(get.ProjectionExpression)
+    const projected = projection.split(',').map((name) => name.trim())
+
+    expect(projected.sort()).toEqual([
+      '#state',
+      'category',
+      'incidentId',
+      'kind',
+      'resolvedAt',
+      'resolvedByName',
+      'subjectLicense',
+      'subjectName',
+      'verdict',
+    ])
+
+    // None of these may be named, whatever else changes above.
+    for (const secret of [
+      'summary',
+      'evidence',
+      'matchTimeline',
+      'reporterName',
+      'reporterLicense',
+      'resolution',
+      'note',
+      'events',
+    ]) {
+      expect(projected, secret).not.toContain(secret)
+    }
+  })
+
+  /**
+   * `state` IS ONE OF DYNAMODB'S 573 RESERVED WORDS, so naming it bare makes the
+   * whole request fail at run time with "Invalid ProjectionExpression: Attribute
+   * name is a reserved keyword" — on the box, and nowhere earlier, which is
+   * exactly how `at` shipped and broke every ban replacement on 2026-08-30. The
+   * mapping is asserted and not just the string, which is what makes this a guard
+   * rather than a transcription.
+   */
+  it('alias the reserved word in the incident projection', async () => {
+    const fake = fakeDocument({
+      get: async () => ({ ...META, Item: { incidentId: INCIDENT, state: 'resolved' } }),
+    })
+    const ddb = createDdb({ document: fake.doc })
+
+    await ddb.incidents.get(INCIDENT)
+
+    const get = fake.calls[0]?.input as GetCommandInput
+    const projection = String(get.ProjectionExpression)
+
+    expect(get.ExpressionAttributeNames).toEqual({ '#state': 'state' })
+    expect(projection).not.toMatch(/(^|[\s,])state([\s,]|$)/u)
+  })
+
+  it('report a case that is not in the table as null rather than as a failure', async () => {
+    const ddb = createDdb({ document: fakeDocument().doc })
+
+    await expect(ddb.incidents.get(INCIDENT)).resolves.toEqual({ ok: true, value: null })
   })
 
   it('read the audit log newest first', async () => {
@@ -1784,7 +1924,7 @@ describe('what the bot may do to these tables', () => {
     ])
   })
 
-  it('reads the seven it is pointed at, and no others', async () => {
+  it('reads the eight it is pointed at, and no others', async () => {
     const fake = fakeDocument()
     const ddb = createDdb({ document: fake.doc })
 
@@ -1799,6 +1939,9 @@ describe('what the bot may do to these tables', () => {
       'ringmaster-audit',
       'ringmaster-bans',
       'ringmaster-bot-state',
+      // Read and never written, which is the whole of the bot's business with
+      // it: a case is closed in the console, and this repo describes that.
+      'ringmaster-incidents',
       'ringmaster-maintenance',
       'ringmaster-player-ids',
       'ringmaster-players',

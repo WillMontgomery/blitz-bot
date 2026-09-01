@@ -7,6 +7,14 @@ import {
   type Guild,
 } from 'discord.js'
 
+import {
+  POLL_LIMIT,
+  POLL_MS,
+  pollAuditWindow,
+  SETTLE_MS,
+  type AuditPollMessages,
+  type RowStep,
+} from './auditpoll.ts'
 import type { Config } from './config.ts'
 import {
   isBanActive,
@@ -14,6 +22,7 @@ import {
   type AuditAction,
   type AuditRow,
   type Ban,
+  type Ddb,
   type DdbWithAuditWindow,
   type PlayerRecord,
 } from './ddb.ts'
@@ -194,16 +203,25 @@ export const TAGS_KEY = 'game-ban-role-tags'
 export const CURSOR_KEY = 'game-ban-audit-cursor'
 
 /**
- * How often the audit log is polled.
+ * The two numbers that describe the WALK rather than this consumer, re-exported
+ * because src/banrole.test.ts asserts the window this poller asks for and those
+ * are the bounds of it. `POLL_MS` is NOT among them: nothing imports it from
+ * here, and a re-export with no importer is a second name for a number that only
+ * has to disagree once.
  *
- * MEASURED AGAINST HOW LONG A BANNED PLAYER SHOULD GO UNMARKED, which is the only
- * thing this number is really about — the ban itself is already in force at the
- * game's door the instant the console writes the row, so nothing here is on the
- * path of enforcement. Half a minute is fast enough that an admin who bans
- * somebody and then looks at the guild sees the role, and slow enough that an idle
- * bot makes two DynamoDB reads a minute.
+ * THEY LIVE IN src/auditpoll.ts BECAUSE THEY WERE IDENTICAL IN TWO FILES and
+ * because they are properties of reading `ringmaster-audit` — how far behind the
+ * clock, how much in one page — rather than properties of what this file does
+ * with a row. The reasoning for each is with the definition; the ban-specific
+ * half of `SETTLE_MS` is trap 1's hold-back, which is the reason that constant
+ * exists at all.
+ *
+ * WHAT IS NOT SHARED IS BELOW: `MAX_BAN_READS`, `MAX_ROLE_EDITS`,
+ * `RECONCILE_MS`, `RECONCILE_READS`, `TAG_LIMIT`, `JOIN_BACKLOG` and
+ * `PARTITION_SILENCE_MS` are all about this feature and none of them has a
+ * counterpart in the other consumer that means the same thing.
  */
-export const POLL_MS = 30_000
+export { POLL_LIMIT, SETTLE_MS }
 
 /**
  * How often the bot re-checks the bans it has already marked. Trap 3's timer.
@@ -214,38 +232,6 @@ export const POLL_MS = 30_000
  * here that reads rows nothing asked about.
  */
 export const RECONCILE_MS = 300_000
-
-/**
- * How far behind the clock the poll stops reading. Trap 1's hold-back.
- *
- * AN AUDIT ROW IS WRITTEN BEFORE THE BAN ROW IT DESCRIBES, so the newest rows in
- * the log are intents whose ban row may not exist yet. Reading one of those and
- * finding no ban would be read as "the ban failed", the cursor would move past it,
- * and that ban would never be marked — a silent miss on the exact event this file
- * exists for. Holding back five seconds means the console's next write has landed
- * long before we look: the gap between the two is one DynamoDB round trip.
- *
- * IT IS ALSO SIZED AGAINST TRAP 4. `nextTs` steps a colliding write forward by a
- * millisecond, so a burst can stamp a row slightly AHEAD of the wall clock; five
- * seconds is thousands of collisions of headroom.
- *
- * THE TWO CLOCKS ARE THE SAME CLOCK. The console and the bot are two processes on
- * one box (docs/deploy.md), so comparing the console's `ts` against this process's
- * `Date.now()` is comparing one machine to itself. If the bot is ever moved off
- * that box, this number has to cover the skew between them as well.
- */
-export const SETTLE_MS = 5_000
-
-/**
- * How much of the audit log one poll may pull back.
- *
- * A BOUND AND NOT A CAPACITY. A caught-up poller reads a handful of rows a day;
- * this number only matters after an outage, and there it is the answer to "how
- * much are we willing to spend catching up in one pass". Passes repeat every
- * `POLL_MS`, and the cursor advances over what was actually dealt with, so a long
- * backlog is drained across passes rather than in one.
- */
-export const POLL_LIMIT = 50
 
 /**
  * How many distinct ban rows one poll may read, and how many one reconcile may.
@@ -558,6 +544,65 @@ export function discordIdIn(banKey: string): string | null {
 
   const id = banKey.slice(prefix.length)
   return SNOWFLAKE.test(id) ? id : null
+}
+
+/**
+ * The Discord account behind a qualified identifier. `'failed'` means the read
+ * did not answer.
+ *
+ * A `discord:` KEY CARRIES THE ANSWER AND COSTS NO READ. Every other key is a
+ * license, and the registry row is the only place that says which Discord
+ * account has played on it.
+ *
+ * THREE ANSWERS AND NOT TWO, WHICH IS THE WHOLE REASON IT IS NOT `string | null`.
+ * `null` is "the game has never seen a Discord account for this player" — an
+ * ordinary, permanent fact, because FiveM only reports a `discord:` identifier
+ * when the player has Discord's activity integration switched on and that is
+ * opt-in. `'failed'` is "the registry did not answer this time", which the next
+ * pass may answer differently. A caller that collapsed the two would either give
+ * up forever on a timeout or retry a fact that will never change.
+ *
+ * AT MODULE SCOPE AND EXPORTED BECAUSE THERE ARE TWO CALLERS NOW. src/incidents.ts
+ * asks the same question of an incident's `subjectLicense` — already qualified,
+ * so it needs no `qualifyId` on the way in — and a second implementation of
+ * "which account is this" is a second opinion about whose avatar goes on a post
+ * and whose ban gets marked.
+ *
+ * IT TAKES THE READER RATHER THAN A WHOLE `Ddb`, so neither caller widens its own
+ * access by using it: the registry is read, and nothing else is reachable through
+ * the parameter.
+ *
+ * ═══ AND EACH CALLER BRINGS ITS OWN SENTENCE FOR A READ THAT DID NOT ANSWER ═══
+ *
+ * `whenUnreadable` IS A PARAMETER BECAUSE THE CONSEQUENCE IS NOT THE SAME ONE.
+ * That line is copied verbatim into the owner's status channel, and what it has
+ * to tell him is what a failed read COST: on the ban path the ban was not marked
+ * and the pass stops, on the incident path the record is posted anyway without a
+ * thumbnail. One sentence covering both would have to stop saying either, and
+ * reaching for a vaguer wording that fits two callers is how the ban path's line
+ * — 'could not read the player registry, so this ban was not marked' — quietly
+ * became a sentence about resolving accounts when this function was pulled out
+ * of the poller. Both are pinned verbatim by their own tests.
+ */
+export async function discordIdFor(
+  players: Ddb['players'],
+  key: string,
+  whenUnreadable: string,
+): Promise<string | null | 'failed'> {
+  const direct = discordIdIn(key)
+  if (direct !== null) return direct
+
+  const record = await players.get(key)
+  if (!record.ok) {
+    log('warn', whenUnreadable, {
+      key,
+      failure: record.failure.kind,
+      detail: record.failure.message,
+    })
+    return 'failed'
+  }
+
+  return newestDiscordId(record.value)
 }
 
 /* ------------------------------------------------------------------ *
@@ -1100,30 +1145,6 @@ export function createBanRoleSync(deps: BanRoleDeps): BanRoleSync {
     return { ok: true, key: qualified, ban: second.value }
   }
 
-  /**
-   * The Discord account behind a ban key. `'failed'` means the read did not answer.
-   *
-   * A `discord:` KEY CARRIES THE ANSWER AND COSTS NO READ. Every other key is a
-   * license, and the registry row is the only place that says which Discord
-   * account has played on it.
-   */
-  async function discordIdFor(key: string): Promise<string | null | 'failed'> {
-    const direct = discordIdIn(key)
-    if (direct !== null) return direct
-
-    const record = await deps.ddb.players.get(key)
-    if (!record.ok) {
-      log('warn', 'could not read the player registry, so this ban was not marked', {
-        key,
-        failure: record.failure.kind,
-        detail: record.failure.message,
-      })
-      return 'failed'
-    }
-
-    return newestDiscordId(record.value)
-  }
-
   /* -------------------------------------------------------------- *
    * The two decisions.
    * -------------------------------------------------------------- */
@@ -1143,7 +1164,13 @@ export function createBanRoleSync(deps: BanRoleDeps): BanRoleSync {
    * every other function here may rely on that.
    */
   async function mark(tags: Book, key: string, ban: Ban): Promise<Step> {
-    const discordId = await discordIdFor(key)
+    // The sentence is this caller's, verbatim, and it says what the failed read
+    // cost HERE: the pass stops and nobody is marked. See `discordIdFor`.
+    const discordId = await discordIdFor(
+      deps.ddb.players,
+      key,
+      'could not read the player registry, so this ban was not marked',
+    )
     if (discordId === 'failed') return 'stop'
 
     if (discordId === null) {
@@ -1250,23 +1277,6 @@ export function createBanRoleSync(deps: BanRoleDeps): BanRoleSync {
   }
 
   /* -------------------------------------------------------------- *
-   * The cursor.
-   * -------------------------------------------------------------- */
-
-  async function saveCursor(at: number): Promise<void> {
-    const written = await deps.ddb.botState.put(CURSOR_KEY, String(at))
-    if (!written.ok) {
-      // The work was done; only the bookmark was not. The next pass reads the
-      // same window again, and every decision in it is idempotent.
-      log('warn', 'the game-ban poll finished but its cursor could not be saved', {
-        cursor: at,
-        failure: written.failure.kind,
-        detail: written.failure.message,
-      })
-    }
-  }
-
-  /* -------------------------------------------------------------- *
    * The passes.
    * -------------------------------------------------------------- */
 
@@ -1319,143 +1329,121 @@ export function createBanRoleSync(deps: BanRoleDeps): BanRoleSync {
     })
   }
 
+  /**
+   * The sentences this consumer's walk says. See `AuditPollMessages`.
+   *
+   * VERBATIM WHAT THEY WERE, because three of them reach the owner's status
+   * channel and every one of them is grepped for by a test. Moving the walk into
+   * src/auditpoll.ts moved no words.
+   */
+  const MESSAGES: AuditPollMessages = {
+    cursorUnreadable: 'could not read the game-ban poll cursor, so nothing was polled',
+    /**
+     * NO CURSOR MEANS START HERE, NOT START AT THE BEGINNING. Walking the whole
+     * log would re-read months of triggers to arrive at the state the bans table
+     * already holds, and it still would not tag anybody whose ban predates the
+     * log — see `TAGS_KEY` on why there is no backfill at all.
+     */
+    noCursorYet:
+      'no game-ban poll cursor yet, so bans from now on will be marked and earlier ones will not',
+    cursorUnusable:
+      'the game-ban poll cursor is not a position in the log, so polling restarts from now',
+    windowUnreadable: 'could not read the audit log, so no game ban was marked this pass',
+    cursorUnsaved: 'the game-ban poll finished but its cursor could not be saved',
+    rowWithoutSortKey: 'an audit row carries no sort key, so the game-ban poll stopped',
+  }
+
   async function poll(): Promise<void> {
-    const at = now()
-    const until = at - SETTLE_MS
-
-    const stored = await deps.ddb.botState.get(CURSOR_KEY)
-    if (!stored.ok) {
-      log('warn', 'could not read the game-ban poll cursor, so nothing was polled', {
-        failure: stored.failure.kind,
-        detail: stored.failure.message,
-      })
-      return
-    }
-
-    const raw = stored.value?.value ?? null
-    const parsed = raw === null ? null : Number(raw)
-
-    if (parsed === null || !Number.isFinite(parsed)) {
-      /**
-       * NO CURSOR MEANS START HERE, NOT START AT THE BEGINNING. Walking the whole
-       * log would re-read months of triggers to arrive at the state the bans
-       * table already holds, and it still would not tag anybody whose ban predates
-       * the log — see `TAGS_KEY` on why there is no backfill at all. So the first
-       * ever start records where it came in and marks bans from then on.
-       */
-      log(
-        raw === null ? 'info' : 'warn',
-        raw === null
-          ? 'no game-ban poll cursor yet, so bans from now on will be marked and earlier ones will not'
-          : 'the game-ban poll cursor is not a number, so polling restarts from now',
-        { cursor: raw },
-      )
-      await saveCursor(until)
-      return
-    }
-
-    const cursor = parsed
-
-    const page = await deps.ddb.auditWindow.since(cursor, until, POLL_LIMIT)
-    if (!page.ok) {
-      log('warn', 'could not read the audit log, so no game ban was marked this pass', {
-        partition: deps.ddb.auditWindow.partition,
-        failure: page.failure.kind,
-        detail: page.failure.message,
-      })
-      return
-    }
-
-    const rows = page.value
-
-    if (rows.length === 0) {
-      // Trap 5's continuous half. A quiet log is ordinary; a log that has been
-      // quiet for a very long time is worth one question.
-      if (at - lastRowAt >= PARTITION_SILENCE_MS) {
-        lastRowAt = at
-        await probe()
-      }
-
-      /**
-       * THE CURSOR IS DELIBERATELY NOT MOVED OVER AN EMPTY WINDOW, and it costs
-       * nothing to leave it where it is. The next pass asks about a WIDER window
-       * with the same lower bound, which is a superset — so nothing can be
-       * skipped by not writing — and a key-range query over a range with nothing
-       * in it is one seek however wide the range is. Advancing anyway would be a
-       * DynamoDB write every `POLL_MS` for the life of an idle bot, which is
-       * thousands of writes a day to record that nothing happened.
-       */
-      return
-    }
-
-    lastRowAt = at
-
-    const tags = await openBook()
-    if (tags === null) return
+    /**
+     * THE TAG BOOK IS HELD IN AN OBJECT RATHER THAN IN A `let`, so that the three
+     * callbacks below are reading one thing rather than three closures over a
+     * variable whose narrowing they each have to argue about.
+     */
+    const held: { book: Book | null } = { book: null }
 
     let edits = 0
     let reads = 0
-    let advanced = cursor
     const decided = new Set<string>()
 
-    for (const row of rows) {
-      if (edits >= MAX_ROLE_EDITS || reads >= MAX_BAN_READS) break
+    await pollAuditWindow(
+      { ddb: deps.ddb, now },
+      {
+        cursorKey: CURSOR_KEY,
+        messages: MESSAGES,
 
-      if (typeof row.ts !== 'number') {
-        // The type says this cannot happen and the table is another repo's, so
-        // it can. Stopping here rather than skipping keeps the cursor behind a
-        // row we could not place — and a silent `break` is the exact kind of
-        // quiet halt this whole file is written against.
-        log('error', 'an audit row carries no sort key, so the game-ban poll stopped', {
-          action: row.action,
-        })
-        break
-      }
+        room: () => edits < MAX_ROLE_EDITS && reads < MAX_BAN_READS,
 
-      if (!isBanTrigger(row)) {
-        // Trap 2: `player.kick` and `incident.resolve` rows follow a ban and are
-        // about the same person. Nothing here reads `detail.becauseOf`, because
-        // nothing that is not one of the two verbs gets this far.
-        advanced = row.ts
-        continue
-      }
+        // Trap 5's continuous half. A quiet log is ordinary; a log that has been
+        // quiet for a very long time is worth one question.
+        onEmpty: async (at) => {
+          if (at - lastRowAt >= PARTITION_SILENCE_MS) {
+            lastRowAt = at
+            await probe()
+          }
+        },
 
-      const target = row.targetLicense
-      if (typeof target !== 'string' || target === '') {
-        log('warn', 'a ban audit row names no target, so no role decision was made', {
-          ts: row.ts,
-          action: row.action,
-        })
-        advanced = row.ts
-        continue
-      }
+        // A tag list that could not be read stops the pass before a single
+        // decision is made against nothing. See `openBook`.
+        onRows: async (at) => {
+          lastRowAt = at
+          held.book = await openBook()
+          return held.book !== null
+        },
 
-      // One decision per key per pass. A re-ban and its lift in the same window
-      // are two rows about one row in `ringmaster-bans`, and the ban row already
-      // holds the answer both of them are asking about.
-      if (decided.has(target)) {
-        advanced = row.ts
-        continue
-      }
-      decided.add(target)
-      reads++
+        onRow: async (row): Promise<RowStep> => {
+          const tags = held.book
+          // `onRows` answered false if this is null, so the walk never got here.
+          if (tags === null) return 'stop'
 
-      const step = await settle(tags, target, row.action)
-      if (step === 'stop') break
-      if (step === 'edited') edits++
+          if (!isBanTrigger(row)) {
+            // Trap 2: `player.kick` and `incident.resolve` rows follow a ban and
+            // are about the same person. Nothing here reads `detail.becauseOf`,
+            // because nothing that is not one of the two verbs gets this far.
+            return 'done'
+          }
 
-      advanced = row.ts
-    }
+          const target = row.targetLicense
+          if (typeof target !== 'string' || target === '') {
+            log('warn', 'a ban audit row names no target, so no role decision was made', {
+              ts: row.ts,
+              action: row.action,
+            })
+            return 'done'
+          }
 
-    /**
-     * THE CURSOR MOVES ONLY OVER WORK THAT WAS ACTUALLY RECORDED. Every drop this
-     * pass made lives in that one write; if it did not land, the decisions behind
-     * it are not durable, and a cursor moved past them would mean re-deriving
-     * them never happens. Repeating the window is free — every decision in it is
-     * idempotent — so the strict order is the cheap one.
-     */
-    if (!(await saveBook(tags))) return
-    if (advanced > cursor) await saveCursor(advanced)
+          // One decision per key per pass. A re-ban and its lift in the same
+          // window are two rows about one row in `ringmaster-bans`, and the ban
+          // row already holds the answer both of them are asking about.
+          if (decided.has(target)) return 'done'
+          decided.add(target)
+          reads++
+
+          const step = await settle(tags, target, row.action)
+          if (step === 'stop') return 'stop'
+          if (step === 'edited') edits++
+
+          /**
+           * `done` AND NEVER `persist`, WHICH IS THE OPPOSITE CALL FROM THE
+           * INCIDENT POLLER'S AND IS RIGHT FOR THE OPPOSITE REASON. Every
+           * decision here is idempotent — a role added twice is a role, a tag
+           * refreshed twice is a tag — so repeating a window costs nothing, and
+           * the one write that has to land is the tag book below. A record
+           * posted to a channel cannot be un-posted, which is why that consumer
+           * writes its cursor as it goes.
+           */
+          return 'done'
+        },
+
+        /**
+         * THE CURSOR MOVES ONLY OVER WORK THAT WAS ACTUALLY RECORDED. Every drop
+         * this pass made lives in that one write; if it did not land, the
+         * decisions behind it are not durable, and a cursor moved past them would
+         * mean re-deriving them never happens. Repeating the window is free — see
+         * above — so the strict order is the cheap one.
+         */
+        onFinish: async () => (held.book === null ? false : await saveBook(held.book)),
+      },
+    )
   }
 
   async function reconcile(): Promise<void> {

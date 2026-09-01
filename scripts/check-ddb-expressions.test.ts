@@ -353,7 +353,9 @@ describe('the check over this repo', () => {
       const source = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')
       return findExpressionStrings(file, source).length
     })
-    expect(seen).toEqual([11, 11])
+    // The twelfth in src/ddb.ts is `incidents.get`'s `ProjectionExpression`,
+    // added when that read stopped pulling back the whole incident row.
+    expect(seen).toEqual([12, 11])
   })
 
   /**
