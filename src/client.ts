@@ -86,9 +86,15 @@ import { installStickies } from './sticky.ts'
  * The notice is a courtesy to one person; it is not evidence and nothing reads
  * it back.
  *
- * THE WORDS THEMSELVES ARE NOT WRITTEN YET AND ARE A MARKED PLACEHOLDER — see
- * `NOTICE_PLACEHOLDER`. The owner supplies user-facing wording; this file
- * supplies everything around it.
+ * THE WORDS ARE THE OWNER'S AND THIS PARAGRAPH USED TO SAY THEY WERE NOT. It
+ * read "THE WORDS THEMSELVES ARE NOT WRITTEN YET AND ARE A MARKED PLACEHOLDER —
+ * see `NOTICE_PLACEHOLDER`", and there has been no `NOTICE_PLACEHOLDER` since he
+ * supplied the six sentences in `COPY`. A header that says the copy is a draft,
+ * over copy that is not, is the drift a comment convention costs — worth naming
+ * here, because it is the argument against marking a string in prose and the
+ * reason `scripts/check-placeholders.ts` prints the list to the one person who
+ * can tell it is stale. The one string in this file still awaiting wording is
+ * `BAN_REASON_UNWRITTEN`, and it is tagged where it is declared.
  */
 
 /**
@@ -856,15 +862,21 @@ async function postLine(
 
 /**
  * ============================================================================
- * WHAT THE POSTER IS TOLD. PLACEHOLDER — THE OWNER SUPPLIES THIS WORDING.
+ * WHAT THE POSTER IS TOLD. THE WORDING IS THE OWNER'S.
  * ============================================================================
  *
- * NONE OF THESE STRINGS ARE THE FINAL TEXT AND NONE MAY SHIP AS IF THEY WERE.
- * They are deliberately unmistakable so that one cannot reach a member's DMs
- * without somebody noticing: no apology, no explanation, no house style,
- * nothing that reads like a sentence the owner would have written. Everything
- * AROUND them — which rule fired, how it is delivered, when the fallback is
- * taken down — is decided and tested; only the words are open.
+ * THIS HEADING SAID THE OPPOSITE FOR WEEKS AFTER IT STOPPED BEING TRUE. It read
+ * "PLACEHOLDER — THE OWNER SUPPLIES THIS WORDING. NONE OF THESE STRINGS ARE THE
+ * FINAL TEXT AND NONE MAY SHIP AS IF THEY WERE", over six sentences he had
+ * supplied and a test one file over asserting that not one of them says
+ * PLACEHOLDER. Anybody auditing what this bot says to members had to choose
+ * which of the two to believe. It is corrected rather than deleted because it is
+ * the case FOR `scripts/check-placeholders.ts` printing its list to the owner:
+ * no static check can see a marker that outlived its draft, and he can, at a
+ * glance, because he wrote the sentence.
+ *
+ * EVERYTHING AROUND THEM IS DECIDED AND TESTED — which rule fired, how it is
+ * delivered, when the fallback is taken down.
  *
  * ONE RECORD, EXPORTED, AND THAT IS THE POINT RATHER THAN THE TIDINESS.
  * src/commands/sticky.ts is the worked example of getting this wrong: its tests
@@ -5288,16 +5300,22 @@ export function moderationEntry(entry: GuildAuditLogsEntry): ModerationEntry | n
 
 /**
  * ============================================================================
- * THE BAN REASON WHEN DISCORD'S DIALOG WAS LEFT BLANK. PLACEHOLDER — THE OWNER
- * SUPPLIES THIS WORDING.
+ * THE BAN REASON WHEN DISCORD'S DIALOG WAS LEFT BLANK. THE OWNER SUPPLIES THIS
+ * WORDING AND HAS NOT SUPPLIED IT.
  * ============================================================================
  *
- * THIS STRING IS SHOWN TO A PLAYER AT CONNECT. `Ban.reason` is written for the
- * banned person and not for the log — src/ddb.ts says so — and it is required,
- * so a Discord ban typed with no reason has to carry something. That something
- * is not this file's to invent, and it is deliberately unmistakable so it cannot
- * ship by accident: no apology, no house style, nothing that reads like a
- * sentence the owner would have written.
+ * THIS STRING IS READ BY THE PERSON IT IS ABOUT, WHICH IS WHY IT IS FIRST ON THE
+ * LIST. `Ban.reason` is written for the banned person and not for the log —
+ * src/ddb.ts says so — and it is required, so a Discord ban typed with no reason
+ * has to carry something. The game shows it at the connect refusal, and
+ * `/profile` shows it back to them in their own self view (`selfBanBody` in
+ * ./commands/profile.ts). Three surfaces, one of them in another codebase.
+ *
+ * IT USED TO LEAD WITH A LITERAL `PLACEHOLDER:`, AND THAT WAS SHOWN TO THEM TOO.
+ * The marker was there so it could not ship by accident; what it actually did
+ * was ship, to the one reader in this whole repo who is least able to ask what
+ * it means. It is a tag in this comment now, and
+ * `scripts/check-placeholders.ts` prints the string on every verify.
  *
  * EVERYTHING AROUND IT IS DECIDED AND TESTED. When it is used, where it is
  * stored, and that it never replaces a reason the moderator did type. Only the
@@ -5307,8 +5325,10 @@ export function moderationEntry(entry: GuildAuditLogsEntry): ModerationEntry | n
  * default for a reasonless kick, written by whoever wrote the console, so
  * src/ringmaster.ts omits the field rather than inventing a second wording for
  * the same silence.
+ *
+ * @unwritten player — the ban reason stored when Discord's own dialog was left blank; the game shows it at connect refusal.
  */
-export const BAN_REASON_PLACEHOLDER = 'PLACEHOLDER: banned from the Discord server.'
+export const BAN_REASON_UNWRITTEN = 'Banned from the Discord server.'
 
 /**
  * The reason the bot stamps on its own role edit, in Discord's audit log.
@@ -5955,7 +5975,7 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
           // the player, and src/banrole.ts feeds it straight back into `bans.get`.
           targetLicense: key,
           targetName: entry.targetName,
-          reason: entry.reason ?? BAN_REASON_PLACEHOLDER,
+          reason: entry.reason ?? BAN_REASON_UNWRITTEN,
           detail: {
             // The console's two, in the console's words: see its
             // `src/app/api/bans/route.ts`. Both are constants here, because the
@@ -5980,7 +6000,7 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
       byName: issuerName,
       // The moderator's own words, or the marked placeholder. Never a rewrite of
       // what they typed.
-      reason: entry.reason ?? BAN_REASON_PLACEHOLDER,
+      reason: entry.reason ?? BAN_REASON_UNWRITTEN,
       /**
        * PERMANENT, AND IT IS THE POLICY RATHER THAN A DEFAULT. "A Discord ban
        * means banned in the game, permanently." Discord's ban dialog has no

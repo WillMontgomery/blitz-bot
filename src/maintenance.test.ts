@@ -8,11 +8,13 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vite
 
 import type { DdbFailure, DdbResult, MaintenanceState, MaintenanceWindow } from './ddb.ts'
 import {
+  CONSOLE_SAID,
   MAINTENANCE_POLL_MS,
   maintenanceMemory,
   maintenancePoster,
   maintenanceStatePath,
   maintenanceWatch,
+  NOT_BACK,
   RESTART_GRACE_MS,
   watchMaintenance,
   type MaintenanceMemory,
@@ -719,7 +721,13 @@ describe('the completion gate — waiting for the game to speak', () => {
 
     // Out of time as well as unprovable, so it says the thing it can stand
     // behind rather than nothing at all. See `graceExpired`.
-    expect(at(watch.post, 0)).toContain('PLACEHOLDER')
+    //
+    // PINNED BY CONSTANT, WHICH IT WAS NOT. This read `toContain('PLACEHOLDER')`
+    // because the sentence led with the marker — into the one channel players
+    // read. The marker is a tag in the doc comment now and the string is on the
+    // list `scripts/check-placeholders.ts` prints; this holds which message
+    // arrived, and survives the owner wording it.
+    expect(at(watch.post, 0)).toContain(NOT_BACK)
     expect(at(watch.post, 0)).not.toContain('back up')
   })
 
@@ -869,7 +877,10 @@ describe('the completion gate — waiting for the game to speak', () => {
 
     await watch.check()
 
-    const reason = at(watch.post, 0).split('the console said: ')[1] ?? ''
+    // Split on the frame rather than on a typed-out copy of it: that copy was
+    // `'the console said: '`, lowercase, because the sentence used to open with
+    // `PLACEHOLDER:` and this clause ran on after it.
+    const reason = at(watch.post, 0).split(CONSOLE_SAID(''))[1] ?? ''
     const points = [...reason]
 
     expect(points.at(-1)).toBe('…')

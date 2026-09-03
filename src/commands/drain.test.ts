@@ -10,7 +10,13 @@ import {
   type DrainFailure,
   type DrainResult,
 } from '../ringmaster.ts'
-import { refusalFor, runCommand, type Invocation, type Responder } from './command.ts'
+import {
+  COPY as COMMAND_COPY,
+  refusalFor,
+  runCommand,
+  type Invocation,
+  type Responder,
+} from './command.ts'
 import {
   COPY,
   drainCommand,
@@ -729,12 +735,22 @@ describe('/drain — the reply says what is happening and when, not that it aske
       expect(frame.toLowerCase(), frame).not.toContain('no wording supplied')
     }
 
-    // And the whole record, including the strings Discord is registered with,
-    // so a description or a subcommand name cannot carry it either.
-    for (const [key, value] of Object.entries(COPY)) {
-      if (typeof value !== 'string') continue
+    // And the whole record plus the two names Discord registers, so a
+    // description or a subcommand cannot carry it either. The subcommands are
+    // named here rather than read out of `COPY`: `COPY.startPlaceholderName`
+    // held `start` only so that "this word is not his" stayed sayable, and the
+    // `@unwritten` tag on the constant itself says it to him instead.
+    const registered: [string, string][] = [
+      ...Object.entries(COPY).filter(
+        (pair): pair is [string, string] => typeof pair[1] === 'string',
+      ),
+      ['DRAIN_START_SUBCOMMAND', DRAIN_START_SUBCOMMAND],
+      ['DRAIN_CANCEL_SUBCOMMAND', DRAIN_CANCEL_SUBCOMMAND],
+    ]
 
+    for (const [key, value] of registered) {
       expect(value, key).not.toContain('PLACEHOLDER')
+      expect(value, key).not.toContain('@unwritten')
       expect(value.toLowerCase(), key).not.toContain('no wording supplied')
     }
   })
@@ -970,19 +986,21 @@ describe('/drain — through runCommand, the way Discord reaches it', () => {
    * is left looking at "The application did not respond" over a game server
    * whose state they now cannot guess at.
    *
-   * ═══ AND THIS ONE FRAME IS STILL A MARKED STAND-IN, IN ../command.ts ═══
+   * ═══ AND THIS ONE FRAME IS STILL A STAND-IN, IN ../command.ts ═══
    *
    * IT IS NOT `/drain`'s STRING AND NOT THIS FILE'S TO FIX. `COPY.failed` in
    * ./command.ts is the sentence every command's crash reaches an admin with,
-   * and it still reads `PLACEHOLDER: no wording supplied yet for a command that
-   * failed.` So a `/drain start` that throws DOES put the marker in front of an
-   * admin — which is exactly the shape of the fault the owner just read, one
-   * file over and owned by somebody else.
+   * and nobody has worded it. So a `/drain start` that throws still answers with
+   * a stand-in — one file over and owned by somebody else.
    *
-   * THE ASSERTION IS KEPT AS-IS SO THE GAP IS VISIBLE RATHER THAN QUIET. It
-   * pins today's behaviour, it will fail the moment that string is given real
-   * wording, and the failure is how whoever supplies it finds this case. The
-   * sweep above deliberately covers only the frames `/drain` composes itself.
+   * THIS USED TO ASSERT `toContain('PLACEHOLDER')`, and it said so: the marker
+   * was kept in the string so the gap was visible, and this case pinned it "so
+   * the gap is visible rather than quiet". The gap is now visible somewhere
+   * better — `scripts/check-placeholders.ts` prints that string, its audience
+   * and its current text on every verify and every push, which is a list the
+   * owner reads rather than a red assertion whoever supplies the wording has to
+   * decode. So the marker is out of the sentence and this pins the CONSTANT,
+   * which survives him wording it.
    */
   it('answers even when the relay itself comes apart', async () => {
     const respond = responder()
@@ -995,7 +1013,7 @@ describe('/drain — through runCommand, the way Discord reaches it', () => {
     await runCommand(invocation(), cfg(), respond, [drainCommand(() => broken)])
 
     expect(respond.edited).toHaveLength(1)
-    expect(respond.edited[0]).toContain('PLACEHOLDER')
+    expect(respond.edited[0]).toBe(COMMAND_COPY.failed)
     expect(stderr.join('')).toContain('level=error')
   })
 })

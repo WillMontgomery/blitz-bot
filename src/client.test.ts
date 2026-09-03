@@ -23,7 +23,7 @@ import {
   announcer,
   auditReader,
   AUDIT_CURSOR_KEY,
-  BAN_REASON_PLACEHOLDER,
+  BAN_REASON_UNWRITTEN,
   botManualPath,
   commitFiles,
   COPY,
@@ -3770,14 +3770,26 @@ describe('the file header', () => {
    * called it a standing instruction from the owner — which it was, until he
    * replaced it. Anybody reading the file to find out whether a notice was
    * deliberate would have been told, in capitals, that it could not exist.
+   *
+   * AND IT WENT STALE A SECOND TIME, IN THE OTHER DIRECTION, WHICH THIS CASE
+   * HELD IN PLACE. It went on to say the notice wording was "NOT WRITTEN YET AND
+   * A MARKED PLACEHOLDER — see `NOTICE_PLACEHOLDER`" for weeks after the owner
+   * supplied all six sentences, and the assertion here was
+   * `expect(header).toContain('PLACEHOLDER')`, which pinned the wrong claim as
+   * firmly as a right one. What the header has to say is who the wording belongs
+   * to, so that is what is asserted; the word itself was never the point.
    */
-  it('no longer claims the bot never talks to members', async () => {
+  it('no longer claims the bot never talks to members, or that his wording is a draft', async () => {
     const source = await readFile(new URL('./client.ts', import.meta.url), 'utf8')
     const header = source.slice(0, source.indexOf('export interface ScannedMessage'))
 
     expect(header).not.toContain('THE BOT NEVER TALKS TO MEMBERS')
     expect(header).toMatch(/which rule/i)
-    expect(header).toContain('PLACEHOLDER')
+
+    // The one string in the file that IS still awaiting wording, named where
+    // anybody auditing what this bot says to members will read it.
+    expect(header).toContain('BAN_REASON_UNWRITTEN')
+    expect(header).not.toContain('NOTICE_PLACEHOLDER`. The owner supplies')
   })
 })
 
@@ -8201,20 +8213,32 @@ describe('a discord ban becomes a permanent game ban', () => {
   })
 
   /**
-   * THE PLACEHOLDER, PINNED BY CONSTANT AND NEVER BY ITS PROSE. That is the
-   * lesson src/commands/sticky.ts learned the hard way: a test asserting a
-   * fragment of draft wording is a test that gets deleted rather than updated
-   * when the owner's real words arrive.
+   * PINNED BY CONSTANT AND NEVER BY ITS PROSE. That is the lesson
+   * src/commands/sticky.ts learned the hard way: a test asserting a fragment of
+   * draft wording is a test that gets deleted rather than updated when the
+   * owner's real words arrive. This one survives him wording it.
    */
-  it('falls back to the marked placeholder when the dialog was left blank', async () => {
+  it('falls back to the unwritten reason when the dialog was left blank', async () => {
     const harness = mirrorHarness()
     await mirrorEntry(entryOf({ reason: null }), harness.deps)
 
-    expect(harness.issued[0]?.reason).toBe(BAN_REASON_PLACEHOLDER)
+    expect(harness.issued[0]?.reason).toBe(BAN_REASON_UNWRITTEN)
   })
 
-  it('marks the placeholder unmistakably so it cannot ship by accident', () => {
-    expect(BAN_REASON_PLACEHOLDER).toContain('PLACEHOLDER')
+  /**
+   * AND IT DOES NOT CARRY A MARKER, WHICH IS THE ASSERTION THAT TURNED ROUND.
+   * It used to read `toContain('PLACEHOLDER')`, because the string led with the
+   * word so that shipping it was obvious. It ships to the person being banned —
+   * the connect refusal shows `Ban.reason`, and `/profile`'s self view shows it
+   * back to them — so "obvious" meant obvious to THEM. The marker is a tag in
+   * the doc comment now and `scripts/check-placeholders.ts` is what makes it
+   * visible; this holds the string clean, and `npm test` is not where the gap is
+   * reported.
+   */
+  it('carries no marker, because the person being banned is the one who reads it', () => {
+    expect(BAN_REASON_UNWRITTEN).not.toContain('PLACEHOLDER')
+    expect(BAN_REASON_UNWRITTEN).not.toContain('@unwritten')
+    expect(BAN_REASON_UNWRITTEN.trim()).not.toBe('')
   })
 
   /**
@@ -8855,8 +8879,8 @@ describe('the audit row a mirrored ban leaves behind', () => {
     const harness = mirrorHarness()
     await mirrorEntry(entryOf({ reason: null }), harness.deps)
 
-    expect(harness.opened[0]?.reason).toBe(BAN_REASON_PLACEHOLDER)
-    expect(harness.issued[0]?.reason).toBe(BAN_REASON_PLACEHOLDER)
+    expect(harness.opened[0]?.reason).toBe(BAN_REASON_UNWRITTEN)
+    expect(harness.issued[0]?.reason).toBe(BAN_REASON_UNWRITTEN)
   })
 
   it('carries the policy and the provenance in detail', async () => {

@@ -59,31 +59,43 @@ export interface StickyFields {
 }
 
 /**
- * PLACEHOLDER COPY, AND NONE OF IT IS THE OWNER'S WORDING, under the rule
- * ./command.ts sets: every string a member can see is in one record so that
- * supplying the real text is one edit to one object. The strings say what they
- * are on purpose — shipping one by accident has to be obvious rather than
- * invisible.
+ * EVERY STRING THIS COMMAND CAN SAY, IN ONE RECORD, under the rule ./command.ts
+ * sets: a string an admin can see lives here so that changing one is one edit to
+ * one object.
  *
- * `description` AND THE OPTION DESCRIPTION ARE MINE RATHER THAN HIS, for the
- * reason `/help`'s are: Discord requires a description on a command and on an
- * option and will not accept an empty one. They are deliberately plain and they
- * are the two strings to hand back when he wants his own.
+ * SIX OF THEM ARE HIS, VERBATIM, AND TWO ARE NOT. `empty` and `tooLong` are the
+ * two nobody has worded, and they carry `@unwritten` in their own doc comments
+ * rather than a `PLACEHOLDER:` in the sentence — the marker used to be in the
+ * text, he asked for it out of `/drain`'s replies, and it now lives where
+ * `scripts/check-placeholders.ts` reads it and prints both on every verify. The
+ * sentences underneath say what they are, which is what they are.
+ *
+ * THE DESCRIPTIONS ARE MINE RATHER THAN HIS, for the reason `/help`'s are:
+ * Discord requires a description on a command and on an option and will not
+ * accept an empty one. They are deliberately plain, they are on the list, and
+ * they are the three strings to hand back when he wants his own.
  */
 export const COPY = {
-  /** Discord allows 1-100 characters here. */
+  /** @unwritten picker — the `/sticky` command as Discord's picker describes it. Discord allows 1-100 characters. */
   stickyDescription: 'Keep a message at the bottom of this channel',
+
+  /** @unwritten picker — the `/unsticky` command as Discord's picker describes it. */
   unstickyDescription: 'Stop keeping a message at the bottom of this channel',
 
-  /** Same limit, on the option. */
+  /** @unwritten picker — the `text` option of `/sticky`, in the picker. Same limit. */
   textOption: 'What the message says',
 
   set: "Sticky note set. To turn it off, use `/unsticky`",
   replaced: "Sticky note set. To turn it off, use `/unsticky`",
   cleared: "Sticky turned off.",
   nothingToClear: "There's nothing to unstick in this channel.",
-  empty: 'PLACEHOLDER: no wording supplied yet for a sticky with no text in it.',
-  tooLong: `PLACEHOLDER: no wording supplied yet for a sticky longer than ${STICKY_TEXT_CAP} characters.`,
+
+  /** @unwritten admin — what an admin is told when `/sticky` is run with nothing but whitespace in it. */
+  empty: 'No wording supplied yet for a sticky with no text in it.',
+
+  /** @unwritten admin — what an admin is told when the sticky text is over the cap. The cap is interpolated. */
+  tooLong: `No wording supplied yet for a sticky longer than ${STICKY_TEXT_CAP} characters.`,
+
   noChannel: "Something went wrong. Try again.",
   unavailable: "Something went wrong. Try again.",
 }

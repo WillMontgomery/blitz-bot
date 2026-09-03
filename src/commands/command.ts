@@ -386,16 +386,41 @@ export interface Responder {
 }
 
 /**
- * PLACEHOLDER COPY, AND NONE OF IT IS THE OWNER'S WORDING. Every string a
- * member can see is here, in one record, so that supplying the real text is one
- * edit to one object rather than a hunt through the command files. The strings
- * say what they are on purpose: shipping one by accident has to be obvious in
- * the channel rather than invisible.
+ * NONE OF THIS IS THE OWNER'S WORDING. Every string a member can see is here, in
+ * one record, so that supplying the real text is one edit to one object rather
+ * than a hunt through the command files.
+ *
+ * ═══ THE MARKER USED TO BE IN THE SENTENCE AND IT IS NOW IN THE COMMENT ═══
+ *
+ * All three led with a literal `PLACEHOLDER:` so that shipping one was obvious
+ * in the channel. He read one on `/drain` and answered: "remove PLACEHOLDER:
+ * from all text please." A marker that ships is a marker he has to look at, in
+ * the product, so it moved up here where `scripts/check-placeholders.ts` reads
+ * it and prints these three on every verify.
+ *
+ * WHAT IS UNDERNEATH THE MARKER IS UNCHANGED, AND IT IS STILL A STAND-IN. Each
+ * sentence still says of itself that nobody has worded it, which is what it is;
+ * removing the prefix did not make it his, and inventing something that reads
+ * like a finished reply would be worse — that is exactly what happened to
+ * `/drain`'s `scheduledLead`, where stripping the marker left a stand-in that
+ * had merely stopped announcing itself. These say what they are until he
+ * answers, and the list is how he is asked.
+ *
+ * EXPORTED SO A TEST CAN PIN THE CONSTANT INSTEAD OF THE PROSE. src/client.ts's
+ * record records what that costs: nine assertions there held FRAGMENTS of draft
+ * wording, and all nine broke on the day the real text arrived, so whoever
+ * pasted it in spent the afternoon editing tests. ../commands/drain.test.ts
+ * asserts on `COPY.failed` for the same reason.
  */
-const COPY = {
-  refused: 'PLACEHOLDER: no wording supplied yet for a command you may not run.',
-  unknown: 'PLACEHOLDER: no wording supplied yet for a command this bot does not have.',
-  failed: 'PLACEHOLDER: no wording supplied yet for a command that failed.',
+export const COPY = {
+  /** @unwritten member — what somebody is told when they run a command their role does not allow. */
+  refused: 'No wording supplied yet for a command you may not run.',
+
+  /** @unwritten member — what somebody is told when Discord offers a command this bot does not have. */
+  unknown: 'No wording supplied yet for a command this bot does not have.',
+
+  /** @unwritten member — what somebody is told when a command's handler threw. Every command's crash arrives here. */
+  failed: 'No wording supplied yet for a command that failed.',
 }
 
 /**

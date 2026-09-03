@@ -107,9 +107,33 @@ telling the truth.
 bash verify.sh
 ```
 
-Runs `npm run typecheck`, then `npm run lint`, then `npm test`, in that order,
-and stops at the first failure with the failed step named in a banner. Run the
-three npm scripts directly if you want a subset.
+Runs `npm run typecheck`, then `npm run lint`, then `npm test`, then two static
+checks over the source — DynamoDB expression strings, and the copy inventory
+below — then a parse of `deploy/`. It stops at the first failure with the failed
+step named in a banner. Run the npm scripts directly if you want a subset.
+
+### Copy nobody has worded yet
+
+The last thing `verify.sh` prints is every user-facing string in `src/` that the
+owner has not supplied wording for: where it is, what it has to say, who reads
+it, and the sentence shipping in its place today. There are forty at the time of
+writing, and finding that out used to mean running the bot and reading them in
+Discord one at a time.
+
+A string says it is unwritten in its **doc comment**, never in the string:
+
+```ts
+/** @unwritten admin — what an admin is told when `/sticky` is run with no text. */
+empty: 'No wording supplied yet for a sticky with no text in it.',
+```
+
+The tag starts a line, names one of `player`, `member`, `admin` or `picker`, and
+carries one clause saying what the sentence has to say — that clause is what the
+owner writes from. `verify.sh` fails if a marker ever reaches a shipped string,
+which is a bug that has happened, and if a tag is written without an audience or
+a note. It does **not** fail on the list itself: unwritten copy is a normal state
+here, and a permanently red check is one everybody learns to run past.
+`scripts/check-placeholders.ts` argues all of it.
 
 `bash verify.sh` rather than `./verify.sh`, here and in CI, and it is worth one
 sentence: this repo is developed on Windows with `core.filemode=false`, so the

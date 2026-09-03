@@ -167,12 +167,12 @@ import {
  */
 
 /**
- * PLACEHOLDER-FREE, DELIBERATELY, AND THAT IS A DIFFERENT CALL FROM command.ts.
- * The strings in `COPY` there are things a MEMBER reads — a refusal, a failure
- * — and the owner supplies those verbatim. Every one of these is either a label
- * on a number or one of the two statements the command exists to make: how much
- * was cut, and what could not be read. A placeholder in either of those is a
- * command that cannot answer its question.
+ * NO STAND-INS IN HERE, DELIBERATELY, AND THAT IS A DIFFERENT CALL FROM
+ * command.ts. The strings in `COPY` there are things a MEMBER reads — a refusal,
+ * a failure — and the owner supplies those verbatim. Every one of these is
+ * either a label on a number or one of the two statements the command exists to
+ * make: how much was cut, and what could not be read. A stand-in in either of
+ * those is a command that cannot answer its question.
  *
  * A MEMBER NOW READS SOME OF THESE, which was not true when this record was
  * written: the self view reuses the labels and the two honest-absence
@@ -183,15 +183,20 @@ import {
  * ONE RECORD ANYWAY, for the reason command.ts gives: changing the wording is
  * an edit to one object rather than a hunt through the file.
  *
- * `description` AND `userOption` GO TO DISCORD AT REGISTRATION and are what an
- * admin reads in the command picker; Discord will not accept an empty one.
- * Those two are the ones to hand back if the owner wants his own words.
+ * `description` AND `userOption` GO TO DISCORD AT REGISTRATION and are what
+ * anybody reads in the command picker — `/profile` has a gate that depends on
+ * the invocation, so `commandData` registers it with no default permission and
+ * every member sees both strings. Discord will not accept an empty one. Those
+ * two are the ones to hand back if the owner wants his own words, which is why
+ * they are tagged `@unwritten picker` and appear on the list
+ * `scripts/check-placeholders.ts` prints: handing them back needs somebody to
+ * know they exist.
  */
 const COPY = {
-  /** Discord allows 1-100 characters here. */
+  /** @unwritten picker — the `/profile` command as Discord's picker describes it. Discord allows 1-100 characters. */
   description: 'Look a player up by their Discord account',
 
-  /** Same limit, on the option. */
+  /** @unwritten picker — the `user` option of `/profile`, in the picker. Same limit. */
   userOption: 'Whose profile to show',
 
   /** The embed title when no in-game name is known. */

@@ -10,16 +10,19 @@ import { TARGET_OPTION, type BotCommand } from './command.ts'
  * all, and it reaches no database and no other service, so when it misbehaves
  * the fault is in the wiring rather than in what the command was trying to do.
  *
- * TWO THINGS HERE ARE NOT DECIDED YET, and both are one line.
+ * ONE THING HERE IS NOT DECIDED YET, and it is one line. WHO MAY RUN IT:
+ * `adminOnly` below is `false`, so anybody in the guild can. Flipping it to
+ * `true` turns on the role check in `refusalFor` AND the
+ * `defaultMemberPermissions: 0n` that hides it in the client, because
+ * `commandData` derives the second from the first. One word, both halves.
  *
- *   WHO MAY RUN IT. `adminOnly` below is `false`, so anybody in the guild can.
- *   Flipping it to `true` turns on the role check in `refusalFor` AND the
- *   `defaultMemberPermissions: 0n` that hides it in the client, because
- *   `commandData` derives the second from the first. One word, both halves.
- *
- *   THE WORDING. Every string a member can see is in `COPY` below and every one
- *   of them says PLACEHOLDER. The owner supplies wording verbatim; nothing here
- *   is an attempt at it.
+ * THERE WERE TWO, AND THE SECOND WAS ALREADY FALSE WHEN IT WAS WRITTEN DOWN. It
+ * read "THE WORDING. Every string a member can see is in `COPY` below and every
+ * one of them says PLACEHOLDER", over a record whose own comment says THE
+ * OWNER'S WORDS, VERBATIM in capitals, and which has never contained the word.
+ * The reply is his, character for character. The two Discord descriptions are
+ * not his, and they are tagged where they are declared rather than described up
+ * here, which is the whole reason this paragraph could go stale unnoticed.
  */
 
 /**
@@ -40,10 +43,10 @@ import { TARGET_OPTION, type BotCommand } from './command.ts'
  * his own.
  */
 const COPY = {
-  /** Discord allows 1-100 characters here. */
+  /** @unwritten picker — the `/help` command as Discord's picker describes it. Discord allows 1-100 characters. */
   description: 'Point somebody at the player guide',
 
-  /** Same limit, on the option. */
+  /** @unwritten picker — the `user` option of `/help`, in the picker. Same limit. */
   userOption: 'Who it is for. Leave it blank and it is for you.',
 
   /** His words. The mention is the only thing this fills in. */

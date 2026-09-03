@@ -379,11 +379,16 @@ function backUp(window: MaintenanceWindow): string {
 /**
  * What is said when the game never spoke.
  *
- * PLACEHOLDER — THE OWNER SUPPLIES USER-FACING WORDING. He asked for the bound
- * ("if no heartbeat arrives within some window, say something rather than
- * staying silent forever") and not for the sentence, so the sentence says what
- * it is. Shipping an unapproved line has to be obvious in the channel rather
- * than invisible.
+ * THE OWNER SUPPLIES USER-FACING WORDING AND HAS NOT SUPPLIED THIS. He asked
+ * for the bound ("if no heartbeat arrives within some window, say something
+ * rather than staying silent forever") and not for the sentence, so the sentence
+ * says what it is.
+ *
+ * THE MARKER IS IN THE COMMENT NOW AND NOT IN THE POST. Both halves of this
+ * message used to lead with a literal `PLACEHOLDER:`, into the one channel
+ * players read — the loudest place in the bot for a marker to be, and the thing
+ * he asked to have taken out of `/drain`. `scripts/check-placeholders.ts` reads
+ * the tag below and prints both on every verify instead.
  *
  * THE CONSOLE'S OWN REASON RIDES INSIDE IT WHEN THERE IS ONE, unedited, for the
  * reason /drain shows a refusal verbatim: this bot cannot know better than the
@@ -394,13 +399,33 @@ function backUp(window: MaintenanceWindow): string {
  * `\n` and it was the last multi-line message left in the file once the drain
  * and going-down notices went. "Why is anything wrapped on multiple lines" was
  * not a remark about one post.
+ *
+ * @unwritten member — what players are told when the update finished and the game server never reported back.
  */
-const NOT_BACK = 'PLACEHOLDER: the update finished but the game server has not reported back.'
+export const NOT_BACK = 'The update finished but the game server has not reported back.'
+
+/**
+ * How the console's own reason is introduced when there is one.
+ *
+ * ITS OWN CONSTANT RATHER THAN A CLAUSE INSIDE THE TEMPLATE, and that is what
+ * the marker forced: a second unwritten sentence buried mid-template is a second
+ * unwritten sentence, and it cannot be on a list while it has no name. It had a
+ * `PLACEHOLDER:` of its own and reached the same channel.
+ *
+ * `The console said:` IS THE CLAUSE `/drain` ALREADY USES — `COPY.refused` and
+ * `COPY.cancelRefused` in ./commands/drain.ts — and those are wording the owner
+ * supplied. Two spellings of "here is what the other system told us" is how one
+ * bot starts reading as two, so this borrows his rather than inventing a second.
+ * The sentence around it is still nobody's, which is why it is on the list.
+ *
+ * @unwritten member — how the console's own reason is introduced when the game never reported back.
+ */
+export const CONSOLE_SAID = (reason: string): string => `The console said: ${reason}`
 
 function didNotConfirm(reason: string | null): string {
   return reason === null
     ? NOT_BACK
-    : `${NOT_BACK} PLACEHOLDER: the console said: ${capped(reason, REASON_CAP)}`
+    : `${NOT_BACK} ${CONSOLE_SAID(capped(reason, REASON_CAP))}`
 }
 
 /**

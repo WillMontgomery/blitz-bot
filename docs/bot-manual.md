@@ -70,4 +70,4 @@ Five. **Admin** means holding the admin role.
 - `/sticky <text>` — **admin**. Keeps a message at the bottom of this channel. Running it again replaces it.
 - `/unsticky` — **admin**. Takes it down.
 
-Some replies are still placeholder text and say so.
+Some replies are still stand-in text.

@@ -4,7 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Config } from '../config.ts'
 import { setSink } from '../log.ts'
 import { setStickies, STICKY_TEXT_CAP, type Stickies } from '../sticky.ts'
-import { refusalFor, runCommand, type Invocation, type Responder } from './command.ts'
+import {
+  COPY as COMMAND_COPY,
+  refusalFor,
+  runCommand,
+  type Invocation,
+  type Responder,
+} from './command.ts'
 import { sticky, STICKY_TEXT_OPTION, unsticky, type StickyFields, COPY } from './sticky.ts'
 
 /**
@@ -203,13 +209,21 @@ describe('what Discord is told about the two commands', () => {
   })
 
   /**
-   * EVERY STRING THE ADMIN CAN SEE IS STILL A PLACEHOLDER. The owner supplies
-   * wording verbatim and none has been given for these, so shipping one by
-   * accident has to be obvious in the channel rather than invisible. The
-   * descriptions are the exception ./help.ts already names: Discord requires
-   * them and will not take an empty one.
+   * SIX OF THESE ARE HIS AND TWO ARE NOT, AND ALL EIGHT ARE PINNED BY CONSTANT.
+   *
+   * IT USED TO ASSERT THAT THE TWO SAID `PLACEHOLDER`. They led with the word so
+   * that shipping one was obvious in the channel, and he then read one on
+   * `/drain` and asked for the marker out of the product. It is a tag in the doc
+   * comment now, `scripts/check-placeholders.ts` prints both on every verify,
+   * and this case compares against the record — which is what src/client.ts's
+   * COPY says to do, and says using this file as the example of the alternative:
+   * nine assertions there held fragments of draft prose and all nine broke on
+   * the day the real wording arrived.
+   *
+   * SO NOTHING HERE FAILS WHEN HE SUPPLIES THE LAST TWO, which is the point. It
+   * fails when a reply stops being the string the record says it is.
    */
-  it('carries the owner’s wording, and marks only what he has not supplied', async () => {
+  it('answers out of the record, for the six he supplied and the two he has not', async () => {
     const engine = fakeEngine()
     setStickies(engine)
 
@@ -226,11 +240,18 @@ describe('what Discord is told about the two commands', () => {
     expect(replies[3]).toBe(COPY.noChannel)
     expect(replies[4]).toBe(COPY.nothingToClear)
 
-    // `empty` and `tooLong` are the two he has NOT supplied. They must stay
-    // obviously unfinished rather than quietly shipping wording nobody chose,
-    // and this is what fails the moment somebody invents some.
-    expect(replies[1]).toContain('PLACEHOLDER')
-    expect(replies[2]).toContain('PLACEHOLDER')
+    // `empty` and `tooLong` are the two he has NOT supplied. Pinned by constant,
+    // so supplying them is one edit to ./sticky.ts and nothing here moves.
+    expect(replies[1]).toBe(COPY.empty)
+    expect(replies[2]).toBe(COPY.tooLong)
+
+    // And neither carries a marker into the channel, which is the fault that
+    // reached him on /drain. The tag lives in the doc comment; see
+    // scripts/check-placeholders.ts, which refuses this repo-wide.
+    for (const reply of replies) {
+      expect(reply).not.toContain('PLACEHOLDER')
+      expect(reply).not.toContain('@unwritten')
+    }
   })
 })
 
@@ -450,7 +471,9 @@ describe('through runCommand', () => {
 
     await runCommand(invocation(), cfg(), respond, [sticky])
 
-    expect(respond.edited[0]).toContain('PLACEHOLDER')
+    // ../command.ts's `COPY.failed`, pinned by constant. It is that file's
+    // string and this case is only asserting which of them arrives.
+    expect(respond.edited[0]).toBe(COMMAND_COPY.failed)
     expect(stderr.join('')).toContain('slash command handler failed')
   })
 })

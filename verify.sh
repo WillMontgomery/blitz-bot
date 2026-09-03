@@ -171,6 +171,42 @@ ddb_expressions() {
   node scripts/check-ddb-expressions.ts
 }
 
+# Every user-facing string in src/ that nobody has the owner's words for, listed
+# with who reads it, what it has to say, and what ships in its place today.
+#
+# WHY IT IS A STEP AND NOT A TEST. The owner has been finding out which replies
+# are unfinished by running the bot and reading them in his own Discord, weeks
+# after each was written: "What other surprise PLACEHOLDER text exists? I was
+# never made aware of these and finding them on the fly is terrible." No test can
+# tell him that, because there is nothing failing -- unwritten copy is a normal
+# state in this repo, supplied in batches over days. What was missing was a place
+# where the whole list is stated, to everybody, on every run. That is a report
+# over the source text, which is a step.
+#
+# IT REPORTS AND DOES NOT FAIL ON THE LIST, DELIBERATELY. A check that went red
+# on unwritten copy would be red for weeks at a time, and a permanently red check
+# is one everybody learns to run past -- at which point the next real failure is
+# invisible too.
+#
+# WHAT IT DOES FAIL ON is a marker inside a string that SHIPS, which is the bug
+# that actually reached him: a real admin ran /drain and read `PLACEHOLDER: no
+# wording supplied yet for a window that was scheduled.` The marker belongs in
+# the doc comment above the string, and that rule has a definite answer, so it is
+# enforced. A marker that does not parse fails too -- a marker with no audience
+# or no note is a string that thinks it is on the list and is not.
+copy_inventory() {
+  # Same guard as ddb_expressions above and for the same reason: it parses src/
+  # with TypeScript's own parser, `npm ci` installs it here and on CI, and a
+  # check that could not run has to say so rather than read as a tick.
+  if [ ! -d node_modules/typescript ]; then
+    printf 'copy: no node_modules/typescript here, so the copy inventory was NOT printed\n'
+    printf 'copy: `npm ci` installs it, and CI runs that, so CI does print it\n'
+    return 0
+  fi
+
+  node scripts/check-placeholders.ts
+}
+
 step 'npm run typecheck' npm run typecheck
 step 'npm run lint' npm run lint
 step 'npm test' npm test
@@ -191,4 +227,13 @@ step 'src/ -- DynamoDB expression strings' ddb_expressions
 # rather than at the top as a headline.
 step 'deploy/ -- shell syntax and unit files' deploy
 
-printf '\nverify: typecheck, lint, test, DynamoDB expressions and deploy/ all passed\n'
+# LAST OF ALL, AND THAT IS THE WHOLE PLACEMENT DECISION. It is not ordered
+# against anything: it reads the same source the expression check reads and has
+# no relationship with lint, the tests or the unit files. What it produces is a
+# LIST somebody is meant to read rather than a verdict, and the last thing
+# printed is the thing that gets read. Put in front of the tests it would be a
+# wall of text between you and the failure you were looking for, which is how a
+# report earns the scrolling past that makes it useless.
+step 'src/ -- copy awaiting wording' copy_inventory
+
+printf '\nverify: typecheck, lint, test, DynamoDB expressions, deploy/ and the copy inventory all passed\n'

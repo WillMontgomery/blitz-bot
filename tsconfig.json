@@ -59,6 +59,12 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src", "tests", "*.ts"],
+  // `scripts` IS IN HERE AND WAS NOT, WHICH MEANT THE TWO CHECKS verify.sh RUNS
+  // WERE THE ONLY TypeScript IN THIS REPO NOTHING TYPE-CHECKED. They are run by
+  // `node`, which strips types without checking them, and imported by tests,
+  // which do not check them either — so a type error in a check would have
+  // surfaced as that check crashing on somebody's verify. Adding the directory
+  // costs nothing: both files were already clean.
+  "include": ["src", "scripts", "tests", "*.ts"],
   "exclude": ["node_modules", "dist"]
 }

@@ -520,10 +520,18 @@ function renderable(at: unknown): at is number {
  * THE LABELS ARE STRUCTURAL AND THE SENTENCES ARE NOT, AND THAT IS THE WHOLE
  * REASON THIS OBJECT EXISTS. `Case`, `Player`, `Verdict` and `Resolved by` are
  * names for the facts beside them — they are the embed's structure written down,
- * the way a column heading is. Everything marked PLACEHOLDER below is a statement
+ * the way a column heading is. Everything tagged `@unwritten` below is a statement
  * this bot makes in the owner's moderation channel, and the owner supplies his own
  * copy: each one is the minimum factual version, in one place, so that rewording
  * the lot is one edit to this object and nothing else.
+ *
+ * THE TAGS ARE NEW AND THE GAP IS NOT, WHICH IS THE COMPLAINT THIS ANSWERS.
+ * Every string here was marked in prose in this very comment and nowhere else,
+ * so `Incident filed`, `Case` and `Unclassified` read as finished copy to
+ * anybody who was not holding the source open beside the channel — and the owner
+ * found out what was unwritten by reading his own Discord, weeks later, one
+ * string at a time. `scripts/check-placeholders.ts` reads the tags and prints
+ * all eighteen on every verify. Nothing about the strings themselves changed.
  *
  * `verdictUnknown` IS THE ONE TO READ TWICE. It is what a case with NO verdict
  * gets — resolved before the field existed, or auto-resolved at open — and it must
@@ -539,18 +547,25 @@ function renderable(at: unknown): at is number {
  */
 export const COPY = {
   /**
-   * PLACEHOLDER — the closed post's title, and the only place it says which of
-   * the two events it is about.
+   * The closed post's title, and the only place it says which of the two events
+   * it is about.
    *
    * IT WAS `title` UNTIL THERE WERE TWO. A bare `COPY.title` beside a
    * `COPY.filedTitle` reads as "the title" and "the other title", which is
    * exactly the shape of name somebody reaches for the wrong one of.
+   *
+   * ON THE LIST THOUGH HE HAS SEEN IT, and the distinction is deliberate. This
+   * is wording he has read in the channel and not objected to; it is not wording
+   * he supplied. Under-reporting is the failure this list exists against, and
+   * striking one line off it costs him a word.
+   *
+   * @unwritten admin — the title on the post made when a case is CLOSED. He has seen this one and not objected.
    */
   resolvedTitle: 'Incident resolved',
 
   /**
-   * PLACEHOLDER, AND UNLIKE EVERY OTHER LINE IN THIS OBJECT IT HAS NOT BEEN PUT
-   * TO THE OWNER AT ALL.
+   * UNLIKE EVERY OTHER LINE IN THIS OBJECT IT HAS NOT BEEN PUT TO THE OWNER AT
+   * ALL.
    *
    * WHAT IT HAS TO SAY IS THAT A CASE EXISTS, AND NOT THAT ANYBODY DID ANYTHING.
    * A filed case is a thing the GAME noticed or a player reported; nobody has
@@ -561,6 +576,8 @@ export const COPY = {
    *
    * THE FACTUAL MINIMUM IS THEREFORE THE WHOLE BRIEF, and this is it until the
    * owner says otherwise. See the open question on blitz-bot#19.
+   *
+   * @unwritten admin — the title on the post made when a case is FILED. Nobody has approved this one.
    */
   filedTitle: 'Incident filed',
 
@@ -570,8 +587,8 @@ export const COPY = {
   resolvedBy: 'Resolved by',
 
   /**
-   * PLACEHOLDER — what a case is said to be about when its `kind` is one this
-   * bot does not have a word for.
+   * What a case is said to be about when its `kind` is one this bot does not
+   * have a word for.
    *
    * IT IS NOT "OTHER" AND IT MUST NOT BECOME THE RAW VALUE. The whole reason the
    * post is built from `kind` and `category` is that both are closed
@@ -580,20 +597,26 @@ export const COPY = {
    * the attribute is a 32-character string as far as `buildIncidentItem` is
    * concerned. A word this bot chose is the only safe answer to a word it does
    * not know.
+   *
+   * @unwritten admin — what a case is called when its `kind` is one this bot has no word for. Never the raw value.
    */
   kindUnknown: 'Case',
-  /** PLACEHOLDER — the same, for a `category` this bot has no word for. */
+
+  /** @unwritten admin — the same, for a `category` this bot has no word for. */
   categoryUnknown: 'Unclassified',
 
-  /** PLACEHOLDER — a ban with an expiry. The time is appended after it. */
+  /** @unwritten admin — the verdict on a case closed by a ban with an expiry. The time is appended after it. */
   verdictBan: 'Banned',
-  /** PLACEHOLDER — a ban with no expiry. */
+
+  /** @unwritten admin — the verdict on a case closed by a ban with no expiry. */
   verdictBanPermanent: 'Banned permanently',
-  /** PLACEHOLDER */
+
+  /** @unwritten admin — the verdict on a case closed by a kick. */
   verdictKick: 'Kicked',
+
   /**
-   * PLACEHOLDER — the row carries NO verdict, so this says exactly that and
-   * claims nothing about what was decided.
+   * The row carries NO verdict, so this says exactly that and claims nothing
+   * about what was decided.
    *
    * THERE IS NO STRING BESIDE IT FOR `{ action: 'none' }` ANY MORE, AND THAT IS
    * THE ONE ABSENCE HERE WORTH A LINE. `verdictNone` ('No action taken') stood
@@ -603,6 +626,12 @@ export const COPY = {
    * from is this string, and that distinction is untouched: a case with no
    * verdict is still posted, under these words, because nobody recorded a
    * decision on it.
+   *
+   * WHATEVER REPLACES IT MUST NOT SAY "NO ACTION WAS TAKEN", which is the one
+   * constraint on this line and the reason the tag carries it: the row records
+   * no decision, and saying nobody acted states a decision nobody made.
+   *
+   * @unwritten admin — a closed case whose row carries no verdict at all. It must NOT read as "no action was taken".
    */
   verdictUnknown: 'No verdict recorded',
 
@@ -834,7 +863,12 @@ function inert(text: unknown, cap = FIELD_VALUE_CAP): string {
 }
 
 /**
- * What a case is about, per `kind`. PLACEHOLDERS, every one.
+ * What a case is about, per `kind`. NOBODY HAS WORDED ANY OF THE THREE.
+ *
+ * ONE TAG FOR THE RECORD RATHER THAN THREE ABOVE THREE ONE-WORD LABELS, which is
+ * what `scripts/check-placeholders.ts` expands: the list gets `KIND_LABEL.report`
+ * and its two siblings by name, and this file does not grow three doc comments
+ * saying the same sentence over `'Anticheat'`.
  *
  * A `Record<IncidentKind, string>` SO A FOURTH KIND IS A COMPILE ERROR rather
  * than a silent fall-through to `COPY.kindUnknown` — the fallback is for a value
@@ -845,6 +879,8 @@ function inert(text: unknown, cap = FIELD_VALUE_CAP): string {
  * because an admin reading a case in the channel and then opening it in the
  * console is reading one record in two places, and two vocabularies for one field
  * is how they stop looking like the same record.
+ *
+ * @unwritten admin — what a case is said to be about, one label per `kind`. The console's own words for the same field.
  */
 export const KIND_LABEL: Record<IncidentKind, string> = {
   report: 'Player report',
@@ -951,7 +987,13 @@ export function unqueryableKind(incident: Pick<Incident, 'kind'>): string | null
   return typeof kind === 'string' ? kind : String(kind)
 }
 
-/** Why, per `category`. PLACEHOLDERS, and the console's own words again. */
+/**
+ * Why, per `category`. Nobody has worded any of the seven, and they are the
+ * console's own words again — see `KIND_LABEL`, which argues both halves and
+ * says why one tag covers a record.
+ *
+ * @unwritten admin — why a case was filed, one label per `category`. The console's own words for the same field.
+ */
 export const CATEGORY_LABEL: Record<IncidentCategory, string> = {
   cheating: 'Cheating',
   teaming: 'Teaming',

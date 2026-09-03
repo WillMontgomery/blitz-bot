@@ -76,8 +76,11 @@ import type { BotCommand, Invocation } from './command.ts'
  * note however much was typed, or a `/drain cancel` that falls through to the
  * "which half did you mean" refusal.
  *
- * `cancel` IS THE OWNER'S WORD, FROM THE BRIEF. `start` IS NOT — see
- * `COPY.startPlaceholderName`.
+ * `cancel` IS THE OWNER'S WORD, FROM THE BRIEF. `start` IS NOT.
+ */
+
+/**
+ * @unwritten picker — the `/drain` subcommand that schedules a window. The word `start` is the bot's; his brief said `/drain [note]`.
  */
 export const DRAIN_START_SUBCOMMAND = 'start'
 export const DRAIN_CANCEL_SUBCOMMAND = 'cancel'
@@ -190,25 +193,26 @@ function ended(reason: string): string {
  * THE DESCRIPTIONS ARE MINE RATHER THAN HIS, for the reason /sticky's are:
  * Discord requires a description on a command, on a subcommand and on an
  * option, and will not accept an empty one. They are deliberately plain and
- * they are the strings to hand back when he wants his own.
+ * they are the strings to hand back when he wants his own — which is a promise
+ * three files make and none of them could keep, so all four are tagged
+ * `@unwritten picker` and `scripts/check-placeholders.ts` prints them in a group
+ * of their own. `COPY.startPlaceholderName` existed to keep "the word `start`
+ * was not his" sayable and is gone: the tag on `DRAIN_START_SUBCOMMAND` says it
+ * where the word actually is, and says it to him rather than to a reader of this
+ * file.
  */
 export const COPY = {
-  /** Discord allows 1-100 characters on each of these four. */
+  /** @unwritten picker — the `/drain` command as Discord's picker describes it. Discord allows 1-100 characters. */
   description: 'Take the server down for an update',
-  startDescription: 'Stop letting players in, then update and restart the server',
-  cancelDescription: 'Call off the maintenance window',
-  noteOption: 'What players who try to join are told. Optional',
 
-  /**
-   * `start` IS A NAME NOBODY SUPPLIED. The brief says `/drain [note]` and
-   * `/drain cancel`, and Discord cannot give both of those on one command (see
-   * the header) — so the scheduling half needs a name of its own and this is
-   * the one it was given. It is a COMMAND NAME rather than a sentence, so it
-   * was never spelled with the marker the sentences carried; the constant is
-   * kept, and named, so that "the word `start` was not his" stays sayable now
-   * that every marked string in this file has had its marker removed.
-   */
-  startPlaceholderName: DRAIN_START_SUBCOMMAND,
+  /** @unwritten picker — the `/drain start` subcommand, in the picker. */
+  startDescription: 'Stop letting players in, then update and restart the server',
+
+  /** @unwritten picker — the `/drain cancel` subcommand, in the picker. */
+  cancelDescription: 'Call off the maintenance window',
+
+  /** @unwritten picker — the `note` option of `/drain start`, in the picker. */
+  noteOption: 'What players who try to join are told. Optional',
 
   /**
    * The three sentences of the start reply, in the order they are spoken.
@@ -231,12 +235,23 @@ export const COPY = {
    * the `when-empty` sentence above, which is the mode this command asks for and
    * the only one he has ever been shown. These keep the words he approved
    * before, recapitalised for their place in the paragraph and not otherwise
-   * touched — see the head of this record. They are not stand-ins and they must
-   * not be marked as any: they are real sentences awaiting a second opinion,
-   * and a `PLACEHOLDER:` on them would ship the marker to an admin the day the
-   * console answers `at-time`.
+   * touched — see the head of this record. They are not stand-ins: they are real
+   * sentences awaiting a second opinion, and they read as finished copy because
+   * they nearly are.
+   *
+   * WHICH IS WHY THEY WENT UNTRACKED, AND WHY THEY ARE TRACKED NOW. This comment
+   * used to end "they must not be marked as any: a `PLACEHOLDER:` on them would
+   * ship the marker to an admin the day the console answers `at-time`." That
+   * objection was to the marker SHIPPING and it was right; the answer was not to
+   * leave the two sentences off every list there is. The tag stays in the
+   * comment and `scripts/check-placeholders.ts` prints them, so an admin sees
+   * these words and the owner sees that nobody chose them.
+   *
+   * @unwritten admin — the restart sentence when the console schedules by time. He has only ever been shown the when-empty one.
    */
   deployAtTime: (at: string) => `It restarts at ${at}, ending any match still running.`,
+
+  /** @unwritten admin — the restart sentence when the console did not say what triggers the restart. */
   deployModeUnknown: 'The console did not say what triggers the restart. Check the console.',
 
   doorNote: (note: string) => `Players who try to join are told: ${note}.`,
