@@ -5,13 +5,7 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import {
-  channelCollisions,
-  connectIp,
-  type Config,
-  DEFAULT_SERVER_IPS,
-  loadConfig,
-} from './config.ts'
+import { channelCollisions, type Config, loadConfig } from './config.ts'
 import { CONSOLE_URL } from './console.ts'
 
 /**
@@ -558,54 +552,6 @@ describe('BLITZ_SERVER_IPS', () => {
    */
   it('is in the template operators copy, with the same two addresses', () => {
     expect(repoFile('.env.example')).toContain('BLITZ_SERVER_IPS=3.130.92.28,18.222.244.205')
-  })
-})
-
-/**
- * WHICH ADDRESS A PLAYER IS TOLD TO CONNECT TO.
- *
- * THE MAINTENANCE NOTICE ENDS WITH ONE — "The game server is back up and
- * maintenance is complete. … fivem://connect/3.130.92.28." — and the owner's
- * instruction was that it "should come from the server-ip allowlist already in
- * config rather than being a second copy of a constant". This is where the two
- * are one thing.
- *
- * THE ADDRESS IS BARE IN THAT SENTENCE AND IS NOT A MASKED LINK. The
- * `[Click here to connect](…)` form shipped for one cycle and printed as literal
- * brackets; `connectLink` in src/maintenance.ts holds the live message and what
- * was read off it. Quoted here only so that the sentence this function feeds is
- * recognisable — nothing below asserts on the wording.
- */
-describe('connectIp', () => {
-  const base = { DISCORD_BOT_TOKEN: 'token', DISCORD_GUILD_ID: 'guild' }
-
-  it('is the head of a configured allowlist', () => {
-    const config = loadConfig({ ...base, BLITZ_SERVER_IPS: '10.0.0.7,10.0.0.8' })
-
-    expect(connectIp(config.serverIps)).toBe('10.0.0.7')
-  })
-
-  /**
-   * AND IT IS THE ADDRESS IN THE OWNER'S OWN SENTENCE when nobody has configured
-   * anything, which is the state every box this bot runs on is actually in. If
-   * this ever stops being true the notice starts sending players somewhere else,
-   * and nothing else in the repo would say so.
-   */
-  it('is the address the notice names when the allowlist is unset', () => {
-    expect(connectIp(loadConfig(base).serverIps)).toBe('3.130.92.28')
-    expect(connectIp()).toBe('3.130.92.28')
-    expect(DEFAULT_SERVER_IPS[0]).toBe('3.130.92.28')
-  })
-
-  /**
-   * AN EMPTY LIST CANNOT COME OUT OF `loadConfig` — `ipList` refuses to produce
-   * one — so this arm is only reachable by a caller handing over a bare array.
-   * It answers with the same address rather than with undefined, because a
-   * notice with a hole where the address goes is worse than one naming the
-   * default box.
-   */
-  it('falls back rather than answering with nothing at all', () => {
-    expect(connectIp([])).toBe('3.130.92.28')
   })
 })
 

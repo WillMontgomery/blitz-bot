@@ -3,7 +3,6 @@ import { join } from 'node:path'
 
 import { DiscordAPIError, Events, RESTJSONErrorCodes, type Client } from 'discord.js'
 
-import { connectIp, DEFAULT_SERVER_IPS } from './config.ts'
 import type { Ddb, DdbResult, MaintenanceState, MaintenanceWindow } from './ddb.ts'
 import { log } from './log.ts'
 
@@ -270,19 +269,20 @@ function parseMark(raw: string): Mark | null {
 /**
  * The owner's sentence, and the whole of what this bot says.
  *
- * ═══ HIS WORDING, VERBATIM, WITH TWO HOLES IN IT ═══
+ * ═══ HIS WORDING, VERBATIM, WITH ONE HOLE IN IT ═══
  *
  * "The game server is back up and maintenance is complete. The server is now
- * running [hash as hyperlink]. [Click here to connect](fivem:// hyperlink)."
+ * running [hash as hyperlink]."
  *
- * NO SENTENCE HERE WAS INVENTED BY THIS BOT. The two holes are a commit off the
- * row and an address off the allowlist, and the one frame that has no wording
- * from him yet says so in the string itself; see `NOT_BACK`.
+ * NO SENTENCE HERE WAS INVENTED BY THIS BOT. The one hole is a commit off the
+ * row, and the one frame that has no wording from him yet says so in the string
+ * itself; see `NOT_BACK`.
  *
- * HIS LAST CLAUSE IS THE ADDRESS ITSELF AND NOT HIS LINK TEXT, which is the one
- * place the post departs from the quote above — "Click here to connect" is not in
- * the message. Discord printed his markdown as literal brackets in a live cycle;
- * see `connectLink`, which carries what was seen.
+ * HE WROTE A THIRD CLAUSE AND THEN CUT IT. The sentence used to end "[Click here
+ * to connect](fivem:// hyperlink)"; it shipped masked, then bare, and no form of
+ * it ever rendered as something a player could click. "Let's remove that fivem
+ * link instead of showing something that's dead." `backUp` carries what was
+ * tried, what Discord did with each form, and the one option nobody has tested.
  *
  * ═══ ONE FLOWING PARAGRAPH. THE NEWLINES ARE NOT TO BE PUT BACK ═══
  *
@@ -307,52 +307,73 @@ function parseMark(raw: string): Mark | null {
 const BACK = 'The game server is back up and maintenance is complete.'
 
 /**
- * The connect link, as a bare url.
+ * The notice. IT ENDS AT THE COMMIT BECAUSE THERE IS NO CONNECT LINK DISCORD
+ * WILL RENDER — and the whole of why is written down here, once.
  *
- * ═══ THE MASKED FORM SHIPPED FOR ONE CYCLE AND DID NOT RENDER ═══
+ * ═══ FOUR DEPLOY CYCLES WENT INTO THAT LAST CLAUSE. IT IS CLOSED ═══
  *
- * HE WROTE IT AS A MASKED LINK — "[Click here to connect](fivem:// hyperlink)" —
- * SO THAT IS WHAT WENT OUT, AND THIS IS WHAT CAME BACK. The owner posted the
- * live message:
+ * The owner's sentence ended "[Click here to connect](fivem:// hyperlink)". That
+ * shipped, then a bare url shipped, and each time the channel got characters a
+ * player has to select and paste. His verdict ended it: "let's remove that fivem
+ * link instead of showing something that's dead." So the message stops after the
+ * commit. The paragraphs below exist so nobody spends a fifth cycle rediscovering
+ * three separate mechanisms that are each, independently, shut.
+ *
+ * ═══ THREE SURFACES, THREE MECHANISMS, ALL SHUT ═══
+ *
+ * A LINK BUTTON IS REFUSED SERVER-SIDE. A `ButtonStyle.Link` component carrying a
+ * `fivem://` url comes back HTTP 400, code 50035: `Scheme "fivem" is not
+ * supported. Scheme must be one of ('http', 'https', 'discord')`. The components
+ * reference documents no such restriction anywhere — the error string is the only
+ * place it is written down, which is why it is transcribed here in full.
+ *
+ * A MASKED LINK FALLS BACK TO LITERAL TEXT CLIENT-SIDE, identically in message
+ * content and in an embed. The owner posted the live message:
  *
  *   The game server is back up and maintenance is complete. The server is now
  *   running 2e880268. [Click here to connect](fivem://connect/3.130.92.28).
  *
- * The brackets and the parentheses were printed as characters a player reads.
- * AND `2e880268` IN THE SAME SENTENCE WAS A WORKING LINK — `commitLink` built it
- * the same way, out of the same `[text](url)` — which is what makes the reading
- * unambiguous rather than a guess about one bad post. Markdown itself is fine in
- * plain message content; the only thing separating the two links in that message
- * is the scheme.
+ * The brackets and the parentheses printed as characters a player reads. AND
+ * `2e880268` IN THE SAME SENTENCE WAS A WORKING LINK — `commitLink` built it the
+ * same `[text](url)` way, out of an https url — which is what makes this an
+ * observation rather than a guess about one bad post. Markdown itself is fine in
+ * plain message content; the scheme is the whole of the difference, and the
+ * masked-link allowlist is therefore not a rule about embeds and buttons only.
  *
- * SO DISCORD'S MASKED-LINK ALLOWLIST — http, https and discord — IS NOT A RULE
- * ABOUT EMBEDS AND BUTTON COMPONENTS. It applies to plain message content too.
- * This file used to call that documented neither way, and an earlier version of
- * it asserted the outcome while citing the embed rule as its proof — the right
- * answer resting on a rule about a different surface. It is settled by
- * observation now, and that is the point of writing the message down here:
- * nobody has to run the experiment again to change this line back.
+ * THE LINKIFIER ONLY AUTO-LINKS http(s) AND steam, so a bare url is not a fallback
+ * either: `fivem://connect/…` sitting on its own in the content is plain text. That
+ * was the form that shipped after the masked one, and it is the "something that's
+ * dead" his instruction names.
  *
- * A BARE URL IS CLICKABLE IN MESSAGE CONTENT AND DOES LAUNCH THE GAME, which is
- * the whole of the fix — the link text becomes the address and nothing else in
- * the notice moves. That is what the link being a function of its own was for.
+ * ═══ THE ONE ESCAPE THIS REPO NEVER TESTED, SO NOBODY THINKS IT WAS MISSED ═══
  *
- * THE ADDRESS COMES FROM THE ALLOWLIST AND NOT FROM A LITERAL HERE. `connectIp`
- * reads the head of `BLITZ_SERVER_IPS`, which links.ts already uses to decide
- * whose server a `fivem://connect/` link points at. A second copy in this file is
- * the copy that does not get updated the day the community moves boxes.
+ * `<fivem://connect/…>` — the same url inside angle brackets — is
+ * community-reported to click through on desktop and on web and NOT on mobile. It
+ * is undocumented, and it was never tried here. It is recorded as skipped rather
+ * than eliminated: a link that works for some fraction of the players is not
+ * obviously better than no link, which is why it did not earn a fifth cycle.
+ *
+ * ═══ THE ROAD NOT TAKEN, AND WHOSE CALL THAT WAS ═══
+ *
+ * `https://cfx.re/join/<code>` is the form that clears every mechanism above. It
+ * is https, so the linkifier auto-links it, a masked link accepts it, and a link
+ * button accepts it. Cfx's own page is an ordinary https page whose script sets
+ * `location.href` to the `fivem://` scheme after 750ms — that redirect is how it
+ * reaches the game without any Discord surface ever seeing an unsupported scheme.
+ *
+ * THE OWNER DECLINED IT, BELIEVING THOSE LINKS ARE DEAD SINCE THE REVERSE PROXY
+ * WAS REMOVED. THAT IS HIS CALL AND HIS REASON, RECORDED AS SUCH AND NOT AS
+ * SOMETHING THIS REPO VERIFIED — nothing here has fetched a `cfx.re/join` code for
+ * this community and watched what happens to it. Whoever revisits this has exactly
+ * one belief to re-check: if a join code still resolves, the clause can come back
+ * as an https link and none of the three mechanisms above applies to it.
  */
-function connectLink(serverIp: string): string {
-  return `fivem://connect/${serverIp}`
-}
-
-function backUp(window: MaintenanceWindow, serverIp: string): string {
+function backUp(window: MaintenanceWindow): string {
   const sha = runningSha(window)
   const running = sha === null ? '' : ` The server is now running ${commitLink(sha)}.`
 
-  // One line, deliberately over the width the rest of this file keeps to. See
-  // `BACK`: breaking the literal is how the newlines get back in.
-  return `${BACK}${running} ${connectLink(serverIp)}.`
+  // See `BACK`: breaking this literal is how the newlines get back in.
+  return `${BACK}${running}`
 }
 
 /**
@@ -503,9 +524,9 @@ const GAME_REPO_URL = 'https://github.com/WillMontgomery/fivem-br-gamemode'
  * "SAME FOR THE BUILD HASH BEING A HYPERLINK", which is a standing rule rather
  * than a request about one notice. A MASKED LINK WORKS HERE BECAUSE THE SCHEME IS
  * https: Discord's own allowlist covers it, and this one has been seen rendering
- * as a link in a real message — the same message in which the connect link two
- * functions up printed as literal brackets. See `connectLink`: the scheme is the
- * whole of the difference between them.
+ * as a link in a real message — the same message in which the connect link that
+ * used to follow it printed as literal brackets. See `backUp`: the scheme was the
+ * whole of the difference between them, and the connect link is the one that went.
  *
  * ONLY A VALUE THAT IS CERTAINLY A COMMIT IS LINKED, and everything else is
  * printed exactly as `shortSha` would print it. `runningSha` can return a value
@@ -557,8 +578,8 @@ function commitLink(sha: string): string {
  * NULL IS ORDINARY AND COSTS THE CLAUSE, NOT THE NOTICE. An automatic 72-hour
  * window nobody was looking at, or a console whose branch reading was too old to
  * stand behind, carries no commit at all — and "the game server is back up and
- * maintenance is complete" followed by the connect link is still the whole of
- * what he asked to be told.
+ * maintenance is complete", alone, is still the whole of what he asked to be
+ * told.
  */
 function runningSha(window: MaintenanceWindow): string | null {
   return (
@@ -681,9 +702,6 @@ const say = (content: string, alarm = false): Step => ({ kind: 'post', content, 
 interface Moment {
   readonly now: number
 
-  /** The address a player is told to connect to. See `connectLink`. */
-  readonly serverIp: string
-
   /**
    * The window this process has already reported as not having come back, or
    * null.
@@ -731,7 +749,7 @@ function completion(mark: Mark, window: MaintenanceWindow, at: Moment): Step {
   if (failure !== null) return said ? QUIET : say(didNotConfirm(failure), true)
 
   if (heartbeatAfterDeploy(window) !== null) {
-    return !said || at.alarmed === window.createdAt ? say(backUp(window, at.serverIp)) : QUIET
+    return !said || at.alarmed === window.createdAt ? say(backUp(window)) : QUIET
   }
 
   if (said) return QUIET
@@ -862,20 +880,6 @@ export interface MaintenanceWatchOptions {
 
   readonly memory?: MaintenanceMemory
 
-  /**
-   * The IP allowlist, whose head is the address the notice tells people to type.
-   *
-   * OPTIONAL, AND THE DEFAULT IS THE LIST'S OWN DEFAULT rather than a literal
-   * of this module's. src/client.ts wires this watcher and hands it a channel
-   * id, a data layer and nothing else — it holds a `Config` and does not pass
-   * it — so a required parameter here would not compile against the one call
-   * site there is. See `connectIp`: an operator who has never set
-   * `BLITZ_SERVER_IPS` gets the same address either way, and passing
-   * `config.serverIps` from client.ts is the one line that makes an operator who
-   * HAS set it reach the notice too.
-   */
-  readonly serverIps?: readonly string[]
-
   /** The clock, so the grace can be tested offline. */
   readonly now?: () => number
 }
@@ -894,7 +898,6 @@ export interface MaintenanceWatchOptions {
 export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceWatch {
   const { read, post } = options
   const memory = options.memory ?? maintenanceMemory()
-  const serverIp = connectIp(options.serverIps ?? DEFAULT_SERVER_IPS)
   const now = options.now ?? Date.now
 
   let mark: Mark | null = null
@@ -1011,7 +1014,7 @@ export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceW
     const seen = await baseline()
     const next: Mark = { window: window.createdAt, state: window.state }
 
-    const step = decide(seen, window, { now: now(), serverIp, alarmed })
+    const step = decide(seen, window, { now: now(), alarmed })
 
     /**
      * THE DECISION IS TAKEN EVERY POLL AND THE WRITE IS NOT.
@@ -1127,8 +1130,6 @@ export function watchMaintenance(
   options: {
     intervalMs?: number
     memory?: MaintenanceMemory
-    /** See `MaintenanceWatchOptions.serverIps`. Pass `config.serverIps` here. */
-    serverIps?: readonly string[]
     now?: () => number
   } = {},
 ): void {
@@ -1136,7 +1137,6 @@ export function watchMaintenance(
     read: () => ddb.maintenance.current(),
     post: maintenancePoster(client, channelId),
     memory: options.memory,
-    serverIps: options.serverIps,
     now: options.now,
   })
 

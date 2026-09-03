@@ -177,16 +177,21 @@ function confirmedRow(overrides: Partial<MaintenanceWindow> & RowExtras = {}): M
 }
 
 /**
- * The notice, in his words, as the pieces of it.
+ * The notice, in his words, and the whole of it when the row names no commit.
  *
  * SPELLED OUT HERE AND NOT ASSEMBLED FROM THE MODULE'S OWN CONSTANTS, because
  * the whole property being tested is that the wording is HIS and unedited. A
  * string imported from maintenance.ts would agree with whatever that file
  * happened to say, including a version somebody rephrased.
+ *
+ * IT USED TO HAVE A CONNECT CLAUSE GLUED ONTO IT, out of a `connectTo` helper and
+ * the head of the IP allowlist. "Let's remove that fivem link instead of showing
+ * something that's dead", so the notice is his sentence minus its last clause and
+ * this is one literal again — no trailing space, no stray period where the
+ * address was. src/maintenance.ts's `backUp` carries the three mechanisms that
+ * made every form of that link unrenderable.
  */
-const BACK = 'The game server is back up and maintenance is complete.'
-const connectTo = (ip: string): string => `fivem://connect/${ip}`
-const BACK_UP = `${BACK} ${connectTo('3.130.92.28')}.`
+const BACK_UP = 'The game server is back up and maintenance is complete.'
 
 /** Where a commit in a maintenance notice has to point. NOT this bot's repo. */
 const GAME_COMMIT = 'https://github.com/WillMontgomery/fivem-br-gamemode/commit/'
@@ -303,9 +308,6 @@ interface WatcherOptions {
    * second form exists.
    */
   now?: number | (() => number)
-
-  /** The IP allowlist, for the address the notice names. */
-  serverIps?: readonly string[]
 }
 
 function watcher(
@@ -332,7 +334,6 @@ function watcher(
     post,
     memory: store.memory,
     now,
-    serverIps: options.serverIps,
   })
 
   return {
@@ -384,8 +385,7 @@ describe('the outage — the one thing this bot says', () => {
     expect(watch.post).toHaveBeenCalledTimes(1)
     expect(at(watch.post, 0)).toBe(
       'The game server is back up and maintenance is complete. ' +
-        `The server is now running [a1b2c3d4](${GAME_COMMIT}${LANDED}). ` +
-        'fivem://connect/3.130.92.28.',
+        `The server is now running [a1b2c3d4](${GAME_COMMIT}${LANDED}).`,
     )
   })
 
@@ -409,48 +409,47 @@ describe('the outage — the one thing this bot says', () => {
   })
 
   /**
-   * ═══ THE CONNECT LINK IS A BARE URL, AND A REAL MESSAGE IS WHY ═══
+   * ═══ NO CONNECT ADDRESS COMES BACK, IN ANY FORM. FOUR CYCLES BOUGHT THIS ═══
    *
-   * HE WROTE IT AS A MASKED LINK — "[Click here to connect](fivem:// hyperlink)"
-   * — so that is what shipped, and the owner posted what came out of it:
+   * The notice ended with a connect link for four deploy cycles and never once
+   * rendered as something a player could click. "Let's remove that fivem link
+   * instead of showing something that's dead." src/maintenance.ts's `backUp`
+   * holds the whole finding — a link button refused server-side with code 50035,
+   * a masked link falling back to literal text in content AND in embeds, and a
+   * linkifier that only auto-links http(s) and steam so the bare url is plain
+   * text.
    *
-   *   The game server is back up and maintenance is complete. The server is now
-   *   running 2e880268. [Click here to connect](fivem://connect/3.130.92.28).
-   *
-   * The brackets and parentheses printed as characters. `2e880268` in the same
-   * sentence was a working link, built the same `[text](url)` way by
-   * `commitLink` — so markdown is fine in plain message content and the scheme
-   * is the whole of the difference. Discord's masked-link allowlist is not a
-   * rule about embeds and buttons only; it covers message content too.
-   *
-   * SO THIS PINS THE BARE FORM AND FAILS IF ANYONE WRAPS IT BACK UP. The second
-   * assertion is a shape and not the old label: a re-wrap under any text at all
-   * is the same mistake, and it is one nobody should have to learn from a second
-   * live cycle.
+   * THIS ASSERTS THE ABSENCE RATHER THAN THE ENDING, and that is the point of it
+   * being its own case. The whole-message `toBe` assertions elsewhere in this
+   * file already pin what the notice says; a `toBe` fails just as loudly when
+   * somebody FIXES a typo as when they re-add the link, so it does not tell the
+   * next reader which mistake they made. This one names the mistake, and it is
+   * deliberately wider than the form that shipped: the scheme, the addresses in
+   * the allowlist's default, any dotted quad at all, the angle-bracket spelling
+   * `<fivem://…>` that nobody here has tested, and the `cfx.re/join` https form
+   * the owner declined. Each is a form somebody could reasonably reach for, and
+   * each has to argue with a failing test rather than with a live cycle.
    */
-  it('offers the connect link as a bare url, never masked', async () => {
-    const watch = watcher([ok(confirmedRow())], { seen: mark('deploying') })
-
-    await watch.check()
-
-    expect(at(watch.post, 0)).toContain('fivem://connect/3.130.92.28')
-    expect(at(watch.post, 0)).not.toMatch(/\[[^\]]*\]\(fivem:/u)
-  })
-
-  /**
-   * AND THE ADDRESS COMES OFF THE ALLOWLIST RATHER THAN OUT OF THIS FILE. A
-   * literal in the notice would be the same string written down twice, and the
-   * day the community moves boxes only one of the copies gets updated.
-   */
-  it('names the head of the server allowlist', async () => {
-    const watch = watcher([ok(confirmedRow())], {
+  it('names no connect address at all — bare, masked or angle-bracketed', async () => {
+    const watch = watcher([ok(confirmedRow({ deployLandedSha: LANDED }))], {
       seen: mark('deploying'),
-      serverIps: ['10.0.0.7', '10.0.0.8'],
     })
 
     await watch.check()
+    const posted = at(watch.post, 0)
 
-    expect(at(watch.post, 0)).toBe(`${BACK} ${connectTo('10.0.0.7')}.`)
+    expect(posted).not.toContain('fivem:')
+    expect(posted).not.toContain('cfx.re')
+    expect(posted).not.toContain('connect')
+    for (const ip of ['3.130.92.28', '18.222.244.205']) expect(posted).not.toContain(ip)
+
+    // Any dotted quad, so an address off a list nobody here knows about is
+    // caught too — the commit link is the only url the notice may carry.
+    expect(posted).not.toMatch(/\d{1,3}(?:\.\d{1,3}){3}/u)
+
+    // `<scheme://…>`, the one escape this repo never tested. It is undocumented
+    // and reported broken on mobile; adding it has to be a decision, not a diff.
+    expect(posted).not.toMatch(/<[^\s>]+:\/\/[^\s>]*>/u)
   })
 
   /**
@@ -607,8 +606,10 @@ describe('the commit — what the box is running now', () => {
    * AN ABSENT COMMIT COSTS ITS OWN CLAUSE AND NOT THE NOTICE. An automatic
    * 72-hour window nobody was looking at, or a console whose branch reading was
    * too old to stand behind, carries no commit at all — and "the game server is
-   * back up and maintenance is complete" followed by the connect link is still the
-   * whole of what he asked to be told.
+   * back up and maintenance is complete", by itself, is still the whole of what
+   * he asked to be told. IT IS ALSO THE LAST CLAUSE NOW, so this case is the one
+   * that fails on a trailing space or a stray period left where the connect link
+   * used to be.
    */
   it('drops the middle clause when the row names no commit', async () => {
     const watch = confirmed({})

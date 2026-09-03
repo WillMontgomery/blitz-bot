@@ -390,15 +390,15 @@ const idList = z
   })
 
 /**
- * The address the community connects to, and the head of the allowlist.
+ * The head of the allowlist, named so the pair below reads as an address.
  *
- * NAMED SEPARATELY BECAUSE TWO THINGS NEED IT AND ONLY ONE OF THEM IS A FILTER.
- * The allowlist below answers "may this message name this address"; `connectIp`
- * answers "which address do we tell somebody to type", which is a question the
- * maintenance notice asks when it says the server is back up. Both are this same
- * string, and naming it once is what stops the second reader from pasting a
- * literal into a sentence — where a server move would leave the notice pointing
- * players at a box that is not there while the allowlist quietly moved on.
+ * IT USED TO HAVE A SECOND READER AND NOW IT HAS ONE. The maintenance notice
+ * ended by telling players an address to connect to, and this constant existed so
+ * that sentence and the allowlist could not drift apart. The owner removed that
+ * clause — "let's remove that fivem link instead of showing something that's
+ * dead"; src/maintenance.ts's `backUp` holds the whole of why. So the only
+ * question this list answers now is the filter's: "may this message name this
+ * address".
  */
 const PRIMARY_SERVER_IP = '3.130.92.28'
 
@@ -410,46 +410,13 @@ const PRIMARY_SERVER_IP = '3.130.92.28'
  * `EnvironmentFile=` — which never reads that file — silently does not have; see
  * this file's header for how that class of bug already bit this repo once.
  *
- * EXPORTED SINCE THE MAINTENANCE NOTICE NEEDED AN ADDRESS. src/maintenance.ts is
- * wired by src/client.ts, which does not hand it a `Config` — so its default has
- * to come from somewhere, and the only acceptable somewhere is the list an
- * operator actually configures. See `connectIp`.
+ * MODULE-LOCAL AGAIN. It was exported for one caller — src/maintenance.ts, which
+ * is wired without a `Config` and needed an address for the notice's last clause.
+ * The clause is gone, the caller is gone, and an export nothing imports is the
+ * next reader's invitation to wire something to it. `ipList` below is now the
+ * whole of its use.
  */
-export const DEFAULT_SERVER_IPS = [PRIMARY_SERVER_IP, '18.222.244.205']
-
-/**
- * WHICH ADDRESS A PLAYER IS TOLD TO CONNECT TO.
- *
- * THE FIRST ENTRY OF THE ALLOWLIST, AND NOT A CONSTANT OF ITS OWN. The owner's
- * back-up notice ends by naming an address — "fivem://connect/3.130.92.28" — and
- * the allowlist already holds that string because links.ts needs it to know which
- * `fivem://connect/` target is this community's own. A second literal in the
- * notice would be a copy that nothing keeps in step: move the server, update
- * `BLITZ_SERVER_IPS`, and the announcement that follows the next restart sends
- * every player to the old box.
- *
- * THE BARE URL IS THE NOTICE'S REAL ENDING AND THE MASKED FORM IS NOT. The
- * `[Click here to connect](…)` spelling shipped for one cycle and printed as
- * literal brackets; `connectLink` in src/maintenance.ts holds the live message
- * that settled it and the reading taken from it. Nothing here depends on which
- * form it is — the address is the address — which is exactly why this quote sat
- * a cycle out of date without anything failing.
- *
- * FIRST RATHER THAN ANY OTHER RULE, because the allowlist is ordered and the
- * documented order is the community's own: the head is the address people are
- * given, the rest are the other boxes whose links must not be deleted. There is
- * nothing on the list that says which is "primary" and inventing a marker would
- * be a second setting to get wrong.
- *
- * THE FALLBACK IS THE SAME STRING THE ALLOWLIST FALLS BACK TO, so a caller with
- * no list in hand and an operator who never set the variable land on one value.
- * An allowlist cannot be empty — `ipList` refuses to produce one — so this arm is
- * unreachable through `loadConfig` and exists because the parameter is a plain
- * array that a caller can hand over empty.
- */
-export function connectIp(serverIps: readonly string[] = DEFAULT_SERVER_IPS): string {
-  return serverIps[0] ?? PRIMARY_SERVER_IP
-}
+const DEFAULT_SERVER_IPS = [PRIMARY_SERVER_IP, '18.222.244.205']
 
 /**
  * What an entry in `BLITZ_SERVER_IPS` has to look like.
