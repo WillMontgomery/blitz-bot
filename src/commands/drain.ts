@@ -236,6 +236,12 @@ export const COPY = {
    * has accepted the window and answered -- so "stops" was describing something
    * that had happened as though it were about to.
    *
+   * "it's" IS CORRECTED TO "its" AND HE ASKED FOR THAT (2026-09-04: "please
+   * correct the typo to 'on its own'"). His words are quoted above exactly as
+   * he typed them, because the quote is the record of what he asked for; the
+   * SHIPPED string is the corrected one, because that is what he then asked to
+   * ship. The two differing is the point, not a slip.
+   *
    * `doorClosesUnknown` MOVED WITH IT, and that is the one line here he did not
    * type. It is the other branch of the SAME sentence in the same slot -- the
    * console failed to say WHEN the door shut -- so leaving it in the present
@@ -244,7 +250,7 @@ export const COPY = {
    */
   doorClosesAt: (at: string) => `The server stopped accepting players at ${at}.`,
   doorClosesUnknown: 'The console did not say when the server stopped accepting players.',
-  deployWhenEmpty: "It will restart on it's own once all players have left.",
+  deployWhenEmpty: 'It will restart on its own once all players have left.',
 
   /**
    * THE OTHER TWO RESTART BRANCHES, AND HE HAS NOT WORDED THESE TWO. He supplied

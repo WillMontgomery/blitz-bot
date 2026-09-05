@@ -466,7 +466,7 @@ describe('/drain — the reply says what is happening and when, not that it aske
   it('reads as the one paragraph he approved, word for word', () => {
     expect(replyForSchedule(SCHEDULED)).toBe(
       'The server stopped accepting players at <t:1700000000:t>. ' +
-        "It will restart on it's own once all players have left. " +
+        'It will restart on its own once all players have left. ' +
         'Players who try to join are told: `a server update`.',
     )
   })
