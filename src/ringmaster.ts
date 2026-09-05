@@ -1290,7 +1290,33 @@ export function createDrainer(options: DrainerOptions): Drainer {
           : readDrainAnswer(delivered.status, delivered.body)
 
       if (result.outcome === 'scheduled') {
-        log('warn', 'a maintenance window was scheduled and the server will restart', {
+        /*
+         * INFO, NOT WARN, AND THE LEVEL IS THE WHOLE POINT OF THIS LINE.
+         *
+         * `log()` hands every non-info line to the status sink, so a `warn`
+         * here is a post in #bot-status. This is the SUCCESS branch of a
+         * command an admin has just run on purpose: they typed `/drain`, the
+         * console accepted it, and the window is scheduled. Telling them so in
+         * a fault channel, in journal syntax, is the bot asking them to look at
+         * something that is already exactly what they asked for.
+         *
+         * Owner, 2026-09-04, with a screenshot of the line: "please get the bot
+         * to stop posting this line when a drain starts".
+         *
+         * THE LINE ITSELF STAYS. It is a record of who scheduled a restart and
+         * when it starts, which is worth having in the journal and is the first
+         * thing anyone asks after an unexpected restart. What changes is who is
+         * interrupted by it: the journal keeps it, Discord does not.
+         *
+         * ITS SIBLING BELOW IS UNTOUCHED. A window the console REFUSED is a
+         * fault, nobody asked for it, and it still posts at `levelFor`.
+         *
+         * THE SAME ARGUMENT AS THE GATEWAY RECONNECTS the owner asked about
+         * earlier: routine housekeeping that had already resolved itself was
+         * filling the channel that has to be readable when something is
+         * actually wrong.
+         */
+        log('info', 'a maintenance window was scheduled and the server will restart', {
           actor: input.actorDiscordId,
           state: result.window.state,
           drainStartsAt: result.window.drainStartsAt,

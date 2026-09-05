@@ -225,10 +225,26 @@ export const COPY = {
    * gone. The one that ended without a full stop was `doorNote`, which is why
    * its period is now inside the frame rather than left to the layout.
    */
-  doorClosesAt: (at: string) => `The server stops accepting players at ${at}.`,
-  doorClosesUnknown: 'The console did not say when the server stops accepting players.',
-  deployWhenEmpty:
-    'It restarts on its own once the last match finishes, and anyone still playing is dropped then.',
+  /*
+   * PAST TENSE, AND HE GAVE BOTH SENTENCES (2026-09-04):
+   *
+   *   "that should read as past-tense. How about 'The server stopped accepting
+   *    players at [@time]. It will restart on it's own once all players have
+   *    left.'"
+   *
+   * The door is already shut by the time an admin reads the reply -- the console
+   * has accepted the window and answered -- so "stops" was describing something
+   * that had happened as though it were about to.
+   *
+   * `doorClosesUnknown` MOVED WITH IT, and that is the one line here he did not
+   * type. It is the other branch of the SAME sentence in the same slot -- the
+   * console failed to say WHEN the door shut -- so leaving it in the present
+   * tense would put "stopped" and "stops" in the same paragraph depending on a
+   * field the admin cannot see. Flagged to him rather than done quietly.
+   */
+  doorClosesAt: (at: string) => `The server stopped accepting players at ${at}.`,
+  doorClosesUnknown: 'The console did not say when the server stopped accepting players.',
+  deployWhenEmpty: "It will restart on it's own once all players have left.",
 
   /**
    * THE OTHER TWO RESTART BRANCHES, AND HE HAS NOT WORDED THESE TWO. He supplied

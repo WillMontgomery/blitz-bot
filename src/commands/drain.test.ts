@@ -465,8 +465,8 @@ describe('/drain — the reply says what is happening and when, not that it aske
    */
   it('reads as the one paragraph he approved, word for word', () => {
     expect(replyForSchedule(SCHEDULED)).toBe(
-      'The server stops accepting players at <t:1700000000:t>. ' +
-        'It restarts on its own once the last match finishes, and anyone still playing is dropped then. ' +
+      'The server stopped accepting players at <t:1700000000:t>. ' +
+        "It will restart on it's own once all players have left. " +
         'Players who try to join are told: `a server update`.',
     )
   })
@@ -628,9 +628,10 @@ describe('/drain — the reply says what is happening and when, not that it aske
       // Nothing the note carried escaped the span to become markup of its own,
       // and nothing it carried put the reply on a second line.
       expect(shown, note).not.toMatch(/[\n\r\u2028\u2029]/u)
-      expect(shown.startsWith('The server stops accepting players at <t:1700000000:t>.'), note).toBe(
-        true,
-      )
+      expect(
+        shown.startsWith('The server stopped accepting players at <t:1700000000:t>.'),
+        note,
+      ).toBe(true)
     }
   })
 

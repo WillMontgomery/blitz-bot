@@ -982,20 +982,34 @@ describe('/drain cancel — which the console does not open to this bot yet', ()
 /**
  * THE JOURNAL, WHICH IS THE ONLY PLACE A RESTART IS EXPLAINED AFTERWARDS.
  *
- * A scheduled window is `warn` because it is the line that answers "why did the
- * server go down and everybody's match end"; the door's refusals are `error`
- * because they mean `/drain` is broken for every admin until an operator acts.
- * `log` sends both to stderr, which is what these assert against.
+ * A scheduled window is `info`: it is the line that answers "why did the server
+ * go down and everybody's match end", so it has to be written -- but it is the
+ * SUCCESS branch of a command an admin just typed, and `log()` posts every
+ * non-info line to #bot-status. The door's refusals stay `error`, because they
+ * mean `/drain` is broken for every admin until an operator acts.
+ *
+ * SO THE LEVEL IS LOAD-BEARING AND IS ASSERTED AS SUCH. Owner, 2026-09-04, with
+ * a screenshot of the line in Discord: "please get the bot to stop posting this
+ * line when a drain starts". `log` sends info to stdout and everything else to
+ * stderr, which is what these assert against -- stderr is the channel.
  */
 describe('/drain — what reaches the journal', () => {
-  it('says loudly that a window was scheduled and the server will restart', async () => {
+  it('records a scheduled window without interrupting anybody about it', async () => {
     const { fetch } = replies(answer(201, SCHEDULED))
     await drainer(fetch).schedule({ actorDiscordId: ADMIN })
 
-    const line = stderr.join('')
-    expect(line).toContain('level=warn')
+    // NOTHING ON STDERR IS THE ASSERTION. `log()` hands every non-info line to
+    // the status sink, so a warn here is a post in #bot-status -- which is what
+    // the owner asked to stop. A drain he typed himself is not a fault.
+    expect(stderr.join('')).toBe('')
+
+    const line = stdout.join('')
+    expect(line).toContain('level=info')
     expect(line).toContain('restart')
     expect(line).toContain(ADMIN)
+    // ...but it is still WRITTEN, because it is the first thing anyone asks
+    // after an unexpected restart: who scheduled it, and when it starts.
+    expect(line).toContain('drainStartsAt')
     // And never the credential, on any path.
     expect(line).not.toContain(SECRET)
   })
