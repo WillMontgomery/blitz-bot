@@ -51,9 +51,10 @@ import { log } from './log.ts'
  * one remaining post exists to not have.
  *
  * See `heartbeatAfterDeploy` for the one field on this row that can prove the
- * game is speaking again, and `RESTART_GRACE_MS` for what is said when it never
- * does. A wait with no end is silence, and a server that never came back is
- * exactly what an admin needs to know.
+ * game is speaking again, and `RESTART_GRACE_MS` for how long it is waited for.
+ * NOTHING IS SAID WHEN IT NEVER COMES. There was a notice there and the owner
+ * deleted it; the paragraph at `THE ALARM THAT WAS DELETED` is why, and is where
+ * to read before writing another one.
  *
  * ═══ THE COMMIT LINKS INTO THE GAME'S REPO, NOT INTO THIS ONE ═══
  *
@@ -73,6 +74,13 @@ import { log } from './log.ts'
  * could not POST (`check`). Those are the bot failing, not maintenance
  * happening, and they are the only two reasons a maintenance window is allowed
  * to appear in the status channel at all.
+ *
+ * A DEPLOY THAT NEVER BROUGHT THE GAME BACK IS NOT A THIRD ONE. It is the loudest
+ * thing this file could reasonably say and it says NOTHING — not in
+ * #maintenance-notifications, not in #bot-status. The give-up line is `info`, so
+ * it reaches the journal and no channel. That is deliberate and it is the owner's
+ * decision; `THE ALARM THAT WAS DELETED` carries it in full, including what it
+ * costs.
  *
  * READS ONLY, AND NOW EXACTLY ONE READ. This module calls one thing on the data
  * layer — `maintenance.current()`, a GetItem against one row — and the parameter
@@ -111,26 +119,42 @@ export const MAINTENANCE_POLL_MS = 15_000
 const MAINTENANCE_BLIND_POLLS = 4
 
 /**
- * How long a restart is allowed to explain the game's silence.
+ * How long the game is waited for before this bot stops caring about a window.
  *
  * THE CONSOLE'S OWN NUMBER, AND A COPY OF `RESTART_GRACE_MS` IN ITS
  * lib/serverPhase.ts. Same argument, from the other side of the same wait:
  * `royale-deploy` syncs resources and restarts FXServer, which is tens of
  * seconds, and the game pushes every two. Anything past five minutes is not a
- * slow restart, it is a problem — and at that point the honest thing is to stop
- * offering an excuse.
+ * slow restart, it is a problem.
  *
- * A WAIT WITH NO END IS NOT A WAIT, IT IS SILENCE. The owner's rule is that the
- * complete notice must never show before the game speaks; the bound is what
- * stops that rule from turning a server which never came back into a channel
- * that says nothing at all. "A server that never came back is exactly what an
- * admin needs to know."
+ * ═══ THE BOUND OUTLIVED THE ALARM IT WAS ADDED FOR ═══
  *
- * IF THE CONSOLE RETUNES ITS NUMBER THIS ONE MUST FOLLOW. Nothing enforces
- * that; it is why this comment names the file. Being generous in the same
- * direction is the safe way to be wrong — a bot that alarms EARLIER than the
- * console's own page would be raising an alarm the console is still calling a
- * restart in progress.
+ * It went in so the alarm had a moment to fire at: the rule is that the complete
+ * notice must never show before the game speaks, and this was what stopped that
+ * rule from turning a server which never came back into a channel that said
+ * nothing at all. The alarm is deleted — see `THE ALARM THAT WAS DELETED` — so
+ * that job is gone, and the bound is not.
+ *
+ * BECAUSE THE OTHER THING IT DOES IS THE WHOLE REASON THE SURVIVING NOTICE CAN BE
+ * TRUSTED. An unbounded wait is not silence, it is a window held open forever:
+ * this process would keep a mark for a window from last Tuesday, and the first
+ * heartbeat the game HAPPENS to send — an SSM patch reboot, a box restarted by
+ * hand, anything that hands the console's driver a new `bootEpoch` to stamp
+ * `deployConfirmedAt` with — would become "the game server is back up and
+ * maintenance is complete" a week after the fact. That post is worse than the
+ * silence it breaks. It is false, it is about an outage nobody remembers, and it
+ * would be produced by exactly the scheduled reboot the owner asked to stop
+ * hearing about.
+ *
+ * SO IT IS CHECKED BEFORE THE HEARTBEAT AND NOT AFTER IT, which is a real
+ * decision with a real cost. See `completion`.
+ *
+ * IF THE CONSOLE RETUNES ITS NUMBER THIS ONE MUST FOLLOW. Nothing enforces that;
+ * it is why this comment names the file. Being generous in the same direction is
+ * still the safe way to be wrong, though the failure it guards has changed sides:
+ * a bot that gave up EARLIER than the console's own page still calls a restart in
+ * progress would drop the one notice this feature exists to post, over a deploy
+ * that was about to succeed.
  */
 export const RESTART_GRACE_MS = 5 * 60_000
 
@@ -274,9 +298,10 @@ function parseMark(raw: string): Mark | null {
  * "The game server is back up and maintenance is complete. The server is now
  * running [hash as hyperlink]."
  *
- * NO SENTENCE HERE WAS INVENTED BY THIS BOT. The one hole is a commit off the
- * row, and the one frame that has no wording from him yet says so in the string
- * itself; see `NOT_BACK`.
+ * NO SENTENCE HERE WAS INVENTED BY THIS BOT, AND THERE IS NO LONGER A SECOND ONE
+ * THAT WAS. The one hole is a commit off the row. The frame that had no wording
+ * from him — the notice for a game that never reported back — is deleted rather
+ * than waiting to be written; see `THE ALARM THAT WAS DELETED`.
  *
  * HE WROTE A THIRD CLAUSE AND THEN CUT IT. The sentence used to end "[Click here
  * to connect](fivem:// hyperlink)"; it shipped masked, then bare, and no form of
@@ -377,83 +402,47 @@ function backUp(window: MaintenanceWindow): string {
 }
 
 /**
- * What is said when the game never spoke.
+ * ═══ THE ALARM THAT WAS DELETED, AND WHY IT IS NOT TO BE PUT BACK ═══
  *
- * THE OWNER SUPPLIES USER-FACING WORDING AND HAS NOT SUPPLIED THIS. He asked
- * for the bound ("if no heartbeat arrives within some window, say something
- * rather than staying silent forever") and not for the sentence, so the sentence
- * says what it is.
+ * A SECOND NOTICE STOOD HERE. When the deploy finished and the game had not
+ * reported back inside `RESTART_GRACE_MS`, this file posted "The update finished
+ * but the game server has not reported back." into #maintenance-notifications,
+ * with the console's own `deployError` carried after it verbatim when there was
+ * one, and a one-shot correction that followed up with the back-up notice if the
+ * game turned up late. Two exported constants, a cap that bounded somebody else's
+ * error text, and an in-memory record of which window had been alarmed about all
+ * existed to serve that one sentence. Every part of it is gone.
  *
- * THE MARKER IS IN THE COMMENT NOW AND NOT IN THE POST. Both halves of this
- * message used to lead with a literal `PLACEHOLDER:`, into the one channel
- * players read — the loudest place in the bot for a marker to be, and the thing
- * he asked to have taken out of `/drain`. `scripts/check-placeholders.ts` reads
- * the tag below and prints both on every verify instead.
+ * THE OWNER DELETED IT, AFTER IT FIRED ON A ROUTINE SSM PATCH REBOOT: "I don't
+ * want any discord alarming for this. just remove the message." Not quieter, not
+ * a longer grace, not the other channel — removed.
  *
- * THE CONSOLE'S OWN REASON RIDES INSIDE IT WHEN THERE IS ONE, unedited, for the
- * reason /drain shows a refusal verbatim: this bot cannot know better than the
- * thing that tried the deploy, and a house summary of somebody else's error is
- * a worse copy of it.
+ * AND HE IS RIGHT, FOR A REASON THIS CODEBASE CANNOT SEE FROM THE INSIDE. He has
+ * CloudWatch for host health, and that is what actually watches these boxes; this
+ * bot is not a host monitor and was never asked to be one. An SSM patch window
+ * reboots them on a schedule NOTHING IN THIS REPO KNOWS ABOUT — no maintenance row
+ * is written, no window is scheduled, the game simply stops answering for a few
+ * minutes because AWS is patching the host underneath it. A bot that shouts every
+ * time that happens teaches him to scroll past #maintenance-notifications, and
+ * that channel exists for exactly one sentence he does want to read. An alarm
+ * nobody reads costs the notice standing next to it.
  *
- * ONE LINE, LIKE THE NOTICE ABOVE IT. This used to join its two halves with a
- * `\n` and it was the last multi-line message left in the file once the drain
- * and going-down notices went. "Why is anything wrapped on multiple lines" was
- * not a remark about one post.
+ * ═══ WHAT IS GENUINELY LOST, STATED RATHER THAN ARGUED WITH ═══
  *
- * @unwritten member — what players are told when the update finished and the game server never reported back.
+ * A Ringmaster deploy that really does fail to bring the gamemode back is now
+ * SILENT IN DISCORD — nothing in #maintenance-notifications, nothing in
+ * #bot-status, at any level. AND CLOUDWATCH DOES NOT COVER THAT CASE EITHER: in
+ * that failure the host is perfectly healthy, it is FXServer or br_ringmaster that
+ * is not, and host health cannot tell the difference. So this is a real hole, and
+ * the thing that replaced the alarm does not cover it.
+ *
+ * THAT IS HIS CALL, MADE KNOWINGLY, AND IT IS WRITTEN DOWN AS HIS. The next person
+ * to notice the hole is looking at a decision and not at an oversight, and should
+ * not helpfully restore the message. What remains is the journal: `check` writes
+ * one `info` line when the wait runs out, which reaches the box and no channel. If
+ * this is ever reopened, the question to put to him is whether a DEPLOY HE STARTED
+ * may say something — never whether a reboot may.
  */
-export const NOT_BACK = 'The update finished but the game server has not reported back.'
-
-/**
- * How the console's own reason is introduced when there is one.
- *
- * ITS OWN CONSTANT RATHER THAN A CLAUSE INSIDE THE TEMPLATE, and that is what
- * the marker forced: a second unwritten sentence buried mid-template is a second
- * unwritten sentence, and it cannot be on a list while it has no name. It had a
- * `PLACEHOLDER:` of its own and reached the same channel.
- *
- * `The console said:` IS THE CLAUSE `/drain` ALREADY USES — `COPY.refused` and
- * `COPY.cancelRefused` in ./commands/drain.ts — and those are wording the owner
- * supplied. Two spellings of "here is what the other system told us" is how one
- * bot starts reading as two, so this borrows his rather than inventing a second.
- * The sentence around it is still nobody's, which is why it is on the list.
- *
- * @unwritten member — how the console's own reason is introduced when the game never reported back.
- */
-export const CONSOLE_SAID = (reason: string): string => `The console said: ${reason}`
-
-function didNotConfirm(reason: string | null): string {
-  return reason === null
-    ? NOT_BACK
-    : `${NOT_BACK} ${CONSOLE_SAID(capped(reason, REASON_CAP))}`
-}
-
-/**
- * How much of the console's stated reason is carried.
- *
- * A CAP BECAUSE DISCORD'S IS 2000 CHARACTERS AND IT REJECTS THE WHOLE MESSAGE,
- * not the overflow. This cap used to sit on the admin's free-text note, which
- * went with the going-down notice; it is kept and moved rather than deleted
- * because `deployError` is now the one value in a post that this repo does not
- * bound — it is written by another codebase out of whatever a shell script or an
- * SSH library said, and nothing between there and here shortens it. The failure
- * without a cap is that the message reporting a server which never came back is
- * itself dropped by the API, invisibly.
- *
- * 1500 IS FAR MORE REASON THAN ANY OF THEM CARRY and far less than the limit.
- */
-const REASON_CAP = 1500
-
-/**
- * Cut by code point, like every other cut in this repo: a UTF-16 slice can land
- * inside a surrogate pair and put half a character in a post.
- */
-function capped(value: string, cap: number): string {
-  const points = [...value.trim()]
-  if (points.length <= cap) return points.join('')
-
-  return `${points.slice(0, cap).join('')}…`
-}
 
 /**
  * A field off a row whose type does not name it.
@@ -661,7 +650,7 @@ function heartbeatAfterDeploy(window: MaintenanceWindow): number | null {
 }
 
 /**
- * The console's stated reason the deploy did not happen, or null.
+ * Did the console say the deploy never happened?
  *
  * `deployError` IS THE HOST REFUSING, WHICH IS NOT THE SAME FAILURE AS SILENCE.
  * The console's `deployPhase` tests this field before it tests anything about
@@ -669,29 +658,50 @@ function heartbeatAfterDeploy(window: MaintenanceWindow): number | null {
  * server was never restarted, so the game pushing happily afterwards is the
  * EXPECTED state rather than evidence of a successful deploy. This bot reads it
  * in the same order and for the same reason.
+ *
+ * ═══ A BOOLEAN NOW, AND THE NARROWING IS THE POINT ═══
+ *
+ * This used to hand back the console's words so the alarm could carry them
+ * verbatim, behind a 1500-character cap because another codebase writes them out
+ * of whatever a shell script said. The alarm is gone — see `THE ALARM THAT WAS
+ * DELETED` — and with it the only reader of the TEXT, so the cap and the code-point
+ * cut that went with it are gone too.
+ *
+ * WHAT THE FIELD STILL DOES IS THE REASON IT IS STILL READ, and it is not
+ * bookkeeping. A row that says the deploy was refused can never honestly produce
+ * "maintenance is complete", whatever heartbeat turns up beside it: the box was
+ * never restarted, so a new `bootEpoch` in the next few minutes is an unrelated
+ * reboot rather than this deploy landing. Returning a boolean is what makes that
+ * un-leakable — there is no longer a string here for a future edit to put in a
+ * post.
  */
-function deployFailure(window: MaintenanceWindow): string | null {
-  return stringOn(window, 'deployError')
+function deployRefused(window: MaintenanceWindow): boolean {
+  return stringOn(window, 'deployError') !== null
 }
 
 /**
- * Has the wait run out?
+ * Has the wait run out? True means STOP WAITING AND SAY NOTHING — see
+ * `completion`, which is the only caller.
  *
- * A STATED FAILURE ENDS IT IMMEDIATELY. Sitting out five minutes of grace over
- * an answer already written on the row would be five minutes of silence with
- * the explanation in hand.
+ * A STATED REFUSAL ENDS IT IMMEDIATELY, and that is a live rule rather than an
+ * optimisation. Without it this window would sit in `hold` for five more minutes
+ * with the answer already written on the row, and a heartbeat arriving inside
+ * those five minutes — the host rebooting for its own reasons, since this deploy
+ * never restarted anything — would be read as the deploy landing and post that
+ * maintenance is complete. See `deployRefused`.
  *
  * OTHERWISE THE CLOCK IS THE ROW'S AND NEVER THIS PROCESS'S UPTIME. `completedAt`
  * is when the deploy verb returned; a bot restarted during the outage must not
- * restart the grace with itself, or a crash loop would hold the alarm off
- * forever.
+ * restart the grace with itself, or a crash loop would hold a window open
+ * forever — and an open window is one a stray heartbeat can still post about.
  *
- * A ROW WITH NO CLOCK AT ALL IS OUT OF TIME AT ONCE, because the alternative is
- * a wait that can never end — and a wait with no end is the silence the bound
- * exists to prevent.
+ * A ROW WITH NO CLOCK AT ALL IS OUT OF TIME AT ONCE, because the alternative is a
+ * wait that can never end. That is the same answer as before the alarm went, for
+ * a sharper reason: the wait is now the only thing standing between a week-old
+ * window and a false announcement.
  */
 function graceExpired(window: MaintenanceWindow, now: number): boolean {
-  if (deployFailure(window) !== null) return true
+  if (deployRefused(window)) return true
 
   const clock = completedAt(window) ?? deployStartedAt(window)
   if (clock === null) return true
@@ -704,7 +714,8 @@ function graceExpired(window: MaintenanceWindow, now: number): boolean {
  * ------------------------------------------------------------------ */
 
 /**
- * The three things a poll can decide, and `hold` is the one that is not obvious.
+ * The four things a poll can decide. `hold` and `gaveUp` are the two that are not
+ * obvious, and they are the two ends of the same wait.
  *
  * `hold` MEANS "SAY NOTHING AND DO NOT WRITE THE MARK DOWN". A decision that was
  * final at the moment the state changed would not need it; the completion gate is
@@ -712,34 +723,30 @@ function graceExpired(window: MaintenanceWindow, now: number): boolean {
  * has no answer yet — so the poll has to be able to leave the window exactly as
  * unfinished as it found it and ask again in fifteen seconds. Advancing the mark
  * there would record the transition as handled and cost the notice permanently.
+ *
+ * `gaveUp` IS `quiet` PLUS ONE JOURNAL LINE, AND IT EARNS THE EXTRA CASE. It is
+ * the wait running out with the game still silent, which is the failure the
+ * deleted alarm used to announce; the mark advances exactly as it does for
+ * `quiet`, so the window is closed and nothing is ever posted about it. The line
+ * is `info`, so it reaches the journal and no Discord channel — the whole of what
+ * is left of that path, and the only trace on the box that a deploy did not bring
+ * the game back. See `THE ALARM THAT WAS DELETED`.
+ *
+ * IT IS A KIND RATHER THAN A `log` CALL INSIDE THE DECISION because `decide` is
+ * pure and is tested as a pure function of a row and a mark. A decision that
+ * wrote to the journal could not be asked twice about the same row.
  */
 type Step =
-  | { readonly kind: 'post'; readonly content: string; readonly alarm: boolean }
+  | { readonly kind: 'post'; readonly content: string }
   | { readonly kind: 'hold' }
   | { readonly kind: 'quiet' }
+  | { readonly kind: 'gaveUp' }
 
 const HOLD: Step = { kind: 'hold' }
 const QUIET: Step = { kind: 'quiet' }
+const GAVE_UP: Step = { kind: 'gaveUp' }
 
-const say = (content: string, alarm = false): Step => ({ kind: 'post', content, alarm })
-
-/** What the poll knows that is not on the row. */
-interface Moment {
-  readonly now: number
-
-  /**
-   * The window this process has already reported as not having come back, or
-   * null.
-   *
-   * IN MEMORY AND DELIBERATELY NOT ON DISK. It exists to let ONE window produce
-   * the alarm and then, if the game turns up late, the back-up notice as well —
-   * the alarm is not the end of the story and a channel that says "it has not
-   * come back" and then never mentions it again is worse than one that never
-   * said either. A restart loses it, which costs the late correction and cannot
-   * cost a repeat: the mark on disk already says `complete` by then.
-   */
-  readonly alarmed: number | null
-}
+const say = (content: string): Step => ({ kind: 'post', content })
 
 /**
  * What to do about a `complete` row.
@@ -755,31 +762,70 @@ interface Moment {
  * this bot posts is about the GAME finishing, and they are tens of seconds
  * apart on a good day.
  *
- * THREE ANSWERS AND A WAIT, IN THIS ORDER:
+ * THE GATE ITSELF IS UNTOUCHED BY THE ALARM'S DELETION, and it is now the only
+ * thing that decides whether anything is said at all.
  *
- *   THE HOST REFUSED — say so at once, with its reason. Waiting for a heartbeat
- *   here would be waiting for a restart that never started.
+ * ═══ FOUR ANSWERS, AND THE ORDER OF THE MIDDLE TWO IS THE DECISION ═══
  *
- *   A HEARTBEAT NEWER THAN THE DEPLOY — the notice, in his words. Said once,
- *   and said a second time only where the previous thing this bot said about
- *   this window was the alarm, which the late arrival has just corrected.
+ *   THE MARK ALREADY SAYS `complete` — nothing. This window is settled, and
+ *   settled covers both endings: the notice went out, or the wait ran out. The
+ *   mark records what was SEEN and not what was posted (see `Mark`), which is what
+ *   lets one test serve both.
  *
- *   NOTHING YET — hold, until the grace runs out and the silence becomes the
- *   thing worth saying.
+ *   THE WAIT IS OVER — give up, silently, and close the window. See
+ *   `graceExpired` for what ends it and `THE ALARM THAT WAS DELETED` for why the
+ *   answer is silence.
+ *
+ *   A HEARTBEAT NEWER THAN THE DEPLOY — the notice, in his words, once.
+ *
+ *   NOTHING YET — hold, and ask again in fifteen seconds.
+ *
+ * ═══ WHY THE BOUND IS TESTED BEFORE THE HEARTBEAT AND NOT AFTER IT ═══
+ *
+ * Both can be true on one poll, and which wins is a real choice with a real cost
+ * either way.
+ *
+ * TESTED AFTER, "past the bound, nothing is said about this window again" would be
+ * enforced only by the mark — which is to say, only by this process having been
+ * alive and polling at the moment the bound passed, to write `complete` down. A
+ * bot that was down for an update, or blind on a table it could not read, across
+ * those five minutes comes back holding a mark that still says `deploying`, and
+ * posts on whatever heartbeat it then finds. AND THE HEARTBEAT IT FINDS NEED NOT
+ * BE THIS DEPLOY'S: `deployConfirmedAt` is stamped on a new `bootEpoch`, and the
+ * SSM patch window produces one of those on a schedule this repo knows nothing
+ * about. That is the week-late post `RESTART_GRACE_MS` describes, arriving through
+ * the back door, caused by the exact scheduled reboot the owner asked to stop
+ * hearing about.
+ *
+ * TESTED FIRST, THE BOUND IS A PROPERTY OF THE ROW RATHER THAN OF THIS PROCESS'S
+ * UPTIME — the same principle `graceExpired` already applies to its clock. A
+ * window past its bound is closed no matter who was watching, or for how long, or
+ * what turns up afterwards.
+ *
+ * WHAT IT COSTS, PAID DELIBERATELY: a heartbeat that lands in the last poll before
+ * the bound can be read on the poll after it and dropped, and a TRUE notice is
+ * lost. That is a deploy which took between four and a half and five minutes to
+ * answer, against a restart the console budgets tens of seconds for — and one
+ * second later the same deploy is dropped anyway, by any ordering. Losing the
+ * notice on a deploy that slow is a smaller wrong than announcing one that never
+ * landed.
+ *
+ * ═══ AND THE ONE-SHOT LATE CORRECTION WENT WITH THE ALARM IT SERVED ═══
+ *
+ * A window that had been alarmed about was allowed to post a SECOND time if the
+ * game turned up late, tracked in memory: "the alarm is not the end of the story
+ * and a channel that says it has not come back and then never mentions it again is
+ * worse than one that never said either." Every word of that was about following
+ * up a sentence that is no longer said. With nothing to correct, the correction IS
+ * the week-late post — so the field on the moment, the `alarm` flag on a post and
+ * the mutable that carried it between polls are all deleted with it.
  */
-function completion(mark: Mark, window: MaintenanceWindow, at: Moment): Step {
-  const said = mark.state === 'complete'
+function completion(mark: Mark, window: MaintenanceWindow, now: number): Step {
+  if (mark.state === 'complete') return QUIET
+  if (graceExpired(window, now)) return GAVE_UP
+  if (heartbeatAfterDeploy(window) !== null) return say(backUp(window))
 
-  const failure = deployFailure(window)
-  if (failure !== null) return said ? QUIET : say(didNotConfirm(failure), true)
-
-  if (heartbeatAfterDeploy(window) !== null) {
-    return !said || at.alarmed === window.createdAt ? say(backUp(window)) : QUIET
-  }
-
-  if (said) return QUIET
-
-  return graceExpired(window, at.now) ? say(didNotConfirm(null), true) : HOLD
+  return HOLD
 }
 
 /**
@@ -806,11 +852,11 @@ function completion(mark: Mark, window: MaintenanceWindow, at: Moment): Step {
  * boolean, because a boolean derived from a null check does not narrow the value:
  * this is the form the compiler can see, and it is the same test.
  */
-function decide(mark: Mark | null, window: MaintenanceWindow, at: Moment): Step {
+function decide(mark: Mark | null, window: MaintenanceWindow, now: number): Step {
   if (window.state !== 'complete') return QUIET
   if (mark === null || mark.window !== window.createdAt) return QUIET
 
-  return completion(mark, window, at)
+  return completion(mark, window, now)
 }
 
 /* ------------------------------------------------------------------ *
@@ -931,14 +977,6 @@ export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceW
   let failures = 0
 
   /**
-   * The window this process has already reported as not having come back.
-   *
-   * See `Moment.alarmed`: it is what lets a late heartbeat correct the alarm,
-   * and it is in memory rather than on disk on purpose.
-   */
-  let alarmed: number | null = null
-
-  /**
    * The mark off disk, once.
    *
    * AN ABSENT FILE IS THE ORDINARY STATE OF A BOX NOBODY HAS RUN THIS ON and
@@ -1039,20 +1077,31 @@ export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceW
     const seen = await baseline()
     const next: Mark = { window: window.createdAt, state: window.state }
 
-    const step = decide(seen, window, { now: now(), alarmed })
+    const step = decide(seen, window, now())
 
     /**
      * THE DECISION IS TAKEN EVERY POLL AND THE WRITE IS NOT.
      *
      * This used to return early whenever the mark equalled the state, before
-     * anything was decided. It cannot any more: a `complete` window whose
-     * heartbeat arrives after this bot has already reported it as not back is
-     * exactly that case, and the correction is the one post worth making from
-     * it. `decide` is a pure function over a row already in hand, so asking it
+     * anything was decided. It cannot any more: a `complete` window is read again
+     * on every poll until the game answers or the wait runs out, and both of those
+     * are answers this loop has to be able to reach without the state having
+     * moved. `decide` is a pure function over a row already in hand, so asking it
      * four times a minute costs nothing — the thing that had to stay cheap was
      * the WRITE, and that is guarded below where it belongs.
      */
     if (step.kind === 'hold') return
+
+    // THE WAIT RAN OUT WITH THE GAME STILL SILENT, which is where a post used to
+    // be. `info`, so it reaches the journal and NEITHER Discord channel — see
+    // `THE ALARM THAT WAS DELETED` for whose decision that is and what it costs.
+    // It is written once per window: the mark is advanced below, and every later
+    // poll on this row is answered by the first line of `completion`.
+    if (step.kind === 'gaveUp') {
+      log('info', 'the game server never reported back after the deploy, nothing will be posted', {
+        window: window.createdAt,
+      })
+    }
 
     if (step.kind === 'post') {
       try {
@@ -1080,10 +1129,6 @@ export function maintenanceWatch(options: MaintenanceWatchOptions): MaintenanceW
         log('info', 'could not post a maintenance notice, it will be retried', { error })
         return
       }
-
-      // SET BY THE ALARM AND CLEARED BY EVERY OTHER POST, which is what makes
-      // the correction fire exactly once. See `Moment.alarmed`.
-      alarmed = step.alarm ? window.createdAt : null
     }
 
     // ADVANCED IN MEMORY FIRST AND THE WRITE IS BEST EFFORT. A state directory

@@ -8,13 +8,11 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vite
 
 import type { DdbFailure, DdbResult, MaintenanceState, MaintenanceWindow } from './ddb.ts'
 import {
-  CONSOLE_SAID,
   MAINTENANCE_POLL_MS,
   maintenanceMemory,
   maintenancePoster,
   maintenanceStatePath,
   maintenanceWatch,
-  NOT_BACK,
   RESTART_GRACE_MS,
   watchMaintenance,
   type MaintenanceMemory,
@@ -46,6 +44,12 @@ import {
  *   a window that ran while the bot was down is never caught up on — the audit
  *   trail is the record, and "the server is back" four hours late is worse
  *   than nothing;
+ *
+ *   a deploy that never brought the game back is not announced either — "I don't
+ *   want any discord alarming for this. just remove the message." That notice was
+ *   deleted, in both channels, and the cases for it are now cases about an
+ *   absence; see `the wait running out` below and `THE ALARM THAT WAS DELETED` in
+ *   src/maintenance.ts;
  *
  *   a restart mid-window does not re-announce — which is the entire job of the
  *   file in the state directory;
@@ -104,10 +108,16 @@ const DEPLOY_STARTED_AT = CREATED_AT + 600_000
 /**
  * The clock every case runs against, unless it says otherwise.
  *
- * AN HOUR AFTER THE WINDOW WAS CREATED, WHICH MAKES EVERY FIXTURE ROW STALE BY
- * DEFAULT. The grace in `RESTART_GRACE_MS` reads the clock, and a default
- * `Date.now()` would have made those answers depend on the real date the suite
- * ran on.
+ * AN HOUR AFTER THE WINDOW WAS CREATED, AND FIXED RATHER THAN REAL. The bound in
+ * `RESTART_GRACE_MS` reads the clock, and a default `Date.now()` would have made
+ * every answer here depend on the date the suite ran on.
+ *
+ * WHICH END OF THE BOUND A ROW SITS ON IS NOW THE ROW'S BUSINESS, NOT THIS
+ * CONSTANT'S. It used to be enough that an hour made every fixture stale, because
+ * the bound only gated the alarm and a heartbeat was read before it was ever
+ * consulted. The bound is tested FIRST now — see `completion` — so a row that
+ * means "the game answered" has to carry a `completedAt` inside the five minutes,
+ * and `confirmedRow` is where that is arranged.
  */
 const NOW = CREATED_AT + 3_600_000
 
@@ -167,9 +177,15 @@ function windowRow(
  *
  * NO COMMIT ON IT BY DEFAULT, so `BACK_UP` below is the shortest true form of
  * the notice and the cases that care about the hash add one.
+ *
+ * AND IT IS INSIDE THE BOUND, WHICH IT DID NOT USED TO HAVE TO BE. `completedAt`
+ * was `DEPLOY_STARTED_AT + 30_000`, which against a `NOW` an hour later is fifty
+ * minutes stale — fine while the heartbeat was read before the bound, and wrong
+ * now that the bound is read first. A minute old is what a row looks like when the
+ * game has just come back, which is what every case using this fixture means.
  */
 function confirmedRow(overrides: Partial<MaintenanceWindow> & RowExtras = {}): MaintenanceWindow {
-  const completedAt = DEPLOY_STARTED_AT + 30_000
+  const completedAt = NOW - 60_000
 
   return windowRow('complete', {
     completedAt,
@@ -719,111 +735,11 @@ describe('the completion gate — waiting for the game to speak', () => {
 
     await watch.check()
 
-    // Out of time as well as unprovable, so it says the thing it can stand
-    // behind rather than nothing at all. See `graceExpired`.
-    //
-    // PINNED BY CONSTANT, WHICH IT WAS NOT. This read `toContain('PLACEHOLDER')`
-    // because the sentence led with the marker — into the one channel players
-    // read. The marker is a tag in the doc comment now and the string is on the
-    // list `scripts/check-placeholders.ts` prints; this holds which message
-    // arrived, and survives the owner wording it.
-    expect(at(watch.post, 0)).toContain(NOT_BACK)
-    expect(at(watch.post, 0)).not.toContain('back up')
-  })
-
-  /**
-   * ═══ THE WAIT IS BOUNDED, WHICH IS THE OTHER HALF OF WHAT HE ASKED FOR ═══
-   *
-   * "If no heartbeat arrives within some window, say something rather than
-   * staying silent forever — a server that never came back is exactly what an
-   * admin needs to know." Five minutes is the console's own `RESTART_GRACE_MS`,
-   * and past it the honest thing is to stop offering an excuse.
-   */
-  it('reports a server that never came back once the grace runs out', async () => {
-    const completedAt = NOW - RESTART_GRACE_MS - 1_000
-    const watch = watcher([ok(windowRow('complete', { completedAt }))], {
-      seen: mark('deploying'),
-    })
-
-    await watch.check()
-
-    expect(watch.post).toHaveBeenCalledTimes(1)
-    expect(at(watch.post, 0)).toContain('has not reported back')
-  })
-
-  it('reports it once and not on every poll after that', async () => {
-    const completedAt = NOW - RESTART_GRACE_MS - 1_000
-    const watch = watcher([ok(windowRow('complete', { completedAt }))], {
-      seen: mark('deploying'),
-    })
-
-    for (let poll = 0; poll < 4; poll += 1) await watch.check()
-
-    expect(watch.post).toHaveBeenCalledTimes(1)
-  })
-
-  /**
-   * A STATED FAILURE ENDS THE WAIT AT ONCE. `deployError` is the host refusing —
-   * an SSH channel that is not configured, a pin the box would not take, a
-   * script that exited non-zero — and the console's `deployPhase` tests it
-   * before anything about heartbeats for the same reason: the code never
-   * shipped, so no amount of waiting produces a restart to hear from.
-   */
-  it('does not sit out the grace when the console recorded a deploy error', async () => {
-    const row = windowRow('complete', {
-      completedAt: NOW - 1_000,
-      deployError: 'host refused: no ssh key configured',
-    })
-    const watch = watcher([ok(row)], { seen: mark('deploying') })
-
-    await watch.check()
-
-    expect(at(watch.post, 0)).toContain('has not reported back')
-
-    // The console's own words, unedited, for the reason /drain shows a refusal
-    // verbatim: this bot cannot know better than the thing that tried it.
-    expect(at(watch.post, 0)).toContain('host refused: no ssh key configured')
-  })
-
-  /**
-   * AND IT IS ONE LINE, like the notice it stands in for. The alarm joined its
-   * two halves with a `\n` while the going-down notice was still stacking lines
-   * above it; "why is anything wrapped on multiple lines" was not a remark about
-   * one post, and this was the last multi-line message in the file.
-   */
-  it('says it on one line, with the reason flowing after it', async () => {
-    const row = windowRow('complete', {
-      completedAt: NOW - 1_000,
-      deployError: 'host refused: no ssh key configured',
-    })
-    const watch = watcher([ok(row)], { seen: mark('deploying') })
-
-    await watch.check()
-
-    expect(at(watch.post, 0)).not.toContain('\n')
-  })
-
-  /**
-   * AND AN ALARM IS NOT THE END OF THE STORY. A heartbeat that arrives after the
-   * grace has expired is the server coming back, and a channel that said "it has
-   * not reported back" and then never mentioned it again is worse than one that
-   * said neither.
-   */
-  it('corrects its own alarm when the game turns up late, exactly once', async () => {
-    const completedAt = NOW - RESTART_GRACE_MS - 1_000
-    const late = windowRow('complete', { completedAt, deployConfirmedAt: NOW - 500 })
-
-    const watch = watcher([ok(windowRow('complete', { completedAt })), ok(late)], {
-      seen: mark('deploying'),
-    })
-
-    await watch.check()
-    await watch.check()
-    await watch.check()
-
-    expect(watch.post).toHaveBeenCalledTimes(2)
-    expect(at(watch.post, 0)).toContain('has not reported back')
-    expect(at(watch.post, 1)).toBe(BACK_UP)
+    // UNPROVABLE AND ALSO OUT OF TIME — a row that cannot say when its deploy
+    // began has nothing left to wait on — so the window is closed in silence.
+    // This case used to assert the alarm; see `THE ALARM THAT WAS DELETED` in
+    // src/maintenance.ts for who deleted it and why.
+    expect(watch.post).not.toHaveBeenCalled()
   })
 
   /**
@@ -845,46 +761,174 @@ describe('the completion gate — waiting for the game to speak', () => {
     expect(watch.post).not.toHaveBeenCalled()
   })
 
-  /**
-   * DISCORD REJECTS THE WHOLE MESSAGE AT 2000 CHARACTERS, not the overflow, and
-   * `deployError` is the one value left in a post that this repo does not bound:
-   * another codebase writes it out of whatever a shell script or an SSH library
-   * said. The cap moved here off the admin's note when the going-down notice went.
-   */
-  it('caps a console reason that would take the post past what Discord accepts', async () => {
-    const row = windowRow('complete', {
-      completedAt: NOW - 1_000,
-      deployError: 'x'.repeat(5_000),
-    })
-    const watch = watcher([ok(row)], { seen: mark('deploying') })
+})
+
+/* ------------------------------------------------------------------ *
+ * The wait running out.
+ * ------------------------------------------------------------------ */
+
+/**
+ * ═══ "I DON'T WANT ANY DISCORD ALARMING FOR THIS. JUST REMOVE THE MESSAGE." ═══
+ *
+ * The owner said it after the not-back notice fired on a routine SSM patch
+ * reboot. Five cases used to stand here: that a server which never came back was
+ * reported, that it was reported once, that a stated deploy error skipped the
+ * wait, that the console's own reason was carried into the post and capped, and
+ * that a late heartbeat corrected the alarm. Every one of them described a message
+ * that no longer exists.
+ *
+ * AN ABSENCE HAS NO TEXT TO MATCH ON, which is what makes these cases harder to
+ * write than the ones they replace and worth writing carefully. Each asserts that
+ * the channel was never touched AND that `stderr` stayed empty: "no discord
+ * alarming" is BOTH channels, log.ts copies `warn` and `error` into #bot-status,
+ * so an empty `stderr` is the second half of the requirement rather than a detail.
+ *
+ * WHAT IS LEFT IS ONE `info` LINE ON THE BOX. It is asserted too — it is the only
+ * evidence anywhere that a deploy did not bring the game back, and a line nothing
+ * pins is a line the next cleanup deletes.
+ */
+describe('the wait running out — silence, in both channels', () => {
+  /** A window whose deploy finished before the bound and never spoke again. */
+  const abandoned = (extras: RowExtras = {}): ReturnType<typeof watcher> =>
+    watcher(
+      [ok(windowRow('complete', { completedAt: NOW - RESTART_GRACE_MS - 1_000, ...extras }))],
+      { seen: mark('deploying') },
+    )
+
+  it('says nothing to either channel when the game never reports back', async () => {
+    const watch = abandoned()
 
     await watch.check()
 
-    expect(at(watch.post, 0).length).toBeLessThan(2_000)
-    expect(at(watch.post, 0)).toContain('…')
+    expect(watch.post).not.toHaveBeenCalled()
+    expect(stderr.join('')).toBe('')
   })
 
   /**
-   * CUT BY CODE POINT, like every other cut in this repo. A UTF-16 slice can land
-   * inside a surrogate pair and put half a character into an announcement.
+   * THE JOURNAL IS THE WHOLE OF WHAT SURVIVES. The owner has CloudWatch for host
+   * health and this is not that: in this failure the host is fine and the gamemode
+   * is not, so nothing outside this box will notice. One `info` line is what a
+   * person debugging it later has.
    */
-  it('cuts that reason by code point, never through a surrogate pair', async () => {
+  it('leaves one line in the journal, which is the only trace of it', async () => {
+    const watch = abandoned()
+
+    await watch.check()
+
+    expect(stdout.join('')).toContain('never reported back after the deploy')
+    expect(stderr.join('')).toBe('')
+  })
+
+  /**
+   * AND THE WINDOW IS CLOSED, NOT MERELY UNANSWERED. The mark advances to
+   * `complete` on the poll that gives up, which is what stops the journal line
+   * repeating four times a minute for as long as the row sits there — and what
+   * makes a restart read the window as finished.
+   */
+  it('closes the window so it gives up exactly once', async () => {
+    const watch = abandoned()
+
+    for (let poll = 0; poll < 4; poll += 1) await watch.check()
+
+    expect(watch.post).not.toHaveBeenCalled()
+    expect(watch.file()).toBe(`${mark('complete')}\n`)
+    expect(stdout.join('').match(/never reported back after the deploy/gu)).toHaveLength(1)
+  })
+
+  /**
+   * ═══ THE ONE-SHOT LATE CORRECTION IS GONE, AND THIS IS WHERE IT DIED ═══
+   *
+   * A window that had been alarmed about was allowed to post a second time if the
+   * game turned up late, because "a channel that says it has not come back and
+   * then never mentions it again is worse than one that never said either". That
+   * was an argument about following up a sentence. There is no sentence now, so
+   * the follow-up is just a late announcement of an outage nobody was told about.
+   */
+  it('never posts about that window again, however late the heartbeat arrives', async () => {
+    const completedAt = NOW - RESTART_GRACE_MS - 1_000
+    const late = windowRow('complete', { completedAt, deployConfirmedAt: NOW - 500 })
+
+    const watch = watcher([ok(windowRow('complete', { completedAt })), ok(late)], {
+      seen: mark('deploying'),
+    })
+
+    for (let poll = 0; poll < 3; poll += 1) await watch.check()
+
+    expect(watch.post).not.toHaveBeenCalled()
+    expect(stderr.join('')).toBe('')
+  })
+
+  /**
+   * ═══ THE BOUND IS READ BEFORE THE HEARTBEAT, AND THIS IS THE CASE THAT SAYS SO ═══
+   *
+   * The row here is past the bound AND carries a confirmation newer than the
+   * deploy, on the FIRST poll that sees it — which is what a bot that was down or
+   * blind across those five minutes comes back to, holding a mark that still says
+   * `deploying`. Read the heartbeat first and it posts "the game server is back
+   * up" for a deploy that finished long ago, on whatever `bootEpoch` the console's
+   * driver last stamped — an SSM patch reboot included, which is the exact noise
+   * this whole change removed.
+   *
+   * IT COSTS A TRUE NOTICE IN ONE PLACE and that is deliberate: a heartbeat
+   * landing in the last poll before the bound is dropped. See `completion` in
+   * src/maintenance.ts, which argues the trade rather than assuming it.
+   */
+  it('says nothing about a heartbeat that only turns up past the bound', async () => {
+    const watch = abandoned({ deployConfirmedAt: NOW - 500 })
+
+    await watch.check()
+
+    expect(watch.post).not.toHaveBeenCalled()
+    expect(stderr.join('')).toBe('')
+  })
+
+  /**
+   * A STATED REFUSAL ENDS THE WAIT AT ONCE, and it is still read for a reason
+   * that has nothing to do with the deleted alarm. `deployError` is the host
+   * refusing — an SSH channel that is not configured, a pin the box would not
+   * take, a script that exited non-zero — so the code never shipped and nothing
+   * was restarted. The console's `deployPhase` tests it before anything about
+   * heartbeats; this does the same.
+   *
+   * WHICH MATTERS BECAUSE A HEARTBEAT CAN STILL ARRIVE. The row below is inside
+   * the bound and carries a confirmation newer than the deploy — the box rebooting
+   * for its own reasons, since this deploy never restarted it — and announcing
+   * "maintenance is complete" over a deploy the console says was refused would be
+   * the one FALSE thing this feature can still say. Delete the `deployError` test
+   * in `graceExpired` and this case posts.
+   */
+  it('never calls a refused deploy complete, whatever heartbeat turns up beside it', async () => {
     const row = windowRow('complete', {
-      completedAt: NOW - 1_000,
-      deployError: '🎮'.repeat(2_000),
+      completedAt: NOW - 30_000,
+      deployConfirmedAt: NOW - 10_000,
+      deployError: 'host refused: no ssh key configured',
     })
     const watch = watcher([ok(row)], { seen: mark('deploying') })
 
     await watch.check()
 
-    // Split on the frame rather than on a typed-out copy of it: that copy was
-    // `'the console said: '`, lowercase, because the sentence used to open with
-    // `PLACEHOLDER:` and this clause ran on after it.
-    const reason = at(watch.post, 0).split(CONSOLE_SAID(''))[1] ?? ''
-    const points = [...reason]
+    expect(watch.post).not.toHaveBeenCalled()
+    expect(stderr.join('')).toBe('')
+  })
 
-    expect(points.at(-1)).toBe('…')
-    expect(points.slice(0, -1).every((point) => point === '🎮')).toBe(true)
+  /**
+   * AND THE CONSOLE'S WORDS REACH NOTHING. They used to be carried into the post
+   * verbatim, behind a 1500-character cap, because another codebase writes them
+   * out of whatever a shell script said. Nothing prints them now — which is why
+   * `deployRefused` hands back a boolean and the cap is deleted rather than kept
+   * "just in case".
+   */
+  it('carries no part of the console error into the channel', async () => {
+    const row = windowRow('complete', {
+      completedAt: NOW - 1_000,
+      deployError: 'host refused: no ssh key configured',
+    })
+    const watch = watcher([ok(row)], { seen: mark('deploying') })
+
+    await watch.check()
+
+    expect(watch.post).not.toHaveBeenCalled()
+    expect(journal()).not.toContain('no ssh key configured')
   })
 })
 
@@ -1414,12 +1458,21 @@ describe('the send — nobody is pinged', () => {
   })
 
   /**
-   * AND IT HOLDS FOR THE ONE STRING IN A POST THAT ANOTHER CODEBASE WROTE. The
-   * console's `deployError` is carried verbatim into the alarm, so it is the one
-   * place text this repo never saw can reach an announcement channel.
+   * ═══ AND THE ONE STRING ANOTHER CODEBASE WROTE NO LONGER REACHES DISCORD ═══
+   *
+   * This case used to prove that `allowedMentions` made the console's
+   * `deployError` inert, because that text was carried verbatim into the alarm and
+   * was the one place words this repo never saw could land in an announcement
+   * channel. The alarm is deleted, so the answer is stronger than suppression: the
+   * message is not sent.
+   *
+   * IT IS KEPT RATHER THAN DELETED WITH THE ALARM because the row still carries
+   * the field and `deployRefused` still reads it. What changed is that it reads it
+   * as a boolean — and this is the case that fails if a future edit reaches for the
+   * string again and puts it back in a post.
    */
-  it('suppresses them for a console error that is trying to ping', async () => {
-    const { client, send, sent } = channelHarness()
+  it('sends nothing at all for a console error that is trying to ping', async () => {
+    const { client, send } = channelHarness()
     const row = windowRow('complete', {
       completedAt: NOW - 1_000,
       deployError: '@everyone the deploy failed',
@@ -1434,12 +1487,7 @@ describe('the send — nobody is pinged', () => {
 
     await watch.check()
 
-    expect(send.mock.calls[0]?.[0].allowedMentions).toEqual({ parse: [] })
-
-    // The text is carried through as text — the console's own words, unedited —
-    // and it is the `allowedMentions` above, not any rewriting of the content
-    // here, that makes it inert.
-    expect(sent[0]).toContain('@everyone the deploy failed')
+    expect(send).not.toHaveBeenCalled()
   })
 
   it('posts to the channel it was given and no other', async () => {
