@@ -463,12 +463,41 @@ describe('/drain — the reply says what is happening and when, not that it aske
    * word of it fails here, which is what he asked for when he approved the
    * wording rather than the shape.
    */
+  /*
+   * AND IT IS TWO SENTENCES BECAUSE HE REMOVED THE THIRD (2026-09-05):
+   * "'Players who try to join are told: a server update.' please remove this
+   * text from the drain command output". `SCHEDULED` still carries a note, so
+   * this also pins that the reply does not quietly grow it back.
+   */
   it('reads as the one paragraph he approved, word for word', () => {
     expect(replyForSchedule(SCHEDULED)).toBe(
       'The server stopped accepting players at <t:1700000000:t>. ' +
-        'It will restart on its own once all players have left. ' +
-        'Players who try to join are told: `a server update`.',
+        'It will restart on its own once all players have left.',
     )
+  })
+
+  /**
+   * THE NOTE IS NOT ECHOED, AND `SCHEDULED` HAS ONE ON IT. Pinned as its own
+   * case rather than left to the word-for-word assertion above, because that one
+   * would also fail on a wording change he asked for later — and this is the
+   * thing he asked for, stated so it cannot be undone by accident.
+   *
+   * THE OPTION IS NOT AFFECTED. `/drain start` still sends the note to the
+   * console, which is what a player at the closed door reads; the case that
+   * proves it is "passes the note through exactly as it was typed", above.
+   */
+  it('never reads the note back to the admin, however the window arrived', () => {
+    for (const note of ['a server update', 'back in ten', '', null]) {
+      const shown = replyForSchedule({
+        outcome: 'scheduled',
+        status: 201,
+        window: { ...WINDOW, note },
+      })
+
+      expect(shown, String(note)).not.toContain('told')
+      expect(shown, String(note)).not.toContain('`')
+      if (note !== null && note !== '') expect(shown, note).not.toContain(note)
+    }
   })
 
   /** And the other half, which was the second stand-in that shipped. */
@@ -491,7 +520,16 @@ describe('/drain — the reply says what is happening and when, not that it aske
    * `\r` AND `\u2028` TOO, not just `\n`. Discord breaks a line on a carriage
    * return and on the Unicode line separator exactly as it does on a newline,
    * so a check for `\n` alone would pass over a reply that is visibly two
-   * lines. The note goes through `inert`, which flattens all of them.
+   * lines.
+   *
+   * WHAT THIS SWEEPS IS THIS REPO'S OWN FRAMES, WHICH IS NOW ALL OF THEM ON THE
+   * SUCCESS PATH. The note used to be the one value in the start reply that
+   * could smuggle a line break in from outside, and `inert` in ./drain.ts
+   * flattened it for that reason; he removed the sentence and both went with it.
+   * The console's reason still rides inside the two refusal frames unflattened
+   * and unedited — that is the deliberate rule those frames follow, not an
+   * oversight here — so what is checked is that no frame this file writes puts a
+   * break in by itself.
    */
   it('never puts a line break in any reply, however it was reached', () => {
     const breaks = /[\n\r\u2028\u2029\v\f]/u
@@ -570,107 +608,23 @@ describe('/drain — the reply says what is happening and when, not that it aske
   })
 
   /**
-   * So the admin sees what players will see without opening the console.
+   * ═══ THE FOUR NOTE CASES THAT STOOD HERE WENT WITH THE SENTENCE ═══
    *
-   * IT IS SHOWN IN A CODE SPAN, WHICH IS THE POINT OF THE NEXT CASE and is
-   * asserted here as the ordinary shape rather than as a special one — a note
-   * this dull renders inert exactly as a hostile one does, so there is no
-   * "escaped" path that only the attack takes.
-   */
-  it('shows the note players at the door are given', () => {
-    expect(replyForSchedule(SCHEDULED)).toContain('Players who try to join are told: `a server update`.')
-  })
-
-  /**
-   * ═══ THE NOTE IS SOMEBODY ELSE'S TEXT INSIDE THE BOT'S OWN SENTENCE ═══
+   * They pinned the echo he removed: that the note was shown at all, that a
+   * masked link, a forged `<t:…>`, a bare url, a quote, a spoiler or a backtick
+   * typed into it came out as characters inside one intact code span, that a
+   * note of nothing but markup was named rather than printed as an empty pair of
+   * backticks, and that a non-string note off the console's JSON did not throw
+   * `.replace is not a function` mid-reply. Every one of those was a claim about
+   * `inert` in ./drain.ts, and `inert` has no caller now: the start reply
+   * interpolates nothing this repo did not write.
    *
-   * IT ARRIVES OFF THE CONSOLE'S JSON AND IT IS THE ONE PART OF THIS REPLY THIS
-   * REPO DID NOT WRITE — typed by an admin, or generated over there — and it
-   * lands after a colon in a paragraph a reader takes to be the bot speaking. A
-   * masked link in it is a live, official-looking link in a bot message; a
-   * `<t:…>` forges a second timestamp beside the real one; a backtick, a quote
-   * or a spoiler restructures the paragraph; and a bare url needs no markup at
-   * all because Discord linkifies one on sight.
-   *
-   * ASSERTED AS "THE SPAN IS INTACT" RATHER THAN AS "THE ATTACK IS GONE". The
-   * markup is deliberately still THERE, character for character — inside
-   * `` ` ` `` Discord renders every one of these literally, and the admin needs
-   * the note to match the console's copy of it. So what this pins is that the
-   * value sits in exactly one code span and closes it exactly once, which is
-   * the property a backtick in the input would break. See `inert` in ./drain.ts
-   * and the original in ../incidents.ts.
+   * WHAT DID NOT GO IS THE COVERAGE UNDERNEATH THEM. The `@everyone` case at the
+   * foot of this file was the only one of the five that was never really about
+   * the note — it is about `allowedMentions` on the SEND, which guards every
+   * reply — so it is repointed at the console's own reason rather than deleted.
+   * See there.
    */
-  it('renders a note carrying markup inert instead of letting it out', () => {
-    const attacks = [
-      '[Appeal your ban here](https://not-the-console.example)',
-      'https://not-the-console.example',
-      '@everyone the server is fine',
-      '<t:0:t> <@444444444444444444> <#555555555555555555>',
-      '> quoted ||spoilered|| **bold**',
-      'a `code` fence ``` and more',
-      'line one\nline two\r\nline three',
-    ]
-
-    for (const note of attacks) {
-      const shown = replyForSchedule({
-        outcome: 'scheduled',
-        status: 201,
-        window: { ...WINDOW, note },
-      })
-
-      // The note is in a span, and the sentence around it is unbroken: exactly
-      // two backticks in the whole reply, opening and closing one span, with
-      // the reply's own full stop after the close.
-      expect(shown.match(/`/gu), note).toHaveLength(2)
-      expect(shown, note).toContain('Players who try to join are told: `')
-      expect(shown, note).toMatch(/`\.$/u)
-
-      // Nothing the note carried escaped the span to become markup of its own,
-      // and nothing it carried put the reply on a second line.
-      expect(shown, note).not.toMatch(/[\n\r\u2028\u2029]/u)
-      expect(
-        shown.startsWith('The server stopped accepting players at <t:1700000000:t>.'),
-        note,
-      ).toBe(true)
-    }
-  })
-
-  /**
-   * A NOTE THAT IS NOTHING BUT MARKUP IS THE SAME AS NO NOTE. Backticks are the
-   * one character `inert` removes rather than renders, so a note of nothing but
-   * backticks leaves an empty span — and a label followed by an empty pair of
-   * them reads as a fact that failed to load, which is worse than saying
-   * plainly that there was nothing to show.
-   */
-  it('says the note is unknown rather than printing an empty pair of backticks', () => {
-    for (const note of ['```', '   ', '\u200b\u200b', '\u0000']) {
-      const shown = replyForSchedule({
-        outcome: 'scheduled',
-        status: 201,
-        window: { ...WINDOW, note },
-      })
-
-      expect(shown, note).toContain(COPY.doorNoteUnknown)
-      expect(shown, note).not.toContain('``')
-    }
-  })
-
-  /**
-   * AND A NOTE THAT IS NOT A STRING DOES NOT THROW MID-REPLY. `note` comes off
-   * another service's JSON body, so `string | null` is a claim rather than a
-   * fact; the old code would have run `.replace` on a number while composing a
-   * message about a server that is going down.
-   */
-  it('names an unreadable note rather than coming apart on it', () => {
-    const shown = replyForSchedule({
-      outcome: 'scheduled',
-      status: 201,
-      window: { ...WINDOW, note: 7 as unknown as string },
-    })
-
-    expect(shown).toContain(COPY.doorNoteUnknown)
-    expect(shown).not.toContain('told:')
-  })
 
   /**
    * A WINDOW WITH UNREADABLE FIELDS IS STILL A WINDOW, and the server is still
@@ -686,7 +640,6 @@ describe('/drain — the reply says what is happening and when, not that it aske
 
     expect(shown).toContain(COPY.doorClosesUnknown)
     expect(shown).toContain(COPY.deployModeUnknown)
-    expect(shown).toContain(COPY.doorNoteUnknown)
     expect(shown).not.toContain('NaN')
     expect(shown).not.toContain('undefined')
   })
@@ -1020,16 +973,34 @@ describe('/drain — through runCommand, the way Discord reaches it', () => {
 })
 
 /**
- * ═══ THE NOTE IS ADMIN-TYPED TEXT AND IT NOTIFIES NOBODY ═══
+ * ═══ BORROWED TEXT IN A REPLY NOTIFIES NOBODY ═══
  *
- * THE CODE SPAN IS NOT THE GUARD, WHICH IS THE WHOLE REASON THIS DESCRIBE
- * EXISTS. `inert` in ./drain.ts wraps the note in `` ` ` `` and the case above
- * pins that the span stays intact around an `@everyone` — but that is a
- * RENDERING rule. Discord decides who a message pings from `allowed_mentions` on
- * the request, before a character of markdown is looked at: `@everyone` inside a
- * code span is displayed literally AND still notifies the guild. A reader of the
- * reply cannot tell those two apart, which is exactly how a note-shaped ping
- * ships.
+ * ═══ THIS USED TO BE ABOUT THE NOTE, AND ITS SUBJECT MOVED RATHER THAN WENT
+ * (2026-09-05) ═══
+ *
+ * IT WAS "a note that says @everyone pings nobody", driven through the admin's
+ * typed note. He then asked for the note out of the reply — "'Players who try to
+ * join are told: a server update.' please remove this text from the drain command
+ * output" — which removed the subject and NOT the risk. `allowedMentions` is on
+ * `responderFor` in ./index.ts, which every reply from every command goes out
+ * through, so deleting these cases with the sentence they happened to use would
+ * have taken the guard's only proof with it.
+ *
+ * THE CONSOLE'S OWN REASON IS THE BORROWED TEXT NOW. `COPY.refused` and
+ * `COPY.cancelRefused` in ./drain.ts interpolate a string written by the
+ * maintenance route — deliberately verbatim, because this bot cannot see what
+ * that route looked at — and it lands inside a sentence a reader takes to be the
+ * bot speaking, exactly as the note did. Nothing escapes it on the way: there is
+ * no `inert` on that path and never was, `ended` adds at most one full stop, and
+ * a console that answers `@everyone the deploy is going` therefore puts those
+ * characters straight into a Discord message.
+ *
+ * A CODE SPAN WOULD NOT HAVE BEEN THE GUARD EITHER, WHICH IS THE WHOLE REASON
+ * THIS DESCRIBE EXISTS. Discord decides who a message pings from
+ * `allowed_mentions` on the request, before a character of markdown is looked
+ * at: `@everyone` inside a code span is displayed literally AND still notifies
+ * the guild. A reader of the reply cannot tell those two apart, which is exactly
+ * how a ping ships without anybody meaning to send one.
  *
  * SO WHAT IS DRIVEN HERE IS THE REAL `responderFor`, against a `ReplyTarget`
  * THAT HAS NO CLIENT ON IT. `createClient` in ../client.ts sets
@@ -1045,7 +1016,7 @@ describe('/drain — through runCommand, the way Discord reaches it', () => {
  * gets NOTIFIED, and the two are decided by different fields. Nothing below
  * depends on the reply staying invisible to the channel.
  */
-describe('/drain — a note that says @everyone pings nobody', () => {
+describe('/drain — the console`s own reason pings nobody', () => {
   /** The interaction reduced to the one thing that matters here: what was sent. */
   function target(): ReplyTarget & { sent: Parameters<ReplyTarget['editReply']>[0][] } {
     const sent: Parameters<ReplyTarget['editReply']>[0][] = []
@@ -1061,34 +1032,55 @@ describe('/drain — a note that says @everyone pings nobody', () => {
     }
   }
 
-  /** Every shape of mention Discord resolves, in one note an admin could type. */
-  const SHOUTED = `@everyone @here <@&${ADMIN_ROLE}> <@${MEMBER}> back in ten`
+  /** Every shape of mention Discord resolves, in one reason the console could send. */
+  const SHOUTED = `@everyone @here <@&${ADMIN_ROLE}> <@${MEMBER}> the deploy is already going`
 
-  it('sends the note unedited and suppresses every mention in it', async () => {
+  it('sends the console`s reason unedited and suppresses every mention in it', async () => {
     const interaction = target()
 
-    await runCommand(invocation({ note: SHOUTED }), cfg(), responderFor(interaction), [
+    await runCommand(invocation(), cfg(), responderFor(interaction), [
       drainCommand(() =>
-        relay({ outcome: 'scheduled', status: 201, window: { ...WINDOW, note: SHOUTED } }),
+        relay({ outcome: 'refused', failure: 'refused', detail: SHOUTED, status: 409 }),
       ),
     ])
 
     const sent = interaction.sent[0]
     if (sent === undefined) throw new Error('the admin was shown nothing at all')
 
-    // The admin's words are still there, character for character, inside the one
-    // span — because the reply's job is to show what players will be shown and
-    // the note has to match the console's copy of itself.
-    expect(sent.content).toContain(`\`${SHOUTED}\``)
+    // The route's words are still there, character for character — the frame
+    // shows a refusal verbatim because this bot cannot see what the route
+    // looked at. `ended` adds the sentence's own full stop and nothing else.
+    expect(sent.content).toBe(`Nothing was scheduled. The console said: ${SHOUTED}.`)
     expect(sent.content).toContain('@everyone')
 
-    // AND THIS IS THE THING THAT MAKES THEM INERT. Not the backticks above it.
+    // AND THIS IS THE THING THAT MAKES THEM INERT. Nothing in the frame is.
     expect(sent.allowedMentions).toEqual({ parse: [] })
   })
 
+  /** The cancel half quotes the route too, and goes out the same seam. */
+  it('suppresses the mentions in a cancel refusal as well', async () => {
+    const interaction = target()
+
+    await runCommand(
+      invocation({ subcommand: DRAIN_CANCEL_SUBCOMMAND }),
+      cfg(),
+      responderFor(interaction),
+      [
+        drainCommand(() =>
+          relay(SCHEDULED, { outcome: 'refused', failure: 'refused', detail: SHOUTED, status: 409 }),
+        ),
+      ],
+    )
+
+    expect(interaction.sent[0]?.content).toBe(
+      `Nothing was cancelled. The console said: ${SHOUTED}.`,
+    )
+    expect(interaction.sent[0]?.allowedMentions).toEqual({ parse: [] })
+  })
+
   /**
-   * THE SAME OPTION ON A REPLY THAT CARRIES NO NOTE AT ALL, so the suppression
-   * is a property of the seam rather than of the one command that needed it.
+   * THE SAME OPTION ON A REPLY THAT BORROWS NOTHING AT ALL, so the suppression
+   * is a property of the seam rather than of the one frame that needed it.
    * `/drain cancel` says one fixed sentence and still goes out suppressed.
    */
   it('suppresses mentions on a reply with nothing borrowed in it', async () => {

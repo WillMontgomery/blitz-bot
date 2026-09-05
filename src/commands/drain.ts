@@ -56,6 +56,13 @@ import type { BotCommand, Invocation } from './command.ts'
  * absent it is OMITTED from the request so the console's own generated wording
  * is used — see `DrainInput.note` in ../ringmaster.ts.
  *
+ * THE OPTION IS STILL HERE AND THE REPLY NO LONGER ECHOES IT (2026-09-05). He
+ * asked for the "Players who try to join are told: …" sentence out of the drain
+ * output and asked for nothing else, so the note keeps travelling to the console
+ * — where a player at a closed door actually reads it — and the admin simply is
+ * not read it back. See `COPY` for his words and `scheduledReply` for what is
+ * left.
+ *
  * ═══ AND THE REPLY REPORTS WHAT CAME BACK ═══
  *
  * `scheduled` or a refusal, never "asked". The console's 409 carries a REASON —
@@ -215,15 +222,29 @@ export const COPY = {
   noteOption: 'What players who try to join are told. Optional',
 
   /**
-   * The three sentences of the start reply, in the order they are spoken.
+   * The two sentences of the start reply, in the order they are spoken.
    *
    * ONE PARAGRAPH AND NOT FOUR LINES. `scheduledReply` joins these with a
    * SPACE, and the reason is his, said three times: multi-line replies "look so
    * weird" and he asked for flowing sentences. So each of these is a whole
    * sentence — capital at the front, full stop at the back — because a fragment
    * that only worked as its own line reads as a stumble once the newline is
-   * gone. The one that ended without a full stop was `doorNote`, which is why
-   * its period is now inside the frame rather than left to the layout.
+   * gone.
+   *
+   * ═══ THERE WERE THREE, AND HE TOOK THE THIRD OUT (2026-09-05) ═══
+   *
+   *   "'Players who try to join are told: a server update.' please remove this
+   *    text from the drain command output"
+   *
+   * So `doorNote` and its `doorNoteUnknown` branch are gone, and with them the
+   * `inert` that rendered somebody else's text safely inside that sentence —
+   * this reply no longer carries a value this repo did not write.
+   *
+   * THE `note` OPTION IS NOT GONE AND WAS NOT WHAT HE ASKED ABOUT. It still
+   * travels to the console and the console still shows it to a player who hits
+   * the closed door; what he deleted is the echo back to the admin who typed it.
+   * `COPY.noteOption` therefore still describes it truthfully — it says what
+   * players are told, which is the option's job and never was this reply's.
    */
   /*
    * PAST TENSE, AND HE GAVE BOTH SENTENCES (2026-09-04):
@@ -275,9 +296,6 @@ export const COPY = {
 
   /** @unwritten admin — the restart sentence when the console did not say what triggers the restart. */
   deployModeUnknown: 'The console did not say what triggers the restart. Check the console.',
-
-  doorNote: (note: string) => `Players who try to join are told: ${note}.`,
-  doorNoteUnknown: 'The console did not say what players at the door are told.',
 
   cancelled: 'The maintenance window has been called off. The server is accepting players again.',
 
@@ -370,100 +388,33 @@ function at(ms: number | null): string | null {
 }
 
 /**
- * A string cut to a budget without splitting a character in half.
+ * ═══ `inert` AND `cut` STOOD HERE, AND THEY WENT WITH THE SENTENCE THEY
+ * GUARDED (2026-09-05) ═══
  *
- * CUT ON CODE POINTS, because a UTF-16 slice can land in the middle of a
- * surrogate pair and leave half a character in the reply. Lifted, with its
- * reason, from `cut` in ../incidents.ts.
+ * NOT SIMPLIFIED AWAY — ORPHANED. `inert` was a deliberate copy of
+ * ../incidents.ts's function of the same name: it wrapped the note in `` ` ` ``
+ * so that a masked link, a forged `<t:…>`, a `> quote`, a `||spoiler||` or a
+ * bare url typed into it rendered as characters rather than as markup inside a
+ * paragraph a reader takes to be the bot speaking, and it flattened `\s+` to one
+ * space so that somebody else's line break could not put half the reply on a
+ * second line. `cut` was its budget, on code points so a UTF-16 slice could not
+ * leave half a character in the reply. Both had exactly one caller — the
+ * `Players who try to join are told: …` sentence — and he asked for that
+ * sentence out, so neither has a caller now.
+ *
+ * WHAT THE ARGUMENT WAS FOR, IN CASE IT IS NEEDED AGAIN: this reply no longer
+ * interpolates ANY value this repo did not write on the success path, so there
+ * is nothing here left to render inert. The refusal frames still carry the
+ * console's own reason — see `ended` and `refusalReply` — and the reason THAT is
+ * safe is not markdown at all: `responderFor` in ./index.ts sends every reply
+ * with `allowedMentions: { parse: [] }`, which is what stops an `@everyone` in
+ * borrowed text from notifying a guild. ./drain.test.ts proves that on the
+ * refusal path now that the note is not there to prove it on.
+ *
+ * IF A BORROWED VALUE EVER RETURNS TO THIS FILE, take ../incidents.ts's `inert`
+ * rather than writing a third opinion about escaping; the day it is exported,
+ * import it.
  */
-function cut(line: string, cap: number): string {
-  if (line.length <= cap) return line
-
-  const room = Math.max(1, cap - 1)
-  let kept = ''
-  for (const point of line) {
-    if (kept.length + point.length > room) break
-    kept += point
-  }
-
-  return `${kept}…`
-}
-
-/**
- * THE NOTE, RENDERED AS ITSELF AND AS NOTHING ELSE.
- *
- * ═══ THIS IS ../incidents.ts's `inert`, AND IT IS COPIED RATHER THAN CALLED ═══
- *
- * NOT A THIRD OPINION ABOUT ESCAPING — THE SAME ONE. `inert` in ../incidents.ts
- * is module-private, and that file is not this agent's to edit, so it cannot be
- * imported today. Everything below is its construction and its reasoning, and
- * the day one of the two is exported the other should be deleted into it. READ
- * THAT ONE FOR THE FULL ARGUMENT; the short version follows, because a copy
- * that does not say why it is shaped this way gets "simplified" back into a
- * hole.
- *
- * ═══ WHAT THE NOTE IS ═══
- *
- * IT IS THE ONLY PART OF THIS REPLY THIS REPO DID NOT WRITE. It is typed by an
- * admin, or generated by the console, and it lands inside a sentence — `Players
- * who try to join are told: …` — which a reader takes to be the bot speaking.
- * A note of `[Appeal your ban here](https://not-the-console.example)` puts a
- * live, official-looking link in a bot message; `<t:0:t>` forges a second
- * timestamp beside the real one; `> quoted`, `||spoilers||` and a backtick
- * restructure the paragraph the previous four lines were just flattened into;
- * and a bare `https://…` needs no markup at all, because Discord linkifies a
- * url on sight.
- *
- * A CODE SPAN AND NOT `escapeMarkdown`, WHICH IS A MEASUREMENT AND NOT A TASTE.
- * discord.js's escaper leaves `> quoted`, `<t:…>` and every other entity form,
- * `@everyone`, and a bare url exactly as it found them — see ../incidents.ts.
- * Inside `` ` ` `` Discord renders all of those literally and linkifies
- * nothing, and it does it without spraying backslashes through words an admin
- * has to compare against the console's copy of the same note.
- *
- * AND IT IS ALSO WHAT KEEPS THE REPLY ON ONE LINE. `\s+` → one space runs over
- * newlines, so a note with a line break in it cannot put the last third of this
- * paragraph on a second line — which is the shape he has asked three times not
- * to be sent. The whole-reply guarantee is asserted in ./drain.test.ts and this
- * is the only place a newline could enter.
- *
- * A BACKTICK IS REMOVED BECAUSE IT WOULD CLOSE THE SPAN and let the rest out as
- * markup. `\p{C}` — control codes, zero-width joiners, the bidi overrides that
- * reorder what a human reads without changing a stored byte — goes with it.
- * `@` AND `<` ARE KEPT: they are inert inside the span, they are ordinary
- * characters in a sentence a person wrote for players, and this string is shown
- * beside the console's own copy of the same note.
- *
- * `DRAIN_NOTE_CAP` IS THE BUDGET, WHICH IS THE CONSOLE'S OWN LIMIT ON THIS
- * FIELD — so a note that passed its schema is never cut here, and a console
- * answering with something far longer cannot spend a Discord message on it. The
- * two backticks sit OUTSIDE the budget rather than inside it, which is the one
- * way this differs from ../incidents.ts: there the cap is an embed field's
- * 1024 and the backticks count against it, here the message's 2000 is nowhere
- * near binding.
- *
- * EMPTY IS THE SAME ANSWER AS ABSENT, and the caller says "the console did not
- * say" instead. A note that is nothing but backticks leaves nothing to put in a
- * span, and an empty pair of them reads as a fact that failed to load.
- *
- * IT TAKES `unknown` AND REFUSES ANYTHING THAT IS NOT A STRING. The note comes
- * off a JSON body another service writes, so `string | null` is a claim rather
- * than a fact, and a numeric one would otherwise throw `.replace is not a
- * function` in the middle of composing a reply about a server that is going
- * down.
- */
-function inert(text: unknown): string | null {
-  if (typeof text !== 'string') return null
-
-  const flattened = text
-    .replace(/\s+/gu, ' ')
-    .replace(/[`\p{C}]/gu, '')
-    .trim()
-
-  if (flattened === '') return null
-
-  return `\`${cut(flattened, DRAIN_NOTE_CAP)}\``
-}
 
 /**
  * What is about to happen, and when, from the window the console handed back.
@@ -492,39 +443,25 @@ function scheduledReply(window: DrainWindow): string {
         : COPY.deployModeUnknown
 
   /**
-   * THE NOTE IS ECHOED BACK SO THE ADMIN SEES WHAT PLAYERS WILL SEE, which is
-   * the one thing about this window they cannot check anywhere else without
-   * opening the console. It is their own text, or the console's generated one,
-   * and not a word of it is rewritten.
-   *
-   * IT IS THE ONE VALUE HERE THIS REPO DID NOT WRITE, so it goes through
-   * `inert` — which renders it exactly as it was typed and renders it as
-   * nothing else. An unreadable or empty one is named rather than printed as an
-   * empty pair of backticks. See `inert`.
-   */
-  const note = inert(window.note)
-
-  /**
    * ONE PARAGRAPH. JOINED WITH A SPACE, AND THERE IS NO NEWLINE IN THIS FILE.
    *
    * THIS USED TO BE `join('\n')` AND IT SHIPPED AS FOUR LINES. He has said
    * three times that multi-line replies "look so weird" and asked for flowing
-   * sentences, so the separator is the one thing here that is not negotiable —
-   * and it is the reason `inert` flattens the note's own whitespace, because
-   * the only newline that could still reach this string would arrive inside
-   * somebody else's text. ./drain.test.ts asserts the absence over the whole
-   * reply rather than over this line, so a newline smuggled into any frame
-   * fails there.
+   * sentences, so the separator is the one thing here that is not negotiable.
+   * ./drain.test.ts asserts the absence of a line break over the whole reply
+   * rather than over this line, so a newline smuggled into any frame — a
+   * refusal carrying the console's own multi-line reason, now that the note is
+   * gone — fails there.
    *
    * AND THE LEAD IS GONE RATHER THAN REWORDED. The four lines opened with a
    * stand-in that told a real admin no wording had been supplied; the reply he
-   * then wrote is these three sentences and it introduces itself.
+   * then wrote introduces itself.
+   *
+   * TWO SENTENCES, NOT THREE. `window.note` is deliberately not read here any
+   * more — see `COPY` for the words he removed and for why the option that
+   * carries it stays.
    */
-  return [
-    closes === null ? COPY.doorClosesUnknown : COPY.doorClosesAt(closes),
-    restart,
-    note === null ? COPY.doorNoteUnknown : COPY.doorNote(note),
-  ].join(' ')
+  return [closes === null ? COPY.doorClosesUnknown : COPY.doorClosesAt(closes), restart].join(' ')
 }
 
 /**

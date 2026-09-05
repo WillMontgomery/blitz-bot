@@ -498,17 +498,21 @@ export interface ReplyTarget {
 /**
  * NOTHING A COMMAND ANSWERS WITH NOTIFIES ANYBODY, SAID AT THE SEND.
  *
- * ═══ A CODE SPAN IS NOT THE GUARD PEOPLE ASSUME IT IS ═══
+ * ═══ AND NOTHING IN A FRAME IS THE GUARD, WHICH IS THE ASSUMPTION TO KILL ═══
  *
- * `/drain`'s reply carries an admin's note — somebody else's typed text, landing
- * inside a sentence a reader takes to be the bot speaking — and `inert` in
- * ./drain.ts wraps it in `` ` ` `` so that a link, a `<t:…>` or a `> quote` in
- * it renders as characters instead of as markup. THAT IS A RENDERING RULE AND
- * NOT A NOTIFICATION RULE. Discord decides who a message pings from the
- * `allowed_mentions` field on the REQUEST, before any markdown is looked at:
- * `@everyone` inside a code span is displayed literally AND still notifies the
- * guild, exactly as it would bare. The span makes the note look inert, which is
- * the reason to be explicit here rather than to rely on how it reads.
+ * `/drain`'s refusals carry the console's own reason — somebody else's text,
+ * landing inside a sentence a reader takes to be the bot speaking, and quoted
+ * verbatim on purpose because that command cannot see what the route looked at.
+ * A reason of `@everyone the deploy is going` is therefore an `@everyone` in a
+ * Discord message, and NO AMOUNT OF RENDERING CARE ANYWHERE UPSTREAM CHANGES
+ * THAT. Discord decides who a message pings from the `allowed_mentions` field on
+ * the REQUEST, before any markdown is looked at: `@everyone` inside a code span
+ * is displayed literally AND still notifies the guild, exactly as it would bare.
+ *
+ * THAT DISTINCTION WAS WRITTEN AGAINST `/drain`'s NOTE, which used to be echoed
+ * back to the admin inside `` ` ` `` by an `inert` in ./drain.ts. He asked for
+ * that sentence out of the reply on 2026-09-05 and both went with it; the reason
+ * to be explicit here did not, because it was never the span doing the work.
  *
  * ═══ AND THE CLIENT-WIDE DEFAULT IS BORROWED, NOT STATED ═══
  *
@@ -606,9 +610,9 @@ function visibility(onlyInvoker: boolean): { flags?: MessageFlags.Ephemeral } {
  *
  * THE TWO THAT CARRY TEXT ALSO CARRY `allowedMentions`, STATED HERE RATHER THAN
  * INHERITED. See `noMentions` for why the client-wide default is not something
- * this function may lean on, and for why `/drain`'s code span is not the thing
- * that stops an `@everyone` in an admin's note. The defer carries no text and
- * takes none.
+ * this function may lean on, and for why this is the only thing that stops an
+ * `@everyone` in the console's own reason reaching a guild through `/drain`'s
+ * refusal frames. The defer carries no text and takes none.
  */
 export function responderFor(interaction: ReplyTarget): Responder {
   return {
