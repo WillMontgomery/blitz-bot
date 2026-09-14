@@ -9,9 +9,7 @@ import {
 } from '../ddb.ts'
 import { log } from '../log.ts'
 import {
-  capped,
   createDrainer,
-  DRAIN_NOTE_CAP,
   type CancelResult,
   type DrainFailure,
   type Drainer,
@@ -63,22 +61,16 @@ import { COPY as COMMAND_COPY, type BotCommand, type Invocation } from './comman
  * have NO other options, so `/drain <note>` and `/drain cancel` cannot be the
  * same command. Of the shapes that are available, subcommands are the only one
  * where "cancel" is a thing an admin picks by name instead of a magic value
- * typed into a free-text box — and a note that happens to read "cancel" must
- * never call off a window.
+ * typed into a free-text box.
  *
- * ═══ THE NOTE IS THE ADMIN'S WORDS OR NOBODY'S ═══
+ * ═══ THERE IS NO NOTE (2026-09-14) ═══
  *
- * `note` is shown to players turned away at the door, so this file neither
- * invents one nor edits one. It goes out exactly as typed, and when it is
- * absent it is OMITTED from the request so the console's own generated wording
- * is used — see `DrainInput.note` in ../ringmaster.ts.
- *
- * THE OPTION IS STILL HERE AND THE REPLY NO LONGER ECHOES IT (2026-09-05). He
- * asked for the "Players who try to join are told: …" sentence out of the drain
- * output and asked for nothing else, so the note keeps travelling to the console
- * — where a player at a closed door actually reads it — and the admin simply is
- * not read it back. See `COPY` for his words and `scheduledReply` for what is
- * left.
+ * `/drain start` used to take a `note` for players turned away at the door. He
+ * asked for the option out entirely, so nothing here sends one to the console or
+ * writes one on a dev row. A prod player at the door reads the console's own
+ * generated wording, which is what an absent note always got, and a dev player
+ * reads the game's default. The reply had already stopped echoing the note on
+ * 2026-09-05; see `COPY`.
  *
  * ═══ AND THE REPLY REPORTS WHAT CAME BACK ═══
  *
@@ -91,14 +83,13 @@ import { COPY as COMMAND_COPY, type BotCommand, type Invocation } from './comman
  */
 
 /**
- * The names Discord registers, and the name the note is read out of.
+ * The names Discord registers.
  *
  * ONE CONSTANT EACH SO THE TWO HALVES CANNOT DRIFT, exactly as
  * `STICKY_TEXT_OPTION` is one: this file declares them and `invocationOf` in
  * ./index.ts has to ask Discord for them by the same strings. A rename in only
- * one place is not a compile error — it is a `/drain` that reports an empty
- * note however much was typed, or a `/drain cancel` that falls through to the
- * "which half did you mean" refusal.
+ * one place is not a compile error. It is a `/drain cancel` that falls through
+ * to the "which half did you mean" refusal.
  *
  * `cancel` IS THE OWNER'S WORD, FROM THE BRIEF. `start` IS NOT.
  */
@@ -108,7 +99,6 @@ import { COPY as COMMAND_COPY, type BotCommand, type Invocation } from './comman
  */
 export const DRAIN_START_SUBCOMMAND = 'start'
 export const DRAIN_CANCEL_SUBCOMMAND = 'cancel'
-export const DRAIN_NOTE_OPTION = 'note'
 
 /**
  * The `server` option and its two choices, which are the owner's words.
@@ -139,9 +129,6 @@ export const DRAIN_SERVER_DEV = 'dev'
 export interface DrainFields {
   /** Which subcommand was invoked. `interaction.options.getSubcommand(false)`. */
   readonly subcommand?: string | null
-
-  /** The text of the `note` option, when one was supplied. */
-  readonly note?: string | null
 
   /** The value of the `server` option, when one was supplied. Absent is prod. */
   readonly server?: string | null
@@ -254,9 +241,6 @@ export const COPY = {
   /** @unwritten picker — the `/drain cancel` subcommand, in the picker. */
   cancelDescription: 'Call off the maintenance window',
 
-  /** @unwritten picker — the `note` option of `/drain start`, in the picker. */
-  noteOption: 'What players who try to join are told. Optional',
-
   /** @unwritten picker - the `server` option of `/drain start` and `/drain cancel`, in the picker. */
   serverOption: 'Which server, prod or dev. Optional, prod when left out',
 
@@ -279,11 +263,8 @@ export const COPY = {
    * `inert` that rendered somebody else's text safely inside that sentence —
    * this reply no longer carries a value this repo did not write.
    *
-   * THE `note` OPTION IS NOT GONE AND WAS NOT WHAT HE ASKED ABOUT. It still
-   * travels to the console and the console still shows it to a player who hits
-   * the closed door; what he deleted is the echo back to the admin who typed it.
-   * `COPY.noteOption` therefore still describes it truthfully — it says what
-   * players are told, which is the option's job and never was this reply's.
+   * THE `note` OPTION WENT NINE DAYS LATER. He asked for it out of `/drain`
+   * entirely on 2026-09-14; see the head of this file.
    */
   /*
    * PAST TENSE, AND HE GAVE BOTH SENTENCES (2026-09-04):
@@ -516,8 +497,7 @@ function scheduledReply(window: DrainWindow): string {
    * then wrote introduces itself.
    *
    * TWO SENTENCES, NOT THREE. `window.note` is deliberately not read here any
-   * more — see `COPY` for the words he removed and for why the option that
-   * carries it stays.
+   * more. See `COPY` for the words he removed.
    */
   return [closes === null ? COPY.doorClosesUnknown : COPY.doorClosesAt(closes), restart].join(' ')
 }
@@ -572,22 +552,6 @@ function subcommandOf(invocation: Invocation & DrainFields): string | null {
   const name = invocation.subcommand
 
   return typeof name === 'string' && name !== '' ? name : null
-}
-
-/**
- * The note as it arrived, or null.
- *
- * NOT TRIMMED, NOT DEFAULTED, NOT CHECKED FOR EMPTINESS BEYOND `''`. The
- * console's schema trims and caps it and the relay applies the same cap before
- * sending; a third opinion here about the admin's own words would be a third
- * place for them to differ. An empty string is treated as no note, so that an
- * option supplied blank gets the console's generated wording rather than
- * putting nothing on the door.
- */
-function noteOf(invocation: Invocation & DrainFields): string | null {
-  const note = invocation.note
-
-  return typeof note === 'string' && note !== '' ? note : null
 }
 
 /**
@@ -689,9 +653,6 @@ function devLevel(failure: DdbFailure): 'warn' | 'error' {
  *
  * THE REPLY IS PROD'S, READ OFF THE ROW THAT WAS WRITTEN. The door closes now and
  * the restart waits for the box to empty, which is what `scheduledReply` says.
- *
- * THE NOTE IS CAPPED BY THE RELAY'S OWN `capped`, so a dev note is trimmed and
- * cut exactly as a prod one is before the console ever sees it.
  */
 async function startDev(invocation: Invocation & DrainFields, dev: DevMaintenance): Promise<string> {
   const where = { actor: invocation.userId, table: dev.tables.maintenance }
@@ -699,7 +660,6 @@ async function startDev(invocation: Invocation & DrainFields, dev: DevMaintenanc
   const opened = await dev.maintenanceWriter.open({
     createdBy: invocation.userId,
     createdByName: nameOf(invocation),
-    note: capped(noteOf(invocation), DRAIN_NOTE_CAP),
   })
 
   if (opened.ok) {
@@ -711,7 +671,7 @@ async function startDev(invocation: Invocation & DrainFields, dev: DevMaintenanc
 
     return scheduledReply({
       state: opened.value.state,
-      note: opened.value.note ?? null,
+      note: null,
       drainStartsAt: opened.value.drainStartsAt,
       deployMode: opened.value.deployMode,
       deployAt: opened.value.deployAt,
@@ -848,32 +808,7 @@ export function drainCommand(
           type: ApplicationCommandOptionType.Subcommand,
           name: DRAIN_START_SUBCOMMAND,
           description: COPY.startDescription,
-
-          options: [
-            {
-              type: ApplicationCommandOptionType.String,
-
-              // The name `invocationOf` has to read the note out of; see
-              // `DRAIN_NOTE_OPTION`.
-              name: DRAIN_NOTE_OPTION,
-              description: COPY.noteOption,
-
-              // OPTIONAL, AND THAT IS THE CONSOLE'S DESIGN RATHER THAN
-              // LENIENCE. `scheduleSchema` says a note is "optional and usually
-              // absent", because a maintenance window is always the same thing
-              // and asking somebody to type that every time produces either the
-              // same sentence or an empty one. An absent note gets the
-              // console's generated wording, which is written by whoever wrote
-              // the console rather than invented here.
-              required: false,
-
-              // Discord refuses the input in the client at the console's own
-              // limit, so an over-long note is a thing an admin is stopped from
-              // typing rather than a thing that is silently cut afterwards.
-              maxLength: DRAIN_NOTE_CAP,
-            },
-            serverOptionData(),
-          ],
+          options: [serverOptionData()],
         },
         {
           type: ApplicationCommandOptionType.Subcommand,
@@ -897,14 +832,13 @@ export function drainCommand(
     /**
      * EPHEMERAL. Two reasons, and the second is the one that matters.
      *
-     * The reply names the admin's note and the console's refusals, which are
-     * operational detail rather than an announcement — and the announcement
+     * The reply names the console's refusals, which are operational detail
+     * rather than an announcement, and the announcement
      * already exists: ../maintenance.ts posts to the maintenance channel when
      * the window reaches `draining`, `deploying` and a CONFIRMED `complete`, in
      * the owner's chosen shape, for players rather than for admins. A visible
      * reply here would be a second notice of the same outage in a different
-     * channel, carrying the console's refusal text and the admin's typed note,
-     * neither of which is for players.
+     * channel, carrying the console's refusal text, which is not for players.
      *
      * THE DRAIN-START NOTICE IS THE MAINTENANCE CHANNEL'S AND NOT THIS REPLY'S,
      * which is worth stating because the rule it follows was reversed. He used
@@ -958,12 +892,7 @@ export function drainCommand(
        * call carrying nobody is refused before anything is written. See
        * `SERVICE_ACTOR_HEADER` in ../ringmaster.ts.
        */
-      return replyForSchedule(
-        await drainer.schedule({
-          actorDiscordId: invocation.userId,
-          note: noteOf(invocation),
-        }),
-      )
+      return replyForSchedule(await drainer.schedule({ actorDiscordId: invocation.userId }))
     },
   }
 }

@@ -1927,7 +1927,6 @@ describe('the maintenance writer', () => {
     const result = await dev(fake).maintenanceWriter.open({
       createdBy: '280000000000000000',
       createdByName: 'Admin One',
-      note: 'back in ten',
     })
 
     const item = {
@@ -1936,7 +1935,6 @@ describe('the maintenance writer', () => {
       createdAt: 1_700_000_000_000,
       createdBy: '280000000000000000',
       createdByName: 'Admin One',
-      note: 'back in ten',
       drainStartsAt: 1_700_000_000_000,
       deployMode: 'when-empty',
       deployAt: null,
@@ -1955,17 +1953,6 @@ describe('the maintenance writer', () => {
     })
 
     expect(result).toEqual({ ok: true, value: item })
-  })
-
-  /** The contract writes `note` only if one was given. Empty is not given. */
-  it('leaves the note off the row rather than writing it empty', async () => {
-    for (const note of [null, undefined, '']) {
-      const fake = fakeDocument()
-
-      await dev(fake).maintenanceWriter.open({ createdBy: '1', createdByName: 'A', note })
-
-      expect((fake.calls[0]?.input as PutCommandInput).Item, String(note)).not.toHaveProperty('note')
-    }
   })
 
   /** A live window is somebody else's, and refusing it is DynamoDB's job, not a read's. */

@@ -385,11 +385,8 @@ function str(value: unknown): string | null {
 const REASON_CAP = 300
 const PLAYER_NAME_CAP = 120
 
-/**
- * Trimmed, empty as null, and cut at `cap`. Exported so `/drain server:dev`,
- * which writes its note to the row itself, caps it exactly as the relay does.
- */
-export function capped(value: string | null | undefined, cap: number): string | null {
+/** Trimmed, empty as null, and cut at `cap`. */
+function capped(value: string | null | undefined, cap: number): string | null {
   const trimmed = value?.trim()
   if (!trimmed) return null
   return trimmed.length <= cap ? trimmed : trimmed.slice(0, cap)
@@ -874,30 +871,10 @@ export const MAINTENANCE_CANCEL_PATH = '/api/maintenance/cancel'
 export const DRAIN_TIMEOUT_MS = 20_000
 
 /**
- * The console's own cap on the note, applied before the request rather than
- * discovered from a 400.
- *
- * TWO HUNDRED, FROM `scheduleSchema`'s `z.string().trim().max(200)`. It is also
- * declared as `maxLength` on the Discord option (see ./commands/drain.ts), so
- * an admin is stopped in the client rather than after the fact; this cap is for
- * a payload that did not come through that client.
- *
- * NOTHING ELSE IS DONE TO THE TEXT, AND THAT IS A RULE RATHER THAN AN OMISSION.
- * The note is shown to players turned away at the door, so it is the admin's
- * words. The console's schema trims and caps and does nothing else, and a
- * second opinion on this side about what an admin is allowed to say is a second
- * place for the two to disagree. It does not reach a shell either: unlike a
- * kick reason, which becomes an argument on the game box and is base64-encoded
- * over there for exactly that reason, the note is written to a DynamoDB row and
- * read back by the game.
- */
-export const DRAIN_NOTE_CAP = 200
-
-/**
  * The two settings `/drain` does not offer, and what they mean.
  *
- * `drainInMinutes: 0` — THE DOOR CLOSES NOW. `/drain` takes a note and nothing
- * else, so there is no time to schedule for; the console's own scheduling card
+ * `drainInMinutes: 0` — THE DOOR CLOSES NOW. `/drain` takes no time, so there
+ * is none to schedule for; the console's own scheduling card
  * is where an operator picks one. A command whose entire purpose is "stop
  * letting people in, we are shipping" that then waited twenty minutes would be
  * a worse version of the page that already exists.
@@ -976,7 +953,7 @@ export type DrainFailure =
 export interface DrainWindow {
   /** `scheduled`, on a window that was just written. */
   state: string | null
-  /** What players are shown at the door: the admin's words, or the console's. */
+  /** What players are shown at the door, in the console's own wording. */
   note: string | null
   /** When the server stops accepting players. Epoch ms. */
   drainStartsAt: number | null
@@ -1019,20 +996,6 @@ export type CancelResult = { outcome: 'cancelled'; status: number } | DrainRefus
 export interface DrainInput {
   /** The Discord id of the admin to attribute it to. See {@link SERVICE_ACTOR_HEADER}. */
   actorDiscordId: string
-
-  /**
-   * What players turned away at the door are shown, in the admin's own words,
-   * or null.
-   *
-   * NULL IS OMITTED FROM THE BODY RATHER THAN REPLACED, which is `KickInput`'s
-   * `reason` rule and is here for a stronger version of the same reason. The
-   * console GENERATES a note when none is sent — `scheduleSchema` says so, and
-   * says why: a maintenance window is always the same thing, and asking
-   * somebody to type that every time produces either the same sentence or an
-   * empty one. A default invented on this side would be a second wording for
-   * the same silence, shown to players, written by nobody who was asked.
-   */
-  note?: string | null
 
   /** Test seams. See {@link DRAIN_IN_MINUTES}; the command passes neither. */
   drainInMinutes?: number
@@ -1259,15 +1222,13 @@ export function createDrainer(options: DrainerOptions): Drainer {
 
   return {
     async schedule(input) {
-      const note = capped(input.note, DRAIN_NOTE_CAP)
-
       const delivered = await post(
         send,
         `${options.baseUrl}${MAINTENANCE_PATH}`,
         headers(input.actorDiscordId),
         /**
-         * `note` IS OMITTED WHEN ABSENT so that the console's own generated
-         * wording is what players see. See {@link DrainInput.note}.
+         * NO `note`. `/drain` has had no option for one since 2026-09-14, so
+         * the console's own generated wording is what players see.
          *
          * NO `targetRef` OR `targetSha`, EVER. Those switch the box to another
          * branch, and the console pairs them with a commit id read off a page
@@ -1280,7 +1241,6 @@ export function createDrainer(options: DrainerOptions): Drainer {
         JSON.stringify({
           drainInMinutes: input.drainInMinutes ?? DRAIN_IN_MINUTES,
           deployMode: input.deployMode ?? DRAIN_DEPLOY_MODE,
-          ...(note === null ? {} : { note }),
         }),
         timeoutMs,
       )

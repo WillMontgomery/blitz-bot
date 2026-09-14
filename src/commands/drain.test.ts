@@ -12,7 +12,6 @@ import type { Config } from '../config.ts'
 import { createDevMaintenance, type DocumentClient } from '../ddb.ts'
 import { setSink } from '../log.ts'
 import {
-  DRAIN_NOTE_CAP,
   type CancelResult,
   type Drainer,
   type DrainFailure,
@@ -29,7 +28,6 @@ import {
   COPY,
   drainCommand,
   DRAIN_CANCEL_SUBCOMMAND,
-  DRAIN_NOTE_OPTION,
   DRAIN_SERVER_DEV,
   DRAIN_SERVER_OPTION,
   DRAIN_SERVER_PROD,
@@ -50,7 +48,7 @@ import { responderFor, type ReplyTarget } from './index.ts'
  * ASKED FOR — nothing else. Every HTTP concern lives in ../ringmaster.ts and is
  * exercised in ../ringmaster.test.ts against an injected `fetch`; the relay here
  * is an object literal that writes down what it was handed, so these cases are
- * about the gate, the two halves, the note, and which of the eight replies comes
+ * about the gate, the two halves, and which of the eight replies comes
  * back.
  *
  * THE REFUSALS MATTER MORE THAN THE HAPPY PATH, AND MORE THAN THEY DO ANYWHERE
@@ -128,10 +126,10 @@ function cfg(over: Partial<Config> = {}): Config {
 /**
  * An invocation as it arrives today, plus the two fields this command needs.
  *
- * `subcommand` AND `note` ARE SPREAD IN rather than named in the base, which is
- * the shape the command reads them with and the reason it can be written before
- * ./command.ts carries them: an invocation without either is a case below, not
- * a compile error.
+ * THE `DrainFields` ARE SPREAD IN rather than named in the base, which is the
+ * shape the command reads them with and the reason it can be written before
+ * ./command.ts carries them: an invocation without them is a case below, not a
+ * compile error.
  */
 function invocation(over: Partial<Invocation & DrainFields> = {}): Invocation & DrainFields {
   return {
@@ -143,7 +141,6 @@ function invocation(over: Partial<Invocation & DrainFields> = {}): Invocation & 
     channelId: CHANNEL,
     text: null,
     subcommand: DRAIN_START_SUBCOMMAND,
-    note: null,
     server: null,
     userDisplayName: 'A Member',
     ...over,
@@ -230,11 +227,13 @@ function everyFrame(): string[] {
   ]
 }
 
-/** What the relay was asked to do, in order. */
+/**
+ * What the relay was asked to do, in order. The whole input is spread in, so a
+ * field the command starts sending is a failure wherever these are compared.
+ */
 interface RelayCall {
   readonly kind: 'schedule' | 'cancel'
   readonly actorDiscordId: string
-  readonly note: string | null | undefined
 }
 
 interface FakeRelay extends Drainer {
@@ -251,12 +250,12 @@ function relay(
     calls,
 
     schedule: (input) => {
-      calls.push({ kind: 'schedule', actorDiscordId: input.actorDiscordId, note: input.note })
+      calls.push({ kind: 'schedule', ...input })
       return Promise.resolve(schedule)
     },
 
     cancel: (input) => {
-      calls.push({ kind: 'cancel', actorDiscordId: input.actorDiscordId, note: null })
+      calls.push({ kind: 'cancel', ...input })
       return Promise.resolve(cancel)
     },
   }
@@ -417,25 +416,16 @@ describe('/drain — how it is registered, which is half of the guard', () => {
     }
   })
 
-  /**
-   * THE NOTE IS OPTIONAL AND IS CAPPED IN THE CLIENT. Optional because
-   * `scheduleSchema` says a note is usually absent and the console writes its
-   * own; capped at the console's own limit so an admin is stopped from typing
-   * an over-long one rather than having it silently cut afterwards.
-   */
-  it('declares the note as an optional string at the console`s own limit', () => {
+  /** No note since 2026-09-14, at his request. Starting takes which server and nothing else. */
+  it('gives the start half the server option and nothing else', () => {
     const start = (drain.data.options ?? []).find(
       (one) => one.name === DRAIN_START_SUBCOMMAND,
     )
 
-    if (start === undefined || !('options' in start)) throw new Error('no start subcommand')
+    if (start === undefined) throw new Error('no start subcommand')
 
-    const note = (start.options ?? [])[0]
-
-    expect(note?.name).toBe(DRAIN_NOTE_OPTION)
-    expect(note?.type).toBe(ApplicationCommandOptionType.String)
-    expect(note && 'required' in note ? note.required : undefined).toBe(false)
-    expect(note && 'maxLength' in note ? note.maxLength : undefined).toBe(DRAIN_NOTE_CAP)
+    const options = ('options' in start ? (start.options ?? []) : []) as readonly ApplicationCommandOptionData[]
+    expect(options.map((one) => one.name)).toEqual([DRAIN_SERVER_OPTION])
   })
 
   /** Cancelling takes nothing but which server. There is only ever one window on each. */
@@ -476,7 +466,7 @@ describe('/drain — what the console is asked for, and by whom', () => {
     const fake = relay()
     await answerFor(fake)
 
-    expect(fake.calls).toEqual([{ kind: 'schedule', actorDiscordId: MEMBER, note: null }])
+    expect(fake.calls).toEqual([{ kind: 'schedule', actorDiscordId: MEMBER }])
   })
 
   /**
@@ -492,40 +482,11 @@ describe('/drain — what the console is asked for, and by whom', () => {
     expect(fake.calls[0]?.actorDiscordId).toBe('999999999999999999')
   })
 
-  /** The admin's words, unedited. Players at the door are shown them. */
-  it('passes the note through exactly as it was typed', async () => {
-    const fake = relay()
-    const note = 'back in ~10 min — shipping the loot fix. sorry!'
-    await answerFor(fake, { note })
-
-    expect(fake.calls[0]?.note).toBe(note)
-  })
-
-  /**
-   * AN ABSENT NOTE IS ABSENT, NOT A SENTENCE THIS FILE MADE UP. The console
-   * generates one — that wording belongs to whoever wrote the console — and a
-   * default invented here would be a second wording for the same silence, shown
-   * to players.
-   */
-  it('sends no note at all when none was typed, rather than inventing one', async () => {
-    const fake = relay()
-    await answerFor(fake, { note: null })
-
-    expect(fake.calls[0]?.note).toBeNull()
-  })
-
-  it('treats an option supplied blank as no note', async () => {
-    const fake = relay()
-    await answerFor(fake, { note: '' })
-
-    expect(fake.calls[0]?.note).toBeNull()
-  })
-
   it('calls the window off when the cancel half was invoked', async () => {
     const fake = relay()
     await answerFor(fake, { subcommand: DRAIN_CANCEL_SUBCOMMAND })
 
-    expect(fake.calls).toEqual([{ kind: 'cancel', actorDiscordId: MEMBER, note: null }])
+    expect(fake.calls).toEqual([{ kind: 'cancel', actorDiscordId: MEMBER }])
   })
 
   /**
@@ -603,9 +564,8 @@ describe('/drain — the reply says what is happening and when, not that it aske
    * would also fail on a wording change he asked for later — and this is the
    * thing he asked for, stated so it cannot be undone by accident.
    *
-   * THE OPTION IS NOT AFFECTED. `/drain start` still sends the note to the
-   * console, which is what a player at the closed door reads; the case that
-   * proves it is "passes the note through exactly as it was typed", above.
+   * THE CONSOLE STILL PUTS ITS OWN NOTE ON THE WINDOW, which is why `SCHEDULED`
+   * carries one. `/drain` has sent none since 2026-09-14.
    */
   it('never reads the note back to the admin, however the window arrived', () => {
     for (const note of ['a server update', 'back in ten', '', null]) {
@@ -635,8 +595,7 @@ describe('/drain — the reply says what is happening and when, not that it aske
    * reply he was sent had FOUR LINES in it. So this is asserted over every
    * frame this command can produce and not only over the happy path, because
    * the next newline will arrive in whichever one nobody was looking at: a
-   * refusal carrying the console's own multi-line reason, or a note somebody
-   * typed with a line break in it.
+   * refusal carrying the console's own multi-line reason.
    *
    * `\r` AND `\u2028` TOO, not just `\n`. Discord breaks a line on a carriage
    * return and on the Unicode line separator exactly as it does on a newline,
@@ -1049,8 +1008,8 @@ describe('/drain server:dev, the dev box, with no console anywhere in it', () =>
       ).toBe(COPY.cancelled)
 
       expect(fake.calls, String(server)).toEqual([
-        { kind: 'schedule', actorDiscordId: MEMBER, note: null },
-        { kind: 'cancel', actorDiscordId: MEMBER, note: null },
+        { kind: 'schedule', actorDiscordId: MEMBER },
+        { kind: 'cancel', actorDiscordId: MEMBER },
       ])
 
       expect(table.asked(), String(server)).toBe(0)
@@ -1069,7 +1028,7 @@ describe('/drain server:dev, the dev box, with no console anywhere in it', () =>
 
     const shown = await answerFor(
       fake,
-      { server: DRAIN_SERVER_DEV, userDisplayName: 'Admin Nick', note: '  back in ten  ' },
+      { server: DRAIN_SERVER_DEV, userDisplayName: 'Admin Nick' },
       cfg(),
       table.devFor,
     )
@@ -1085,7 +1044,6 @@ describe('/drain server:dev, the dev box, with no console anywhere in it', () =>
             createdAt: NOW,
             createdBy: MEMBER,
             createdByName: 'Admin Nick',
-            note: 'back in ten',
             drainStartsAt: NOW,
             deployMode: 'when-empty',
             deployAt: null,
@@ -1110,34 +1068,17 @@ describe('/drain server:dev, the dev box, with no console anywhere in it', () =>
     expect(fake.calls).toEqual([])
   })
 
-  /** Prod's cap, applied by prod's own function. */
-  it('caps the note at the console`s limit, as the prod relay does', async () => {
+  /**
+   * NO SECRET IS NO OBSTACLE. The dev path never asks the console, so an unset
+   * `COMMAND_SECRET` cannot be what stops it.
+   */
+  it('needs no COMMAND_SECRET', async () => {
     const table = devTable()
 
-    await answerFor(relay(), { server: DRAIN_SERVER_DEV, note: 'x'.repeat(DRAIN_NOTE_CAP + 50) }, cfg(), table.devFor)
+    const shown = await answerFor(null, { server: DRAIN_SERVER_DEV }, cfg({ commandSecret: null }), table.devFor)
 
-    expect((table.calls[0]?.input as PutCommandInput).Item?.note).toBe('x'.repeat(DRAIN_NOTE_CAP))
-  })
-
-  /**
-   * NO NOTE IS NO ATTRIBUTE, AND NO SECRET IS NO OBSTACLE. The contract writes
-   * `note` only if one was given, and the dev path never asks the console, so an
-   * unset `COMMAND_SECRET` cannot be what stops it.
-   */
-  it('leaves the note off the row when none was typed, and needs no COMMAND_SECRET', async () => {
-    for (const note of [null, '', '   ']) {
-      const table = devTable()
-
-      const shown = await answerFor(
-        null,
-        { server: DRAIN_SERVER_DEV, note },
-        cfg({ commandSecret: null }),
-        table.devFor,
-      )
-
-      expect((table.calls[0]?.input as PutCommandInput).Item, String(note)).not.toHaveProperty('note')
-      expect(shown, String(note)).not.toBe(COPY.noCredential)
-    }
+    expect(table.calls.map((call) => call.op)).toEqual(['put'])
+    expect(shown).not.toBe(COPY.noCredential)
   })
 
   it('names the window after the invoker, and after their id when the seam carried no name', async () => {

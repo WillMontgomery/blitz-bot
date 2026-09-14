@@ -8,7 +8,6 @@ import {
   createRingmaster,
   DRAIN_DEPLOY_MODE,
   DRAIN_IN_MINUTES,
-  DRAIN_NOTE_CAP,
   DRAIN_TIMEOUT_MS,
   KICK_ATTEMPTS,
   KICK_PATH,
@@ -606,7 +605,7 @@ describe('/drain — the request the console actually receives', () => {
 
   it('never puts the secret in the url or the body', async () => {
     const { fetch, calls } = replies(answer(201, SCHEDULED))
-    await drainer(fetch).schedule({ actorDiscordId: ADMIN, note: 'shipping the loot fix' })
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN })
 
     expect(calls[0]?.url).not.toContain(SECRET)
     expect(calls[0]?.init.body).not.toContain(SECRET)
@@ -634,7 +633,7 @@ describe('/drain — the request the console actually receives', () => {
    */
   it('never asks for a branch switch', async () => {
     const { fetch, calls } = replies(answer(201, SCHEDULED))
-    await drainer(fetch).schedule({ actorDiscordId: ADMIN, note: 'x' })
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN })
 
     const body = sent(calls)
     expect(body).not.toHaveProperty('targetRef')
@@ -642,51 +641,14 @@ describe('/drain — the request the console actually receives', () => {
   })
 
   /**
-   * THE NOTE IS THE ADMIN'S WORDS. Players turned away at the door are shown
-   * it, so it goes out exactly as typed — not trimmed into a house style, not
-   * capitalised, not summarised.
+   * NO NOTE, EVER. The owner removed the option on 2026-09-14, so the console
+   * writes its own wording for players at the door on every window.
    */
-  it('sends the note verbatim when there is one', async () => {
-    const note = 'back in ~10 min — shipping the loot fix. sorry!'
+  it('never sends a note, so the console writes its own', async () => {
     const { fetch, calls } = replies(answer(201, SCHEDULED))
-    await drainer(fetch).schedule({ actorDiscordId: ADMIN, note })
-
-    expect(sent(calls)).toEqual({ drainInMinutes: 0, deployMode: 'when-empty', note })
-  })
-
-  /**
-   * OMITTED RATHER THAN NULL OR INVENTED, which is the same rule the kick's
-   * `reason` follows and matters more here. `scheduleSchema` says the console
-   * GENERATES this when it is absent, because a maintenance window is always
-   * the same thing; a default written on this side would be a second wording
-   * for the same silence, shown to players, written by nobody who was asked.
-   */
-  it('omits the note entirely when there is none, so the console writes its own', async () => {
-    const { fetch, calls } = replies(answer(201, SCHEDULED))
-    await drainer(fetch).schedule({ actorDiscordId: ADMIN, note: null })
+    await drainer(fetch).schedule({ actorDiscordId: ADMIN })
 
     expect(sent(calls)).not.toHaveProperty('note')
-  })
-
-  it('drops a whitespace-only note rather than putting blanks on the door', async () => {
-    const { fetch, calls } = replies(answer(201, SCHEDULED))
-    await drainer(fetch).schedule({ actorDiscordId: ADMIN, note: '   ' })
-
-    expect(sent(calls)).not.toHaveProperty('note')
-  })
-
-  /**
-   * The console's `scheduleSchema` accepts 200. Truncating keeps the drain; a
-   * zod message back would lose it over the length of a sentence. Discord also
-   * refuses the input at this length in the client, so this is the belt behind
-   * that.
-   */
-  it('truncates a note too long for the console rather than losing the drain', async () => {
-    const { fetch, calls } = replies(answer(201, SCHEDULED))
-    await drainer(fetch).schedule({ actorDiscordId: ADMIN, note: 'x'.repeat(400) })
-
-    expect(sent(calls).note).toHaveLength(DRAIN_NOTE_CAP)
-    expect(DRAIN_NOTE_CAP).toBe(200)
   })
 })
 

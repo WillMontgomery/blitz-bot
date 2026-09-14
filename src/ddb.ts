@@ -853,8 +853,6 @@ export interface MaintenanceOpenInput {
   createdBy: string
   /** That admin's Discord display name. */
   createdByName: string
-  /** Shown to players at the door. Left off the row when absent. Capped by the caller. */
-  note?: string | null
 }
 
 /**
@@ -870,7 +868,6 @@ export interface OpenedMaintenanceWindow {
   createdAt: number
   createdBy: string
   createdByName: string
-  note?: string
   drainStartsAt: number
   deployMode: 'when-empty'
   deployAt: null
@@ -2589,9 +2586,8 @@ function assemble(options: DdbOptions): {
      * writer can stomp the other: no row, or a row that is already `complete`
      * or `cancelled`. `#s` because `state` is a reserved word.
      *
-     * `note` IS LEFT OFF THE ROW WHEN THERE IS NONE rather than written empty,
-     * which is what the contract says and what the prod route does with an
-     * absent note.
+     * NO `note`. `/drain` has had no option for one since 2026-09-14, and the
+     * contract only writes one when it is given.
      *
      * A CONFLICT IS READ BACK ONCE, BECAUSE IT MAY BE THIS CALL'S OWN ROW. The
      * client retries once (see `createDocument`), so a put that landed and lost
@@ -2610,7 +2606,6 @@ function assemble(options: DdbOptions): {
         createdAt,
         createdBy: input.createdBy,
         createdByName: input.createdByName,
-        ...(input.note ? { note: input.note } : {}),
         drainStartsAt: createdAt,
         deployMode: 'when-empty',
         deployAt: null,

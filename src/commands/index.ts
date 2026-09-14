@@ -22,7 +22,6 @@ import {
 } from './command.ts'
 import {
   drainCommand,
-  DRAIN_NOTE_OPTION,
   DRAIN_SERVER_OPTION,
   lazyDevMaintenance,
   lazyDrainer,
@@ -397,28 +396,13 @@ function textOf(options: CommandSource['options']): string | null {
 }
 
 /**
- * The `note` option `/drain` supplied, or null.
- *
- * THE SAME TWO CHECKS `textOf` MAKES, AND A SEPARATE FIELD RATHER THAN REUSING
- * `text`. Reading two differently-named options into one slot would mean a
- * command declaring both has a field whose value depends on which name this
- * function asks for first — and `text` means "the sticky's message" everywhere
- * else in the bot. A note shown to players at the door is not that.
+ * The `server` option `/drain` supplied, or null. The same two checks `textOf`
+ * makes, and the value passed through unjudged: which values count is
+ * ./drain.ts's call.
  *
  * IT IS READ INSIDE A SUBCOMMAND AND THAT COSTS NOTHING. discord.js hoists the
- * invoked subcommand's own options, so `get('note')` finds `/drain start`'s
- * note exactly as it finds a top-level one.
- */
-function noteOf(options: CommandSource['options']): string | null {
-  const option = options.get(DRAIN_NOTE_OPTION)
-
-  if (option === null || option.type !== ApplicationCommandOptionType.String) return null
-  return typeof option.value === 'string' ? option.value : null
-}
-
-/**
- * The `server` option `/drain` supplied, or null. The same two checks again, and
- * the value passed through unjudged: which values count is ./drain.ts's call.
+ * invoked subcommand's own options, so `get('server')` finds either half's
+ * exactly as it finds a top-level one.
  */
 function serverOf(options: CommandSource['options']): string | null {
   const option = options.get(DRAIN_SERVER_OPTION)
@@ -494,7 +478,6 @@ export function invocationOf(interaction: CommandSource): Invocation & DrainFiel
 
     // `/drain`'s, null for every other command. See `DrainFields`.
     subcommand: subcommandOf(interaction.options),
-    note: noteOf(interaction.options),
     server: serverOf(interaction.options),
 
     // What a dev drain's row names its author, resolved the way a target's is.
@@ -561,7 +544,7 @@ export interface ReplyTarget {
  *
  * `{ parse: [] }` AND NOT `escapeMarkdown` ANYWHERE NEAR IT. Suppression is the
  * only thing that stops a notification; rewriting the text would change words an
- * admin has to be able to compare against the console's copy of the same note.
+ * admin has to be able to compare against the console's copy of the same reason.
  */
 function noMentions(): MessageMentionOptions {
   return { parse: [] }

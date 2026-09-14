@@ -21,7 +21,7 @@ import {
   type Invocation,
   type Responder,
 } from './command.ts'
-import { DRAIN_NOTE_OPTION, DRAIN_SERVER_OPTION } from './drain.ts'
+import { DRAIN_SERVER_OPTION } from './drain.ts'
 import { help } from './help.ts'
 import { STICKY_TEXT_OPTION } from './sticky.ts'
 import {
@@ -544,9 +544,9 @@ describe('responderFor — how an interaction is actually answered', () => {
    * ../sticky.ts all restate the option at their own sends for exactly this
    * reason, and this is the fourth.
    *
-   * THE THING IT GUARDS IS SOMEBODY ELSE'S TEXT. `/drain`'s reply echoes an
-   * admin's note and `/help`'s body carries a `<@id>`; a code span makes the
-   * first LOOK inert and does nothing about notifications, because Discord
+   * THE THING IT GUARDS IS SOMEBODY ELSE'S TEXT. `/drain`'s refusals carry the
+   * console's own reason and `/help`'s body carries a `<@id>`; a code span would
+   * make the first LOOK inert and do nothing about notifications, because Discord
    * decides who is pinged from the request field and not from the markdown. See
    * `noMentions` in ./index.ts and the `@everyone` case in ./drain.test.ts.
    *
@@ -754,7 +754,6 @@ describe('invocationOf — a live interaction reduced to a record', () => {
       targetDisplayName: undefined,
       text: null,
       subcommand: null,
-      note: null,
       server: null,
       userDisplayName: `display-${MEMBER}`,
     })
@@ -944,39 +943,6 @@ describe('invocationOf — a live interaction reduced to a record', () => {
     })
 
     expect(invocationOf(source({ options })).text).toBe('')
-  })
-
-  /**
-   * `/drain`'s NOTE IS ITS OWN FIELD AND NOT `text`. The two are read by
-   * different names into different slots on purpose: `text` means the sticky's
-   * message everywhere else in this bot, and a note shown to players at a
-   * closed door is not that. A single slot fed by two names would make the
-   * value depend on which name this seam asked for first.
-   */
-  it('reads /drain’s note by its own name, into its own field', () => {
-    const options = optionNamed(DRAIN_NOTE_OPTION, {
-      type: ApplicationCommandOptionType.String,
-      value: 'shipping the loot fix',
-    })
-
-    const invocation = invocationOf(source({ options }))
-
-    expect(invocation.note).toBe('shipping the loot fix')
-    expect(invocation.text).toBeNull()
-  })
-
-  it('is null for a command that supplied no note', () => {
-    expect(invocationOf(source()).note).toBeNull()
-  })
-
-  /** The same trap again: a USER option named `note` is not a note. */
-  it('ignores a note-named option of the wrong type, rather than throwing', () => {
-    const options = optionNamed(DRAIN_NOTE_OPTION, {
-      type: ApplicationCommandOptionType.User,
-      user: account(TARGET),
-    })
-
-    expect(invocationOf(source({ options })).note).toBeNull()
   })
 
   /**
