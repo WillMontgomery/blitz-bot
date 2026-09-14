@@ -918,7 +918,7 @@ describe('/drain — it asks exactly once, whatever comes back', () => {
   })
 })
 
-describe('/drain cancel — which the console does not open to this bot yet', () => {
+describe('/drain cancel, the console`s cancel route', () => {
   it('posts to the cancel route, not to the scheduling one', async () => {
     const { fetch, calls } = replies(answer(200, { ok: true }))
     await drainer(fetch).cancel({ actorDiscordId: ADMIN })
@@ -939,14 +939,9 @@ describe('/drain cancel — which the console does not open to this bot yet', ()
   })
 
   /**
-   * ═══ TODAY'S REAL ANSWER, PINNED SO IT CANNOT BE MISTAKEN FOR A BUG ═══
-   *
-   * `SERVICE_ROUTES` in the console is `/api/bans`, `/api/kick` and
-   * `/api/maintenance` — an exact-match allowlist that does not include the
-   * cancel path — and that route authorises with `authorize('process', 'write')`,
-   * which is session-bound. So the gate answers 403 `scope` and nothing is
-   * cancelled. This asserts the bot classifies that honestly rather than
-   * pretending, and it is the case to delete when the console opens the route.
+   * THE ROUTE HAS BEEN ON THE CONSOLE'S `SERVICE_ROUTES` SINCE fivem-ringmaster
+   * 3765a24, so a 403 `scope` here means the two repos have drifted apart. This
+   * asserts the bot still classifies that honestly rather than pretending.
    */
   it('reports the console`s scope refusal as denied rather than pretending', async () => {
     const { fetch } = replies(answer(403, { ok: false, error: 'scope' }))

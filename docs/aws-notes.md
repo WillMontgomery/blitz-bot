@@ -44,17 +44,17 @@ a wrong grant could not have made harmless.
 
 ### What the bot's own policy needs, when #4 writes one
 
-Eight tables are read; three of those are also written. There is no `DeleteItem`
+Nine tables are read; four of those are also written. There is no `DeleteItem`
 and no `Scan` anywhere in this list, and the module has no code path that could
 use either — its document-client interface exposes `get`, `put`, `update` and
 `query` and nothing else.
 
 | Action | Resource |
 |---|---|
-| `dynamodb:GetItem` | `ringmaster-bans`, `ringmaster-players`, `ringmaster-player-ids`, `ringmaster-maintenance`, `ringmaster-bot-state`, **`ringmaster-incidents`**, `br-players` |
+| `dynamodb:GetItem` | `ringmaster-bans`, `ringmaster-players`, `ringmaster-player-ids`, `ringmaster-maintenance`, `ringmaster-bot-state`, **`ringmaster-incidents`**, `br-players`, `dev-ringmaster-maintenance` |
 | `dynamodb:Query` | `ringmaster-audit`, **`ringmaster-incidents` — the table AND `…/index/kind-openedAt-index`** |
-| `dynamodb:PutItem` | `ringmaster-audit`, `ringmaster-bot-state`, **`ringmaster-bans`** |
-| `dynamodb:UpdateItem` | `ringmaster-audit`, **`ringmaster-bans`** |
+| `dynamodb:PutItem` | `ringmaster-audit`, `ringmaster-bot-state`, **`ringmaster-bans`**, `dev-ringmaster-maintenance` |
+| `dynamodb:UpdateItem` | `ringmaster-audit`, **`ringmaster-bans`**, `dev-ringmaster-maintenance` |
 
 All in `us-east-2`. See the region section below before writing an ARN.
 
@@ -108,6 +108,25 @@ these two rows as the decision, not as a detail of it.
 be added.** A ban is a record; lifting one stamps fields onto the row and keeps
 it. See below.
 
+### `dev-ringmaster-maintenance` needs a grant today
+
+`/drain server:dev` writes the dev stack's maintenance row itself, because the
+dev box has no console to ask (see `src/commands/drain.ts`). **This one is
+missing at runtime until somebody adds it**: `RingmasterTableAccess` grants
+`ringmaster-*`, and `dev-ringmaster-maintenance` does not match that pattern.
+The console box's instance role needs, on
+`arn:aws:dynamodb:us-east-2:<account>:table/dev-ringmaster-maintenance`:
+
+| Action | Used by |
+|---|---|
+| `dynamodb:PutItem` | `/drain start server:dev`, opening the window |
+| `dynamodb:UpdateItem` | `/drain cancel server:dev`, calling it off |
+| `dynamodb:GetItem` | a refused start or cancel, reading the row back |
+
+Without it every dev drain gets the failure reply and the journal says `denied`
+at `error`. No `DeleteItem`, no `Scan`, and no other `dev-` table. Add the grant
+before deploying the bot that carries `server:dev`.
+
 ### `br-players` is denied by the role the bot has today
 
 `fivem-ringmaster/docs/aws-setup.md` §2 flags this against the console and it
@@ -157,6 +176,7 @@ game's from `DDB_GAME_TABLE_PREFIX` (`br-`).
 | `ringmaster-players` | `license` (S) | read | `lib/players.ts` |
 | `ringmaster-player-ids` | `id` (S) | read | `lib/players.ts` |
 | `ringmaster-maintenance` | `id` (S), one row, `id = "current"` | read | `lib/maintenance.ts` |
+| `dev-ringmaster-maintenance` | `id` (S), one row, `id = "current"` | read **and write** | the dev drain contract; `OpenedMaintenanceWindow` in `src/ddb.ts` |
 | `ringmaster-audit` | `pk` (S) + `ts` (N) | read **and write** | `lib/audit.ts` |
 | `ringmaster-bot-state` | `id` (S) | read **and write** | this repo |
 | `ringmaster-incidents` | `incidentId` (S), GSI `kind-openedAt-index` | read | `lib/incidents.ts` |

@@ -100,7 +100,7 @@ export const COMMAND_SECRET_HEADER = 'x-ringmaster-service'
  */
 export const SERVICE_ACTOR_HEADER = 'x-ringmaster-actor'
 
-/** The console route. One of three the command credential opens; see `SERVICE_ROUTES`. */
+/** The console route. One of four the command credential opens; see `SERVICE_ROUTES`. */
 export const KICK_PATH = '/api/kick'
 
 /**
@@ -385,7 +385,11 @@ function str(value: unknown): string | null {
 const REASON_CAP = 300
 const PLAYER_NAME_CAP = 120
 
-function capped(value: string | null | undefined, cap: number): string | null {
+/**
+ * Trimmed, empty as null, and cut at `cap`. Exported so `/drain server:dev`,
+ * which writes its note to the row itself, caps it exactly as the relay does.
+ */
+export function capped(value: string | null | undefined, cap: number): string | null {
   const trimmed = value?.trim()
   if (!trimmed) return null
   return trimmed.length <= cap ? trimmed : trimmed.slice(0, cap)
@@ -819,7 +823,7 @@ export function createRingmaster(options: RingmasterOptions): Ringmaster {
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * The route. One of three the command credential opens; see `SERVICE_ROUTES`.
+ * The route. One of four the command credential opens; see `SERVICE_ROUTES`.
  *
  * EXACT, NEVER A PREFIX, AND THE CONSOLE MATCHES IT THAT WAY ON PURPOSE.
  * `/api/maintenance/force` — the button that skips the drain and restarts the
@@ -831,24 +835,21 @@ export const MAINTENANCE_PATH = '/api/maintenance'
 /**
  * Where a window is called off.
  *
- * ═══ THIS ROUTE IS NOT OPEN TO THE BOT TODAY, AND THE CALL IS REFUSED ═══
+ * ═══ OPEN TO THE BOT SINCE fivem-ringmaster 3765a24 ═══
  *
- * `SERVICE_ROUTES` in fivem-ringmaster/src/lib/service.ts is `/api/bans`,
- * `/api/kick` and `/api/maintenance` — an EXACT-match allowlist that does not
- * include this path — and `POST /api/maintenance/cancel` authorises with
- * `authorize('process', 'write')`, which is session-bound and does not consult
- * the service credential at all. So the gate answers 403 `scope`, and nothing
- * is cancelled.
+ * `SERVICE_ROUTES` in fivem-ringmaster/src/lib/service.ts lists this path
+ * beside `/api/bans`, `/api/kick` and `/api/maintenance`, and the route
+ * authorizes with `authorizeWrite('process', req)`, the same door the scheduling
+ * route uses. Its own refusals still run: a 404 when there is no live window and
+ * a 409 once the deploy has started, both carried through as the console's
+ * words. A `scope` answer now means the two repos have drifted, and
+ * `maintenanceRefusal` still classifies it as `denied` so the journal says which.
  *
- * IT IS STILL WRITTEN AGAINST THE REAL ROUTE RATHER THAN LEFT OUT. The console
- * needs two lines to open it — this path added to `SERVICE_ROUTES`, and that
- * route's `authorize` swapped for `authorizeWrite('process', req)` — and on the
- * day they land this works with no change here. Until then `/drain cancel`
- * reports the console's refusal, which is the truthful thing for it to do, and
- * `maintenanceRefusal` classifies `scope` as `denied` so the journal says which.
- * The alternative — cancelling by writing the row — is the DynamoDB shortcut
- * this whole section exists to refuse, and it is worse here than anywhere: the
- * row it would stamp over is a window that is already draining a live server.
+ * NOT BY WRITING THE ROW. That is the DynamoDB shortcut this whole section exists
+ * to refuse, and it is worse here than anywhere: the row it would stamp over is a
+ * window that is already draining a live server. (`/drain server:dev` does write
+ * its row, and only because the dev box has no console; see
+ * ./commands/drain.ts.)
  */
 export const MAINTENANCE_CANCEL_PATH = '/api/maintenance/cancel'
 
@@ -1060,7 +1061,7 @@ export interface Drainer {
   /** Schedule the window. One attempt; see this section's header. */
   schedule(input: DrainInput): Promise<DrainResult>
 
-  /** Call one off. Refused by the console today — see {@link MAINTENANCE_CANCEL_PATH}. */
+  /** Call one off. See {@link MAINTENANCE_CANCEL_PATH}. */
   cancel(input: CancelInput): Promise<CancelResult>
 }
 

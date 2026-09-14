@@ -23,6 +23,8 @@ import {
 import {
   drainCommand,
   DRAIN_NOTE_OPTION,
+  DRAIN_SERVER_OPTION,
+  lazyDevMaintenance,
   lazyDrainer,
   type DrainFields,
 } from './drain.ts'
@@ -51,9 +53,10 @@ import { sticky, STICKY_TEXT_OPTION, unsticky } from './sticky.ts'
  * time; it also has to answer "there is no secret, so there is no console to
  * ask" per invocation rather than deciding that once, here, before the config
  * has been loaded. Both fall out of passing `lazyDrainer()` instead of a relay.
+ * `lazyDevMaintenance()` is `/profile`'s reason again, for `server:dev`'s table.
  */
 export const COMMANDS: readonly BotCommand[] = [
-  drainCommand(lazyDrainer()),
+  drainCommand(lazyDrainer(), lazyDevMaintenance()),
   help,
   profileCommand(lazyReadsFrom(() => createDdb())),
   sticky,
@@ -168,6 +171,13 @@ export async function registerCommands(guild: RegistrationGuild): Promise<void> 
  */
 export interface InteractionMember {
   readonly roles: readonly string[] | { readonly cache: ReadonlyMap<string, unknown> }
+
+  /**
+   * The invoker's name in this guild, in the two shapes `OptionMember` names.
+   * Optional for that type's reason; `/drain server:dev` is the only reader.
+   */
+  readonly displayName?: string
+  readonly nick?: string | null
 }
 
 /** The role ids off an interaction's member, or null when it carried none. */
@@ -407,6 +417,17 @@ function noteOf(options: CommandSource['options']): string | null {
 }
 
 /**
+ * The `server` option `/drain` supplied, or null. The same two checks again, and
+ * the value passed through unjudged: which values count is ./drain.ts's call.
+ */
+function serverOf(options: CommandSource['options']): string | null {
+  const option = options.get(DRAIN_SERVER_OPTION)
+
+  if (option === null || option.type !== ApplicationCommandOptionType.String) return null
+  return typeof option.value === 'string' ? option.value : null
+}
+
+/**
  * Which subcommand was invoked, or null.
  *
  * NULL FOR EVERY COMMAND THAT HAS NO SUBCOMMANDS, which is four of the five, so
@@ -471,9 +492,13 @@ export function invocationOf(interaction: CommandSource): Invocation & DrainFiel
 
     text: textOf(interaction.options),
 
-    // `/drain`'s two, null for every other command. See `DrainFields`.
+    // `/drain`'s, null for every other command. See `DrainFields`.
     subcommand: subcommandOf(interaction.options),
     note: noteOf(interaction.options),
+    server: serverOf(interaction.options),
+
+    // What a dev drain's row names its author, resolved the way a target's is.
+    userDisplayName: displayNameOf(interaction.user, interaction.member),
   }
 }
 

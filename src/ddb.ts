@@ -14,7 +14,7 @@ import type {
 } from '@aws-sdk/lib-dynamodb'
 
 /**
- * DynamoDB: the tables the bot reads, and the three it writes.
+ * DynamoDB: the tables the bot reads, and the four it writes.
  *
  * THIS IS THE FIRST AWS CALL THIS PROCESS HAS EVER MADE, so everything here is
  * a first decision rather than a convention already in force. The console —
@@ -103,6 +103,23 @@ const DEFAULT_TABLE_PREFIX = 'ringmaster-'
  * that, which is a sentence you cannot write if both sets share a prefix.
  */
 const DEFAULT_GAME_TABLE_PREFIX = 'br-'
+
+/**
+ * The DEV stack's two prefixes: what the dev game box is forced onto.
+ *
+ * NOT OPTIONS ANYBODY PASSES. `createDevMaintenance` forces both, so nothing
+ * spells a dev table and nothing can hand the dev writer a prod prefix.
+ * `dev-ringmaster-maintenance` is the only dev table anything in this repo touches.
+ */
+const DEV_TABLE_PREFIX = 'dev-ringmaster-'
+const DEV_GAME_TABLE_PREFIX = 'dev-br-'
+
+/**
+ * How long a window `maintenanceWriter.open` writes may stay live before the dev
+ * box's runner cancels it on its own. Four hours, from the contract both repos
+ * implement. The game itself ignores `expiresAt`; the runner is what reads it.
+ */
+const OPENED_WINDOW_TTL_MS = 4 * 60 * 60_000
 
 /**
  * How long any one call may take before it is a failure instead of a wait.
@@ -393,7 +410,10 @@ export interface TableNames {
   playerIds: string
   /** Read AND written. The only one the bot APPENDS to. See `begin`. */
   audit: string
-  /** Read only. One row, fixed key, the scheduled window. */
+  /**
+   * One row, fixed key, the scheduled window. Read, and written only through
+   * `maintenanceWriter` by `/drain server:dev` under `DEV_TABLE_PREFIX`.
+   */
   maintenance: string
   /**
    * Read AND written. The bot's own durable state.
@@ -790,6 +810,12 @@ export interface MaintenanceWindow {
   deployAt: number | null
   completedAt?: number | null
   cancelledAt?: number | null
+
+  /**
+   * True on a window blitz-patch (blitz-host-patching) opened for host patching,
+   * absent on every other row. Nothing in this repo may close one of those.
+   */
+  hostPatch?: boolean | null
 }
 
 /**
@@ -819,6 +845,37 @@ export function isMaintenanceDraining(
   if (!isMaintenanceLive(w)) return false
   if (w.state === 'deploying') return true
   return now >= w.drainStartsAt
+}
+
+/** What `/drain server:dev` opens a window with. The rest of the row is fixed. */
+export interface MaintenanceOpenInput {
+  /** The invoking admin's Discord user id. */
+  createdBy: string
+  /** That admin's Discord display name. */
+  createdByName: string
+  /** Shown to players at the door. Left off the row when absent. Capped by the caller. */
+  note?: string | null
+}
+
+/**
+ * The row `maintenanceWriter.open` writes, whole.
+ *
+ * NOT `MaintenanceWindow`, WHICH IS A SUBSET OF THE CONSOLE'S ROW. This one is the
+ * contract between `/drain server:dev` and the dev box's runner in
+ * fivem-royale-m9, and every attribute on it is one that runner reads.
+ */
+export interface OpenedMaintenanceWindow {
+  id: 'current'
+  state: 'scheduled'
+  createdAt: number
+  createdBy: string
+  createdByName: string
+  note?: string
+  drainStartsAt: number
+  deployMode: 'when-empty'
+  deployAt: null
+  expiresAt: number
+  source: 'discord'
 }
 
 /* ------------------------------------------------------------------ *
@@ -1267,7 +1324,8 @@ const INCIDENT_QUERY_CAP = 50
  * place a compiler reads. Four tables offer a read and nothing else; three
  * offer a write. There is still no `players.write` and no
  * `maintenance.schedule` — the console owns those actions and owns the
- * consequences of getting them wrong.
+ * consequences of getting them wrong. The one maintenance write that does exist
+ * is `maintenanceWriter`, kept off this interface on purpose; see there.
  *
  * `bans.issue` AND `bans.lift` ARE NEW, AND THIS COMMENT USED TO SAY THEY
  * WOULD NEVER BE HERE. The reason it gave was that a Discord bot able to ban
@@ -1498,7 +1556,84 @@ export interface DdbWithAuditWindow extends Ddb {
   readonly auditWindow: AuditWindow
 }
 
+/**
+ * Opening and calling off a maintenance window by writing the row.
+ *
+ * ═══ ONLY EVER BUILT ON THE DEV PREFIX ═══
+ *
+ * ON `ringmaster-maintenance` THIS WOULD BE THE SHORTCUT src/ringmaster.ts's
+ * drain section refuses: the console's driver deploys any `scheduled` row it
+ * finds, and the gates that make a prod row safe live in its route. The dev box
+ * has no console. Its runner reads `dev-ringmaster-maintenance` itself, and the
+ * owner's rule is that a dev drain must not involve Ringmaster at all, so for
+ * that table writing the row IS the request. `createDevMaintenance` is the only
+ * way to get one and it forces `DEV_TABLE_PREFIX`; `createDdb` does not return it.
+ *
+ * A CAPABILITY OF ITS OWN, FOR `AuditWindow`'s REASON. Every caller that takes
+ * `Pick<Ddb, 'maintenance'>` today, the maintenance watcher among them, goes on
+ * holding a read and nothing else.
+ */
+export interface MaintenanceWriter {
+  /**
+   * Open a window, unless one is live. A live one comes back as a `conflict`
+   * with nothing written, unless it is the row this call wrote; see there.
+   */
+  open(input: MaintenanceOpenInput): Promise<DdbResult<OpenedMaintenanceWindow>>
+
+  /**
+   * Call a `scheduled` or `draining` window off. Anything else (no row, a
+   * `deploying` window, a host-patch window) comes back as a `conflict` with
+   * nothing written.
+   */
+  cancel(): Promise<DdbResult<void>>
+
+  /**
+   * The row, read consistently. `/drain cancel` reads it after a refused
+   * `cancel` to say why, and a stale replica could answer with the state from
+   * before the runner's last move.
+   */
+  current(): Promise<DdbResult<MaintenanceWindow | null>>
+}
+
+/** What `createDevMaintenance` returns, and all of the dev stack this repo reaches. */
+export interface DevMaintenance {
+  readonly tables: TableNames
+  readonly maintenance: Ddb['maintenance']
+  readonly maintenanceWriter: MaintenanceWriter
+}
+
 export function createDdb(options: DdbOptions = {}): DdbWithAuditWindow {
+  return assemble(options).ddb
+}
+
+/**
+ * The dev stack's maintenance row, read and written. `/drain server:dev` is the
+ * one caller.
+ *
+ * THE PREFIXES ARE FORCED, NOT DEFAULTED. The option type does not offer them,
+ * and they are spread last, so no caller can point this writer at
+ * `ringmaster-maintenance`.
+ */
+export function createDevMaintenance(
+  options: Omit<DdbOptions, 'tablePrefix' | 'gameTablePrefix'> = {},
+): DevMaintenance {
+  const { ddb, maintenanceWriter } = assemble({
+    ...options,
+    tablePrefix: DEV_TABLE_PREFIX,
+    gameTablePrefix: DEV_GAME_TABLE_PREFIX,
+  })
+
+  return { tables: ddb.tables, maintenance: ddb.maintenance, maintenanceWriter }
+}
+
+/**
+ * Both factories' body. The writer shares the client, clock and deadline, and
+ * comes back apart from the `Ddb` so `createDdb` can leave it behind.
+ */
+function assemble(options: DdbOptions): {
+  ddb: DdbWithAuditWindow
+  maintenanceWriter: MaintenanceWriter
+} {
   const region = options.region ?? DEFAULT_REGION
   const prefix = options.tablePrefix ?? DEFAULT_TABLE_PREFIX
   const gamePrefix = options.gameTablePrefix ?? DEFAULT_GAME_TABLE_PREFIX
@@ -1608,7 +1743,7 @@ export function createDdb(options: DdbOptions = {}): DdbWithAuditWindow {
     })
   }
 
-  return {
+  const ddb: DdbWithAuditWindow = {
     region,
     tables,
     timeoutMs,
@@ -2445,4 +2580,124 @@ export function createDdb(options: DdbOptions = {}): DdbWithAuditWindow {
       },
     },
   }
+
+  const maintenanceWriter: MaintenanceWriter = {
+    /**
+     * A `PutItem` of the whole row, conditioned on there being no live window.
+     *
+     * THE SAME CONDITION blitz-patch PUTS ITS OWN WINDOWS WITH, so neither
+     * writer can stomp the other: no row, or a row that is already `complete`
+     * or `cancelled`. `#s` because `state` is a reserved word.
+     *
+     * `note` IS LEFT OFF THE ROW WHEN THERE IS NONE rather than written empty,
+     * which is what the contract says and what the prod route does with an
+     * absent note.
+     *
+     * A CONFLICT IS READ BACK ONCE, BECAUSE IT MAY BE THIS CALL'S OWN ROW. The
+     * client retries once (see `createDocument`), so a put that landed and lost
+     * its answer is retried into its own condition and refused. A live row with
+     * this call's `createdAt` and `createdBy` is that, whatever state the runner
+     * has moved it to, and it is the success it was. Consistent, for
+     * `incidents.get`'s reason: read once, acted on once. A read that fails
+     * leaves the conflict standing.
+     */
+    async open(input) {
+      const createdAt = now()
+
+      const window: OpenedMaintenanceWindow = {
+        id: 'current',
+        state: 'scheduled',
+        createdAt,
+        createdBy: input.createdBy,
+        createdByName: input.createdByName,
+        ...(input.note ? { note: input.note } : {}),
+        drainStartsAt: createdAt,
+        deployMode: 'when-empty',
+        deployAt: null,
+        expiresAt: createdAt + OPENED_WINDOW_TTL_MS,
+        source: 'discord',
+      }
+
+      const put = await call('put', tables.maintenance, async (o) => {
+        await doc.put(
+          {
+            TableName: tables.maintenance,
+            Item: window,
+            ConditionExpression: 'attribute_not_exists(id) OR #s = :complete OR #s = :cancelled',
+            ExpressionAttributeNames: { '#s': 'state' },
+            ExpressionAttributeValues: { ':complete': 'complete', ':cancelled': 'cancelled' },
+          },
+          o,
+        )
+        return window
+      })
+
+      if (put.ok || put.failure.kind !== 'conflict') return put
+
+      const seen = await call('get', tables.maintenance, async (o) => {
+        const res = await doc.get(
+          { TableName: tables.maintenance, Key: { id: 'current' }, ConsistentRead: true },
+          o,
+        )
+        return (res.Item as (MaintenanceWindow & { createdBy?: unknown }) | undefined) ?? null
+      })
+
+      if (
+        seen.ok &&
+        isMaintenanceLive(seen.value) &&
+        seen.value.createdAt === createdAt &&
+        seen.value.createdBy === input.createdBy
+      ) {
+        return { ok: true, value: window }
+      }
+
+      return put
+    },
+
+    /**
+     * An `UpdateItem` that only lands on a window a human can still call off.
+     *
+     * THE CONDITION ALSO CLOSES THE UPSERT. An update against a missing key
+     * would create a half-row holding nothing but `cancelled`; a missing row
+     * has no `state`, so it fails the condition instead.
+     *
+     * `hostPatch` IS NEVER TOUCHED, in either spelling of "not a host patch":
+     * absent, or written `false`. blitz-patch owns those windows and closes
+     * them itself.
+     */
+    cancel() {
+      return call('update', tables.maintenance, async (o) => {
+        await doc.update(
+          {
+            TableName: tables.maintenance,
+            Key: { id: 'current' },
+            UpdateExpression: 'SET #s = :cancelled, cancelledAt = :now',
+            ConditionExpression:
+              '(#s = :scheduled OR #s = :draining) AND (attribute_not_exists(hostPatch) OR hostPatch = :false)',
+            ExpressionAttributeNames: { '#s': 'state' },
+            ExpressionAttributeValues: {
+              ':cancelled': 'cancelled',
+              ':now': now(),
+              ':scheduled': 'scheduled',
+              ':draining': 'draining',
+              ':false': false,
+            },
+          },
+          o,
+        )
+      })
+    },
+
+    current() {
+      return call('get', tables.maintenance, async (o) => {
+        const res = await doc.get(
+          { TableName: tables.maintenance, Key: { id: 'current' }, ConsistentRead: true },
+          o,
+        )
+        return (res.Item as MaintenanceWindow | undefined) ?? null
+      })
+    },
+  }
+
+  return { ddb, maintenanceWriter }
 }

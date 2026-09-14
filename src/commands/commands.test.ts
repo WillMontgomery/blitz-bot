@@ -21,7 +21,7 @@ import {
   type Invocation,
   type Responder,
 } from './command.ts'
-import { DRAIN_NOTE_OPTION } from './drain.ts'
+import { DRAIN_NOTE_OPTION, DRAIN_SERVER_OPTION } from './drain.ts'
 import { help } from './help.ts'
 import { STICKY_TEXT_OPTION } from './sticky.ts'
 import {
@@ -755,6 +755,8 @@ describe('invocationOf — a live interaction reduced to a record', () => {
       text: null,
       subcommand: null,
       note: null,
+      server: null,
+      userDisplayName: `display-${MEMBER}`,
     })
   })
 
@@ -975,6 +977,49 @@ describe('invocationOf — a live interaction reduced to a record', () => {
     })
 
     expect(invocationOf(source({ options })).note).toBeNull()
+  })
+
+  /**
+   * `/drain`'s `server` IS READ THE SAME WAY AND PASSED THROUGH UNJUDGED. Which
+   * values count is ./drain.ts's call, so a value that is neither choice still
+   * arrives and is refused there, rather than dropped here into "prod".
+   */
+  it('reads /drain’s server by its own name, whatever value it carries', () => {
+    for (const value of ['dev', 'prod', 'staging']) {
+      const options = optionNamed(DRAIN_SERVER_OPTION, {
+        type: ApplicationCommandOptionType.String,
+        value,
+      })
+
+      expect(invocationOf(source({ options })).server).toBe(value)
+    }
+
+    expect(invocationOf(source()).server).toBeNull()
+  })
+
+  it('ignores a server-named option of the wrong type, rather than throwing', () => {
+    const options = optionNamed(DRAIN_SERVER_OPTION, {
+      type: ApplicationCommandOptionType.User,
+      user: account(TARGET),
+    })
+
+    expect(invocationOf(source({ options })).server).toBeNull()
+  })
+
+  /**
+   * THE INVOKER'S OWN NAME, THE GUILD'S NICKNAME FIRST, in both member shapes, by
+   * the same rule the target's follows. A dev drain writes it as `createdByName`.
+   */
+  it('carries the invoker’s display name, the guild’s nickname first', () => {
+    expect(
+      invocationOf(source({ member: { roles: [], displayName: 'Cached Nick' } })).userDisplayName,
+    ).toBe('Cached Nick')
+
+    expect(invocationOf(source({ member: { roles: [], nick: 'Raw Nick' } })).userDisplayName).toBe(
+      'Raw Nick',
+    )
+
+    expect(invocationOf(source({ member: null })).userDisplayName).toBe(`display-${MEMBER}`)
   })
 
   /**

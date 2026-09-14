@@ -571,7 +571,7 @@ guild is told about them; this is what the operator needs:
 
 | Command | Who | What it needs beyond the scope |
 |---|---|---|
-| `/drain start`, `/drain cancel` | admin | `COMMAND_SECRET` and `BLITZ_RINGMASTER_URL` (§5) |
+| `/drain start`, `/drain cancel` | admin | `COMMAND_SECRET` and `BLITZ_RINGMASTER_URL` (§5); with `server:dev`, AWS instead (`docs/aws-notes.md`) |
 | `/help` | anyone | nothing |
 | `/profile` | anyone, for their own; another member's is admin | AWS (§15) |
 | `/sticky`, `/unsticky` | admin | nothing |

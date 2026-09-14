@@ -62,8 +62,8 @@ Anything done while the bot was down is picked up at the next start.
 
 Five. **Admin** means holding the admin role.
 
-- `/drain start [note]` — **admin**. Stops the server letting anybody in, then updates and restarts it, ending every match in progress. `note` is what players who try to join are shown. Private.
-- `/drain cancel` — **admin**. Calls that window off. The console does not offer that route yet, so it is refused. Private.
+- `/drain start [note] [server]` — **admin**. Stops the server letting anybody in, then updates and restarts it, ending every match in progress. `note` is what players who try to join are shown. `server` is `prod` or `dev`, and `prod` when left out. Private.
+- `/drain cancel [server]` — **admin**. Calls that window off. Private.
 - `/help [user]` — anyone. Links the player guide. Posted in the channel when aimed at somebody, private otherwise.
 - `/profile` — anyone. Your own progression and match record. Private.
 - `/profile <user>` — **admin**. Bans, career, registry row, last five matches, and a button to the console. Private.

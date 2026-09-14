@@ -357,8 +357,10 @@ describe('the check over this repo', () => {
     // added when that read stopped pulling back the whole incident row; the
     // thirteenth is `incidents.opened`'s `KeyConditionExpression`, which is the
     // one expression in this repo that names a secondary index's key schema
-    // rather than a table's.
-    expect(seen).toEqual([13, 11])
+    // rather than a table's. The fourteenth to sixteenth are `maintenanceWriter`'s,
+    // for `/drain server:dev`: the `open` put's ConditionExpression, and the
+    // `cancel` update's UpdateExpression and ConditionExpression.
+    expect(seen).toEqual([16, 14])
   })
 
   /**

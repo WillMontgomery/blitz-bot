@@ -1,7 +1,15 @@
-import { ApplicationCommandOptionType } from 'discord.js'
+import type {
+  GetCommandOutput,
+  PutCommandInput,
+  PutCommandOutput,
+  QueryCommandOutput,
+  UpdateCommandOutput,
+} from '@aws-sdk/lib-dynamodb'
+import { ApplicationCommandOptionType, type ApplicationCommandOptionData } from 'discord.js'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { Config } from '../config.ts'
+import { createDevMaintenance, type DocumentClient } from '../ddb.ts'
 import { setSink } from '../log.ts'
 import {
   DRAIN_NOTE_CAP,
@@ -22,10 +30,15 @@ import {
   drainCommand,
   DRAIN_CANCEL_SUBCOMMAND,
   DRAIN_NOTE_OPTION,
+  DRAIN_SERVER_DEV,
+  DRAIN_SERVER_OPTION,
+  DRAIN_SERVER_PROD,
   DRAIN_START_SUBCOMMAND,
+  lazyDevMaintenance,
   lazyDrainer,
   replyForCancel,
   replyForSchedule,
+  type DevMaintenanceFor,
   type DrainFields,
 } from './drain.ts'
 import { responderFor, type ReplyTarget } from './index.ts'
@@ -59,6 +72,13 @@ const CHANNEL = '555555555555555555'
 const NOTHING_TO_DEPLOY =
   'The server is already running the latest code — there is nothing to deploy.'
 const ALREADY = 'A maintenance window is already scheduled. Cancel it first.'
+
+/** And the console's cancel route's two, from fivem-ringmaster's `api/maintenance/cancel`. */
+const NOTHING_TO_CANCEL = 'There is no maintenance window to cancel.'
+const DEPLOY_STARTED = 'The deploy has already started. It cannot be cancelled now.'
+
+/** The dev writer's clock, held still so the row can be asserted whole. */
+const NOW = 1_700_000_000_000
 
 const stderr: string[] = []
 const stdout: string[] = []
@@ -124,6 +144,8 @@ function invocation(over: Partial<Invocation & DrainFields> = {}): Invocation & 
     text: null,
     subcommand: DRAIN_START_SUBCOMMAND,
     note: null,
+    server: null,
+    userDisplayName: 'A Member',
     ...over,
   }
 }
@@ -198,6 +220,13 @@ function everyFrame(): string[] {
 
     COPY.noCredential,
     COPY.noSubcommand,
+
+    // `server:dev`'s, which are whole replies rather than frames.
+    COPY.alreadyOpen,
+    COPY.nothingToCancel,
+    COPY.deployStarted,
+    COPY.hostPatchWindow,
+    COPY.noServer,
   ]
 }
 
@@ -230,6 +259,75 @@ function relay(
       calls.push({ kind: 'cancel', actorDiscordId: input.actorDiscordId, note: null })
       return Promise.resolve(cancel)
     },
+  }
+}
+
+/**
+ * The dev table for every prod case: reaching it at all is the failure. A throw
+ * inside `run` lands as `COMMAND_COPY.failed`, so a prod case that touched it
+ * fails on its reply too.
+ */
+const NO_DEV: DevMaintenanceFor = () => {
+  throw new Error('a prod /drain reached the dev maintenance table')
+}
+
+/** One DynamoDB answer, or a rejection. */
+type DevAnswer = () => Promise<Record<string, unknown>>
+
+/** What the dev document client was asked, in order. */
+interface DevCall {
+  readonly op: 'get' | 'put' | 'update' | 'query'
+  readonly input: unknown
+}
+
+/** An AWS-shaped exception: the SDK identifies these by `name`, and so does ../ddb.ts. */
+function awsError(name: string): Error {
+  const error = new Error('from the fake')
+  error.name = name
+  return error
+}
+
+const fails =
+  (name: string): DevAnswer =>
+  () =>
+    Promise.reject(awsError(name))
+
+/**
+ * The REAL `createDevMaintenance`, over a document client that writes down what
+ * it was handed. What is asserted is therefore the request ../ddb.ts actually
+ * builds for `/drain server:dev`, not what a fake of it promises.
+ */
+function devTable(answers: { get?: DevAnswer; put?: DevAnswer; update?: DevAnswer } = {}): {
+  calls: DevCall[]
+  devFor: DevMaintenanceFor
+  asked: () => number
+} {
+  const calls: DevCall[] = []
+  let asked = 0
+
+  function op<O>(name: DevCall['op'], answer: DevAnswer | undefined) {
+    return async (input: unknown): Promise<O> => {
+      calls.push({ op: name, input })
+      return ((await answer?.()) ?? { $metadata: {} }) as O
+    }
+  }
+
+  const document: DocumentClient = {
+    get: op<GetCommandOutput>('get', answers.get),
+    put: op<PutCommandOutput>('put', answers.put),
+    update: op<UpdateCommandOutput>('update', answers.update),
+    query: op<QueryCommandOutput>('query', undefined),
+  }
+
+  const dev = createDevMaintenance({ document, now: () => NOW })
+
+  return {
+    calls,
+    devFor: () => {
+      asked += 1
+      return dev
+    },
+    asked: () => asked,
   }
 }
 
@@ -270,10 +368,11 @@ async function answerFor(
   fake: Drainer | null,
   over: Partial<Invocation & DrainFields> = {},
   config = cfg(),
+  devFor: DevMaintenanceFor = NO_DEV,
 ): Promise<string> {
   const respond = responder()
 
-  await runCommand(invocation(over), config, respond, [drainCommand(() => fake)])
+  await runCommand(invocation(over), config, respond, [drainCommand(() => fake, devFor)])
 
   const shown = respond.edited[0] ?? respond.replied[0]?.[0]
   if (shown === undefined) throw new Error('the admin was shown nothing at all')
@@ -281,7 +380,7 @@ async function answerFor(
 }
 
 describe('/drain — how it is registered, which is half of the guard', () => {
-  const drain = drainCommand(() => relay())
+  const drain = drainCommand(() => relay(), NO_DEV)
 
   /**
    * ADMIN-ONLY, UNCONDITIONALLY, AND EPHEMERAL. There is no half of this command
@@ -339,14 +438,36 @@ describe('/drain — how it is registered, which is half of the guard', () => {
     expect(note && 'maxLength' in note ? note.maxLength : undefined).toBe(DRAIN_NOTE_CAP)
   })
 
-  /** Cancelling takes nothing. There is only ever one window to call off. */
-  it('gives the cancel half no options at all', () => {
+  /** Cancelling takes nothing but which server. There is only ever one window on each. */
+  it('gives the cancel half the server option and nothing else', () => {
     const cancel = (drain.data.options ?? []).find(
       (one) => one.name === DRAIN_CANCEL_SUBCOMMAND,
     )
 
     if (cancel === undefined) throw new Error('no cancel subcommand')
-    expect('options' in cancel ? cancel.options : undefined).toBeUndefined()
+
+    const options = ('options' in cancel ? (cancel.options ?? []) : []) as readonly ApplicationCommandOptionData[]
+    expect(options.map((one) => one.name)).toEqual([DRAIN_SERVER_OPTION])
+  })
+
+  /**
+   * THE SERVER OPTION IS ON BOTH HALVES, OFFERS THE OWNER'S TWO WORDS, AND IS
+   * NEVER REQUIRED, because leaving it out is prod, which is his decision.
+   */
+  it('offers prod or dev on both halves, and never requires either', () => {
+    for (const half of drain.data.options ?? []) {
+      const options = ('options' in half ? (half.options ?? []) : []) as readonly ApplicationCommandOptionData[]
+      const server = options.find((one) => one.name === DRAIN_SERVER_OPTION)
+
+      if (server === undefined) throw new Error(`no server option on ${half.name}`)
+
+      expect(server.type, half.name).toBe(ApplicationCommandOptionType.String)
+      expect('required' in server ? server.required : undefined, half.name).toBe(false)
+      expect('choices' in server ? server.choices : undefined, half.name).toEqual([
+        { name: 'prod', value: 'prod' },
+        { name: 'dev', value: 'dev' },
+      ])
+    }
   })
 })
 
@@ -905,12 +1026,381 @@ describe('/drain — a refusal is shown, in the console`s own words', () => {
   })
 })
 
+describe('/drain server:dev, the dev box, with no console anywhere in it', () => {
+  /**
+   * ═══ LEAVING `server` OUT IS PROD, AND PROD IS EXACTLY WHAT IT WAS ═══
+   *
+   * The owner's decision, pinned on both halves and on the spelled-out choice:
+   * the console is asked, the dev table is never so much as built, and the admin
+   * reads the reply he always read.
+   */
+  it('treats no server, and prod by name, exactly as /drain always was', async () => {
+    for (const server of [undefined, null, DRAIN_SERVER_PROD]) {
+      const fake = relay()
+      const table = devTable()
+
+      expect(await answerFor(fake, { server }, cfg(), table.devFor), String(server)).toBe(
+        replyForSchedule(SCHEDULED),
+      )
+
+      expect(
+        await answerFor(fake, { server, subcommand: DRAIN_CANCEL_SUBCOMMAND }, cfg(), table.devFor),
+        String(server),
+      ).toBe(COPY.cancelled)
+
+      expect(fake.calls, String(server)).toEqual([
+        { kind: 'schedule', actorDiscordId: MEMBER, note: null },
+        { kind: 'cancel', actorDiscordId: MEMBER, note: null },
+      ])
+
+      expect(table.asked(), String(server)).toBe(0)
+      expect(table.calls, String(server)).toEqual([])
+    }
+  })
+
+  /**
+   * THE ROW AND THE CONDITION, WHOLE, AS THE DEV BOX'S RUNNER READS THEM. Every
+   * attribute here is one the contract names, so an attribute renamed on either
+   * side is a failure here rather than a dev box that never drains.
+   */
+  it('opens the dev window with exactly the row and the condition the contract names', async () => {
+    const fake = relay()
+    const table = devTable()
+
+    const shown = await answerFor(
+      fake,
+      { server: DRAIN_SERVER_DEV, userDisplayName: 'Admin Nick', note: '  back in ten  ' },
+      cfg(),
+      table.devFor,
+    )
+
+    expect(table.calls).toEqual([
+      {
+        op: 'put',
+        input: {
+          TableName: 'dev-ringmaster-maintenance',
+          Item: {
+            id: 'current',
+            state: 'scheduled',
+            createdAt: NOW,
+            createdBy: MEMBER,
+            createdByName: 'Admin Nick',
+            note: 'back in ten',
+            drainStartsAt: NOW,
+            deployMode: 'when-empty',
+            deployAt: null,
+            expiresAt: NOW + 14_400_000,
+            source: 'discord',
+          },
+          ConditionExpression: 'attribute_not_exists(id) OR #s = :complete OR #s = :cancelled',
+          ExpressionAttributeNames: { '#s': 'state' },
+          ExpressionAttributeValues: { ':complete': 'complete', ':cancelled': 'cancelled' },
+        },
+      },
+    ])
+
+    // Prod's reply, because it is true of dev: the door is shut and the restart
+    // waits for the box to empty.
+    expect(shown).toBe(
+      'The server stopped accepting players at <t:1700000000:t>. ' +
+        'It will restart on its own once all players have left.',
+    )
+
+    // And nothing reached the console.
+    expect(fake.calls).toEqual([])
+  })
+
+  /** Prod's cap, applied by prod's own function. */
+  it('caps the note at the console`s limit, as the prod relay does', async () => {
+    const table = devTable()
+
+    await answerFor(relay(), { server: DRAIN_SERVER_DEV, note: 'x'.repeat(DRAIN_NOTE_CAP + 50) }, cfg(), table.devFor)
+
+    expect((table.calls[0]?.input as PutCommandInput).Item?.note).toBe('x'.repeat(DRAIN_NOTE_CAP))
+  })
+
+  /**
+   * NO NOTE IS NO ATTRIBUTE, AND NO SECRET IS NO OBSTACLE. The contract writes
+   * `note` only if one was given, and the dev path never asks the console, so an
+   * unset `COMMAND_SECRET` cannot be what stops it.
+   */
+  it('leaves the note off the row when none was typed, and needs no COMMAND_SECRET', async () => {
+    for (const note of [null, '', '   ']) {
+      const table = devTable()
+
+      const shown = await answerFor(
+        null,
+        { server: DRAIN_SERVER_DEV, note },
+        cfg({ commandSecret: null }),
+        table.devFor,
+      )
+
+      expect((table.calls[0]?.input as PutCommandInput).Item, String(note)).not.toHaveProperty('note')
+      expect(shown, String(note)).not.toBe(COPY.noCredential)
+    }
+  })
+
+  it('names the window after the invoker, and after their id when the seam carried no name', async () => {
+    const table = devTable()
+
+    await answerFor(relay(), { server: DRAIN_SERVER_DEV, userDisplayName: undefined }, cfg(), table.devFor)
+
+    expect((table.calls[0]?.input as PutCommandInput).Item?.createdByName).toBe(MEMBER)
+  })
+
+  /** A live window refuses, in the console's own sentence, and nothing is written. */
+  it('refuses in Ringmaster`s own words when a window is already live', async () => {
+    const live = [
+      undefined,
+      { id: 'current', state: 'scheduled', drainStartsAt: 1, createdAt: NOW - 60_000, createdBy: MEMBER },
+      { id: 'current', state: 'draining', drainStartsAt: 1, createdAt: NOW, createdBy: 'another admin' },
+    ]
+
+    for (const item of live) {
+      const table = devTable({
+        put: fails('ConditionalCheckFailedException'),
+        get: () => Promise.resolve(item === undefined ? { $metadata: {} } : { $metadata: {}, Item: item }),
+      })
+
+      const shown = await answerFor(relay(), { server: DRAIN_SERVER_DEV }, cfg(), table.devFor)
+
+      expect(shown, String(item?.createdBy)).toBe(ALREADY)
+      expect(shown).toBe('A maintenance window is already scheduled. Cancel it first.')
+      expect(table.calls.map((call) => call.op)).toEqual(['put', 'get'])
+    }
+  })
+
+  /**
+   * A PUT THAT LANDED AND LOST ITS ANSWER IS RETRIED INTO ITS OWN CONDITION. The
+   * row read back is this admin's, at this call's `createdAt`, so the window they
+   * opened is reported as opened rather than as somebody else's.
+   */
+  it('reports its own retried write as opened, not as a window already live', async () => {
+    const table = devTable({
+      put: fails('ConditionalCheckFailedException'),
+      get: () =>
+        Promise.resolve({
+          $metadata: {},
+          Item: { id: 'current', state: 'scheduled', drainStartsAt: NOW, createdAt: NOW, createdBy: MEMBER },
+        }),
+    })
+
+    const shown = await answerFor(relay(), { server: DRAIN_SERVER_DEV }, cfg(), table.devFor)
+
+    expect(shown).toBe(
+      'The server stopped accepting players at <t:1700000000:t>. ' +
+        'It will restart on its own once all players have left.',
+    )
+
+    expect(table.calls.map((call) => call.op)).toEqual(['put', 'get'])
+    expect(table.calls[1]?.input).toEqual({
+      TableName: 'dev-ringmaster-maintenance',
+      Key: { id: 'current' },
+      ConsistentRead: true,
+    })
+  })
+
+  it('calls the dev window off with exactly the update and the condition the contract names', async () => {
+    const fake = relay()
+    const table = devTable()
+
+    const shown = await answerFor(
+      fake,
+      { server: DRAIN_SERVER_DEV, subcommand: DRAIN_CANCEL_SUBCOMMAND },
+      cfg(),
+      table.devFor,
+    )
+
+    expect(table.calls).toEqual([
+      {
+        op: 'update',
+        input: {
+          TableName: 'dev-ringmaster-maintenance',
+          Key: { id: 'current' },
+          UpdateExpression: 'SET #s = :cancelled, cancelledAt = :now',
+          ConditionExpression:
+            '(#s = :scheduled OR #s = :draining) AND (attribute_not_exists(hostPatch) OR hostPatch = :false)',
+          ExpressionAttributeNames: { '#s': 'state' },
+          ExpressionAttributeValues: {
+            ':cancelled': 'cancelled',
+            ':now': NOW,
+            ':scheduled': 'scheduled',
+            ':draining': 'draining',
+            ':false': false,
+          },
+        },
+      },
+    ])
+
+    expect(shown).toBe(COPY.cancelled)
+    expect(fake.calls).toEqual([])
+  })
+
+  /**
+   * A REFUSED CANCEL IS READ, ONLY TO PICK THE SENTENCE THAT IS TRUE. The update
+   * decided; the read explains. No row and a finished row are Ringmaster's 404, a
+   * deploying one is its 409, and a host-patch window is nobody's to call off.
+   */
+  it('refuses a cancel it may not make, in the words that fit what is there', async () => {
+    const cases: [string, Record<string, unknown> | undefined, string][] = [
+      ['no row at all', undefined, NOTHING_TO_CANCEL],
+      ['a finished window', { id: 'current', state: 'complete', drainStartsAt: 1 }, NOTHING_TO_CANCEL],
+      ['a cancelled window', { id: 'current', state: 'cancelled', drainStartsAt: 1 }, NOTHING_TO_CANCEL],
+      [
+        'a window cancelled an hour ago',
+        { id: 'current', state: 'cancelled', drainStartsAt: 1, cancelledAt: Date.now() - 60 * 60_000 },
+        NOTHING_TO_CANCEL,
+      ],
+      ['a window already deploying', { id: 'current', state: 'deploying', drainStartsAt: 1 }, DEPLOY_STARTED],
+      [
+        'a host-patch window',
+        { id: 'current', state: 'draining', drainStartsAt: 1, hostPatch: true },
+        COPY.hostPatchWindow,
+      ],
+    ]
+
+    for (const [name, item, expected] of cases) {
+      const table = devTable({
+        update: fails('ConditionalCheckFailedException'),
+        get: () => Promise.resolve(item === undefined ? { $metadata: {} } : { $metadata: {}, Item: item }),
+      })
+
+      const shown = await answerFor(
+        relay(),
+        { server: DRAIN_SERVER_DEV, subcommand: DRAIN_CANCEL_SUBCOMMAND },
+        cfg(),
+        table.devFor,
+      )
+
+      expect(shown, name).toBe(expected)
+      expect(table.calls.map((call) => call.op), name).toEqual(['update', 'get'])
+      expect(table.calls[1]?.input, name).toEqual({
+        TableName: 'dev-ringmaster-maintenance',
+        Key: { id: 'current' },
+        ConsistentRead: true,
+      })
+    }
+
+    // The console's sentences, verbatim, so a rewording here is a deliberate edit.
+    expect(COPY.nothingToCancel).toBe(NOTHING_TO_CANCEL)
+    expect(COPY.deployStarted).toBe(DEPLOY_STARTED)
+  })
+
+  /**
+   * AN UPDATE THAT LANDED AND LOST ITS ANSWER IS RETRIED INTO ITS OWN CONDITION.
+   * The row read back was cancelled seconds ago, so the admin is told it is off
+   * rather than that there was nothing to cancel.
+   */
+  it('reports a window cancelled seconds ago as cancelled, not as nothing to cancel', async () => {
+    const table = devTable({
+      update: fails('ConditionalCheckFailedException'),
+      get: () =>
+        Promise.resolve({
+          $metadata: {},
+          Item: { id: 'current', state: 'cancelled', drainStartsAt: 1, cancelledAt: Date.now() },
+        }),
+    })
+
+    const shown = await answerFor(
+      relay(),
+      { server: DRAIN_SERVER_DEV, subcommand: DRAIN_CANCEL_SUBCOMMAND },
+      cfg(),
+      table.devFor,
+    )
+
+    expect(shown).toBe(COPY.cancelled)
+    expect(table.calls.map((call) => call.op)).toEqual(['update', 'get'])
+  })
+
+  /**
+   * ═══ A DYNAMODB FAILURE IS A REPLY, NOT A THROW ═══
+   *
+   * `runCommand` would catch a throw and send the same sentence, but it would
+   * also journal the command as having come apart. These are an answer the dev
+   * path gave, so the handler never fails and the journal names the table.
+   */
+  it('answers a DynamoDB failure with the failure reply rather than throwing', async () => {
+    const cases: [string, Partial<Invocation & DrainFields>, Parameters<typeof devTable>[0]][] = [
+      ['a start that could not be written', {}, { put: fails('AccessDeniedException') }],
+      [
+        'a cancel that could not be written',
+        { subcommand: DRAIN_CANCEL_SUBCOMMAND },
+        { update: fails('ResourceNotFoundException') },
+      ],
+      [
+        'a refused cancel that could not be read',
+        { subcommand: DRAIN_CANCEL_SUBCOMMAND },
+        { update: fails('ConditionalCheckFailedException'), get: fails('AccessDeniedException') },
+      ],
+    ]
+
+    for (const [name, over, answers] of cases) {
+      stderr.length = 0
+      stdout.length = 0
+
+      const table = devTable(answers)
+      const respond = responder()
+
+      await runCommand(invocation({ server: DRAIN_SERVER_DEV, ...over }), cfg(), respond, [
+        drainCommand(() => relay(), table.devFor),
+      ])
+
+      const journal = stderr.join('') + stdout.join('')
+
+      expect(respond.edited, name).toEqual([COMMAND_COPY.failed])
+      expect(journal, name).not.toContain('slash command handler failed')
+      expect(journal, name).toContain('dev maintenance window')
+    }
+  })
+
+  /** Neither half is assumed on dev either. */
+  it('asks the dev table nothing when it cannot tell which half was meant', async () => {
+    for (const subcommand of [null, undefined, '', 'schedule']) {
+      const table = devTable()
+
+      expect(await answerFor(relay(), { server: DRAIN_SERVER_DEV, subcommand }, cfg(), table.devFor)).toBe(
+        COPY.noSubcommand,
+      )
+      expect(table.calls).toEqual([])
+    }
+  })
+
+  /**
+   * A SERVER THAT IS NEITHER CHOICE REACHES NEITHER SERVER. Discord would not
+   * send one, and the safe reading of a payload that did is not "probably prod".
+   */
+  it('refuses a server it does not recognize, and reaches neither', async () => {
+    for (const server of ['', 'staging', 'DEV', 'prod ']) {
+      const fake = relay()
+      const table = devTable()
+
+      expect(await answerFor(fake, { server }, cfg(), table.devFor), server).toBe(COPY.noServer)
+      expect(fake.calls, server).toEqual([])
+      expect(table.asked(), server).toBe(0)
+    }
+  })
+
+  /**
+   * `lazyDevMaintenance` IS THE REAL WIRING. Built once, on the dev prefixes, so
+   * the table it writes is named by the prefix and never spelled. Constructing
+   * the SDK client opens no socket and resolves no credentials.
+   */
+  it('builds the dev stack once, on the dev prefixes', () => {
+    const devFor = lazyDevMaintenance()
+    const first = devFor()
+
+    expect(first.tables.maintenance).toBe('dev-ringmaster-maintenance')
+    expect(first.tables.gamePlayers).toBe('dev-br-players')
+    expect(devFor()).toBe(first)
+  })
+})
+
 describe('/drain — through runCommand, the way Discord reaches it', () => {
   /** Deferred before the relay is touched, and deferred ephemeral. */
   it('defers ephemerally and then fills the reply in', async () => {
     const respond = responder()
 
-    await runCommand(invocation(), cfg(), respond, [drainCommand(() => relay())])
+    await runCommand(invocation(), cfg(), respond, [drainCommand(() => relay(), NO_DEV)])
 
     expect(respond.deferred).toEqual([true])
     expect(respond.edited).toHaveLength(1)
@@ -927,7 +1417,7 @@ describe('/drain — through runCommand, the way Discord reaches it', () => {
     const respond = responder()
 
     await runCommand(invocation({ roleIds: [OTHER_ROLE] }), cfg(), respond, [
-      drainCommand(() => fake),
+      drainCommand(() => fake, NO_DEV),
     ])
 
     expect(fake.calls).toEqual([])
@@ -964,7 +1454,7 @@ describe('/drain — through runCommand, the way Discord reaches it', () => {
       cancel: () => Promise.reject(new Error('boom')),
     }
 
-    await runCommand(invocation(), cfg(), respond, [drainCommand(() => broken)])
+    await runCommand(invocation(), cfg(), respond, [drainCommand(() => broken, NO_DEV)])
 
     expect(respond.edited).toHaveLength(1)
     expect(respond.edited[0]).toBe(COMMAND_COPY.failed)
@@ -1039,8 +1529,9 @@ describe('/drain — the console`s own reason pings nobody', () => {
     const interaction = target()
 
     await runCommand(invocation(), cfg(), responderFor(interaction), [
-      drainCommand(() =>
-        relay({ outcome: 'refused', failure: 'refused', detail: SHOUTED, status: 409 }),
+      drainCommand(
+        () => relay({ outcome: 'refused', failure: 'refused', detail: SHOUTED, status: 409 }),
+        NO_DEV,
       ),
     ])
 
@@ -1066,8 +1557,10 @@ describe('/drain — the console`s own reason pings nobody', () => {
       cfg(),
       responderFor(interaction),
       [
-        drainCommand(() =>
-          relay(SCHEDULED, { outcome: 'refused', failure: 'refused', detail: SHOUTED, status: 409 }),
+        drainCommand(
+          () =>
+            relay(SCHEDULED, { outcome: 'refused', failure: 'refused', detail: SHOUTED, status: 409 }),
+          NO_DEV,
         ),
       ],
     )
@@ -1090,7 +1583,7 @@ describe('/drain — the console`s own reason pings nobody', () => {
       invocation({ subcommand: DRAIN_CANCEL_SUBCOMMAND }),
       cfg(),
       responderFor(interaction),
-      [drainCommand(() => relay())],
+      [drainCommand(() => relay(), NO_DEV)],
     )
 
     expect(interaction.sent[0]?.content).toBe(COPY.cancelled)

@@ -1,7 +1,15 @@
-import { ApplicationCommandOptionType } from 'discord.js'
+import { ApplicationCommandOptionType, type ApplicationCommandStringOptionData } from 'discord.js'
 
 import type { Config } from '../config.ts'
 import {
+  createDevMaintenance,
+  isMaintenanceLive,
+  type DdbFailure,
+  type DevMaintenance,
+} from '../ddb.ts'
+import { log } from '../log.ts'
+import {
+  capped,
   createDrainer,
   DRAIN_NOTE_CAP,
   type CancelResult,
@@ -10,7 +18,7 @@ import {
   type DrainResult,
   type DrainWindow,
 } from '../ringmaster.ts'
-import type { BotCommand, Invocation } from './command.ts'
+import { COPY as COMMAND_COPY, type BotCommand, type Invocation } from './command.ts'
 
 /**
  * `/drain` — SCHEDULE THE MAINTENANCE WINDOW. THE MOST CONSEQUENTIAL COMMAND IN
@@ -31,6 +39,15 @@ import type { BotCommand, Invocation } from './command.ts'
  * makes a row safe to write — `nothingToDeploy`, the already-scheduled refusal
  * — lives in `POST /api/maintenance` and nowhere else. So this file's whole job
  * is to decide WHAT AN ADMIN IS TOLD, which is what a command file is for.
+ *
+ * ═══ EXCEPT ON DEV, WHERE THIS FILE WRITES THE ROW ITSELF ═══
+ *
+ * `server:dev` has no console to ask. The dev game box polls
+ * `dev-ringmaster-maintenance` itself, a runner on that box deploys the dev
+ * branch once it is empty, and the owner's rule is that the dev path must not
+ * involve Ringmaster at all. So on dev the row IS the request, written through
+ * `maintenanceWriter` in ../ddb.ts under the conditions both repos agreed on.
+ * Leaving `server` out is prod, and prod is exactly what it was.
  *
  * ═══ TWO SUBCOMMANDS, AND IT IS NOT A TOGGLE ═══
  *
@@ -94,6 +111,16 @@ export const DRAIN_CANCEL_SUBCOMMAND = 'cancel'
 export const DRAIN_NOTE_OPTION = 'note'
 
 /**
+ * The `server` option and its two choices, which are the owner's words.
+ *
+ * NOT REQUIRED, AND LEAVING IT OUT IS PROD. That is his decision, and it is why a
+ * `/drain` typed the way it always was does exactly what it always did.
+ */
+export const DRAIN_SERVER_OPTION = 'server'
+export const DRAIN_SERVER_PROD = 'prod'
+export const DRAIN_SERVER_DEV = 'dev'
+
+/**
  * The two fields this command needs that `Invocation` does not carry yet.
  *
  * WRITTEN AS OPTIONAL, AND THAT IS SCAFFOLDING RATHER THAN A DESIGN, exactly as
@@ -115,6 +142,15 @@ export interface DrainFields {
 
   /** The text of the `note` option, when one was supplied. */
   readonly note?: string | null
+
+  /** The value of the `server` option, when one was supplied. Absent is prod. */
+  readonly server?: string | null
+
+  /**
+   * The invoker's Discord display name, the guild's nickname first. Written onto
+   * a dev window as `createdByName`; the prod path attributes by id alone.
+   */
+  readonly userDisplayName?: string | null
 }
 
 /**
@@ -221,6 +257,9 @@ export const COPY = {
   /** @unwritten picker — the `note` option of `/drain start`, in the picker. */
   noteOption: 'What players who try to join are told. Optional',
 
+  /** @unwritten picker - the `server` option of `/drain start` and `/drain cancel`, in the picker. */
+  serverOption: 'Which server, prod or dev. Optional, prod when left out',
+
   /**
    * The two sentences of the start reply, in the order they are spoken.
    *
@@ -326,9 +365,28 @@ export const COPY = {
     `The console answered but could not do this: ${detail}. Run this again in a moment.`,
   unknown: (detail: string) => `The console's answer could not be read: ${detail}. Check the console.`,
 
-  /** And the two ways this command can fail before it asks anything. */
+  /**
+   * `server:dev`'s refusals, which have no console to quote.
+   *
+   * THESE THREE ARE RINGMASTER'S OWN SENTENCES, TRANSCRIBED RATHER THAN WRITTEN:
+   * `alreadyOpen` from `schedule` in fivem-ringmaster/src/lib/maintenance.ts, the
+   * other two from its `api/maintenance/cancel` route. A dev drain is refused in
+   * the words a prod one is, without the frame that says a console said them.
+   * A DynamoDB failure on that path answers with ./command.ts's `COPY.failed`.
+   */
+  alreadyOpen: 'A maintenance window is already scheduled. Cancel it first.',
+  nothingToCancel: 'There is no maintenance window to cancel.',
+  deployStarted: 'The deploy has already started. It cannot be cancelled now.',
+
+  /** @unwritten admin - `/drain cancel server:dev` refused because the live dev window is a host-patch window, which only blitz-patch closes. */
+  hostPatchWindow: 'This maintenance window was opened by host patching, so it cannot be cancelled here.',
+
+  /** And the ways this command can fail before it asks anything. */
   noCredential: 'This bot has no command credential, so it cannot ask the console for anything.',
   noSubcommand: `It is not clear whether you meant \`/drain ${DRAIN_START_SUBCOMMAND}\` or \`/drain ${DRAIN_CANCEL_SUBCOMMAND}\`, so nothing was done.`,
+
+  /** @unwritten admin - `/drain` refused because its `server` option carried something other than prod or dev. */
+  noServer: `It is not clear whether you meant \`${DRAIN_SERVER_PROD}\` or \`${DRAIN_SERVER_DEV}\`, so nothing was done.`,
 }
 
 /**
@@ -532,6 +590,33 @@ function noteOf(invocation: Invocation & DrainFields): string | null {
   return typeof note === 'string' && note !== '' ? note : null
 }
 
+/**
+ * Which server, or null when the option carried something that is neither.
+ *
+ * ABSENT IS PROD, WHICH IS THE OWNER'S DECISION. A value that is not one of the
+ * two choices is a payload Discord would not have sent, and it is refused rather
+ * than read as the server that ends real players' matches, for the reason an
+ * unreadable subcommand is.
+ */
+function serverOf(
+  invocation: Invocation & DrainFields,
+): typeof DRAIN_SERVER_PROD | typeof DRAIN_SERVER_DEV | null {
+  const server = invocation.server
+
+  if (server === undefined || server === null) return DRAIN_SERVER_PROD
+  return server === DRAIN_SERVER_PROD || server === DRAIN_SERVER_DEV ? server : null
+}
+
+/**
+ * Who a dev window is attributed to by name. The invoker's id when the seam
+ * carried no display name, which `invocationOf` in ./index.ts always does.
+ */
+function nameOf(invocation: Invocation & DrainFields): string {
+  const name = invocation.userDisplayName
+
+  return typeof name === 'string' && name.trim() !== '' ? name : invocation.userId
+}
+
 /** How the command reaches the console. Injected so the tests run offline. */
 export type DrainerFor = (config: Config) => Drainer | null
 
@@ -565,6 +650,181 @@ export function lazyDrainer(): DrainerFor {
   }
 }
 
+/** How the command reaches the dev table. Injected so the tests run offline. */
+export type DevMaintenanceFor = () => DevMaintenance
+
+/**
+ * The real one, built on first use and kept, for `lazyDrainer`'s reasons.
+ *
+ * NO PREFIX AND NO TABLE NAME. `createDevMaintenance` forces the dev prefixes,
+ * so neither is chosen here. No secret gates it: nothing here asks the console
+ * for anything.
+ */
+export function lazyDevMaintenance(): DevMaintenanceFor {
+  let built: DevMaintenance | null = null
+
+  return () => (built ??= createDevMaintenance())
+}
+
+/**
+ * How recently a row must have been cancelled for a refused cancel to be read as
+ * this one. The update, with the SDK's one retry inside it, and the read after it
+ * each run under ../ddb.ts's two-second deadline, so a retry of a cancel that
+ * landed reads back well inside this. A window somebody else called off in the
+ * same seconds is off too, so the reply is still true.
+ */
+const JUST_CANCELLED_MS = 10_000
+
+/**
+ * How loudly a dev-table failure is journaled, for `levelFor`'s reason in
+ * ../ringmaster.ts. A timeout or an unrecognized error may pass on the next try;
+ * a missing table, a denial or no credentials is an operator's to fix.
+ */
+function devLevel(failure: DdbFailure): 'warn' | 'error' {
+  return failure.kind === 'timeout' || failure.kind === 'error' ? 'warn' : 'error'
+}
+
+/**
+ * `/drain start server:dev`: open the window by writing the row.
+ *
+ * THE REPLY IS PROD'S, READ OFF THE ROW THAT WAS WRITTEN. The door closes now and
+ * the restart waits for the box to empty, which is what `scheduledReply` says.
+ *
+ * THE NOTE IS CAPPED BY THE RELAY'S OWN `capped`, so a dev note is trimmed and
+ * cut exactly as a prod one is before the console ever sees it.
+ */
+async function startDev(invocation: Invocation & DrainFields, dev: DevMaintenance): Promise<string> {
+  const where = { actor: invocation.userId, table: dev.tables.maintenance }
+
+  const opened = await dev.maintenanceWriter.open({
+    createdBy: invocation.userId,
+    createdByName: nameOf(invocation),
+    note: capped(noteOf(invocation), DRAIN_NOTE_CAP),
+  })
+
+  if (opened.ok) {
+    // Info, for the reason the prod line is: an admin asked for exactly this.
+    log('info', 'a dev maintenance window was opened and the dev server will restart', {
+      ...where,
+      drainStartsAt: opened.value.drainStartsAt,
+    })
+
+    return scheduledReply({
+      state: opened.value.state,
+      note: opened.value.note ?? null,
+      drainStartsAt: opened.value.drainStartsAt,
+      deployMode: opened.value.deployMode,
+      deployAt: opened.value.deployAt,
+    })
+  }
+
+  if (opened.failure.kind === 'conflict') {
+    log('info', 'no dev maintenance window was opened because one is already live', where)
+    return COPY.alreadyOpen
+  }
+
+  log(devLevel(opened.failure), 'the dev maintenance window could not be written', {
+    ...where,
+    failure: opened.failure.kind,
+    detail: opened.failure.message,
+  })
+
+  return COMMAND_COPY.failed
+}
+
+/**
+ * `/drain cancel server:dev`: call the window off by updating the row.
+ *
+ * A REFUSED UPDATE IS THEN READ, ONLY TO SAY WHY. The update is the act and its
+ * condition is the rule; the read afterwards picks which of Ringmaster's
+ * sentences is true of what is actually there. A row that now looks cancellable
+ * changed between the two, and that is answered as a failure rather than guessed.
+ * A row cancelled in the last few seconds is answered as cancelled; see
+ * `JUST_CANCELLED_MS`.
+ */
+async function cancelDev(invocation: Invocation & DrainFields, dev: DevMaintenance): Promise<string> {
+  const where = { actor: invocation.userId, table: dev.tables.maintenance }
+
+  const cancelled = await dev.maintenanceWriter.cancel()
+
+  if (cancelled.ok) {
+    log('info', 'the dev maintenance window was cancelled', where)
+    return COPY.cancelled
+  }
+
+  if (cancelled.failure.kind !== 'conflict') {
+    log(devLevel(cancelled.failure), 'the dev maintenance window could not be cancelled', {
+      ...where,
+      failure: cancelled.failure.kind,
+      detail: cancelled.failure.message,
+    })
+
+    return COMMAND_COPY.failed
+  }
+
+  const seen = await dev.maintenanceWriter.current()
+
+  if (!seen.ok) {
+    log(devLevel(seen.failure), 'the dev maintenance window refused a cancel and could not be read', {
+      ...where,
+      failure: seen.failure.kind,
+      detail: seen.failure.message,
+    })
+
+    return COMMAND_COPY.failed
+  }
+
+  const window = seen.value
+
+  // An update that landed and lost its answer is retried into its own condition
+  // and refused. The window is off either way, so the admin is told it is.
+  if (
+    window?.state === 'cancelled' &&
+    typeof window.cancelledAt === 'number' &&
+    Math.abs(Date.now() - window.cancelledAt) <= JUST_CANCELLED_MS
+  ) {
+    log('info', 'the dev maintenance window was cancelled', { ...where, cancelledAt: window.cancelledAt })
+    return COPY.cancelled
+  }
+
+  log('info', 'the dev maintenance window was not cancelled', { ...where, state: window?.state })
+
+  if (!isMaintenanceLive(window)) return COPY.nothingToCancel
+  if (window.hostPatch === true) return COPY.hostPatchWindow
+  if (window.state === 'deploying') return COPY.deployStarted
+
+  return COMMAND_COPY.failed
+}
+
+/** Which dev half was invoked. Neither half is assumed, exactly as on prod. */
+async function runDev(invocation: Invocation & DrainFields, devFor: DevMaintenanceFor): Promise<string> {
+  const subcommand = subcommandOf(invocation)
+
+  if (subcommand === DRAIN_CANCEL_SUBCOMMAND) return cancelDev(invocation, devFor())
+  if (subcommand !== DRAIN_START_SUBCOMMAND) return COPY.noSubcommand
+
+  return startDev(invocation, devFor())
+}
+
+/**
+ * The `server` option, declared on both halves.
+ *
+ * A FUNCTION SO EACH HALF HOLDS ITS OWN OBJECT. Discord's grammar puts options
+ * inside the subcommand, so the one declaration has to appear twice.
+ */
+function serverOptionData(): ApplicationCommandStringOptionData {
+  return {
+    type: ApplicationCommandOptionType.String,
+    name: DRAIN_SERVER_OPTION,
+    description: COPY.serverOption,
+    required: false,
+    choices: [
+      { name: DRAIN_SERVER_PROD, value: DRAIN_SERVER_PROD },
+      { name: DRAIN_SERVER_DEV, value: DRAIN_SERVER_DEV },
+    ],
+  }
+}
+
 /**
  * `/drain`.
  *
@@ -574,7 +834,10 @@ export function lazyDrainer(): DrainerFor {
  * server, is exercised against an object literal in a test file with no
  * network anywhere near it.
  */
-export function drainCommand(drainerFor: DrainerFor): BotCommand {
+export function drainCommand(
+  drainerFor: DrainerFor,
+  devMaintenanceFor: DevMaintenanceFor,
+): BotCommand {
   return {
     data: {
       name: 'drain',
@@ -609,12 +872,14 @@ export function drainCommand(drainerFor: DrainerFor): BotCommand {
               // typing rather than a thing that is silently cut afterwards.
               maxLength: DRAIN_NOTE_CAP,
             },
+            serverOptionData(),
           ],
         },
         {
           type: ApplicationCommandOptionType.Subcommand,
           name: DRAIN_CANCEL_SUBCOMMAND,
           description: COPY.cancelDescription,
+          options: [serverOptionData()],
         },
       ],
     },
@@ -653,6 +918,17 @@ export function drainCommand(drainerFor: DrainerFor): BotCommand {
     onlyInvoker: () => true,
 
     run: async (invocation, config) => {
+      /**
+       * THE SERVER FIRST, BECAUSE IT DECIDES WHETHER THE CONSOLE IS INVOLVED AT
+       * ALL. Prod, named or left out, runs every line below this block exactly as
+       * it ran before the option existed. Dev never reaches `drainerFor`, so it
+       * needs no `COMMAND_SECRET`.
+       */
+      const server = serverOf(invocation)
+
+      if (server === null) return COPY.noServer
+      if (server === DRAIN_SERVER_DEV) return runDev(invocation, devMaintenanceFor)
+
       const drainer = drainerFor(config)
 
       // No `COMMAND_SECRET` means there is no door. Saying so is better than a

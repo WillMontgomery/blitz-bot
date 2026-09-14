@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MAX_INDEX_ROWS } from './incidents.ts'
 import {
   createDdb,
+  createDevMaintenance,
   INCIDENT_KIND_INDEX,
   createDocument,
   isBanActive,
@@ -32,6 +33,7 @@ import {
   type DdbOp,
   type DdbWithAuditWindow,
   type DdbResult,
+  type DevMaintenance,
   type DocumentClient,
   type MaintenanceWindow,
   type RequestOptions,
@@ -1898,6 +1900,172 @@ describe('reading the audit log as a stream', () => {
 
   it('is AUDIT when nobody says otherwise, which is what the console writes today', () => {
     expect(createDdb({ document: fakeDocument().doc }).auditWindow.partition).toBe('AUDIT')
+  })
+})
+
+/**
+ * The maintenance writer, which only `/drain server:dev` builds.
+ *
+ * THE CONTRACT WITH THE DEV BOX'S RUNNER IS THESE TWO REQUESTS, and a runner
+ * that reads an attribute this module spelled differently simply never drains.
+ * So both are asserted whole, on the dev prefix the one caller uses.
+ */
+describe('the maintenance writer', () => {
+  const dev = (fake: Fake): DevMaintenance =>
+    createDevMaintenance({ document: fake.doc, now: () => 1_700_000_000_000 })
+
+  it('names the dev stack off its prefixes, like every other table', () => {
+    const { tables } = dev(fakeDocument())
+
+    expect(tables.maintenance).toBe('dev-ringmaster-maintenance')
+    expect(tables.gamePlayers).toBe('dev-br-players')
+  })
+
+  it('opens a window with the whole row, only over no window or a finished one', async () => {
+    const fake = fakeDocument()
+
+    const result = await dev(fake).maintenanceWriter.open({
+      createdBy: '280000000000000000',
+      createdByName: 'Admin One',
+      note: 'back in ten',
+    })
+
+    const item = {
+      id: 'current',
+      state: 'scheduled',
+      createdAt: 1_700_000_000_000,
+      createdBy: '280000000000000000',
+      createdByName: 'Admin One',
+      note: 'back in ten',
+      drainStartsAt: 1_700_000_000_000,
+      deployMode: 'when-empty',
+      deployAt: null,
+      expiresAt: 1_700_014_400_000,
+      source: 'discord',
+    }
+
+    expect(fake.calls).toHaveLength(1)
+    expect(fake.calls[0]?.op).toBe('put')
+    expect(fake.calls[0]?.input).toEqual({
+      TableName: 'dev-ringmaster-maintenance',
+      Item: item,
+      ConditionExpression: 'attribute_not_exists(id) OR #s = :complete OR #s = :cancelled',
+      ExpressionAttributeNames: { '#s': 'state' },
+      ExpressionAttributeValues: { ':complete': 'complete', ':cancelled': 'cancelled' },
+    })
+
+    expect(result).toEqual({ ok: true, value: item })
+  })
+
+  /** The contract writes `note` only if one was given. Empty is not given. */
+  it('leaves the note off the row rather than writing it empty', async () => {
+    for (const note of [null, undefined, '']) {
+      const fake = fakeDocument()
+
+      await dev(fake).maintenanceWriter.open({ createdBy: '1', createdByName: 'A', note })
+
+      expect((fake.calls[0]?.input as PutCommandInput).Item, String(note)).not.toHaveProperty('note')
+    }
+  })
+
+  /** A live window is somebody else's, and refusing it is DynamoDB's job, not a read's. */
+  it('reports a live window as a conflict', async () => {
+    const ddb = dev({ doc: failingDocument(awsError('ConditionalCheckFailedException')), calls: [] })
+
+    const result = await ddb.maintenanceWriter.open({ createdBy: '1', createdByName: 'A' })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.failure.kind).toBe('conflict')
+      expect(result.failure.op).toBe('put')
+      expect(result.failure.table).toBe('dev-ringmaster-maintenance')
+    }
+  })
+
+  it('cancels only a scheduled or draining window that is not a host patch', async () => {
+    const fake = fakeDocument()
+
+    const result = await dev(fake).maintenanceWriter.cancel()
+
+    expect(fake.calls).toHaveLength(1)
+    expect(fake.calls[0]?.op).toBe('update')
+    expect(fake.calls[0]?.input).toEqual({
+      TableName: 'dev-ringmaster-maintenance',
+      Key: { id: 'current' },
+      UpdateExpression: 'SET #s = :cancelled, cancelledAt = :now',
+      ConditionExpression:
+        '(#s = :scheduled OR #s = :draining) AND (attribute_not_exists(hostPatch) OR hostPatch = :false)',
+      ExpressionAttributeNames: { '#s': 'state' },
+      ExpressionAttributeValues: {
+        ':cancelled': 'cancelled',
+        ':now': 1_700_000_000_000,
+        ':scheduled': 'scheduled',
+        ':draining': 'draining',
+        ':false': false,
+      },
+    })
+
+    expect(result).toEqual({ ok: true, value: undefined })
+  })
+
+  it('reports a cancel it may not make as a conflict', async () => {
+    const ddb = dev({ doc: failingDocument(awsError('ConditionalCheckFailedException')), calls: [] })
+
+    const result = await ddb.maintenanceWriter.cancel()
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.failure.kind).toBe('conflict')
+      expect(result.failure.op).toBe('update')
+    }
+  })
+
+  /**
+   * CONSISTENT, because `/drain cancel` reads this right after a refused update
+   * to say why, and an eventually consistent read could answer with the state
+   * from before the runner's last move.
+   */
+  it('reads the dev row consistently', async () => {
+    const fake = fakeDocument()
+
+    await dev(fake).maintenanceWriter.current()
+
+    expect(fake.calls).toHaveLength(1)
+    expect(fake.calls[0]?.op).toBe('get')
+    expect(fake.calls[0]?.input).toEqual({
+      TableName: 'dev-ringmaster-maintenance',
+      Key: { id: 'current' },
+      ConsistentRead: true,
+    })
+  })
+
+  /**
+   * THE WRITER CANNOT REACH A PROD TABLE. The access-policy test below does not
+   * run it, so this is what says so: every request it builds, on every path,
+   * names the dev row, even when a caller smuggles a prefix past the option type.
+   */
+  it('names dev-ringmaster-maintenance in every request it builds, and nothing else', async () => {
+    const landed = fakeDocument()
+    const refused = fakeDocument({
+      put: () => Promise.reject(awsError('ConditionalCheckFailedException')),
+      update: () => Promise.reject(awsError('ConditionalCheckFailedException')),
+    })
+
+    for (const fake of [landed, refused]) {
+      const smuggled = { document: fake.doc, tablePrefix: 'ringmaster-' } as Parameters<
+        typeof createDevMaintenance
+      >[0]
+      const writer = createDevMaintenance(smuggled).maintenanceWriter
+
+      await writer.open({ createdBy: '1', createdByName: 'A' })
+      await writer.cancel()
+      await writer.current()
+    }
+
+    const calls = [...landed.calls, ...refused.calls]
+
+    expect(calls.map((call) => call.op)).toEqual(['put', 'update', 'get', 'put', 'get', 'update', 'get'])
+    expect([...new Set(calls.map((call) => call.table))]).toEqual(['dev-ringmaster-maintenance'])
   })
 })
 
