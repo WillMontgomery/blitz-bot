@@ -12,7 +12,7 @@ match, and draining the server. See
 ## What it does today
 
 **It moderates messages, mirrors Discord's moderation into the game, and answers
-five slash commands.**
+six slash commands.**
 
 Six rules remove a message, and nothing else does: an invite to another Discord
 server, more invite codes in one message than it will check, a
@@ -24,7 +24,8 @@ Around that: a ban, unban or kick in Discord is carried into the game and
 written to DynamoDB; a ban issued in the console puts the game-ban role on the
 player here and takes it off again when it is lifted or expires; an incident
 becomes an embed in the moderation channel when it is filed and again when it is
-closed in the console; `/sticky` keeps a
+closed in the console; a reaction on a message an admin paired with `/reactrole`
+gives that role and taking the reaction off takes it back; `/sticky` keeps a
 message at the bottom of a channel; and `docs/bot-manual.md` is published to a
 channel and reconciled at every start.
 
@@ -80,16 +81,18 @@ node --env-file=.env --disable-warning=ExperimentalWarning src/index.ts
 **A token alone is not enough to get a working bot.** The application needs
 **both** privileged intents turned on — **Message Content** and **Server
 Members** — and the bot needs to be in the guild, invited with the `bot` and
-`applications.commands` scopes, holding **Manage Messages**, **Manage Roles**
-and **View Audit Log**, with its own role above the game-ban role. Miss an
-intent and the gateway closes with code 4014 and login fails on every attempt.
-Miss a scope or a permission and the process still starts and still looks
-healthy: no command is ever registered, or every delete fails, or no game ban is
-marked, or Discord's bans never reach the game.
+`applications.commands` scopes, holding **Manage Messages**, **Manage Roles**,
+**View Audit Log** and **Add Reactions**, with its own role above the game-ban
+role and above any role `/reactrole` hands out. Miss an intent and the gateway
+closes with code 4014 and login fails on every attempt. Miss a scope or a
+permission and the process still starts and still looks healthy: no command is
+ever registered, or every delete fails, or no game ban is marked, or Discord's
+bans never reach the game, or `/reactrole` saves the pairing and cannot put the
+emoji on the message.
 [docs/deploy.md §4](docs/deploy.md) is the checklist, and it applies to a laptop
 exactly as it does to the box.
 
-**AWS is not optional either.** `src/ddb.ts` reads and writes eight DynamoDB
+**AWS is not optional either.** `src/ddb.ts` reads and writes nine DynamoDB
 tables, and on a laptop the SDK will find whatever credentials your environment
 gives it. See [docs/aws-notes.md](docs/aws-notes.md).
 

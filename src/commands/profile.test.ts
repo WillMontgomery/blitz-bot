@@ -643,6 +643,12 @@ describe('readsFrom', () => {
       incidents: { get: unused, opened: unused },
       audit: { begin: unused, resolve: unused, recent: unused },
       botState: { get: unused, put: unused },
+
+      // A profile has no business asking which reaction grants which role, so
+      // both reject — and they are named here for the reason `bans.issue` and
+      // `bans.lift` are: this fake IS a `Ddb`, so a member added to that
+      // interface has to appear here.
+      reactRoles: { get: unused, put: unused },
     }
   }
 

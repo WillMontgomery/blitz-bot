@@ -22,6 +22,8 @@ import {
   isMaintenanceDraining,
   isMaintenanceLive,
   qualifyId,
+  REACT_ROLE_ANY,
+  reactRoleChannelKey,
   tableNames,
   type Actor,
   type AuditAction,
@@ -36,6 +38,7 @@ import {
   type DevMaintenance,
   type DocumentClient,
   type MaintenanceWindow,
+  type ReactRolePairingInput,
   type RequestOptions,
 } from './ddb.ts'
 
@@ -91,6 +94,20 @@ const ISSUE: BanIssueInput = {
   reason: 'cheating',
   expiresAt: null,
   entryId: ENTRY,
+}
+
+/** A message with a reaction-role pairing on it, and the emoji that grants one. */
+const MESSAGE = '1400000000000000000'
+const EMOJI = '🎮'
+
+/** The smallest legal pairing write. Spread and overridden where a test needs more. */
+const PAIRING: ReactRolePairingInput = {
+  messageId: MESSAGE,
+  emoji: EMOJI,
+  roleId: '1500000000000000000',
+  channelId: '1600000000000000000',
+  guildId: '1700000000000000000',
+  createdBy: ACTOR.discordId ?? '',
 }
 
 /** Any AWS response is legal with only this on it; every field we read is optional. */
@@ -206,6 +223,8 @@ const EXERCISES: Array<{
   { name: 'auditWindow.newest', run: (d) => d.auditWindow.newest() },
   { name: 'botState.get', run: (d) => d.botState.get('reported-commit') },
   { name: 'botState.put', run: (d) => d.botState.put('reported-commit', 'abc1234') },
+  { name: 'reactRoles.get', run: (d) => d.reactRoles.get(MESSAGE, EMOJI) },
+  { name: 'reactRoles.put', run: (d) => d.reactRoles.put(PAIRING) },
 ]
 
 /* ------------------------------------------------------------------ */
@@ -270,6 +289,7 @@ describe('table names', () => {
       maintenance: 'ringmaster-maintenance',
       botState: 'ringmaster-bot-state',
       incidents: 'ringmaster-incidents',
+      reactRoles: 'ringmaster-reactroles',
       gamePlayers: 'br-players',
     })
   })
@@ -882,6 +902,113 @@ describe('the bot state table', () => {
     const ddb = createDdb({ document: fakeDocument().doc })
 
     await expect(ddb.botState.get('never-written')).resolves.toEqual({ ok: true, value: null })
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * The reaction-role pairings.
+ *
+ * WHAT THIS SECTION IS FOR: the table is keyed on `messageId` + `emoji`, and
+ * TWO of the four shapes the owner asked for have no message and one has no
+ * emoji. So the interesting assertions here are about the KEYS — that a
+ * channel-wide pairing cannot collide with a real message id, that `any` is
+ * stored as the emoji, and that both halves are always sent.
+ * ------------------------------------------------------------------ */
+
+describe('the reaction-role table', () => {
+  const NOW = 1_700_000_000_000
+
+  it('writes a message pairing under the message id and the emoji, stamped', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc, now: () => NOW })
+
+    const result = await ddb.reactRoles.put(PAIRING)
+
+    expect(result).toEqual({ ok: true, value: { ...PAIRING, createdAt: NOW } })
+    expect(fake.calls[0]?.input).toEqual({
+      TableName: 'ringmaster-reactroles',
+      Item: { ...PAIRING, createdAt: NOW },
+    })
+  })
+
+  /**
+   * NO CONDITION ON THE WRITE, WHICH IS THE OWNER'S RULE RATHER THAN AN
+   * OVERSIGHT: running `/reactrole` again for the same message and emoji
+   * REPLACES the role. The audit write next door is conditional because a row
+   * that already exists there is somebody else's record; a row that already
+   * exists here is the previous answer to the same question.
+   *
+   * ASSERTED AS AN ABSENCE, because that is what would quietly change. A
+   * `ConditionExpression` added here would turn the second `/reactrole` into a
+   * `conflict` and the admin would be told the command failed.
+   */
+  it('replaces a pairing for the same key rather than refusing it', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc, now: () => NOW })
+
+    await ddb.reactRoles.put(PAIRING)
+    await ddb.reactRoles.put({ ...PAIRING, roleId: 'a-different-role' })
+
+    expect(fake.calls).toHaveLength(2)
+    for (const call of fake.calls) {
+      expect(call.op).toBe('put')
+      expect(call.input).not.toHaveProperty('ConditionExpression')
+    }
+
+    expect(fake.calls[1]?.input).toMatchObject({ Item: { roleId: 'a-different-role' } })
+  })
+
+  /**
+   * THE TWO KEY SHAPES, SIDE BY SIDE, which is the whole of how four shapes fit
+   * in one table. A channel-wide pairing is keyed `channel#<id>` — a string a
+   * Discord snowflake can never be, because a snowflake is digits — and `any` is
+   * stored as the emoji.
+   */
+  it('keys a channel-wide pairing where no message id can collide with it', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc, now: () => NOW })
+
+    const channelWide: ReactRolePairingInput = {
+      ...PAIRING,
+      messageId: reactRoleChannelKey(PAIRING.channelId),
+      emoji: REACT_ROLE_ANY,
+    }
+
+    await ddb.reactRoles.put(channelWide)
+
+    expect(reactRoleChannelKey(PAIRING.channelId)).toBe(`channel#${PAIRING.channelId}`)
+    expect(reactRoleChannelKey(PAIRING.channelId)).not.toMatch(/^\d+$/u)
+
+    expect(fake.calls[0]?.input).toMatchObject({
+      TableName: 'ringmaster-reactroles',
+      Item: { messageId: `channel#${PAIRING.channelId}`, emoji: 'any' },
+    })
+  })
+
+  it('reads one pairing by both halves of the key', async () => {
+    const fake = fakeDocument()
+    const ddb = createDdb({ document: fake.doc })
+
+    await ddb.reactRoles.get(MESSAGE, EMOJI)
+
+    expect(fake.calls[0]?.op).toBe('get')
+    expect(fake.calls[0]?.input).toEqual({
+      TableName: 'ringmaster-reactroles',
+      Key: { messageId: MESSAGE, emoji: EMOJI },
+    })
+  })
+
+  it('reads a pairing that was never made as null', async () => {
+    const ddb = createDdb({ document: fakeDocument().doc })
+
+    await expect(ddb.reactRoles.get(MESSAGE, EMOJI)).resolves.toEqual({ ok: true, value: null })
+  })
+
+  it('hands back the row it found', async () => {
+    const row = { ...PAIRING, createdAt: NOW }
+    const ddb = createDdb({ document: fakeDocument({ get: async () => ({ ...META, Item: row }) }).doc })
+
+    await expect(ddb.reactRoles.get(MESSAGE, EMOJI)).resolves.toEqual({ ok: true, value: row })
   })
 })
 
@@ -2058,17 +2185,23 @@ describe('the maintenance writer', () => {
 
 describe('what the bot may do to these tables', () => {
   /**
-   * THE ACCESS POLICY, ASSERTED. Three tables are written and the list is
+   * THE ACCESS POLICY, ASSERTED. Four tables are written and the list is
    * short enough to read: the audit log the bot appends to, the bot's own
-   * state, and — since blitz-bot#16 — the ban table. A future accessor that
-   * writes to a fourth fails here before it reaches a review.
+   * state, the reaction-role pairings it also owns, and — since blitz-bot#16 —
+   * the ban table. A future accessor that writes to a fifth fails here before
+   * it reaches a review.
    *
    * `ringmaster-bans` WAS ON THE OTHER SIDE OF THIS ASSERTION UNTIL #16, and
    * the line moving is the whole of what that change did to the bot's reach
    * into AWS. It is asserted rather than described so that the next widening
    * is also a visible edit to a test rather than a quiet extra call.
+   *
+   * `ringmaster-reactroles` IS THE LATEST TO CROSS IT AND IS THE CHEAPEST. It is
+   * the bot's own table, like `ringmaster-bot-state`: the console neither reads
+   * nor writes it, so nothing outside this repo can be damaged by a mistake in
+   * it.
    */
-  it('writes to the audit log, its own state and the ban table, and nothing else', async () => {
+  it('writes to the audit log, its own two tables and the ban table, and nothing else', async () => {
     const fake = fakeDocument()
     const ddb = createDdb({ document: fake.doc })
 
@@ -2082,10 +2215,11 @@ describe('what the bot may do to these tables', () => {
       'ringmaster-audit',
       'ringmaster-bans',
       'ringmaster-bot-state',
+      'ringmaster-reactroles',
     ])
   })
 
-  it('reads the eight it is pointed at, and no others', async () => {
+  it('reads the nine it is pointed at, and no others', async () => {
     const fake = fakeDocument()
     const ddb = createDdb({ document: fake.doc })
 
@@ -2106,6 +2240,7 @@ describe('what the bot may do to these tables', () => {
       'ringmaster-maintenance',
       'ringmaster-player-ids',
       'ringmaster-players',
+      'ringmaster-reactroles',
     ])
   })
 })

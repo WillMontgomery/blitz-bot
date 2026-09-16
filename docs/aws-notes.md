@@ -44,16 +44,16 @@ a wrong grant could not have made harmless.
 
 ### What the bot's own policy needs, when #4 writes one
 
-Nine tables are read; four of those are also written. There is no `DeleteItem`
+Ten tables are read; five of those are also written. There is no `DeleteItem`
 and no `Scan` anywhere in this list, and the module has no code path that could
 use either — its document-client interface exposes `get`, `put`, `update` and
 `query` and nothing else.
 
 | Action | Resource |
 |---|---|
-| `dynamodb:GetItem` | `ringmaster-bans`, `ringmaster-players`, `ringmaster-player-ids`, `ringmaster-maintenance`, `ringmaster-bot-state`, **`ringmaster-incidents`**, `br-players`, `dev-ringmaster-maintenance` |
+| `dynamodb:GetItem` | `ringmaster-bans`, `ringmaster-players`, `ringmaster-player-ids`, `ringmaster-maintenance`, `ringmaster-bot-state`, **`ringmaster-incidents`**, **`ringmaster-reactroles`**, `br-players`, `dev-ringmaster-maintenance` |
 | `dynamodb:Query` | `ringmaster-audit`, **`ringmaster-incidents` — the table AND `…/index/kind-openedAt-index`** |
-| `dynamodb:PutItem` | `ringmaster-audit`, `ringmaster-bot-state`, **`ringmaster-bans`**, `dev-ringmaster-maintenance` |
+| `dynamodb:PutItem` | `ringmaster-audit`, `ringmaster-bot-state`, **`ringmaster-bans`**, **`ringmaster-reactroles`**, `dev-ringmaster-maintenance` |
 | `dynamodb:UpdateItem` | `ringmaster-audit`, **`ringmaster-bans`**, `dev-ringmaster-maintenance` |
 
 All in `us-east-2`. See the region section below before writing an ARN.
@@ -180,6 +180,7 @@ game's from `DDB_GAME_TABLE_PREFIX` (`br-`).
 | `ringmaster-audit` | `pk` (S) + `ts` (N) | read **and write** | `lib/audit.ts` |
 | `ringmaster-bot-state` | `id` (S) | read **and write** | this repo |
 | `ringmaster-incidents` | `incidentId` (S), GSI `kind-openedAt-index` | read | `lib/incidents.ts` |
+| `ringmaster-reactroles` | `messageId` (S) + `emoji` (S) | read **and write** | this repo |
 | `br-players` | `pk` (S) + `sk` (S), `sk = "profile"` | read | `lib/gameProfile.ts` |
 
 Three of those are worth reading twice.
@@ -306,6 +307,68 @@ at a time (see the table above) and does not need a prefix to express "this one
 is the bot's". The cost, stated so it is a decision and not an accident: the
 console's `ringmaster-*` grant covers this table, so the console *can* write the
 bot's state. It has no reason to and no code that does.
+
+### `ringmaster-reactroles`, and the two key shapes in it
+
+**The second table the console does not own**, and the only one in this repo
+whose shape was decided here rather than transcribed from `fivem-ringmaster`.
+`/reactrole` writes a row; the reaction listeners read one. The console has no
+code that touches it.
+
+| | |
+|---|---|
+| Partition key | `messageId` (S) |
+| Sort key | `emoji` (S) |
+
+```bash
+aws dynamodb create-table \
+  --region us-east-2 \
+  --table-name ringmaster-reactroles \
+  --attribute-definitions \
+      AttributeName=messageId,AttributeType=S \
+      AttributeName=emoji,AttributeType=S \
+  --key-schema \
+      AttributeName=messageId,KeyType=HASH \
+      AttributeName=emoji,KeyType=RANGE \
+  --billing-mode PAY_PER_REQUEST
+```
+
+**IAM already covers it and there is nothing to grant today.** The name matches
+`ringmaster-*`, which is what `RingmasterTableAccess` — the instance role the bot
+shares with the console — grants every action on. That is the opposite of
+`dev-ringmaster-maintenance` above, which does *not* match the pattern and needed
+a grant added by hand. The only thing missing until somebody runs the command
+above is the table itself, and its absence shows up as `no-such-table`: on
+`/reactrole` the admin gets the generic failure reply and the journal says which
+table, and on a reaction #bot-status gets one error saying the table does not
+exist. One, and not one per reaction: it is latched, and an all-clear follows when
+the table answers. See `READ_FAULT` in `src/reactroles.ts` and `src/latch.ts`.
+
+**Four shapes live in one table because the KEY is the shape.** The owner asked
+for a pairing to be able to name one message or any message in a channel, and one
+emoji or any emoji.
+
+| Shape | `messageId` | `emoji` |
+|---|---|---|
+| one message, one emoji | the message id | the emoji |
+| one message, any emoji | the message id | `any` |
+| any message in a channel, one emoji | `channel#<channelId>` | the emoji |
+| any message in a channel, any emoji | `channel#<channelId>` | `any` |
+
+**Neither magic value can collide with a real one.** A Discord snowflake is
+decimal digits and nothing else, so a key carrying a `#` is not one —
+`reactRoleChannelKey` in `src/ddb.ts` is the only place that string is built, for
+the reason `qualifyId` is a function. And an emoji key is a custom emoji's id
+(digits) or the unicode character itself, so it is never the three ASCII letters
+`any`.
+
+**A reaction costs at most four `GetItem`s and usually one.** `pairingFor` in
+`src/reactroles.ts` asks the four keys above in precedence order and stops at the
+first that answers: a message-specific pairing beats a channel-wide one, and an
+exact emoji beats `any`. There is no `Query` and no `Scan` on this table, and a
+reaction from a bot costs nothing at all because that check comes first. The
+write is an unconditional `PutItem`, which is what makes running the command again
+for the same message and emoji replace the role.
 
 ## The bot writes bans now
 

@@ -36,6 +36,7 @@ import { latch } from './latch.ts'
 import { scanLinks, type LinkReason } from './links.ts'
 import { log, type Level, type Sink } from './log.ts'
 import { watchMaintenance } from './maintenance.ts'
+import { installReactionRoles } from './reactroles.ts'
 import { createRingmaster, KICK_TTL_MS, type KickResult, type Ringmaster } from './ringmaster.ts'
 import { installStickies } from './sticky.ts'
 
@@ -1839,12 +1840,30 @@ export function createClient(config: Config): Client {
      * target, executor and reason together and is therefore the one that needs
      * no correlating.
      */
+    /**
+     * `GuildMessageReactions` IS NEW, IS NOT PRIVILEGED, AND NEEDS NOTHING FROM
+     * AN OPERATOR BUT A RESTART. It is what makes the gateway send
+     * `messageReactionAdd` and `messageReactionRemove` at all, which is the whole
+     * of how `/reactrole`'s pairings are acted on — see `installReactionRoles` in
+     * ./reactroles.ts. There is no tick in the Developer Portal for it and no
+     * review: unlike `GuildMembers` and `MessageContent` above, asking for it
+     * cannot put the bot in a 4014 restart loop.
+     *
+     * IT DOES NOT COVER REMOVALS DONE IN BULK. `messageReactionRemoveAll` and
+     * `messageReactionRemoveEmoji` arrive under this intent too and nothing in
+     * this bot listens for either, so an admin who clears a message's reactions
+     * from Discord's own menu leaves everybody holding the role they were given.
+     * That is worth knowing and is not a bug to fix quietly: taking a role off
+     * fifty people because one admin tidied a message is a bigger action than the
+     * one anybody asked for.
+     */
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
       GatewayIntentBits.MessageContent,
       GatewayIntentBits.GuildModeration,
       GatewayIntentBits.GuildMembers,
+      GatewayIntentBits.GuildMessageReactions,
     ],
 
     /**
@@ -1854,8 +1873,25 @@ export function createClient(config: Config): Client {
      * without it the edit bypass survives every restart: post now, let the bot
      * restart, edit the message tomorrow and nothing is ever looked at.
      * `handleLive` fetches what arrives partial rather than scanning it empty.
+     *
+     * ═══ AND IT IS ALSO ONE OF THE THREE REACTIONS NEED ═══
+     *
+     * A REACTION ROLE IS ALWAYS ON AN OLD MESSAGE. The whole point of one is that
+     * it sits in a channel for weeks and members click it as they arrive, which
+     * means the message is never in this process's cache — so without partials
+     * the feature would work only for messages posted since the last restart,
+     * silently, which is the worst possible version of it.
+     *
+     * discord.js's own reaction actions are where the three come from, read
+     * rather than guessed at: `MessageReactionAdd` refuses outright when the
+     * message is partial and `Partials.Reaction` is off, `MessageReactionRemove`
+     * cannot build the reaction without it either, and BOTH bail when the reacting
+     * account is not in the user cache unless `Partials.User` is on — a removal
+     * carries a bare user id and no member object, so that is not a rare case.
+     * `Partials.Channel` is deliberately NOT here: it is for DM channels, and the
+     * `Guilds` intent already caches every channel in the guild.
      */
-    partials: [Partials.Message],
+    partials: [Partials.Message, Partials.Reaction, Partials.User],
 
     /**
      * NOTHING THIS BOT SENDS PINGS ANYONE UNLESS THE SEND ITSELF SAYS SO. Set
@@ -2288,6 +2324,34 @@ export function createClient(config: Config): Client {
    * recording moderation that is still happening in the console.
    */
   installIncidentLog(client, config, createDdb())
+
+  /**
+   * REACTION ROLES — the desk `/reactrole` reaches for, and the two listeners
+   * that act on what it saved.
+   *
+   * WIRED HERE, UNCONDITIONALLY, FOR THE MIRROR'S REASONS. There is no channel id
+   * to hang it off because it is not a thing the bot says: it is members giving
+   * themselves a role an admin decided they could have. With no pairings in the
+   * table it does nothing at all, at the cost of a few point reads per reaction,
+   * and the feature switches itself on the first time somebody runs the command.
+   *
+   * A SEPARATE `Ddb` FOR THE REASONS ABOVE, and `Pick<Ddb, 'reactRoles'>` is what
+   * ../reactroles.ts asks for — so this half of the bot cannot read a ban, write
+   * an audit row or touch the maintenance window however it is edited later.
+   *
+   * REGISTERED AFTER THE GUILD CHECK, like everything else here, and NOT taken off
+   * by the halt. It checks the guild id on every reaction and acts only on rows
+   * this bot wrote for this guild, so a misconfigured bot hands out nothing rather
+   * than handing out the wrong guild's roles.
+   *
+   * IT IS ALSO THE LAST THING WIRED, WHICH IS THE ONE THING WORTH SAYING TWICE:
+   * `installReactionRoles` sets module state that `/reactrole` reads, and
+   * `installCommands` in ./commands/index.ts runs from index.ts AFTER
+   * `createClient` returns. So the desk is always in place before the first
+   * interaction can arrive, and a command that somehow ran earlier refuses rather
+   * than crashing — see `reactRoles()`.
+   */
+  installReactionRoles(client, config, createDdb())
 
   return client
 }

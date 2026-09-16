@@ -58,15 +58,20 @@ It also posts **`Update installed.`** when it starts on a new build. A normal st
 
 Anything done while the bot was down is picked up at the next start.
 
+## Reaction roles
+
+React to a message an admin paired with a role and you are given it. Take the reaction off and it goes.
+
 ## The commands
 
-Five. **Admin** means holding the admin role.
+Six. **Admin** means holding the admin role.
 
 - `/drain start [server]` — **admin**. Stops the server letting anybody in, then updates and restarts it, ending every match in progress. `server` is `prod` or `dev`, and `prod` when left out. Private.
 - `/drain cancel [server]` — **admin**. Calls that window off. Private.
 - `/help [user]` — anyone. Links the player guide. Posted in the channel when aimed at somebody, private otherwise.
 - `/profile` — anyone. Your own progression and match record. Private.
 - `/profile <user>` — **admin**. Bans, career, registry row, last five matches, and a button to the console. Private.
+- `/reactrole <message> <emoji> <role> [channel]` — **admin**. Pairs a reaction with a role. Private.
 - `/sticky <text>` — **admin**. Keeps a message at the bottom of this channel. Running it again replaces it.
 - `/unsticky` — **admin**. Takes it down.
 

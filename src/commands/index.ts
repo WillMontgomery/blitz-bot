@@ -29,6 +29,14 @@ import {
 } from './drain.ts'
 import { help } from './help.ts'
 import { lazyReadsFrom, profileCommand } from './profile.ts'
+import {
+  reactrole,
+  REACTROLE_CHANNEL_OPTION,
+  REACTROLE_EMOJI_OPTION,
+  REACTROLE_MESSAGE_OPTION,
+  REACTROLE_ROLE_OPTION,
+  type ReactRoleFields,
+} from './reactrole.ts'
 import { sticky, STICKY_TEXT_OPTION, unsticky } from './sticky.ts'
 
 /**
@@ -53,11 +61,18 @@ import { sticky, STICKY_TEXT_OPTION, unsticky } from './sticky.ts'
  * ask" per invocation rather than deciding that once, here, before the config
  * has been loaded. Both fall out of passing `lazyDrainer()` instead of a relay.
  * `lazyDevMaintenance()` is `/profile`'s reason again, for `server:dev`'s table.
+ *
+ * `/reactrole` IS A PLAIN VALUE LIKE `/sticky` AND NEEDS NO FACTORY, for the
+ * reason `/sticky` needs none: everything it reaches — the guild, the message it
+ * fetches, the table it writes — is behind the desk `installReactionRoles` puts
+ * in place in ../reactroles.ts, and it asks for that desk per invocation rather
+ * than holding one. So nothing is constructed while this module is imported.
  */
 export const COMMANDS: readonly BotCommand[] = [
   drainCommand(lazyDrainer(), lazyDevMaintenance()),
   help,
   profileCommand(lazyReadsFrom(() => createDdb())),
+  reactrole,
   sticky,
   unsticky,
 ]
@@ -373,7 +388,8 @@ function targetOf(options: CommandSource['options']): Target | null {
 }
 
 /**
- * The `text` option a command supplied, or null.
+ * One option's own value, when an option by that name arrived and is of that
+ * kind.
  *
  * THE SAME TWO CHECKS `targetOf` MAKES, AND FOR THE SAME REASONS. `get` rather
  * than `getString`, because discord.js's typed getters THROW when an option by
@@ -381,7 +397,35 @@ function targetOf(options: CommandSource['options']): Target | null {
  * while assembling `runCommand`'s arguments, outside the promise the listener
  * catches, so it would escape into discord.js's own emit rather than becoming a
  * reply. And the type is compared rather than trusted: a USER option named
- * `text` is not this command's text.
+ * `text` is not `/sticky`'s text.
+ *
+ * ONE FUNCTION RATHER THAN SIX COPIES OF THOSE TWO CHECKS. It was two when only
+ * `/sticky` and `/drain` read an option this way, and `/reactrole` reads four
+ * more; six hand-written copies of "is it there, is it the right kind, is the
+ * value a string" is six chances for one of them to be written differently, and
+ * the one that differs is the one that throws.
+ *
+ * A ROLE AND A CHANNEL OPTION CARRY THEIR ID IN `value`, which is what makes one
+ * function enough for all four kinds. discord.js copies the raw option value onto
+ * every kind it resolves — `if ('value' in option) result.value = option.value`
+ * in its `transformOption` — and for a role or a channel that raw value IS the
+ * snowflake. The resolved `Role` and `Channel` objects hang off the same option
+ * beside it, and this seam deliberately does not carry them: an id is what
+ * `Invocation` is made of.
+ */
+function valueOf(
+  options: CommandSource['options'],
+  name: string,
+  kind: ApplicationCommandOptionType,
+): string | null {
+  const option = options.get(name)
+
+  if (option === null || option.type !== kind) return null
+  return typeof option.value === 'string' ? option.value : null
+}
+
+/**
+ * The `text` option a command supplied, or null.
  *
  * NAMED BY `STICKY_TEXT_OPTION` SO THE TWO HALVES CANNOT DRIFT. ./sticky.ts
  * declares the option by that constant and this asks Discord for it by the same
@@ -389,26 +433,47 @@ function targetOf(options: CommandSource['options']): Target | null {
  * reports an empty message however much text was typed into it.
  */
 function textOf(options: CommandSource['options']): string | null {
-  const option = options.get(STICKY_TEXT_OPTION)
-
-  if (option === null || option.type !== ApplicationCommandOptionType.String) return null
-  return typeof option.value === 'string' ? option.value : null
+  return valueOf(options, STICKY_TEXT_OPTION, ApplicationCommandOptionType.String)
 }
 
 /**
- * The `server` option `/drain` supplied, or null. The same two checks `textOf`
- * makes, and the value passed through unjudged: which values count is
- * ./drain.ts's call.
+ * The `server` option `/drain` supplied, or null. The value is passed through
+ * unjudged: which values count is ./drain.ts's call.
  *
  * IT IS READ INSIDE A SUBCOMMAND AND THAT COSTS NOTHING. discord.js hoists the
  * invoked subcommand's own options, so `get('server')` finds either half's
  * exactly as it finds a top-level one.
  */
 function serverOf(options: CommandSource['options']): string | null {
-  const option = options.get(DRAIN_SERVER_OPTION)
+  return valueOf(options, DRAIN_SERVER_OPTION, ApplicationCommandOptionType.String)
+}
 
-  if (option === null || option.type !== ApplicationCommandOptionType.String) return null
-  return typeof option.value === 'string' ? option.value : null
+/**
+ * `/reactrole`'s four, or null for every command that declares none of them.
+ *
+ * THE TWO STRINGS ARE PASSED THROUGH UNJUDGED, exactly as `/drain`'s `server`
+ * is: what counts as a message reference or an emoji is ./reactrole.ts's call
+ * and is decided in one place, beside the refusal it produces.
+ *
+ * THE ROLE AND THE CHANNEL ARRIVE AS IDS AND ARE NOT RESOLVED HERE. Discord has
+ * already done the resolving — a mention, a name picked out of the list and an id
+ * pasted in all reach this seam as the same snowflake — so there is nothing left
+ * for this bot to parse and nothing for it to get wrong.
+ */
+function messageRefOf(options: CommandSource['options']): string | null {
+  return valueOf(options, REACTROLE_MESSAGE_OPTION, ApplicationCommandOptionType.String)
+}
+
+function emojiRefOf(options: CommandSource['options']): string | null {
+  return valueOf(options, REACTROLE_EMOJI_OPTION, ApplicationCommandOptionType.String)
+}
+
+function roleIdOf(options: CommandSource['options']): string | null {
+  return valueOf(options, REACTROLE_ROLE_OPTION, ApplicationCommandOptionType.Role)
+}
+
+function targetChannelIdOf(options: CommandSource['options']): string | null {
+  return valueOf(options, REACTROLE_CHANNEL_OPTION, ApplicationCommandOptionType.Channel)
 }
 
 /**
@@ -445,8 +510,17 @@ function subcommandOf(options: CommandSource['options']): string | null {
  * an `Invocation` — `runCommand` and every handler — so the widening is visible
  * only to the one command that reads it. When those fields move over there,
  * this annotation and that interface are deleted together.
+ *
+ * `ReactRoleFields` IS THE THIRD OF THOSE AND IT IS FOUR FIELDS RATHER THAN TWO,
+ * which is the point at which this pattern is worth looking at again: six
+ * optional fields hanging off one record for three commands is most of what
+ * `Invocation` would have looked like if each had simply been added to it. It is
+ * done this way for consistency with the two that came first rather than because
+ * the fourth command should also do it — see `ReactRoleFields` in ./reactrole.ts.
  */
-export function invocationOf(interaction: CommandSource): Invocation & DrainFields {
+export function invocationOf(
+  interaction: CommandSource,
+): Invocation & DrainFields & ReactRoleFields {
   const target = targetOf(interaction.options)
 
   return {
@@ -482,6 +556,12 @@ export function invocationOf(interaction: CommandSource): Invocation & DrainFiel
 
     // What a dev drain's row names its author, resolved the way a target's is.
     userDisplayName: displayNameOf(interaction.user, interaction.member),
+
+    // `/reactrole`'s four, null for every other command. See `ReactRoleFields`.
+    messageRef: messageRefOf(interaction.options),
+    emojiRef: emojiRefOf(interaction.options),
+    roleId: roleIdOf(interaction.options),
+    targetChannelId: targetChannelIdOf(interaction.options),
   }
 }
 

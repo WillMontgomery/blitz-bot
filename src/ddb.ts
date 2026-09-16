@@ -449,6 +449,20 @@ export interface TableNames {
    * without touching the log at all.
    */
   incidents: string
+  /**
+   * Read AND written. The bot's own table, like `botState`: which reaction on
+   * which message grants which role.
+   *
+   * UNDER THE CONSOLE'S PREFIX FOR `botState`'s REASON, which is the prefix
+   * marking a stack rather than an owner. The console has no code that reads
+   * this table and no reason to; the bot is the only writer and the only reader.
+   *
+   * THE NAME HAS NO HYPHEN IN IT, UNLIKE `player-ids` AND `bot-state`, and that
+   * is not a style slip — the owner named the table `ringmaster-reactroles` and
+   * a name derived here that did not match it would be a `no-such-table` on
+   * every reaction.
+   */
+  reactRoles: string
   /** Read only, and a different prefix: the GAME's row. `{pk, sk}` keyed. */
   gamePlayers: string
 }
@@ -462,6 +476,7 @@ export function tableNames(prefix: string, gamePrefix: string): TableNames {
     maintenance: `${prefix}maintenance`,
     botState: `${prefix}bot-state`,
     incidents: `${prefix}incidents`,
+    reactRoles: `${prefix}reactroles`,
     gamePlayers: `${gamePrefix}players`,
   }
 }
@@ -1156,6 +1171,83 @@ export interface BotStateRow {
 }
 
 /* ------------------------------------------------------------------ *
+ * Reaction roles.
+ *
+ * THE SECOND TABLE THE CONSOLE DOES NOT OWN, and the only one in this file
+ * whose shape was decided here rather than transcribed from fivem-ringmaster.
+ * The owner named it and named its key: `ringmaster-reactroles`, partition key
+ * `messageId` (S), sort key `emoji` (S).
+ * ------------------------------------------------------------------ */
+
+/**
+ * The sort key that means ANY reaction, for the two shapes that do not name an
+ * emoji.
+ *
+ * IT CANNOT COLLIDE WITH A REAL EMOJI KEY, which is the whole reason a magic
+ * string is safe here. `emojiKeyOf` in src/reactroles.ts stores a custom emoji
+ * as its id — digits — and a unicode emoji as the character itself, and neither
+ * of those is ever the three ASCII letters `any`. The word is the owner's, from
+ * the command he asked for, so the thing he types and the thing stored are the
+ * same word.
+ */
+export const REACT_ROLE_ANY = 'any'
+
+/**
+ * The partition key a CHANNEL-WIDE pairing is stored under.
+ *
+ * A FUNCTION RATHER THAN AN INTERPOLATION AT EACH CALL SITE, for `qualifyId`'s
+ * reason: the failure mode of getting it wrong is not an error. A lookup for
+ * the wrong key is a perfectly valid `GetItem` that returns no row, and "no
+ * pairing" is a sentence this bot would then act on by taking no role off
+ * anybody.
+ *
+ * `channel#…` CANNOT COLLIDE WITH A REAL MESSAGE ID, which is what the owner
+ * asked for in so many words. A Discord snowflake is decimal digits and nothing
+ * else, so a key carrying a `#` is not one — and the `#` separator is the same
+ * one the game's `match#<endedAt>#<matchId>` rows and the console's planned
+ * `AUDIT#<yyyy-mm>` partitions already use in this stack.
+ */
+export function reactRoleChannelKey(channelId: string): string {
+  return `channel#${channelId}`
+}
+
+/**
+ * One pairing: a reaction, somewhere, and the role it grants.
+ *
+ * `messageId` IS A MESSAGE ID OR A CHANNEL KEY, which is the one thing about
+ * this row that has to be read twice. The table is keyed the way the owner
+ * specified — one partition key called `messageId` — and the channel-wide shapes
+ * have no message to key on, so they live in the same table under
+ * `reactRoleChannelKey`. The attribute keeps its name because the TABLE has that
+ * name; an attribute the bot renamed would be a row it cannot find.
+ *
+ * `channelId` IS CARRIED ON BOTH SHAPES and is not derivable from the key on
+ * either: for a message row it is where that message lives, which is the fact a
+ * later reader would otherwise have to fetch the message to learn, and for a
+ * channel row it is the same id the key was built from, written plainly so
+ * nothing has to parse the key apart to get at it.
+ */
+export interface ReactRolePairing {
+  /** Partition key. A message id, or `reactRoleChannelKey(channelId)`. */
+  messageId: string
+  /** Sort key. An emoji key, or `REACT_ROLE_ANY`. */
+  emoji: string
+  /** The role the reaction grants, and that losing the reaction takes away. */
+  roleId: string
+  /** The channel the pairing is about. See above. */
+  channelId: string
+  /** The guild it was made in, so a row cannot be acted on in another. */
+  guildId: string
+  /** Stamped by this module, so no caller has to remember to. */
+  createdAt: number
+  /** The admin who ran `/reactrole`, by Discord id. */
+  createdBy: string
+}
+
+/** What `reactRoles.put` is given. The row, minus the stamp it does not choose. */
+export type ReactRolePairingInput = Omit<ReactRolePairing, 'createdAt'>
+
+/* ------------------------------------------------------------------ *
  * The audit log.
  * ------------------------------------------------------------------ */
 
@@ -1474,6 +1566,31 @@ export interface Ddb {
   botState: {
     get(key: string): Promise<DdbResult<BotStateRow | null>>
     put(key: string, value: string): Promise<DdbResult<BotStateRow>>
+  }
+
+  reactRoles: {
+    /**
+     * One pairing by its WHOLE key, or null.
+     *
+     * A POINT READ AND NEVER A QUERY, WHICH IS A COST DECISION AND THE OWNER'S.
+     * Every reaction anywhere in the guild asks this question, including the
+     * overwhelming majority that are about nothing — so what is on the other end
+     * of it has to be the cheapest read DynamoDB has. A `Query` on the partition
+     * would answer more of the question in one request, and it would also put a
+     * row limit between this bot and a pairing somebody made: a message with more
+     * pairings than the cap has rows that exist and are never seen, silently,
+     * which is the failure mode this repo refuses everywhere else.
+     *
+     * SO THE PRECEDENCE WALK IS THE CALLER'S, and it is `pairingFor` in
+     * src/reactroles.ts: four keys at most, asked in the order that decides which
+     * pairing wins, stopping at the first one that answers. Precedence is a rule
+     * about what a reaction MEANS, which is that module's business and not this
+     * one's.
+     */
+    get(messageId: string, emoji: string): Promise<DdbResult<ReactRolePairing | null>>
+
+    /** Write one pairing, replacing whatever stood for that key and emoji. */
+    put(input: ReactRolePairingInput): Promise<DdbResult<ReactRolePairing>>
   }
 }
 
@@ -2572,6 +2689,46 @@ function assemble(options: DdbOptions): {
 
         return call('put', tables.botState, async (o) => {
           await doc.put({ TableName: tables.botState, Item: row }, o)
+          return row
+        })
+      },
+    },
+
+    reactRoles: {
+      get(messageId, emoji) {
+        return call('get', tables.reactRoles, async (o) => {
+          // BOTH HALVES OF THE KEY, ALWAYS. The table is `messageId` + `emoji`,
+          // and a `GetItem` that named only the partition would not be a
+          // narrower read — DynamoDB refuses it outright.
+          const res = await doc.get({ TableName: tables.reactRoles, Key: { messageId, emoji } }, o)
+          return (res.Item as ReactRolePairing | undefined) ?? null
+        })
+      },
+
+      /**
+       * Write a pairing, replacing whatever was there.
+       *
+       * UNCONDITIONAL, LIKE `botState.put` AND UNLIKE THE AUDIT WRITE, and the
+       * replacement IS the feature rather than a consequence of it: the owner's
+       * rule is that running `/reactrole` again for the same target and emoji
+       * REPLACES the role. A conditional write would have to be followed by a
+       * second call to do the thing he asked for, and the row it would be
+       * protecting has no earlier version worth keeping — there is no history in
+       * this table, only what the pairing is now.
+       *
+       * ONE WRITER, WHICH IS THE OTHER HALF OF WHY THAT IS SAFE. Two admins
+       * running `/reactrole` on the same message and emoji in the same second is
+       * two people deciding the same thing; the last one wins, which is what
+       * they would both expect and what the reply tells each of them.
+       *
+       * RETURNS THE ROW IT WROTE so a caller does not have to reconstruct
+       * `createdAt` to know what is now in the table.
+       */
+      put(input) {
+        const row: ReactRolePairing = { ...input, createdAt: now() }
+
+        return call('put', tables.reactRoles, async (o) => {
+          await doc.put({ TableName: tables.reactRoles, Item: row }, o)
           return row
         })
       },

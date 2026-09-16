@@ -23,6 +23,12 @@ import {
 } from './command.ts'
 import { DRAIN_SERVER_OPTION } from './drain.ts'
 import { help } from './help.ts'
+import {
+  REACTROLE_CHANNEL_OPTION,
+  REACTROLE_EMOJI_OPTION,
+  REACTROLE_MESSAGE_OPTION,
+  REACTROLE_ROLE_OPTION,
+} from './reactrole.ts'
 import { STICKY_TEXT_OPTION } from './sticky.ts'
 import {
   COMMANDS,
@@ -756,6 +762,14 @@ describe('invocationOf — a live interaction reduced to a record', () => {
       subcommand: null,
       server: null,
       userDisplayName: `display-${MEMBER}`,
+
+      // `/reactrole`'s four, null for every other command — which is the point
+      // of asserting them here rather than in that command's own file: they cost
+      // every OTHER command nothing.
+      messageRef: null,
+      emojiRef: null,
+      roleId: null,
+      targetChannelId: null,
     })
   })
 
@@ -973,6 +987,65 @@ describe('invocationOf — a live interaction reduced to a record', () => {
   })
 
   /**
+   * `/reactrole`'s TWO STRINGS ARE PASSED THROUGH UNJUDGED for `server`'s reason:
+   * what counts as a message reference or an emoji is ./reactrole.ts's call, made
+   * once, beside the refusal it produces.
+   */
+  it('reads /reactrole’s message and emoji by their own names, unjudged', () => {
+    const message = optionNamed(REACTROLE_MESSAGE_OPTION, {
+      type: ApplicationCommandOptionType.String,
+      value: 'not a message id at all',
+    })
+
+    expect(invocationOf(source({ options: message })).messageRef).toBe('not a message id at all')
+
+    const emoji = optionNamed(REACTROLE_EMOJI_OPTION, {
+      type: ApplicationCommandOptionType.String,
+      value: 'any',
+    })
+
+    expect(invocationOf(source({ options: emoji })).emojiRef).toBe('any')
+  })
+
+  /**
+   * A ROLE AND A CHANNEL OPTION CARRY THEIR ID IN `value`, which is what lets one
+   * reader serve all four kinds. discord.js copies the raw option value onto
+   * every kind it resolves, and for these two that raw value IS the snowflake —
+   * so a mention, a name picked out of the list and an id pasted in all reach an
+   * `Invocation` as the same string.
+   */
+  it('reads /reactrole’s role and channel as the ids Discord resolved', () => {
+    const role = optionNamed(REACTROLE_ROLE_OPTION, {
+      type: ApplicationCommandOptionType.Role,
+      value: ADMIN_ROLE,
+    })
+
+    expect(invocationOf(source({ options: role })).roleId).toBe(ADMIN_ROLE)
+
+    const channel = optionNamed(REACTROLE_CHANNEL_OPTION, {
+      type: ApplicationCommandOptionType.Channel,
+      value: CHANNEL,
+    })
+
+    expect(invocationOf(source({ options: channel })).targetChannelId).toBe(CHANNEL)
+
+    // AND `targetChannelId` IS NOT `channelId`. One is the channel an option
+    // named and the other is the channel the command was run in; `/reactrole`
+    // reads both and they mean different things.
+    expect(invocationOf(source({ options: channel })).channelId).toBe(CHANNEL)
+    expect(invocationOf(source()).targetChannelId).toBeNull()
+  })
+
+  it('ignores a role-named option of the wrong type, rather than throwing', () => {
+    const options = optionNamed(REACTROLE_ROLE_OPTION, {
+      type: ApplicationCommandOptionType.String,
+      value: ADMIN_ROLE,
+    })
+
+    expect(invocationOf(source({ options })).roleId).toBeNull()
+  })
+
+  /**
    * THE INVOKER'S OWN NAME, THE GUILD'S NICKNAME FIRST, in both member shapes, by
    * the same rule the target's follows. A dev drain writes it as `createdByName`.
    */
@@ -1067,6 +1140,7 @@ describe('registerCommands', () => {
       'drain',
       'help',
       'profile',
+      'reactrole',
       'sticky',
       'unsticky',
     ])
@@ -1095,7 +1169,7 @@ describe('registerCommands', () => {
   it('hides exactly the unconditionally admin-only commands from the client', () => {
     const hidden = COMMANDS.filter((one) => commandData(one).defaultMemberPermissions === 0n)
 
-    expect(hidden.map((one) => one.data.name)).toEqual(['drain', 'sticky', 'unsticky'])
+    expect(hidden.map((one) => one.data.name)).toEqual(['drain', 'reactrole', 'sticky', 'unsticky'])
     expect(hidden.every((one) => one.adminOnly === true)).toBe(true)
   })
 
