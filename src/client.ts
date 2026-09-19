@@ -8,6 +8,7 @@ import {
   Events,
   GatewayIntentBits,
   Partials,
+  escapeMarkdown,
   PermissionsBitField,
   RESTJSONErrorCodes,
   type APIEmbed,
@@ -628,6 +629,36 @@ export async function handleMessage(
       try {
         await actions.remove()
       } catch (error) {
+        /**
+         * `UnknownMessage` MEANS THE MESSAGE IS ALREADY GONE, WHICH IS THE
+         * OUTCOME THIS BRANCH WANTED, AND THE LINE BELOW WOULD HAVE SAID THE
+         * OPPOSITE.
+         *
+         * The owner's #bot-status, 2026-09-19: "delete failed, message left
+         * standing" with `DiscordAPIError[10008]: Unknown Message`, on a message
+         * that was not standing at all. The likeliest cause is this bot seeing
+         * the message TWICE. `messageUpdate` is routed through `onMessage`
+         * below, and Discord sends one a moment after a link is posted, once it
+         * has built the preview; so the first pass deletes and the second finds
+         * nothing to delete. A member deleting their own message first ends in
+         * the same place.
+         *
+         * NOTHING ELSE ABOUT THE BRANCH CHANGES. It still returns before the
+         * record, the strike and the notice, exactly as a failed delete does:
+         * an offense is a message THIS BOT removed, and a duplicate delivery
+         * must not become a second strike or a second DM. Only the sentence
+         * changes, and its level -- info, so a routine double delivery stops
+         * reaching #bot-status as an error. ./sticky.ts makes the same call
+         * about the same code for the same reason.
+         */
+        if (error instanceof DiscordAPIError && error.code === RESTJSONErrorCodes.UnknownMessage) {
+          log('info', 'message was already gone before it could be deleted', {
+            ...where,
+            ...logFields(verdict),
+          })
+          return
+        }
+
         log('error', 'delete failed, message left standing', {
           ...where,
           ...logFields(verdict),
@@ -1030,6 +1061,45 @@ const NOTICE_TTL_MS = 30_000
 export interface NoticeChannel {
   dm: (userId: string, text: string) => Promise<void>
   fallback: (channelId: string, userId: string, text: string) => Promise<void>
+}
+
+/**
+ * A notice as a direct message can actually display it.
+ *
+ * ═══ THE BUG THIS EXISTS FOR (owner, 2026-09-19) ═══
+ *
+ * A removal notice reached a member by DM reading "If this is wrong, contact
+ * @unknown-role." `adminPrompt` writes the admin role as `<@&id>`, which renders
+ * as the role's name inside the guild and as `@unknown-role` in a DM: a DM
+ * belongs to no guild, so Discord has nowhere to look a role up. Channel and user
+ * mentions are unaffected -- the same notice's `<#rules>` rendered as the
+ * channel -- so this rewrites role mentions and nothing else.
+ *
+ * THE DM PATH IS THE ONLY PLACE IT HAPPENS, AND THAT IS THE WHOLE DESIGN. One
+ * notice text goes to both `dm` and `fallback`, and only one of them can show a
+ * role. The fallback posts in a guild channel, where the mention renders and
+ * `roles: []` stops it pinging; rewriting it there would swap a working mention
+ * for plain text. So the text is built once, in the owner's words, and each
+ * transport shows it the best way it can.
+ *
+ * `@` AND THE NAME, which is how the mention reads in the guild, so the member
+ * sees the same thing either way. It cannot ping: a mention needs the `<@&id>`
+ * form, and `allowedMentions: { parse: [] }` refuses any that slip through.
+ *
+ * AN UNRESOLVABLE ROLE READS "an admin", which is the wording `adminPrompt`
+ * already uses when no admin role is configured, so a member is never shown a
+ * bare id or an empty mention. Every role a DM'd notice names today is the admin
+ * role; a notice that ever DMs a different one needs its own fallback word, and
+ * this is where it goes.
+ */
+export function forDirectMessage(
+  text: string,
+  roleName: (id: string) => string | null,
+): string {
+  return text.replace(/<@&(\d+)>/g, (_whole, id: string) => {
+    const name = roleName(id)
+    return name === null || name === '' ? 'an admin' : `@${escapeMarkdown(name)}`
+  })
 }
 
 /**
@@ -2111,7 +2181,7 @@ export function createClient(config: Config): Client {
 
   const resolve = inviteResolver((code) => client.fetchInvite(code))
   const post = config.logChannelId === null ? null : announcer(client, config.logChannelId)
-  const notices = noticeChannel(client)
+  const notices = noticeChannel(client, config.guildId)
   const rulesDdb = createDdb()
   let disciplineDesk: DisciplineDesk | null = null
   const recovery = installRulesRecovery(client, config, {
@@ -2908,11 +2978,15 @@ const LOG_CHANNEL_BACK = 'the log channel can be posted to again, so removals ar
  * process down over a message somebody had probably already dismissed.
  *
  */
-export function noticeChannel(client: Client): NoticeChannel {
+export function noticeChannel(client: Client, guildId: string): NoticeChannel {
   return {
     dm: async (userId, text) => {
       const user = await client.users.fetch(userId)
-      await user.send({ content: text, allowedMentions: { parse: [] } })
+      const roles = client.guilds.cache.get(guildId)?.roles.cache
+      await user.send({
+        content: forDirectMessage(text, (id) => roles?.get(id)?.name ?? null),
+        allowedMentions: { parse: [] },
+      })
     },
 
     fallback: async (channelId, userId, text) => {

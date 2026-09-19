@@ -1321,6 +1321,46 @@ describe('the poster is told, and told which rule fired', () => {
     expect(acts.notify).not.toHaveBeenCalled()
   })
 
+  /**
+   * THE OWNER'S #bot-status, 2026-09-19: "delete failed, message left standing"
+   * with `Unknown Message`, about a message that was not standing at all. A
+   * link-bearing message is seen twice -- `messageUpdate` follows once Discord
+   * has built the preview -- so the second delete finds it already gone.
+   *
+   * THE LINE CHANGES AND NOTHING ELSE DOES. No error, because nothing broke; and
+   * still no notice, record or strike, because the delivery that removed it
+   * already did those once and a duplicate must not do them twice.
+   */
+  it('treats an already-gone message as gone, not as a failed delete', async () => {
+    const gone = new DiscordAPIError(
+      { code: RESTJSONErrorCodes.UnknownMessage, message: 'Unknown Message' },
+      RESTJSONErrorCodes.UnknownMessage,
+      404,
+      'DELETE',
+      '/channels/1/messages/2',
+      {},
+    )
+    const acts = actions({ remove: () => Promise.reject(gone) })
+
+    await handleMessage(msg({ text: 'bit.ly/3xY9k' }), cfg(), acts)
+
+    expect(acts.notify).not.toHaveBeenCalled()
+    expect(acts.discipline).not.toHaveBeenCalled()
+    const all = [...stderr, ...stdout].join('')
+    expect(all).not.toContain('delete failed, message left standing')
+    expect(all).toContain('message was already gone before it could be deleted')
+  })
+
+  it('still reports a delete that genuinely failed as a failure', async () => {
+    // The other half. A permissions error really does leave the message up, and
+    // narrowing the error by code is what keeps that loud.
+    const acts = actions({ remove: () => Promise.reject(new Error('Missing Permissions')) })
+
+    await handleMessage(msg({ text: 'bit.ly/3xY9k' }), cfg(), acts)
+
+    expect([...stderr, ...stdout].join('')).toContain('delete failed, message left standing')
+  })
+
   it('says nothing about a message it never scanned', async () => {
     const acts = actions()
 
@@ -1856,9 +1896,19 @@ describe('noticeChannel — the DM, and the ping that only the fallback carries'
       sendable?: boolean
       fetchUserRejects?: unknown
       channel?: unknown
+      roles?: ReadonlyMap<string, { name: string }>
+      guildMissing?: boolean
     } = {},
   ): Client {
+    const roles = over.roles ?? new Map([[ADMIN_ROLE, { name: 'Admin' }]])
+
     return {
+      guilds: {
+        cache: {
+          get: (id: string) =>
+            over.guildMissing === true || id !== OURS ? undefined : { roles: { cache: roles } },
+        },
+      },
       users: {
         fetch: () =>
           over.fetchUserRejects === undefined
@@ -1886,17 +1936,65 @@ describe('noticeChannel — the DM, and the ping that only the fallback carries'
     const dmSend = sendSpy()
     const channelSend = sendSpy()
 
-    await noticeChannel(clientNoticing(dmSend, channelSend)).dm(AUTHOR, 'a notice')
+    await noticeChannel(clientNoticing(dmSend, channelSend), OURS).dm(AUTHOR, 'a notice')
 
     expect(dmSend).toHaveBeenCalledWith({ content: 'a notice', allowedMentions: { parse: [] } })
     expect(channelSend).not.toHaveBeenCalled()
+  })
+
+  /**
+   * THE OWNER'S SCREENSHOT, 2026-09-19: a DM'd removal notice reading "If this
+   * is wrong, contact @unknown-role." A role mention renders only inside a
+   * guild, and a DM has none. The notice is the real one, built by the real
+   * `removalNotice`, so this fails if either half drifts.
+   */
+  it('shows the admin role by name in a DM, where a role mention cannot render', async () => {
+    const dmSend = sendSpy()
+    const text = removalNotice('foreign-invite', { rulesChannelId: CHANNEL, adminRoleId: ADMIN_ROLE })
+
+    await noticeChannel(clientNoticing(dmSend, sendSpy()), OURS).dm(AUTHOR, text)
+
+    const sent = (dmSend.mock.calls[0]?.[0] as { content: string }).content
+    expect(sent).not.toContain('<@&')
+    expect(sent).toContain('contact @Admin.')
+    // The channel mention DOES render in a DM, so it is left exactly as built.
+    expect(sent).toContain(`<#${CHANNEL}>`)
+  })
+
+  it('leaves the role mention alone on the channel fallback, where it renders', async () => {
+    // The other half of the design, and the one a careless fix would break:
+    // rewriting here swaps a working mention for plain text, in the one place
+    // the member is looking at the guild.
+    const channelSend = sendSpy()
+    const text = removalNotice('foreign-invite', { rulesChannelId: CHANNEL, adminRoleId: ADMIN_ROLE })
+
+    await noticeChannel(clientNoticing(sendSpy(), channelSend), OURS).fallback(CHANNEL, AUTHOR, text)
+
+    const sent = (channelSend.mock.calls[0]?.[0] as { content: string }).content
+    expect(sent).toContain(`<@&${ADMIN_ROLE}>`)
+  })
+
+  it('reads "an admin" in a DM when the role cannot be found', async () => {
+    // A deleted role and a guild not in the cache both land here. The wording
+    // is adminPrompt's own for an unconfigured role, so a member never sees a
+    // bare id or "@unknown-role" either way.
+    for (const over of [{ roles: new Map() }, { guildMissing: true }]) {
+      const dmSend = sendSpy()
+      const text = removalNotice('foreign-invite', { rulesChannelId: CHANNEL, adminRoleId: ADMIN_ROLE })
+
+      await noticeChannel(clientNoticing(dmSend, sendSpy(), over), OURS).dm(AUTHOR, text)
+
+      const sent = (dmSend.mock.calls[0]?.[0] as { content: string }).content
+      expect(sent).toContain('contact an admin.')
+      expect(sent).not.toContain('<@&')
+    }
   })
 
   it('pings exactly the poster on the channel fallback and nobody else', async () => {
     const dmSend = sendSpy()
     const channelSend = sendSpy()
 
-    await noticeChannel(clientNoticing(dmSend, channelSend)).fallback(
+    await noticeChannel(clientNoticing(dmSend, channelSend), OURS).fallback(
       CHANNEL,
       AUTHOR,
       `<@${AUTHOR}> a notice`,
@@ -1914,7 +2012,7 @@ describe('noticeChannel — the DM, and the ping that only the fallback carries'
     // anything look exactly like a bot with nothing to say.
     const dmSend = sendSpy()
     const channelSend = sendSpy()
-    const seam = noticeChannel(clientNoticing(dmSend, channelSend, { sendable: false }))
+    const seam = noticeChannel(clientNoticing(dmSend, channelSend, { sendable: false }), OURS)
 
     await expect(seam.fallback(CHANNEL, AUTHOR, 'a notice')).rejects.toThrow(CHANNEL)
     expect(channelSend).not.toHaveBeenCalled()
@@ -1928,6 +2026,7 @@ describe('noticeChannel — the DM, and the ping that only the fallback carries'
     const channelSend = sendSpy()
     const seam = noticeChannel(
       clientNoticing(dmSend, channelSend, { fetchUserRejects: new Error('Unknown User') }),
+      OURS,
     )
 
     await expect(seam.dm(AUTHOR, 'a notice')).rejects.toThrow('Unknown User')
@@ -1949,7 +2048,7 @@ describe('noticeChannel — the DM, and the ping that only the fallback carries'
         Promise.resolve({ delete: remove }),
       )
 
-      await noticeChannel(clientNoticing(sendSpy(), channelSend)).fallback(
+      await noticeChannel(clientNoticing(sendSpy(), channelSend), OURS).fallback(
         CHANNEL,
         AUTHOR,
         'a notice',
@@ -1983,7 +2082,7 @@ describe('noticeChannel — the DM, and the ping that only the fallback carries'
         Promise.resolve({ delete: () => Promise.reject(new Error('Unknown Message')) }),
       )
 
-      await noticeChannel(clientNoticing(sendSpy(), channelSend)).fallback(
+      await noticeChannel(clientNoticing(sendSpy(), channelSend), OURS).fallback(
         CHANNEL,
         AUTHOR,
         'a notice',
