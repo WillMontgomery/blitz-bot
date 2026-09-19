@@ -1140,18 +1140,16 @@ export interface IncidentPage {
  * The bot's own durable state. The only table here the console does not own.
  *
  * WHAT IT IS FOR: the handful of things the bot has to remember across a
- * restart and currently keeps in files under `/var/lib/blitz-bot` — the commit
- * it last announced, the id of the message holding its manual. Those survive a
- * restart today and do not survive the box, which is fine until the day
- * something is restored from an image and the bot re-announces a deploy from
- * three weeks ago.
+ * restart — audit cursors, ban-role tags, and one row per member awaiting Rules
+ * recovery or serving probation. Each caller owns its key and value schema;
+ * this layer only performs point reads and unconditional current-value writes.
  *
- * THE VALUE IS A STRING AND THAT IS ON PURPOSE. Every one of those is an
- * identifier — a sha, a snowflake — and identifiers are strings. A
- * `Record<string, unknown>` here would be a schema nobody declared, arriving
- * back from the table in whatever shape a previous version of the bot happened
- * to write; a caller that wants structure can stringify it and own the parse,
- * which at least puts the parse somewhere a type can watch it.
+ * THE VALUE IS A STRING AND THAT IS ON PURPOSE. Most rows are identifiers — a
+ * sha, a snowflake — and the rapid-discipline rows are versioned JSON owned and
+ * parsed by `discipline.ts`. A `Record<string, unknown>` here would be a schema
+ * nobody declared, arriving back in whatever shape a previous version happened
+ * to write. Keeping the table generic makes each structured caller own both its
+ * serialization and its validation.
  */
 export interface BotStateRow {
   /**

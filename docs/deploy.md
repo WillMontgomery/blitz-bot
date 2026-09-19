@@ -451,18 +451,38 @@ proof both intents are on.**
   `src/commands/index.ts` calls `guild.commands.set`, and §4.5 lists what it
   registers. Without the second scope that call is refused, nothing else
   breaks, and not one command ever appears in anybody's client.
-- **Bot Permissions**, and there are three of them rather than one:
+- **Bot Permissions**:
   - **Manage Messages** — deleting somebody else's message. Without it every
     delete fails and the bot otherwise looks perfectly healthy — see §12.2.
   - **Manage Roles** — putting the game-ban role on and taking it off
-    (`src/banrole.ts`). Without it no game ban is ever marked in the guild.
-    This one is not silent: the bot checks at start and before every edit and
-    names the problem in `#bot-status`.
+    (`src/banrole.ts`), granting Rules access after Membership Screening, and
+    removing that access after three rapid offenses or restoring it from the
+    private Rules button. Without it those role changes fail. The game-ban role
+    check is not silent; the Rules access edits report failures when they occur.
+  - **Moderate Members** — applying the ten-minute timeout after three
+    qualifying removals in 60 seconds. Without it messages are still removed,
+    but the escalation fails and is reported.
+  - **Ban Members** — banning the member on the next qualifying removal within
+    the one-hour probation that begins when the recovery button is pressed, or
+    immediately before a pending Rules reaction restores access. The bot uses
+    Discord's normal ban API so the resulting audit event follows the existing
+    permanent FiveM-ban path.
   - **View Audit Log** — reading the ban, unban and kick entries the bot
     carries into the game (§4.1). This one **is** silent: without it the
     `GuildModeration` intent is still accepted, the gateway still connects, and
     the events simply never arrive, which reads exactly like a guild in which
     nobody has been banned.
+  - **Create Private Threads** — creating the third-strike warning under the
+    Rules channel after member access is removed.
+  - **Send Messages in Threads** — posting that warning after the member is
+    added to the private thread.
+  - **Manage Threads** — marking the one-hour reminder, locking and archiving a
+    completed recovery thread, and deleting an incomplete warning thread if
+    adding the member or sending the warning fails. Give the admin role this
+    permission as well if staff should be able to open and answer every private
+    warning thread.
+  - **Add Reactions** — placing the configured emoji when `/reactrole` creates
+    a pairing.
 - **View Channel** it normally inherits from `@everyone`. In a guild where
   channels are locked down, the bot's role needs it explicitly — it cannot
   moderate a channel it cannot see, and it will not say so.
@@ -474,17 +494,44 @@ proof both intents are on.**
   and this document used to swap them** — see the box in §5. The docs channel
   also needs **Read Message History**, because the bot reconciles the manual it
   already posted there rather than posting a second copy.
+- It also needs **View Channel** and **Send Messages** in the Rules channel,
+  plus the three thread permissions above. The third-strike warning is created
+  there as a non-invitable private thread, the sanctioned member is added, and
+  only that member is pinged. It contains a **Restore access** button and tags
+  the member once more after an hour if the role is still missing. The thread
+  stays active for up to one week of inactivity and successful button recovery
+  locks and archives it. The configured admin role is displayed but is not
+  pinged. If the thread cannot be completed, the bot tries a DM and reports the
+  delivery failure when neither private route works.
 
 Open the generated URL, pick the Blitz Royale guild, authorise. Then check the
 role Discord created for the bot actually carries Manage Messages in the
 channels you care about — a channel-level override that denies it beats the
 guild-level grant, silently.
 
-**Then move the bot's role above the game-ban role.** Server Settings → Roles.
-Discord refuses a role edit unless the acting member's highest role is above the
-role being assigned, and a new role lands at the bottom of the list, so Manage
-Roles on its own is not enough — `BLITZ_GAME_BAN_ROLE_ID` (§5) has to sit
-*below* the bot. `src/banrole.ts` checks both and names whichever is wrong.
+**Then move the bot's role above the game-ban role, the Rules access role, and
+ordinary members.** Server Settings → Roles. Discord refuses a role edit unless
+the acting member's highest role is above the role being assigned, and refuses
+timeouts or bans against members at or above the bot. Manage Roles, Moderate
+Members and Ban Members are therefore not enough by themselves.
+`BLITZ_GAME_BAN_ROLE_ID` (§5) and the role in the Rules channel's
+any-message/any-reaction `/reactrole` pairing must sit below the bot.
+Administrators and the guild owner are deliberately excluded from the rapid
+sanction window.
+
+Membership Screening does not add a second role setting. In Server Settings,
+make `#rules` the guild's Rules channel, then use `/reactrole` so **any reaction
+on any message in that channel** grants the member access role. Completing
+screening, reacting and the private recovery button all read that same DynamoDB
+pairing. A restart does not re-grant access to every already-screened member,
+because doing so would undo a rapid-offense reset. Open recovery threads are
+rescheduled at startup so their one-hour reminders survive normal restarts.
+Awaiting recovery and active probation are point-read from
+`ringmaster-bot-state`, so both survive a restart. Pressing the recovery button
+persists probation before the role is restored; restoring pending access through
+the legacy Rules reaction does the same before granting the role. The only
+issue-#23 state intentionally lost at restart is an unfinished 60-second strike
+window.
 
 An install done with only the `bot` scope announces nothing in Discord — the
 commands are simply not there, which reads as a build that did not ship them.
@@ -1352,6 +1399,48 @@ journalctl -u blitz-bot -n 50 --no-pager | grep 'msg="deleted'
 
 If the message stayed up and the journal says `delete failed`, the bot is
 missing Manage Messages in that channel — §12.2.
+
+### 9.1 Validate Membership Screening and rapid escalation
+
+Use a disposable test Discord account. For the fourth-offense end-to-end check,
+use one already linked to a FiveM identity so the resulting game ban can be
+observed and then cleaned up.
+
+1. Remove the member access role, join or reset the test account into
+   Membership Screening, and accept the Rules screen. The access role from the
+   Rules channel's any-message/any-reaction pairing must appear.
+2. Post three different messages that each trigger one of the six removal rules,
+   all within 60 seconds. All three must be deleted. On the third, Discord must
+   apply a ten-minute timeout, remove the access role, post the escalation line
+   in `#moderation-notifications`, create a private thread under Rules, add the
+   account, and post the final warning there. The warning must ping the account,
+   render the Rules channel and admin role, show a **Restore access** button, and
+   must not ping the admin role.
+3. Restart `blitz-bot` after the third strike. The private thread and missing
+   access role must remain. Let the timeout expire or clear it manually, then
+   press **Restore access**. The access role must return and the thread must be
+   renamed, locked and archived. The private confirmation must show that
+   probation ends in one hour. The bot deliberately has no timeout check that
+   refuses recovery; Discord itself may prevent the interaction until the
+   timeout ends.
+4. Restart `blitz-bot` again during that probation. Within one hour of pressing
+   the button, post one more message that triggers a removal. The account must
+   be banned from Discord with the rapid-offense audit reason. The audit mirror
+   must then write the permanent FiveM ban and dispatch the existing live kick
+   when the linked player is online.
+5. Unban the disposable account from Discord after checking the result. The
+   ordinary unban mirror should lift the Discord-originated game ban.
+6. Separately, repeat through step 2 and leave the button untouched. After one
+   restart and one hour, the existing private thread must tag the account once
+   with another **Restore access** button and must not be deleted. Press it and
+   verify the role returns, probation starts, and the thread is locked and
+   archived.
+
+Do not run this in dry run: dry-run matches are never deleted and therefore add
+no strikes. Do not restart between the first and third qualifying removals: the
+bounded 60-second strike window is intentionally in memory, so a restart
+forgives it. Restarts after the third strike and during probation are deliberate
+parts of this test.
 
 The bot is now moderating a live community. Everything below is about keeping it
 that way.

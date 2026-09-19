@@ -44,6 +44,7 @@ import {
   docsChannel,
   deployedCommitPath,
   embedBudget,
+  escalationNotifier,
   handleLive,
   handleMessage,
   inviteResolver,
@@ -53,6 +54,7 @@ import {
   ours,
   parseManual,
   readManual,
+  rapidOffenseNotice,
   renderManual,
   remover,
   removalNotice,
@@ -93,6 +95,13 @@ import {
 import { COMMANDS } from './commands/index.ts'
 import type { Config } from './config.ts'
 import {
+  DISCIPLINE_BAN_REASON,
+  type DisciplineDesk,
+  type DisciplineOffense,
+  type DisciplineResult,
+  type DisciplineTiming,
+} from './discipline.ts'
+import {
   qualifyId,
   type AuditInput,
   type AuditOutcome,
@@ -107,6 +116,7 @@ import {
 } from './ddb.ts'
 import { findInviteCodes, type InviteResolver } from './invites.ts'
 import { log, setSink } from './log.ts'
+import type { RulesRecoveryDesk } from './recovery.ts'
 import { KICK_TTL_MS, type KickInput, type KickResult, type Ringmaster } from './ringmaster.ts'
 import { setStickies, stickies } from './sticky.ts'
 
@@ -148,6 +158,10 @@ const CHANNEL = '555555555555555555'
 const LOG_CHANNEL = '666666666666666666'
 const WEBHOOK = '777777777777777777'
 const OTHER_GUILD = '888888888888888888'
+const NOTICE_TIMING: DisciplineTiming = {
+  timeoutUntil: 1_800_000_600_000,
+  probation: 'after-recovery',
+}
 
 /**
  * This community's own game server addresses, as `loadConfig` would hand them
@@ -172,10 +186,11 @@ const OUR_OTHER_IP = '18.222.244.205'
  * what keeps the next unconditional listener a one-line edit here instead of
  * three edits scattered through the file.
  *
- * THREE TODAY: the guild check, the moderation mirror's boot replay, and the
- * game-ban role sync's boot check and pollers (blitz-bot#2).
+ * FOUR TODAY: the guild check, the moderation mirror's boot replay, the
+ * game-ban role sync's boot check and pollers (blitz-bot#2), and rescheduling
+ * open Rules recovery threads.
  */
-const ALWAYS_READY = 3
+const ALWAYS_READY = 4
 
 function cfg(over: Partial<Config> = {}): Config {
   return {
@@ -755,9 +770,13 @@ describe('decide — the link policy', () => {
  */
 function actions(over: Partial<Actions> = {}): Actions & {
   remove: Mock<() => Promise<void>>
+  discipline: Mock<(why: DeleteReason) => Promise<DisciplineResult>>
   notify: Mock<(why: DeleteReason) => Promise<void>>
 } {
   const remove = vi.fn<() => Promise<void>>(over.remove ?? (() => Promise.resolve()))
+  const discipline = vi.fn<(why: DeleteReason) => Promise<DisciplineResult>>(
+    over.discipline ?? (() => Promise.resolve({ did: 'strike', count: 1 })),
+  )
 
   // A SPY FOR THE SAME REASON `remove` IS ONE. "The poster was told, and told
   // this reason" is an assertion about a call rather than about a return value,
@@ -775,6 +794,7 @@ function actions(over: Partial<Actions> = {}): Actions & {
     announce: null,
     ...over,
     remove,
+    discipline,
     notify,
   }
 }
@@ -802,6 +822,25 @@ describe('handleMessage — carrying the verdict out', () => {
 
     expect(acts.remove).toHaveBeenCalledTimes(1)
     expect(stdout.join('')).toContain('deleted message carrying a foreign invite')
+  })
+
+  it('counts an offense only after the message was successfully deleted', async () => {
+    const order: string[] = []
+    const acts = actions({
+      remove: () => {
+        order.push('delete')
+        return Promise.resolve()
+      },
+      discipline: () => {
+        order.push('discipline')
+        return Promise.resolve({ did: 'strike', count: 1 })
+      },
+    })
+
+    await handleMessage(msg(), cfg(), acts)
+
+    expect(order).toEqual(['delete', 'discipline'])
+    expect(acts.discipline).toHaveBeenCalledWith('foreign-invite')
   })
 
   it('posts a factual line to the log channel after a delete', async () => {
@@ -865,6 +904,7 @@ describe('handleMessage — carrying the verdict out', () => {
     // removal line and then finds the message still there has been misinformed
     // by their own tooling.
     expect(posted).toEqual([])
+    expect(acts.discipline).not.toHaveBeenCalled()
   })
 
   it('survives a log channel that cannot be posted to', async () => {
@@ -1210,6 +1250,39 @@ describe('the poster is told, and told which rule fired', () => {
     expect(acts.notify).toHaveBeenCalledWith('link-shortener')
   })
 
+  it('uses the stronger escalation notice instead of a duplicate removal notice', async () => {
+    const timedOut = actions({
+      discipline: () =>
+        Promise.resolve({
+          did: 'timed-out',
+          access: {
+            did: 'removed',
+            roleId: ADMIN_ROLE,
+            rulesChannelId: CHANNEL,
+          },
+        }),
+    })
+    const banned = actions({
+      discipline: () => Promise.resolve({ did: 'banned' }),
+    })
+
+    await handleMessage(msg(), cfg(), timedOut)
+    await handleMessage(msg(), cfg(), banned)
+
+    expect(timedOut.notify).not.toHaveBeenCalled()
+    expect(banned.notify).not.toHaveBeenCalled()
+  })
+
+  it('still explains the removal when a sanction attempt failed', async () => {
+    const acts = actions({
+      discipline: () => Promise.resolve({ did: 'failed', step: 'timeout' }),
+    })
+
+    await handleMessage(msg(), cfg(), acts)
+
+    expect(acts.notify).toHaveBeenCalledWith('foreign-invite')
+  })
+
   it('names the rule that actually fired, not a fixed one', async () => {
     const acts = actions()
 
@@ -1261,6 +1334,20 @@ describe('the poster is told, and told which rule fired', () => {
     expect(seam.dm).toHaveBeenCalledTimes(1)
     expect(seam.dm).toHaveBeenCalledWith(AUTHOR, expect.stringContaining('link-shortener'))
     expect(seam.fallback).not.toHaveBeenCalled()
+  })
+
+  it('names the Rules channel and admin role without a raw URL', async () => {
+    const seam = notices()
+
+    await notifier(seam, msg(), {
+      rulesChannelId: CHANNEL,
+      adminRoleId: ADMIN_ROLE,
+    })('foreign-ip')
+
+    const [, sent] = seam.dm.mock.calls[0] ?? []
+    expect(sent).toContain(`<#${CHANNEL}>`)
+    expect(sent).toContain(`<@&${ADMIN_ROLE}>`)
+    expect(sent).not.toContain('https://discord.com/channels/')
   })
 
   it('falls back to the channel, tagging them, when the DM bounces', async () => {
@@ -1375,6 +1462,98 @@ describe('the poster is told, and told which rule fired', () => {
     for (const why of REASONS.filter((other) => other !== 'foreign-ip')) {
       expect(sent).not.toContain(COPY[why])
     }
+  })
+
+  it('creates the private Rules thread even when the ordinary notice is on cooldown', async () => {
+    const seam = notices()
+    const recovery = recoveries()
+    const access = {
+      did: 'removed' as const,
+      roleId: ADMIN_ROLE,
+      rulesChannelId: CHANNEL,
+    }
+    const event: DisciplineOffense = {
+      messageId: '101010101010101010',
+      userId: AUTHOR,
+      channelId: CHANNEL,
+      reason: 'foreign-ip',
+      webhookId: null,
+      fromBot: false,
+      isOwner: false,
+      administrator: false,
+    }
+
+    await notifier(seam, msg(), {
+      rulesChannelId: CHANNEL,
+      adminRoleId: ADMIN_ROLE,
+    })('foreign-ip')
+    await escalationNotifier(seam, ADMIN_ROLE, recovery)(event, access, NOTICE_TIMING)
+
+    expect(seam.dm).toHaveBeenCalledTimes(1)
+    expect(recovery.open).toHaveBeenCalledWith({
+      userId: AUTHOR,
+      rulesChannelId: CHANNEL,
+      text: rapidOffenseNotice(access, ADMIN_ROLE, NOTICE_TIMING),
+    })
+  })
+
+  it('uses short, explicit wording for the final warning', () => {
+    const access = {
+      did: 'removed' as const,
+      roleId: ADMIN_ROLE,
+      rulesChannelId: CHANNEL,
+    }
+
+    expect(rapidOffenseNotice(access, ADMIN_ROLE, NOTICE_TIMING)).toBe(
+      [
+        `Your server access is restricted due to multiple rule violations. Please read the rules in <#${CHANNEL}> before clicking the button below to restore your access.`,
+        "Additionally, you won't be able to post for a bit. This will clear <t:1800000600:R>.",
+        '**Once your access is restored, your next offense within 1 hour will result in an immediate ban from our Discord and FiveM servers.**',
+        `Need help? Contact <@&${ADMIN_ROLE}>.`,
+      ].join('\n\n'),
+    )
+  })
+
+  it('does not promise probation when durable state could not be saved', () => {
+    const notice = rapidOffenseNotice(
+      { did: 'failed', rulesChannelId: CHANNEL },
+      ADMIN_ROLE,
+      { ...NOTICE_TIMING, probation: 'unavailable' },
+    )
+
+    expect(notice).not.toContain('1 hour')
+    expect(notice).toContain("you won't be able to post for a bit")
+    expect(notice).toContain(`Need help? Contact <@&${ADMIN_ROLE}>.`)
+  })
+
+  it('falls back to a DM when the private Rules thread cannot be created', async () => {
+    const seam = notices()
+    const recovery = recoveries({
+      open: () => Promise.reject(new Error('Missing Permissions')),
+    })
+    const access = {
+      did: 'removed' as const,
+      roleId: ADMIN_ROLE,
+      rulesChannelId: CHANNEL,
+    }
+    const event: DisciplineOffense = {
+      messageId: '101010101010101010',
+      userId: AUTHOR,
+      channelId: CHANNEL,
+      reason: 'foreign-ip',
+      webhookId: null,
+      fromBot: false,
+      isOwner: false,
+      administrator: false,
+    }
+
+    await escalationNotifier(seam, ADMIN_ROLE, recovery)(event, access, NOTICE_TIMING)
+
+    expect(seam.dm).toHaveBeenCalledWith(
+      AUTHOR,
+      rapidOffenseNotice(access, ADMIN_ROLE, NOTICE_TIMING),
+    )
+    expect(seam.fallback).not.toHaveBeenCalled()
   })
 
   it('carries real wording for every reason, and no drafts', () => {
@@ -1670,7 +1849,11 @@ describe('noticeChannel — the DM, and the ping that only the fallback carries'
   function clientNoticing(
     dmSend: Mock<(payload: unknown) => Promise<unknown>>,
     channelSend: Mock<(payload: unknown) => Promise<unknown>>,
-    over: { sendable?: boolean; fetchUserRejects?: unknown } = {},
+    over: {
+      sendable?: boolean
+      fetchUserRejects?: unknown
+      channel?: unknown
+    } = {},
   ): Client {
     return {
       users: {
@@ -1681,7 +1864,12 @@ describe('noticeChannel — the DM, and the ping that only the fallback carries'
       },
       channels: {
         fetch: () =>
-          Promise.resolve({ isSendable: () => over.sendable !== false, send: channelSend }),
+          Promise.resolve(
+            over.channel ?? {
+              isSendable: () => over.sendable !== false,
+              send: channelSend,
+            },
+          ),
       },
     } as unknown as Client
   }
@@ -1713,7 +1901,7 @@ describe('noticeChannel — the DM, and the ping that only the fallback carries'
 
     expect(channelSend).toHaveBeenCalledWith({
       content: `<@${AUTHOR}> a notice`,
-      allowedMentions: { users: [AUTHOR] },
+      allowedMentions: { parse: [], users: [AUTHOR], roles: [] },
     })
   })
 
@@ -2464,12 +2652,19 @@ describe('scanText — the surfaces a message grew after content and embeds', ()
 function guildWhere(fetch: (id: string) => Promise<LiveMember>): LiveGuild & {
   members: { fetch: Mock<(id: string) => Promise<LiveMember>> }
 } {
-  return { members: { fetch: vi.fn<(id: string) => Promise<LiveMember>>(fetch) } }
+  return {
+    ownerId: '999999999999999999',
+    rulesChannelId: '121212121212121212',
+    members: { fetch: vi.fn<(id: string) => Promise<LiveMember>>(fetch) },
+  }
 }
 
 /** A member carrying exactly these role ids. */
 function memberWith(...roleIds: string[]): LiveMember {
-  return { roles: { cache: new Map(roleIds.map((id) => [id, {}])) } }
+  return {
+    roles: { cache: new Map(roleIds.map((id) => [id, {}])) },
+    permissions: { has: () => false },
+  }
 }
 
 /**
@@ -2480,8 +2675,11 @@ function memberWith(...roleIds: string[]): LiveMember {
  * say anything about the name, and adding a third field to the author is one
  * edit here rather than one per test.
  */
-function authorOf(id: string, username: string | null = AUTHOR_NAME): { id: string; username: string | null } {
-  return { id, username }
+function authorOf(
+  id: string,
+  username: string | null = AUTHOR_NAME,
+): { id: string; username: string | null; bot: boolean } {
+  return { id, username, bot: false }
 }
 
 /** A live message, with spies on the two things that reach Discord. */
@@ -2496,6 +2694,7 @@ function live(over: Partial<LiveMessage> = {}): LiveMessage & {
 
   return {
     ...parts({ content: 'join us at discord.gg/abc123' }),
+    id: '101010101010101010',
     partial: false,
     messageSnapshots: new Map<string, ScannableParts>(),
     author: authorOf(AUTHOR),
@@ -2511,11 +2710,24 @@ function live(over: Partial<LiveMessage> = {}): LiveMessage & {
 }
 
 function liveActions(over: Partial<LiveActions> = {}): LiveActions {
-  return { resolve: foreignResolver, announce: null, notices: notices(), ...over }
+  const discipline: DisciplineDesk = over.discipline ?? {
+    record: () => Promise.resolve({ did: 'strike', count: 1 }),
+    startProbation: () => Promise.resolve({ until: 0, started: true }),
+    startProbationForRole: () => Promise.resolve(null),
+    remembered: () => 0,
+  }
+
+  return {
+    resolve: foreignResolver,
+    announce: null,
+    notices: notices(),
+    ...over,
+    discipline,
+  }
 }
 
 /**
- * The two ways to reach a poster, as spies that reach nobody.
+ * The member-facing delivery routes, as spies that reach nobody.
  *
  * THE DM SUCCEEDS BY DEFAULT, so the fallback is only exercised by a case that
  * asks for it. A seam whose default is the failure path would make every
@@ -2529,6 +2741,14 @@ function notices(over: Partial<NoticeChannel> = {}): NoticeChannel & {
   return {
     dm: vi.fn<NoticeChannel['dm']>(over.dm ?? (() => Promise.resolve())),
     fallback: vi.fn<NoticeChannel['fallback']>(over.fallback ?? (() => Promise.resolve())),
+  }
+}
+
+function recoveries(over: Partial<RulesRecoveryDesk> = {}): RulesRecoveryDesk & {
+  open: Mock<RulesRecoveryDesk['open']>
+} {
+  return {
+    open: vi.fn<RulesRecoveryDesk['open']>(over.open ?? (() => Promise.resolve())),
   }
 }
 
@@ -2640,6 +2860,38 @@ describe('handleLive — from a gateway message to a removal', () => {
     await handleLive(message, null, cfg(), liveActions())
 
     expect(message.delete).toHaveBeenCalledTimes(1)
+  })
+
+  it('hands the successfully deleted message to the discipline window', async () => {
+    const record = vi.fn<DisciplineDesk['record']>(() =>
+      Promise.resolve({ did: 'strike', count: 1 }),
+    )
+    const message = live({ id: '909090909090909090' })
+
+    await handleLive(
+      message,
+      null,
+      cfg(),
+      liveActions({
+        discipline: {
+          record,
+          startProbation: () => Promise.resolve({ until: 0, started: true }),
+          startProbationForRole: () => Promise.resolve(null),
+          remembered: () => 1,
+        },
+      }),
+    )
+
+    expect(record).toHaveBeenCalledWith({
+      messageId: '909090909090909090',
+      userId: AUTHOR,
+      channelId: CHANNEL,
+      reason: 'foreign-invite',
+      webhookId: null,
+      fromBot: false,
+      isOwner: false,
+      administrator: false,
+    })
   })
 
   it('spends nothing on a message from a guild we do not moderate', async () => {
@@ -3279,6 +3531,14 @@ describe('createClient — the wiring that would otherwise fail silently', () =>
     // And still no OTHER privileged intent: Presence is the third one and
     // nothing in this bot has ever had a use for it.
     expect(client.options.intents.has(GatewayIntentBits.GuildPresences)).toBe(false)
+
+    await client.destroy()
+  })
+
+  it('listens for membership screening completion', async () => {
+    const client = createClient(cfg())
+
+    expect(client.listenerCount(Events.GuildMemberUpdate)).toBe(1)
 
     await client.destroy()
   })
@@ -8077,6 +8337,34 @@ describe('the moderation mirror — what it will not touch', () => {
     expect(harness.kicks).toEqual([])
   })
 
+  it('accepts only its dedicated rapid-offense Discord ban from itself', async () => {
+    const accepted = mirrorHarness()
+    const ignoredKick = mirrorHarness()
+
+    const result = await mirrorEntry(
+      entryOf({
+        executorId: MOD_SELF,
+        executorName: 'blitz-bot',
+        reason: DISCIPLINE_BAN_REASON,
+      }),
+      accepted.deps,
+    )
+    const kick = await mirrorEntry(
+      entryOf({
+        action: 'kick',
+        executorId: MOD_SELF,
+        reason: DISCIPLINE_BAN_REASON,
+      }),
+      ignoredKick.deps,
+    )
+
+    expect(result).toMatchObject({ did: 'ban' })
+    expect(accepted.issued).toHaveLength(1)
+    expect(accepted.issued[0]?.reason).toBe(DISCIPLINE_BAN_REASON)
+    expect(kick).toEqual({ did: 'ignored', why: 'self' })
+    expect(ignoredKick.kicks).toEqual([])
+  })
+
   it('acts on the same entry when anybody else is the executor', async () => {
     const harness = mirrorHarness()
     const result = await mirrorEntry(entryOf({ executorId: MOD_ADMIN }), harness.deps)
@@ -8757,9 +9045,9 @@ describe('the audit row a mirrored ban leaves behind', () => {
   })
 
   /**
-   * ATTRIBUTION IS THE HUMAN. "blitz-bot" answers the wrong question — which
-   * process wrote the row is never what anybody asks an audit log — and the
-   * console builds the same three fields from the same Discord id.
+   * ATTRIBUTION IS THE HUMAN FOR A MODERATOR-ISSUED BAN. The rapid-offense
+   * self-ban has its own case above; every ordinary entry still carries the
+   * administrator who acted, in the same three fields the console builds.
    */
   it('names the admin who did it, with the licence they play on', async () => {
     const harness = mirrorHarness({

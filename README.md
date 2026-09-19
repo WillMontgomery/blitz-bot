@@ -18,7 +18,19 @@ Six rules remove a message, and nothing else does: an invite to another Discord
 server, more invite codes in one message than it will check, a
 `fivem://connect/` link to another game server, a `cfx.re/join` or
 `servers.fivem.net` listing, an IP address that is not ours, and a link
-shortener. **No word filter, no warnings, no mutes.**
+shortener. **No word filter and no moderation beyond those six rules.**
+
+Successful removals also feed a bounded rapid-offense window. Three distinct
+removals in 60 seconds produce a ten-minute Discord timeout and remove the
+member access role. A private Rules thread gives the member a **Restore access**
+button and tags them once more after an hour if they have not recovered. One
+hour of probation starts when the recovery button is pressed, or immediately
+before a pending Rules reaction restores access; one removal during that
+probation bans the account from Discord, and that ban then follows the existing
+audit-log path into a permanent FiveM ban. Awaiting recovery and active
+probation are stored in `ringmaster-bot-state` and survive a restart. The
+60-second strike window does not. Webhooks, bots, the guild owner and
+administrators are not counted.
 
 Around that: a ban, unban or kick in Discord is carried into the game and
 written to DynamoDB; a ban issued in the console puts the game-ban role on the
@@ -28,6 +40,13 @@ closed in the console; a reaction on a message an admin paired with `/reactrole`
 gives that role and taking the reaction off takes it back; `/sticky` keeps a
 message at the bottom of a channel; and `docs/bot-manual.md` is published to a
 channel and reconciled at every start.
+
+Completing Discord Membership Screening grants the role stored in the Rules
+channel's channel-wide, any-reaction `/reactrole` pairing. The recovery button
+resolves that same pairing and grants its current role directly. Successful
+button validation persists the one-hour probation before restoring the role. A
+legacy Rules reaction that restores pending access persists the same probation
+before granting the role, so neither path can bypass it during a restart.
 
 Behaviour is set entirely by the environment, and `.env.example` is the
 authority on it. All fourteen, in the order `src/config.ts` reads them:
@@ -52,13 +71,18 @@ authority on it. All fourteen, in the order `src/config.ts` reads them:
 The process refuses to start if either required variable is missing or blank,
 and names every problem at once rather than one per restart (`src/config.ts`).
 
-**The bot does talk to members, in exactly one place.** When it removes a
-message it DMs the poster naming the rule that fired, and if their DMs are shut
-it tags them in the channel instead and takes that note down after about half a
-minute — the one message it sends that pings anybody. Nothing it posts quotes
-the removed text. Everything else it says goes to admins:
-`BLITZ_LOG_CHANNEL_ID`, `BLITZ_STATUS_CHANNEL_ID` and the journal. The
-member-facing wording is the owner's; do not add copy of your own.
+**The bot talks to members only about its own removals.** It DMs the poster,
+names the rule, and names the Rules channel and admin role. If their DMs are
+shut it tags them in the channel instead and takes that note down after about
+half a minute. The third rapid removal gets a stronger warning in a private
+thread under Rules with a **Restore access** button. Only that member is pinged;
+if access is still missing after an hour the same thread tags them once more,
+and DM is the creation-failure path. The thread stays active for up to a week
+of inactivity and is never deleted by the reminder; successful button recovery
+locks and archives it. Nothing it posts quotes the removed text. Everything else
+it says goes to admins: `BLITZ_LOG_CHANNEL_ID`, `BLITZ_STATUS_CHANNEL_ID` and
+the journal. The member-facing wording is the owner's; do not add copy of your
+own.
 
 ## Running it locally
 
@@ -82,13 +106,15 @@ node --env-file=.env --disable-warning=ExperimentalWarning src/index.ts
 **both** privileged intents turned on — **Message Content** and **Server
 Members** — and the bot needs to be in the guild, invited with the `bot` and
 `applications.commands` scopes, holding **Manage Messages**, **Manage Roles**,
-**View Audit Log** and **Add Reactions**, with its own role above the game-ban
-role and above any role `/reactrole` hands out. Miss an intent and the gateway
-closes with code 4014 and login fails on every attempt. Miss a scope or a
-permission and the process still starts and still looks healthy: no command is
-ever registered, or every delete fails, or no game ban is marked, or Discord's
-bans never reach the game, or `/reactrole` saves the pairing and cannot put the
-emoji on the message.
+**Moderate Members**, **Ban Members**, **View Audit Log**, **Add Reactions**,
+**Create Private Threads**, **Send Messages in Threads** and **Manage Threads**,
+with its own role above the game-ban role, the Rules access role and any member
+it may timeout or ban. Miss an intent and the gateway closes with code 4014 and
+login fails on every attempt. Miss a scope or a permission and the process still
+starts and still looks healthy: no command is ever registered, every delete or
+sanction fails, no game ban is marked, Discord's bans never reach the game,
+`/reactrole` saves the pairing and cannot put the emoji on the message, or the
+private Rules warning falls back to DM.
 [docs/deploy.md §4](docs/deploy.md) is the checklist, and it applies to a laptop
 exactly as it does to the box.
 

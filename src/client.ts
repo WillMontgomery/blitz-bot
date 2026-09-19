@@ -8,6 +8,7 @@ import {
   Events,
   GatewayIntentBits,
   Partials,
+  PermissionsBitField,
   RESTJSONErrorCodes,
   type APIEmbed,
   type Guild,
@@ -30,13 +31,27 @@ import {
   type DdbFailure,
   type DdbResult,
 } from './ddb.ts'
+import {
+  createDiscipline,
+  ddbDisciplineStore,
+  DISCIPLINE_BAN_REASON,
+  discordDisciplineActions,
+  type AccessReset,
+  type DisciplineDesk,
+  type DisciplineOffense,
+  type DisciplineResult,
+  type DisciplineTiming,
+} from './discipline.ts'
 import { installIncidentLog } from './incidents.ts'
+import { launchInFlight } from './inflight.ts'
 import { scanMessage, type InviteResolver, type ScanResult } from './invites.ts'
 import { latch } from './latch.ts'
 import { scanLinks, type LinkReason } from './links.ts'
 import { log, type Level, type Sink } from './log.ts'
 import { watchMaintenance } from './maintenance.ts'
 import { installReactionRoles } from './reactroles.ts'
+import { installRulesRecovery, type RulesRecoveryDesk } from './recovery.ts'
+import { installRulesScreening } from './rules.ts'
 import { createRingmaster, KICK_TTL_MS, type KickResult, type Ringmaster } from './ringmaster.ts'
 import { installStickies } from './sticky.ts'
 
@@ -78,7 +93,9 @@ import { installStickies } from './sticky.ts'
  * instruction until the owner replaced it. The instruction now is that a poster
  * is told their message was removed and WHICH RULE removed it — by DM, or, if
  * the DM bounces, by a line in the channel that tags them and is taken back down
- * about half a minute later. See `notifier` and `noticeChannel`.
+ * about half a minute later. A third rapid removal is different: its final
+ * warning goes into a private thread under Rules, with DM only as the failure
+ * path. See `notifier`, `escalationNotifier` and `noticeChannel`.
  *
  * EVERYTHING ELSE ABOUT THAT RULE IS UNCHANGED. It is still the case that no
  * removal is announced to the guild at large, that nothing quotes the text that
@@ -527,6 +544,7 @@ export interface Actions {
 
   remove: () => Promise<void>
   announce: ((line: string) => Promise<void>) | null
+  discipline: (why: DeleteReason) => Promise<DisciplineResult>
 
   /**
    * How the poster is told their message was removed, and which rule removed
@@ -621,6 +639,8 @@ export async function handleMessage(
       log('info', `deleted ${CARRIED[verdict.why]}`, { ...where, ...logFields(verdict) })
       await postLine(actions.announce, removedLine(message, verdict))
 
+      const discipline = await actions.discipline(verdict.why)
+
       // THE POSTER IS TOLD LAST, AND ONLY ON A REMOVAL THAT ACTUALLY HAPPENED.
       // It is last for the same reason the announce is after the delete: the
       // record comes before the courtesy, so a member is never told about a
@@ -628,6 +648,13 @@ export async function handleMessage(
       // shared with `would-delete` because a dry run deletes nothing — a DM
       // saying a message was removed, sent while the bot is only watching,
       // would be the bot lying to a member about its own behaviour.
+      //
+      // THE THIRD REMOVAL GETS THE STRONGER TIMEOUT NOTICE INSTEAD, and a member
+      // who has just been banned cannot receive a useful removal notice. Every
+      // other result, including a failed sanction, still gets the ordinary
+      // explanation.
+      if (discipline.did === 'timed-out' || discipline.did === 'banned') return
+
       await actions.notify(verdict.why)
       return
     }
@@ -923,8 +950,8 @@ export const COPY = {
    * rule token is put. One frame rather than six means a rewrite cannot leave
    * five notices carrying the token and one not.
    */
-  frame: (reason: string, why: DeleteReason) =>
-    `Your message was removed. ${reason} If that's wrong, tell an admin. (rule: ${why})`,
+  frame: (reason: string, why: DeleteReason, rules: string, admin: string) =>
+    `Your message was removed. ${reason} ${rules} ${admin} (rule: ${why})`,
 
   'foreign-invite': 'It contained an invite to another Discord server.',
   'over-lookup-cap': 'It contained too many invite links to check.',
@@ -933,12 +960,37 @@ export const COPY = {
   'foreign-ip': 'It contained an IP address. Four numbers separated by dots will trigger this, even in a file name or a version number.',
   'link-shortener': "It contained a shortened link, which we don't allow because the destination is hidden.",
 } satisfies Record<DeleteReason, string> & {
-  frame: (reason: string, why: DeleteReason) => string
+  frame: (reason: string, why: DeleteReason, rules: string, admin: string) => string
+}
+
+export interface NoticeReferences {
+  readonly rulesChannelId: string | null
+  readonly adminRoleId: string | null
+}
+
+export function rulesPrompt(rulesChannelId: string | null): string {
+  if (rulesChannelId === null) return 'Read the server rules before posting again.'
+
+  return `Read <#${rulesChannelId}> before posting again.`
+}
+
+export function adminPrompt(adminRoleId: string | null): string {
+  if (adminRoleId === null) return 'If this is wrong, contact an admin.'
+
+  return `If this is wrong, contact <@&${adminRoleId}>.`
 }
 
 /** The notice for one removal, in whatever words are in force. */
-export function removalNotice(why: DeleteReason): string {
-  return COPY.frame(COPY[why], why)
+export function removalNotice(
+  why: DeleteReason,
+  references: NoticeReferences = { rulesChannelId: null, adminRoleId: null },
+): string {
+  return COPY.frame(
+    COPY[why],
+    why,
+    rulesPrompt(references.rulesChannelId),
+    adminPrompt(references.adminRoleId),
+  )
 }
 
 /**
@@ -953,7 +1005,7 @@ export function removalNotice(why: DeleteReason): string {
 const NOTICE_TTL_MS = 30_000
 
 /**
- * The two ways a poster can be reached, as a seam.
+ * The member-facing delivery routes, as a seam.
  *
  * A SEAM RATHER THAN A discord.js CALL INSIDE `handleMessage`, for the reason
  * `remove` and `announce` are already seams: this file's whole split is that
@@ -973,6 +1025,7 @@ const NOTICE_TTL_MS = 30_000
  * be allowed at the send — see `noticeChannel`. A function that only saw the
  * finished string could put `<@id>` in a message and have no way to make it
  * notify the person it names.
+ *
  */
 export interface NoticeChannel {
   dm: (userId: string, text: string) => Promise<void>
@@ -1104,6 +1157,46 @@ function noticeIsDue(notices: NoticeChannel, authorId: string): boolean {
 }
 
 /**
+ * Send one member-facing notice privately, falling back to one public channel
+ * only when Discord says the member cannot receive DMs.
+ */
+async function deliverMemberNotice(
+  notices: NoticeChannel,
+  userId: string,
+  fallbackChannelId: string,
+  text: string,
+  fields: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await notices.dm(userId, text)
+    return
+  } catch (error) {
+    if (!dmsAreShut(error)) {
+      log('warn', 'the member DM failed for a reason other than closed DMs', {
+        ...fields,
+        error,
+      })
+      return
+    }
+
+    log('info', 'could not DM the member, using the channel fallback instead', {
+      ...fields,
+      error,
+    })
+  }
+
+  try {
+    await notices.fallback(fallbackChannelId, userId, `<@${userId}> ${text}`)
+  } catch (error) {
+    log('error', 'could not deliver the member notice', {
+      ...fields,
+      fallbackChannel: fallbackChannelId,
+      error,
+    })
+  }
+}
+
+/**
  * Tell one poster their message was removed, and which rule removed it.
  *
  * DM FIRST, CHANNEL SECOND, AND THE CHANNEL ONLY WHEN THE DM BOUNCES. A DM is
@@ -1148,6 +1241,7 @@ function noticeIsDue(notices: NoticeChannel, authorId: string): boolean {
 export function notifier(
   notices: NoticeChannel,
   message: ScannedMessage,
+  references: NoticeReferences = { rulesChannelId: null, adminRoleId: null },
 ): (why: DeleteReason) => Promise<void> {
   return async (why) => {
     const where = { author: message.authorId, channel: message.channelId }
@@ -1171,44 +1265,98 @@ export function notifier(
       return
     }
 
-    const text = removalNotice(why)
+    await deliverMemberNotice(
+      notices,
+      message.authorId,
+      message.channelId,
+      removalNotice(why, references),
+      { ...where, reason: why, notice: 'removal' },
+    )
+  }
+}
 
-    try {
-      await notices.dm(message.authorId, text)
-      return
-    } catch (error) {
-      if (!dmsAreShut(error)) {
-        // NOT A BOUNCE, SO THE FALLBACK IS NOT SPENT. A warning and not an info,
-        // unlike the closed-DM case below: a member's privacy setting is
-        // expected traffic, and the API refusing a send for some other reason is
-        // the bot's own fault to look at.
-        log('warn', 'the DM failed for a reason other than closed DMs, so nothing was posted', {
-          ...where,
-          reason: why,
-          error,
+/** The stronger notice sent on the successful third-strike timeout. */
+export function rapidOffenseNotice(
+  access: AccessReset,
+  adminRoleId: string | null,
+  timing: DisciplineTiming,
+): string {
+  const accessText = (() => {
+    if (access.did !== 'removed') return rulesPrompt(access.rulesChannelId)
+
+    return `Your server access is restricted due to multiple rule violations. Please read the rules in <#${access.rulesChannelId}> before clicking the button below to restore your access.`
+  })()
+
+  const help =
+    adminRoleId === null
+      ? 'Need help? Contact an admin.'
+      : `Need help? Contact <@&${adminRoleId}>.`
+  const probation = (() => {
+    if (timing.probation === 'unavailable') return null
+
+    return timing.probation === 'after-recovery'
+      ? '**Once your access is restored, your next offense within 1 hour will result in an immediate ban from our Discord and FiveM servers.**'
+      : '**For the next 1 hour, your next offense will result in an immediate ban from our Discord and FiveM servers.**'
+  })()
+
+  return [
+    accessText,
+    `Additionally, you won't be able to post for a bit. This will clear <t:${Math.floor(timing.timeoutUntil / 1000)}:R>.`,
+    probation,
+    help,
+  ]
+    .filter((line): line is string => line !== null)
+    .join('\n\n')
+}
+
+/**
+ * Escalation bypasses the ordinary notice cooldown and goes into a private
+ * thread under Rules. A DM is the failure path, never the offending channel:
+ * access to that channel may already have disappeared with the role reset.
+ */
+export function escalationNotifier(
+  notices: NoticeChannel,
+  adminRoleId: string | null,
+  recovery: Pick<RulesRecoveryDesk, 'open'>,
+): (
+  offense: DisciplineOffense,
+  access: AccessReset,
+  timing: DisciplineTiming,
+) => Promise<void> {
+  return async (offense, access, timing) => {
+    const text = rapidOffenseNotice(access, adminRoleId, timing)
+    const fields = {
+      author: offense.userId,
+      channel: offense.channelId,
+      rulesChannel: access.rulesChannelId,
+      reason: offense.reason,
+      notice: 'rapid-offense',
+    }
+
+    if (access.rulesChannelId !== null) {
+      try {
+        await recovery.open({
+          userId: offense.userId,
+          rulesChannelId: access.rulesChannelId,
+          text,
         })
         return
+      } catch (error) {
+        log('warn', 'could not deliver the rapid-offense notice in a private Rules thread', {
+          ...fields,
+          error,
+        })
       }
-
-      // Expected traffic, not a fault: a member who does not accept DMs from
-      // this server is the ordinary reason to be here. Recorded at info so that
-      // a bot whose DMs ALL bounce — a token problem, a gateway problem — is
-      // still visible as a pattern in the journal.
-      log('info', 'could not DM the poster, telling them in the channel instead', {
-        ...where,
-        reason: why,
-        error,
-      })
     }
 
     try {
-      await notices.fallback(message.channelId, message.authorId, `<@${message.authorId}> ${text}`)
+      await notices.dm(offense.userId, text)
     } catch (error) {
-      log('error', 'could not tell the poster their message was removed', {
-        ...where,
-        reason: why,
+      log('error', 'could not privately deliver the rapid-offense notice', {
+        ...fields,
         error,
       })
+      throw error
     }
   }
 }
@@ -1515,10 +1663,12 @@ function push(parts: string[], text: string | null | undefined): void {
  */
 export interface LiveMember {
   readonly roles: { readonly cache: ReadonlyMap<string, unknown> }
+  readonly permissions: { has(permission: bigint): boolean }
 }
 
 /**
- * The guild, reduced to the one question this file asks it: who is this author.
+ * The guild, reduced to the member lookup plus the two guild-level facts used
+ * by Rules access and sanction eligibility.
  *
  * `members.fetch` IS A CACHING READ. discord.js checks its own member cache
  * first and only spends a REST call on a miss, and a member it does fetch is
@@ -1526,10 +1676,13 @@ export interface LiveMember {
  * the next message from the same author never reaches this at all.
  */
 export interface LiveGuild {
+  readonly ownerId: string
+  readonly rulesChannelId: string | null
   readonly members: { fetch: (id: string) => Promise<LiveMember> }
 }
 
 export interface LiveMessage extends ScannableMessage {
+  readonly id: string
   readonly partial: boolean
 
   /**
@@ -1543,7 +1696,11 @@ export interface LiveMessage extends ScannableMessage {
    * bring must not be the difference between a record and no record, and the
    * line is built to survive its absence — see `authorRef`.
    */
-  readonly author: { readonly id: string; readonly username: string | null } | null
+  readonly author: {
+    readonly id: string
+    readonly username: string | null
+    readonly bot: boolean
+  } | null
 
   readonly member: LiveMember | null
 
@@ -1568,11 +1725,12 @@ export interface LiveMessage extends ScannableMessage {
 export interface LiveActions {
   resolve: InviteResolver
   announce: ((line: string) => Promise<void>) | null
+  discipline: DisciplineDesk
 
   /**
-   * The two ways to reach a poster. Built once from the client, like the
-   * resolver and the log channel, because neither of them is bound to a
-   * message — `notifier` is what binds them to one.
+   * The member-facing delivery routes. Built once from the client, like the
+   * resolver and the log channel, because none is bound to one message —
+   * `notifier` and `escalationNotifier` provide that binding.
    */
   notices: NoticeChannel
 }
@@ -1630,8 +1788,42 @@ export async function handleLive(
     fetchRoles: memberRoles(full),
     remove: remover(full, config),
     announce: actions.announce,
-    notify: notifier(actions.notices, scanned),
+    discipline: (why) => actions.discipline.record(disciplineOffense(full, authorId, config, why)),
+    notify: notifier(
+      actions.notices,
+      scanned,
+      {
+        rulesChannelId: full.guild?.rulesChannelId ?? null,
+        adminRoleId: config.adminRoleId,
+      },
+    ),
   })
+}
+
+/** Reduce the same live message to the fields the sanction window needs. */
+function disciplineOffense(
+  message: LiveMessage,
+  authorId: string,
+  config: Config,
+  reason: DeleteReason,
+): DisciplineOffense {
+  const member = message.member
+  const administrator =
+    member === null
+      ? null
+      : member.permissions.has(PermissionsBitField.Flags.Administrator) ||
+        (config.adminRoleId !== null && member.roles.cache.has(config.adminRoleId))
+
+  return {
+    messageId: message.id,
+    userId: authorId,
+    channelId: message.channelId,
+    reason,
+    webhookId: message.webhookId,
+    fromBot: message.author?.bot ?? false,
+    isOwner: message.guild?.ownerId === authorId,
+    administrator,
+  }
 }
 
 /** How long an author's roles — or a failure to read them — stay good. */
@@ -1903,20 +2095,46 @@ export function createClient(config: Config): Client {
      *
      * THIS USED TO SAY "CAN EVER PING ANYONE", AND THAT IS NO LONGER TRUE. A
      * default is silently replaced by any call that passes `allowedMentions` of
-     * its own, so what it really guarantees is the sends that say nothing. Two
-     * now say something: `announcer` repeats the suppression at its own `send`,
+     * its own, so what it really guarantees is the sends that say nothing.
+     * `announcer` repeats the suppression at its own `send`,
      * because that call deliberately contains a mention and because a default
-     * set here cannot be asserted on there — and `noticeChannel`'s fallback
-     * DELIBERATELY pings, narrowed to the single poster it names, because its
-     * whole job is to reach a member whose DMs are shut. Both state their
-     * option at the send, which is the only place a reader can see it.
+     * set here cannot be asserted on there. The temporary channel fallback and
+     * the private Rules thread/reminder deliberately ping one member; both are
+     * narrowed to that member and suppress every role mention in their copy.
      */
     allowedMentions: { parse: [], repliedUser: false },
   })
 
   const resolve = inviteResolver((code) => client.fetchInvite(code))
   const post = config.logChannelId === null ? null : announcer(client, config.logChannelId)
-  const actions: LiveActions = { resolve, announce: post, notices: noticeChannel(client) }
+  const notices = noticeChannel(client)
+  const rulesDdb = createDdb()
+  let disciplineDesk: DisciplineDesk | null = null
+  const recovery = installRulesRecovery(client, config, rulesDdb, {
+    startProbation(userId) {
+      if (disciplineDesk === null) {
+        throw new Error('the discipline desk is not installed')
+      }
+
+      return disciplineDesk.startProbation(userId)
+    },
+    startProbationForRole(userId, roleId) {
+      if (disciplineDesk === null) {
+        throw new Error('the discipline desk is not installed')
+      }
+
+      return disciplineDesk.startProbationForRole(userId, roleId)
+    },
+  })
+  const discipline = createDiscipline(
+    discordDisciplineActions(client, config, rulesDdb.reactRoles, {
+      notifyTimeout: escalationNotifier(notices, config.adminRoleId, recovery),
+      report: (line) => postLine(post, line),
+    }),
+    { store: ddbDisciplineStore(rulesDdb.botState) },
+  )
+  disciplineDesk = discipline
+  const actions: LiveActions = { resolve, announce: post, notices, discipline }
 
   client.once(Events.ClientReady, (ready) => {
     // `Events.ClientReady` is `clientReady` in this version; the old `ready`
@@ -2122,9 +2340,13 @@ export function createClient(config: Config): Client {
   // becomes an unhandled rejection several ticks later, attached to no message
   // and no channel.
   const onMessage = (message: LiveMessage): void => {
-    void handleLive(message, client.user?.id ?? null, config, actions).catch((error: unknown) => {
-      log('error', 'message handler failed', { channel: message.channelId, error })
-    })
+    launchInFlight(() =>
+      handleLive(message, client.user?.id ?? null, config, actions).catch(
+        (error: unknown) => {
+          log('error', 'message handler failed', { channel: message.channelId, error })
+        },
+      ),
+    )
   }
 
   client.on(Events.MessageCreate, onMessage)
@@ -2326,6 +2548,16 @@ export function createClient(config: Config): Client {
   installIncidentLog(client, config, createDdb())
 
   /**
+   * MEMBERSHIP SCREENING — completing Discord's Rules screen grants the same
+   * access role as the Rules channel's any-message, any-reaction pairing.
+   *
+   * There is deliberately no startup reconciliation: restoring the role to
+   * every already-screened member would immediately undo a rapid-offense access
+   * reset. The private Rules thread's button is the guided recovery path.
+   */
+  installRulesScreening(client, config, rulesDdb)
+
+  /**
    * REACTION ROLES — the desk `/reactrole` reaches for, and the two listeners
    * that act on what it saved.
    *
@@ -2351,7 +2583,22 @@ export function createClient(config: Config): Client {
    * interaction can arrive, and a command that somehow ran earlier refuses rather
    * than crashing — see `reactRoles()`.
    */
-  installReactionRoles(client, config, createDdb())
+  installReactionRoles(
+    client,
+    config,
+    createDdb(),
+    undefined,
+    undefined,
+    async (userId, roleId, channelId, how) => {
+      // Only the Rules channel's canonical any-reaction pairing participates
+      // in recovery; unrelated reaction roles must not depend on #23 state.
+      const rulesChannelId =
+        client.guilds.cache.get(config.guildId)?.rulesChannelId ?? null
+      if (channelId !== rulesChannelId || how !== 'channel-any') return
+
+      await discipline.startProbationForRole(userId, roleId)
+    },
+  )
 
   return client
 }
@@ -2602,7 +2849,7 @@ export function announcer(client: Client, channelId: string): (line: string) => 
 const LOG_CHANNEL_BACK = 'the log channel can be posted to again, so removals are recorded there'
 
 /**
- * The two ways this bot reaches a poster, built on the live client.
+ * The member-facing delivery routes built on the live client.
  *
  * `users.fetch` THEN `send` IS THE WHOLE OF THE DM. discord.js opens the DM
  * channel on the first send by itself, so there is nothing to cache and nothing
@@ -2645,6 +2892,7 @@ const LOG_CHANNEL_BACK = 'the log channel can be posted to again, so removals ar
  * `notifier` has long since returned and there is nobody left to hand an error
  * to; an unhandled rejection out of a bare timer callback would take the
  * process down over a message somebody had probably already dismissed.
+ *
  */
 export function noticeChannel(client: Client): NoticeChannel {
   return {
@@ -2665,7 +2913,7 @@ export function noticeChannel(client: Client): NoticeChannel {
 
       const sent = await channel.send({
         content: text,
-        allowedMentions: { users: [userId] },
+        allowedMentions: { parse: [], users: [userId], roles: [] },
       })
 
       setTimeout(() => {
@@ -5163,12 +5411,12 @@ export function syncDocsChannel(
  * ═══ THE THREE THINGS THAT WOULD OTHERWISE BITE ═══
  *
  * 1. THE LOOP. This bot removes a role in response to an audit entry, and
- *    removing a role writes an audit entry. `mirrorEntry` ignores any entry
- *    whose `executorId` is the bot's own user id, which is one line and is what
- *    both YAGPDB and Red do. `moderationEntry` is the second line of defence: a
- *    role edit is `MemberRoleUpdate`, which is not in `MIRRORED` and never
- *    becomes a `ModerationEntry` at all. Idempotence is the backstop, not the
- *    mechanism.
+ *    removing a role writes an audit entry. `mirrorEntry` ignores entries whose
+ *    executor is this bot, except for the one exact ban reason emitted by the
+ *    rapid-offense state machine. `moderationEntry` is the second line of
+ *    defence: a role edit is `MemberRoleUpdate`, which is not in `MIRRORED` and
+ *    never becomes a `ModerationEntry` at all. Idempotence is the backstop, not
+ *    the mechanism.
  *
  * 2. IDEMPOTENCY IS THE AUDIT ENTRY ID, stored on the ban row as
  *    `discordEntryId` and checked before the write — Zeppelin's
@@ -5447,8 +5695,10 @@ export function roleTaker(client: Client, guildId: string, roleId: string): Role
  * kicking or banning from discord to be shown in Ringmaster's audit log" — and
  * the two reads pull in opposite directions from the same sentence: `audit` so
  * the ban and the lift leave a row in the chronological record of who did what,
- * and `players` so the WHO on that row is a human name rather than a snowflake.
- * `audit` is the only WRITE the mirror has ever gained that is not a ban.
+ * and `players` so the WHO on that row is a readable executor name rather than
+ * a snowflake. That executor is normally a human moderator; the rapid-offense
+ * ban is the one deliberate automated exception. `audit` is the only WRITE the
+ * mirror has ever gained that is not a ban.
  */
 export interface MirrorDeps {
   /**
@@ -5579,12 +5829,19 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
   const now = deps.now ?? Date.now
 
   /**
-   * THE LOOP PREVENTION, AND IT IS ONE LINE. The bot removes a role, Discord
-   * writes an audit entry for it, the entry comes back to this listener. Both
-   * YAGPDB and Red-DiscordBot do exactly this and nothing more elaborate,
-   * because anything more elaborate is state that can be wrong.
+   * THE SELF GUARD HAS ONE NARROW EXCEPTION. A fourth rapid offense is banned
+   * through Discord specifically so this audit mirror can create the permanent
+   * FiveM ban. The exact reason is the capability token: every other action by
+   * this bot remains ignored, including all role edits.
    */
-  if (entry.executorId !== null && entry.executorId === deps.selfId) {
+  const trustedEscalation =
+    entry.action === 'ban' && entry.reason === DISCIPLINE_BAN_REASON
+
+  if (
+    entry.executorId !== null &&
+    entry.executorId === deps.selfId &&
+    !trustedEscalation
+  ) {
     return { did: 'ignored', why: 'self' }
   }
 
@@ -5696,17 +5953,17 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
   /**
    * The acting admin, in the shape the console's audit log names people in.
    *
-   * ATTRIBUTION IS THE HUMAN, WHICH IS THE WHOLE POINT OF THE ROW. The console
-   * builds this from the Discord id in `SERVICE_ACTOR_HEADER`:
+   * ATTRIBUTION IS THE DISCORD EXECUTOR, WHICH IS THE WHOLE POINT OF THE ROW.
+   * The console builds this from the Discord id in `SERVICE_ACTOR_HEADER`:
    * `{ license: grantsForDiscordId(id)?.license ?? null, name: discordName ?? id,
    * discordId: id }` (fivem-ringmaster `src/lib/service.ts`). This is the same
    * shape reached by the one road this bot has — see `issuerLicence` on why the
    * license comes from `ringmaster-player-ids` and not from the grants table.
    *
-   * "blitz-bot" IS NEVER THE ANSWER. Which process wrote the row is not what
-   * anybody asks an audit log, and an admin who has never played the game is
-   * still a person: they get their Discord id as the name and a NULL license,
-   * which is exactly what the console writes for an admin with no grants row.
+   * "blitz-bot" IS THE ANSWER ONLY FOR THE TRUSTED RAPID-OFFENSE BAN. Every
+   * other self-authored entry is refused above. A human admin who has never
+   * played the game still gets their Discord id as the name and a NULL license,
+   * exactly as the console writes for an admin with no grants row.
    *
    * THE NAME IS DISCORD'S FIRST AND THE GAME'S SECOND, in that order and not the
    * other way round. The console writes the Discord display name, so taking the
@@ -5899,8 +6156,9 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
     const result = await deps.kick.kick({
       license: licence,
       at: entry.at,
-      // The human who acted, so the console's audit row names them and not this
-      // bot. See `SERVICE_ACTOR_HEADER` in src/ringmaster.ts.
+      // The Discord executor. Normally a human moderator; the trusted
+      // rapid-offense ban deliberately names this bot. See
+      // `SERVICE_ACTOR_HEADER` in src/ringmaster.ts.
       actorDiscordId: executorId,
       playerName: entry.targetName,
       reason: entry.reason,

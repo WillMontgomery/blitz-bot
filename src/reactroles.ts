@@ -18,6 +18,7 @@ import {
   type ReactRolePairing,
   type ReactRolePairingInput,
 } from './ddb.ts'
+import { launchInFlight } from './inflight.ts'
 import { latch, type Latch } from './latch.ts'
 import { log } from './log.ts'
 
@@ -276,6 +277,12 @@ export function guildReactRoles(client: Client, guildId: string): ReactRoleGrant
 export interface ReactRoleDeps {
   readonly ddb: Pick<Ddb, 'reactRoles'>
   readonly roles: ReactRoleGrants
+  readonly beforeGrant?: (
+    userId: string,
+    roleId: string,
+    channelId: string,
+    how: PairingSource,
+  ) => Promise<void>
 
   /** The guild this bot is for. A reaction from anywhere else is ignored. */
   readonly guildId: string
@@ -455,8 +462,17 @@ export async function handleReaction(
   }
 
   try {
-    if (move === 'added') await deps.roles.add(reaction.userId, pairing.roleId)
-    else await deps.roles.remove(reaction.userId, pairing.roleId)
+    if (move === 'added') {
+      await deps.beforeGrant?.(
+        reaction.userId,
+        pairing.roleId,
+        reaction.channelId,
+        how,
+      )
+      await deps.roles.add(reaction.userId, pairing.roleId)
+    } else {
+      await deps.roles.remove(reaction.userId, pairing.roleId)
+    }
   } catch (error) {
     /**
      * WARN RATHER THAN ERROR, AND THE COMMAND IS WHY. `/reactrole` refuses a
@@ -803,10 +819,10 @@ export function reactionOf(
  * event before any listener runs, and the feature would work only on messages
  * posted since the last restart. See `createClient`.
  *
- * THE LISTENERS ARE SYNCHRONOUS AND HANDLE THEIR OWN PROMISES, for the reason
- * `onMessage` in client.ts does: an async function handed to an EventEmitter has
- * nowhere to reject to, and becomes an unhandled rejection several ticks later
- * attached to no reaction and no member.
+ * THE LISTENERS ARE SYNCHRONOUS, TRACK THEIR PROMISES FOR SHUTDOWN, AND
+ * SERIALIZE EACH MEMBER'S EVENTS. An async function handed directly to an
+ * EventEmitter has nowhere to reject to; unsequenced add/remove events can also
+ * overtake one another while a durable pre-grant write is in flight.
  *
  * THE DESK AND THE GRANTS ARE PARAMETERS WITH DEFAULTS, which is the only reason
  * the wiring itself is testable. Both defaults are the live ones and no caller
@@ -821,6 +837,12 @@ export function installReactionRoles(
   ddb: Pick<Ddb, 'reactRoles'>,
   desk: ReactRoleDesk = liveDesk(client, config.guildId, ddb),
   roles: ReactRoleGrants = guildReactRoles(client, config.guildId),
+  beforeGrant?: (
+    userId: string,
+    roleId: string,
+    channelId: string,
+    how: PairingSource,
+  ) => Promise<void>,
 ): void {
   setReactRoles(desk)
 
@@ -829,15 +851,46 @@ export function installReactionRoles(
    * handler, because a latch rebuilt per reaction holds nothing and a wall of one
    * sentence is exactly what it is for. See `READ_FAULT`.
    */
-  const deps: ReactRoleDeps = { ddb, roles, guildId: config.guildId, reads: latch() }
+  const deps: ReactRoleDeps = {
+    ddb,
+    roles,
+    beforeGrant,
+    guildId: config.guildId,
+    reads: latch(),
+  }
+  const queues = new Map<string, Promise<void>>()
+
+  function enqueue(userId: string, operation: () => Promise<void>): Promise<void> {
+    const previous = queues.get(userId) ?? Promise.resolve()
+    const result = previous.then(operation, operation)
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    )
+
+    queues.set(userId, tail)
+    void tail.finally(() => {
+      if (queues.get(userId) === tail) queues.delete(userId)
+    })
+
+    return result
+  }
 
   const onReaction = (reaction: LiveReaction, user: LiveReactor, move: ReactionMove): void => {
-    void handleReaction(reactionOf(reaction, user, client.user?.id ?? null), move, deps).catch(
-      (error: unknown) => {
-        // `handleReaction` is written not to throw; this is the guarantee that
-        // it did, rather than a path anything is expected to take.
-        log('error', 'the reaction role handler threw', { message: reaction.message.id, error })
-      },
+    launchInFlight(() =>
+      enqueue(user.id, () =>
+        handleReaction(reactionOf(reaction, user, client.user?.id ?? null), move, deps).then(
+          () => undefined,
+          (error: unknown) => {
+            // `handleReaction` is written not to throw; this is the guarantee that
+            // it did, rather than a path anything is expected to take.
+            log('error', 'the reaction role handler threw', {
+              message: reaction.message.id,
+              error,
+            })
+          },
+        ),
+      ),
     )
   }
 
