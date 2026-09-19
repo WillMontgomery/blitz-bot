@@ -8749,10 +8749,115 @@ describe('the live kick that follows a ban', () => {
 
     expect(harness.kicks[0]).toMatchObject({
       license: MOD_LICENCE,
-      actorDiscordId: MOD_ADMIN,
+      actor: { kind: 'admin', discordId: MOD_ADMIN },
       playerName: 'nate',
       reason: 'cheating',
     })
+  })
+
+  /**
+   * THE ESCALATION'S KICK IS THE SYSTEM'S, AND NEVER THIS BOT'S ID. Sending the
+   * bot's own snowflake is what the console refused as `role-revoked` on
+   * 2026-09-19, with the ban already written and the player still in the match.
+   * The reason goes with it, because it is what tells an admin reading the
+   * console's log why `System` kicked somebody.
+   */
+  it('asks for its own rapid-offense ban`s kick as the system, not as itself', async () => {
+    const harness = mirrorHarness()
+    const result = await mirrorEntry(
+      entryOf({ executorId: MOD_SELF, executorName: 'blitz-bot', reason: DISCIPLINE_BAN_REASON }),
+      harness.deps,
+    )
+
+    expect(result).toMatchObject({ did: 'ban', kick: DISPATCHED })
+    expect(harness.kicks).toHaveLength(1)
+    expect(harness.kicks[0]).toMatchObject({
+      license: MOD_LICENCE,
+      actor: { kind: 'system' },
+      reason: DISCIPLINE_BAN_REASON,
+    })
+    expect(JSON.stringify(harness.kicks[0])).not.toContain(MOD_SELF)
+  })
+
+  /**
+   * THE REASON ALONE IS NOT THE SYSTEM. It is text, and any admin can type it
+   * into Discord's ban dialog; that admin is still a person, still named, and
+   * still put through the console's role gate under their own id.
+   */
+  it('asks as the admin when a human bans with the escalation`s own reason', async () => {
+    const harness = mirrorHarness()
+    await mirrorEntry(
+      entryOf({ executorId: MOD_ADMIN, reason: DISCIPLINE_BAN_REASON }),
+      harness.deps,
+    )
+
+    expect(harness.kicks[0]).toMatchObject({
+      actor: { kind: 'admin', discordId: MOD_ADMIN },
+      reason: DISCIPLINE_BAN_REASON,
+    })
+  })
+
+  /**
+   * AND EVERY HUMAN BAN NAMES ITS HUMAN, whatever else is on the entry. The
+   * system marker is for one entry shape, and a regression that widened it
+   * would ask the console for kicks it refuses for anybody not banned.
+   */
+  it('never asks as the system for a ban a human issued', async () => {
+    for (const reason of ['cheating', null, DISCIPLINE_BAN_REASON]) {
+      const harness = mirrorHarness()
+      await mirrorEntry(entryOf({ executorId: MOD_ADMIN, reason }), harness.deps)
+
+      expect(harness.kicks[0]?.actor).toEqual({ kind: 'admin', discordId: MOD_ADMIN })
+    }
+  })
+
+  /**
+   * THE BAN IS WRITTEN BEFORE THE SYSTEM KICK IS ASKED FOR, which is the whole
+   * of why the console can allow it: it lets the system kick only a license
+   * whose ban it can read as in force, and it can only read one that exists.
+   */
+  it('writes its own ban before it asks for the system kick that enforces it', async () => {
+    const order: string[] = []
+    const harness = mirrorHarness({
+      issue: (input) => {
+        order.push('bans.issue')
+        return Promise.resolve(
+          ok({
+            outcome: 'issued' as const,
+            ban: banRow({ license: input.id, discordEntryId: input.entryId }),
+          }),
+        )
+      },
+      kick: {
+        kick: (input) => {
+          order.push(`kick:${input.actor.kind}`)
+          return Promise.resolve(DISPATCHED)
+        },
+      },
+    })
+
+    await mirrorEntry(
+      entryOf({ executorId: MOD_SELF, reason: DISCIPLINE_BAN_REASON }),
+      harness.deps,
+    )
+
+    expect(order).toEqual(['bans.issue', 'kick:system'])
+  })
+
+  /**
+   * NO BAN WRITTEN, NO KICK ASKED FOR, as for a human. A system kick of
+   * somebody the table does not show banned is one the console refuses, so
+   * asking would only put a refusal in the journal beside the real failure.
+   */
+  it('asks for no system kick when its own ban could not be written', async () => {
+    const harness = mirrorHarness({ issue: () => Promise.resolve(broke()) })
+    const result = await mirrorEntry(
+      entryOf({ executorId: MOD_SELF, reason: DISCIPLINE_BAN_REASON }),
+      harness.deps,
+    )
+
+    expect(result).toMatchObject({ did: 'failed', step: 'issue' })
+    expect(harness.kicks).toEqual([])
   })
 
   /**
@@ -9090,7 +9195,7 @@ describe('a kick is not a ban', () => {
 
     expect(harness.kicks[0]).toMatchObject({
       license: MOD_LICENCE,
-      actorDiscordId: MOD_ADMIN,
+      actor: { kind: 'admin', discordId: MOD_ADMIN },
       reason: 'afk in the bus',
     })
   })

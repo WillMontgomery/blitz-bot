@@ -17,7 +17,10 @@ import { log } from './log.ts'
  * second, quieter implementation of the most dangerous thing in the system. So
  * the bot asks, and everything the console checks it still checks — the closed
  * case, the SSH configuration, the role gate on the human being attributed. The
- * console's `lib/service.ts` is the door and says so at length.
+ * console's `lib/service.ts` is the door and says so at length. For the one
+ * kick no human asked for, the rapid-offense escalation, what the console checks
+ * instead of a role is that the player's ban is already in force; see
+ * {@link SYSTEM_ACTOR}.
  *
  * ═══ THE STANDING RULE: THE BOT MUST NEVER DEPEND ON THE CONSOLE BEING UP ═══
  *
@@ -88,8 +91,8 @@ import { log } from './log.ts'
 export const COMMAND_SECRET_HEADER = 'x-ringmaster-service'
 
 /**
- * The Discord id of the human being attributed, from the console's
- * `SERVICE_ACTOR_HEADER`.
+ * Who the kick is attributed to, from the console's `SERVICE_ACTOR_HEADER`: the
+ * Discord id of the human, or {@link SYSTEM_ACTOR} when there is none.
  *
  * THE ADMIN WHO CLICKED BAN, NEVER THIS BOT. The audit row the console writes
  * names them — their license, their name, their Discord id — because "which
@@ -97,8 +100,57 @@ export const COMMAND_SECRET_HEADER = 'x-ringmaster-service'
  * them" is. It is also not decoration: the console puts this id through the SAME
  * role gate the browser path runs, so a call carrying nobody is refused before
  * anything is written.
+ *
+ * AND WHEN NOBODY CLICKED, IT IS STILL NEVER THIS BOT'S ID. The rapid-offense
+ * escalation is a ban this bot issues itself, so there is no admin to name; it
+ * used to send the bot's own snowflake here, the console put that through the
+ * role gate like any person, the bot does not hold the admin role, and the kick
+ * came back `role-revoked` with the ban already written (2026-09-19). That kick
+ * now sends {@link SYSTEM_ACTOR}, which the console treats as its own kind of
+ * actor with its own, narrower rule. Every kick a human caused still sends that
+ * human's id, exactly as before.
  */
 export const SERVICE_ACTOR_HEADER = 'x-ringmaster-actor'
+
+/**
+ * The actor sent for a kick no human asked for, from the console's
+ * `SYSTEM_ACTOR`.
+ *
+ * VERBATIM, AND A DEPLOYED CONTRACT LIKE THE HEADER IT TRAVELS IN. The console
+ * matches it exactly, and a console that does not know it answers `actor`, which
+ * this file reports as `denied`: the same live-kick failure as before, and
+ * nothing worse.
+ *
+ * A WORD, SO IT CAN NEVER BE A DISCORD ID. Snowflakes are all digits, so no
+ * admin can be mistaken for the system and the system can never be put through
+ * the role gate as though it were an admin.
+ *
+ * WHAT THE CONSOLE LETS IT DO IS ONE THING: kick a license whose ban is already
+ * in force when the kick arrives. Not ban, not close a case, not drain, and not
+ * touch anybody who is not banned. So it may only be sent for a kick that
+ * ENFORCES a ban this bot has just written, which is the rapid-offense
+ * escalation and nothing else; `mirrorEntry` in src/client.ts is the one place
+ * that chooses it. It also needs a reason, and the escalation always has one.
+ */
+export const SYSTEM_ACTOR = 'system'
+
+/**
+ * Who one kick is attributed to.
+ *
+ * TWO SHAPES RATHER THAN ONE STRING, so a caller has to say which it means. A
+ * plain `string` would let the bot's own snowflake be passed as an admin again,
+ * which is exactly how the escalation's kick was refused, and would let the
+ * system marker be passed where an admin was meant, which would ask the console
+ * for a kick it refuses for anybody not banned.
+ */
+export type KickActor =
+  | { readonly kind: 'admin'; readonly discordId: string }
+  | { readonly kind: 'system' }
+
+/** The header value for one {@link KickActor}. */
+function actorHeader(actor: KickActor): string {
+  return actor.kind === 'system' ? SYSTEM_ACTOR : actor.discordId
+}
 
 /** The console route. One of four the command credential opens; see `SERVICE_ROUTES`. */
 export const KICK_PATH = '/api/kick'
@@ -185,6 +237,13 @@ export const LICENSE = /^license2?:[0-9a-f]{6,64}$/i
  * here because the caller does the same thing with all four; the console's own
  * code travels in `detail`, so the journal still says which.
  *
+ * THE SYSTEM ACTOR HAS THREE REFUSALS OF ITS OWN AND THEY ARE `denied` TOO:
+ * `system-scope` (the marker on a path other than the kick), `system-body` (a
+ * kick with no reason, or with more than a kick in it) and `not-banned` (the
+ * license's ban is not in force, most likely lifted between the write and the
+ * kick). None of them changes in a minute. A ban the console could not READ is
+ * `store`, which is retried like every other `store`.
+ *
  * `unknown` IS THE HONEST BUCKET. A 500, a proxy's HTML error page, a body that
  * is not JSON. Reported as itself rather than folded into `unreachable`, because
  * "the console answered something we could not read" and "nothing answered" are
@@ -249,8 +308,12 @@ export interface KickInput {
    */
   at: number
 
-  /** The Discord id of the admin to attribute this to. See {@link SERVICE_ACTOR_HEADER}. */
-  actorDiscordId: string
+  /**
+   * Who to attribute this to: the admin who acted, or the system for the one
+   * kick nobody asked for. See {@link SERVICE_ACTOR_HEADER} and
+   * {@link SYSTEM_ACTOR}.
+   */
+  actor: KickActor
 
   /** Their in-game name, if we know one. Shown in the console's audit row. */
   playerName?: string | null
@@ -482,7 +545,13 @@ export function classify(status: number, body: string): Attempt {
         ? 'unreachable'
         : code === 'refused'
           ? 'refused'
-          : code === 'auth' || code === 'scope' || code === 'actor' || code === 'role-revoked'
+          : code === 'auth' ||
+              code === 'scope' ||
+              code === 'actor' ||
+              code === 'role-revoked' ||
+              code === 'system-scope' ||
+              code === 'system-body' ||
+              code === 'not-banned'
             ? 'denied'
             : 'unknown'
 
@@ -622,7 +691,7 @@ export function createRingmaster(options: RingmasterOptions): Ringmaster {
       {
         'content-type': 'application/json',
         [COMMAND_SECRET_HEADER]: options.secret,
-        [SERVICE_ACTOR_HEADER]: input.actorDiscordId,
+        [SERVICE_ACTOR_HEADER]: actorHeader(input.actor),
       },
       /**
        * `reason` AND `playerName` ARE OMITTED WHEN ABSENT rather than sent as

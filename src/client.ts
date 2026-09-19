@@ -53,7 +53,13 @@ import { watchMaintenance } from './maintenance.ts'
 import { installReactionRoles } from './reactroles.ts'
 import { installRulesRecovery, type RulesRecoveryDesk } from './recovery.ts'
 import { installAccessCheck, installRulesScreening, legacyRulesRecovery } from './rules.ts'
-import { createRingmaster, KICK_TTL_MS, type KickResult, type Ringmaster } from './ringmaster.ts'
+import {
+  createRingmaster,
+  KICK_TTL_MS,
+  type KickActor,
+  type KickResult,
+  type Ringmaster,
+} from './ringmaster.ts'
 import { installStickies } from './sticky.ts'
 
 /**
@@ -5973,6 +5979,30 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
   const executorId = entry.executorId
   const targetId = entry.targetId
 
+  /**
+   * WHO THE CONSOLE'S KICK ROW WILL NAME, decided once for the entry.
+   *
+   * THE SYSTEM ONLY FOR THE TRUSTED ESCALATION THIS BOT AUTHORED ITSELF, and the
+   * executor for everything else, exactly as before. Both halves are asked, not
+   * one: the exact reason alone is text any admin can type into Discord's ban
+   * dialog, and a human who does that is still a human and still goes through
+   * the console's role gate under their own id. Only an entry whose executor IS
+   * this bot, carrying that reason, reaches here as self-authored at all (the
+   * self guard above refuses every other one).
+   *
+   * NEVER THIS BOT'S OWN ID. That was the escalation's kick until 2026-09-19:
+   * the console put the bot's snowflake through the admin role gate, the bot
+   * does not hold the role, and the kick came back `role-revoked` with the ban
+   * already written. The console accepts the system marker for a kick of a
+   * license whose ban is in force and for nothing else, which is precisely what
+   * this kick is: the ban row below is written, and only then is the kick asked
+   * for. See `SYSTEM_ACTOR` in src/ringmaster.ts.
+   */
+  const kickActor: KickActor =
+    trustedEscalation && executorId === deps.selfId
+      ? { kind: 'system' }
+      : { kind: 'admin', discordId: executorId }
+
   /** The license a Discord account plays on, or null. Never a guess. */
   async function licenceFor(discordId: string): Promise<DdbResult<string | null>> {
     const found = await deps.ddb.playerIds.licensesFor(qualifyId('discord', discordId))
@@ -6252,10 +6282,9 @@ export async function mirrorEntry(entry: ModerationEntry, deps: MirrorDeps): Pro
     const result = await deps.kick.kick({
       license: licence,
       at: entry.at,
-      // The Discord executor. Normally a human moderator; the trusted
-      // rapid-offense ban deliberately names this bot. See
-      // `SERVICE_ACTOR_HEADER` in src/ringmaster.ts.
-      actorDiscordId: executorId,
+      // The human executor, or the system for this bot's own rapid-offense ban.
+      // See `kickActor` above.
+      actor: kickActor,
       playerName: entry.targetName,
       reason: entry.reason,
     })

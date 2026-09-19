@@ -18,6 +18,7 @@ import {
   MAINTENANCE_CANCEL_PATH,
   MAINTENANCE_PATH,
   SERVICE_ACTOR_HEADER,
+  SYSTEM_ACTOR,
   type Drainer,
   type DrainerOptions,
   type Fetcher,
@@ -91,7 +92,7 @@ function replies(...pages: HttpResponse[]) {
 }
 
 function input(over: Partial<KickInput> = {}): KickInput {
-  return { license: LICENCE, at: 1_000_000, actorDiscordId: ADMIN, ...over }
+  return { license: LICENCE, at: 1_000_000, actor: { kind: 'admin', discordId: ADMIN }, ...over }
 }
 
 /**
@@ -148,6 +149,39 @@ describe('the request the console actually receives', () => {
     expect(COMMAND_SECRET_HEADER).toBe('x-ringmaster-service')
     expect(SERVICE_ACTOR_HEADER).toBe('x-ringmaster-actor')
     expect(KICK_PATH).toBe('/api/kick')
+  })
+
+  /**
+   * THE SYSTEM MARKER IS A CONTRACT TOO, and the one property that makes it safe
+   * is that it is not digits: a Discord id can never be it, so no admin is ever
+   * sent as the system and the system is never sent as an admin.
+   */
+  it('spells the system marker the way the console spells it, and never as an id', () => {
+    expect(SYSTEM_ACTOR).toBe('system')
+    expect(SYSTEM_ACTOR).not.toMatch(/^[0-9]+$/)
+  })
+
+  it('names the system, and no Discord id at all, for a kick no human asked for', async () => {
+    const { fetch, calls } = replies(answer(200, DISPATCHED))
+    await relay(fetch).ringmaster.kick(input({ actor: { kind: 'system' }, reason: 'rapid offense' }))
+
+    expect(calls[0]?.init.headers[SERVICE_ACTOR_HEADER]).toBe(SYSTEM_ACTOR)
+    expect(calls[0]?.init.headers[COMMAND_SECRET_HEADER]).toBe(SECRET)
+    expect(JSON.stringify(calls[0]?.init)).not.toContain(ADMIN)
+    // The same body a human's kick sends: the console's rule for the system is
+    // about the ban, not about a different request.
+    expect(JSON.parse(calls[0]?.init.body ?? '{}')).toEqual({
+      license: LICENCE,
+      reason: 'rapid offense',
+    })
+  })
+
+  it('names the admin, and never the system, for a kick a human asked for', async () => {
+    const { fetch, calls } = replies(answer(200, DISPATCHED))
+    await relay(fetch).ringmaster.kick(input({ reason: 'cheating' }))
+
+    expect(calls[0]?.init.headers[SERVICE_ACTOR_HEADER]).toBe(ADMIN)
+    expect(calls[0]?.init.headers[SERVICE_ACTOR_HEADER]).not.toBe(SYSTEM_ACTOR)
   })
 
   /**
@@ -326,6 +360,44 @@ describe('what the console said, in the console`s own vocabulary', () => {
       // Asking the same question again after being told the answer.
       expect(calls).toHaveLength(1)
     }
+  })
+
+  /**
+   * THE SYSTEM ACTOR'S OWN REFUSALS, which are answers and not outages. The
+   * likeliest in practice is `not-banned`: an admin lifted the ban in the
+   * seconds between the write and the kick, and asking again in a minute would
+   * be asking to remove somebody who is no longer banned.
+   */
+  it('recognizes the system actor`s refusals as denied, and asks once', async () => {
+    const doors: [number, string][] = [
+      [403, 'system-scope'],
+      [400, 'system-body'],
+      [403, 'not-banned'],
+    ]
+
+    for (const [status, error] of doors) {
+      const { fetch, calls } = replies(answer(status, { ok: false, error }))
+      const result = await relay(fetch).ringmaster.kick(
+        input({ actor: { kind: 'system' }, reason: 'rapid offense' }),
+      )
+
+      expect(result).toMatchObject({ outcome: 'failed', failure: 'denied', status, detail: error })
+      expect(calls).toHaveLength(1)
+    }
+  })
+
+  /**
+   * A BAN THE CONSOLE COULD NOT READ IS `store`, AND IT IS RETRIED. The console
+   * refuses rather than guesses; the ban is still there to be read in a minute.
+   */
+  it('retries a system kick whose ban the console could not read', async () => {
+    const { fetch, calls } = replies(answer(503, { ok: false, error: 'store' }), answer(200, DISPATCHED))
+    const result = await relay(fetch).ringmaster.kick(
+      input({ actor: { kind: 'system' }, reason: 'rapid offense' }),
+    )
+
+    expect(result).toMatchObject({ outcome: 'dispatched', attempts: 2 })
+    expect(calls.map((c) => c.init.headers[SERVICE_ACTOR_HEADER])).toEqual([SYSTEM_ACTOR, SYSTEM_ACTOR])
   })
 
   /** The gate's two transient refusals, which are worth asking again. */
