@@ -474,6 +474,43 @@ describe('acting on a reaction — the four shapes', () => {
     expect(did).toMatchObject({ did: 'granted', roleId: ROLE_B })
     expect(roles.edits).toEqual([['add', MEMBER, ROLE_B]])
   })
+
+  it('makes pending discipline state durable before granting a role', async () => {
+    const order: string[] = []
+    const held = table([pairing()])
+    const roles: ReactRoleGrants = {
+      add: () => {
+        order.push('role')
+        return Promise.resolve()
+      },
+      remove: () => Promise.resolve(),
+    }
+
+    const did = await handleReaction(reaction(), 'added', {
+      ddb: held,
+      roles,
+      beforeGrant: () => {
+        order.push('state')
+        return Promise.resolve()
+      },
+      guildId: GUILD,
+      reads: latch(),
+    })
+
+    expect(did).toMatchObject({ did: 'granted' })
+    expect(order).toEqual(['state', 'role'])
+  })
+
+  it('does not grant a role when its pre-grant state transition fails', async () => {
+    const world = deps([pairing()], {
+      beforeGrant: () => Promise.reject(new Error('DynamoDB unavailable')),
+    })
+
+    await expect(
+      handleReaction(reaction(), 'added', world.deps),
+    ).resolves.toEqual({ did: 'failed', why: 'role' })
+    expect(world.roles.edits).toEqual([])
+  })
 })
 
 describe('acting on a reaction — the ones that must do nothing', () => {
@@ -715,8 +752,16 @@ describe('the gateway wiring', () => {
     const client = bare()
     const held = table([pairing()])
     const roles = grants()
+    const beforeGrant = vi.fn<
+      (
+        userId: string,
+        roleId: string,
+        channelId: string,
+        how: 'message-exact' | 'message-any' | 'channel-exact' | 'channel-any',
+      ) => Promise<void>
+    >(() => Promise.resolve())
 
-    installReactionRoles(client, cfg(), held, desk, roles)
+    installReactionRoles(client, cfg(), held, desk, roles, beforeGrant)
 
     client.emit(Events.MessageReactionAdd, ...asEvent(live, { id: MEMBER, bot: false }))
     client.emit(Events.MessageReactionRemove, ...asEvent(live, { id: MEMBER, bot: false }))
@@ -729,6 +774,12 @@ describe('the gateway wiring', () => {
         ['remove', MEMBER, ROLE_A],
       ])
     })
+    expect(beforeGrant).toHaveBeenCalledExactlyOnceWith(
+      MEMBER,
+      ROLE_A,
+      CHANNEL,
+      'message-exact',
+    )
 
     await client.destroy()
   })

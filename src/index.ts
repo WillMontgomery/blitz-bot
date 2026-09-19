@@ -1,6 +1,10 @@
 import { createClient, statusReporter } from './client.ts'
 import { installCommands } from './commands/index.ts'
 import { channelCollisions, loadConfig, type Config } from './config.ts'
+import {
+  beginInFlightShutdown,
+  drainInFlight,
+} from './inflight.ts'
 import { log, setSink } from './log.ts'
 
 /**
@@ -168,14 +172,13 @@ process.on('unhandledRejection', (reason: unknown) => {
 })
 
 /**
- * Shut the gateway down before exiting.
+ * Stop accepting tracked event work, drain it briefly, then close the gateway.
  *
  * SIGTERM IS WHAT `systemctl restart` SENDS and SIGINT is Ctrl-C in a terminal;
- * both mean the same thing here. Closing the websocket deliberately tells
- * Discord the session is over, rather than leaving it to notice the missed
- * heartbeats — which is the difference between a restart that is invisible and
- * one that leaves the bot appearing online for a minute after it stopped
- * reading anything.
+ * both mean the same thing here. The bounded drain lets an accepted #23 state
+ * write finish while the REST token is still usable. Closing the websocket
+ * afterwards deliberately tells Discord the session is over, rather than
+ * leaving it to notice missed heartbeats.
  *
  * A SECOND SIGNAL EXITS IMMEDIATELY. If the close is stuck on a network that is
  * already gone, an operator pressing Ctrl-C twice means it, and the alternative
@@ -183,6 +186,7 @@ process.on('unhandledRejection', (reason: unknown) => {
  * less politely.
  */
 let stopping = false
+const SHUTDOWN_DRAIN_MS = 10_000
 
 function stop(signal: NodeJS.Signals): void {
   if (stopping) {
@@ -192,16 +196,24 @@ function stop(signal: NodeJS.Signals): void {
 
   stopping = true
   log('info', 'shutting down', { signal })
+  beginInFlightShutdown()
 
-  void client
-    .destroy()
+  void drainInFlight(SHUTDOWN_DRAIN_MS)
+    .then((remaining) => {
+      if (remaining > 0) {
+        log('warn', 'shutdown deadline reached with work still in progress', {
+          remaining,
+          seconds: SHUTDOWN_DRAIN_MS / 1000,
+        })
+      }
+    })
+    .then(() => client.destroy())
     .catch((error: unknown) => {
       log('error', 'gateway did not close cleanly', { error })
     })
     .finally(() => {
-      // Exiting explicitly rather than letting the event loop drain, because a
-      // pending REST request or a reconnect timer would hold the process open
-      // for as long as it felt like and turn a restart into a stop timeout.
+      // Exiting explicitly after the bounded drain rather than letting an
+      // unrelated timer turn a restart into a systemd stop timeout.
       process.exit(0)
     })
 }

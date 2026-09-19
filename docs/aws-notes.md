@@ -294,8 +294,11 @@ aws dynamodb create-table \
 ```
 
 It carries `{ id, value, updatedAt }` — the handful of things the bot has to
-remember across a restart and currently keeps in files under
-`/var/lib/blitz-bot`, which survive a restart and do not survive the box.
+remember across a restart. Most values are identifiers. Issue #23 also stores
+versioned JSON under `rapid-discipline:<discord-user-id>` with either
+`awaiting-recovery` plus the Rules role id, `probation` plus its absolute
+deadline, or `idle`. These are point reads and unconditional writes; no scan,
+index, TTL or additional table is required.
 
 **Why it is under the console's prefix rather than a third one of its own.** A
 prefix marks a stack, and this table belongs to the same stack as everything
