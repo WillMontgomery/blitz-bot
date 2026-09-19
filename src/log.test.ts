@@ -1268,7 +1268,7 @@ describe('docs/deploy.md — what an operator is told at 3am', () => {
    * This test used to take both snowflakes off docs/bot-manual.md and hold
    * deploy.md against them, which made the manual the single unchecked source
    * for both documents — and the manual hard-codes them. `renderManual`
-   * substitutes exactly one token, `exempt-channels`; every `<#…>` in that file
+   * fills in `exempt-channels` and `access-role` only; every `<#…>` in that file
    * is a literal that gets published verbatim whatever the environment says. So
    * a deployment that pointed a variable somewhere else published a manual
    * naming a channel nobody moderates in, and the one assertion in the repo that

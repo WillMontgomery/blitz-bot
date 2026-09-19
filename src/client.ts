@@ -51,7 +51,7 @@ import { log, type Level, type Sink } from './log.ts'
 import { watchMaintenance } from './maintenance.ts'
 import { installReactionRoles } from './reactroles.ts'
 import { installRulesRecovery, type RulesRecoveryDesk } from './recovery.ts'
-import { installRulesScreening } from './rules.ts'
+import { installAccessCheck, installRulesScreening, legacyRulesRecovery } from './rules.ts'
 import { createRingmaster, KICK_TTL_MS, type KickResult, type Ringmaster } from './ringmaster.ts'
 import { installStickies } from './sticky.ts'
 
@@ -1667,8 +1667,13 @@ export interface LiveMember {
 }
 
 /**
- * The guild, reduced to the member lookup plus the two guild-level facts used
- * by Rules access and sanction eligibility.
+ * The guild, reduced to the member lookup plus the owner, whom sanction
+ * eligibility never counts.
+ *
+ * NO RULES CHANNEL, AND THAT IS THE FIX RATHER THAN AN OMISSION. This used to
+ * carry `rulesChannelId` off the guild, which is Discord's Community "Rules or
+ * Guidelines Channel" and is null in a guild that does not use Community mode.
+ * The removal notice now names `config.rulesChannelId`.
  *
  * `members.fetch` IS A CACHING READ. discord.js checks its own member cache
  * first and only spends a REST call on a miss, and a member it does fetch is
@@ -1677,7 +1682,6 @@ export interface LiveMember {
  */
 export interface LiveGuild {
   readonly ownerId: string
-  readonly rulesChannelId: string | null
   readonly members: { fetch: (id: string) => Promise<LiveMember> }
 }
 
@@ -1793,7 +1797,7 @@ export async function handleLive(
       actions.notices,
       scanned,
       {
-        rulesChannelId: full.guild?.rulesChannelId ?? null,
+        rulesChannelId: config.rulesChannelId,
         adminRoleId: config.adminRoleId,
       },
     ),
@@ -2110,7 +2114,7 @@ export function createClient(config: Config): Client {
   const notices = noticeChannel(client)
   const rulesDdb = createDdb()
   let disciplineDesk: DisciplineDesk | null = null
-  const recovery = installRulesRecovery(client, config, rulesDdb, {
+  const recovery = installRulesRecovery(client, config, {
     startProbation(userId) {
       if (disciplineDesk === null) {
         throw new Error('the discipline desk is not installed')
@@ -2127,7 +2131,7 @@ export function createClient(config: Config): Client {
     },
   })
   const discipline = createDiscipline(
-    discordDisciplineActions(client, config, rulesDdb.reactRoles, {
+    discordDisciplineActions(client, config, {
       notifyTimeout: escalationNotifier(notices, config.adminRoleId, recovery),
       report: (line) => postLine(post, line),
     }),
@@ -2436,9 +2440,10 @@ export function createClient(config: Config): Client {
    *
    * THE CONFIG GOES WITH IT BECAUSE THE DOCUMENT IS RENDERED AGAINST IT. Two
    * passages of the manual describe exemptions and are published only when those
-   * exemptions are actually running — see `renderManual`. `ManualConfig` is a
-   * `Pick` of the three fields that decides, so this call hands over the whole
-   * `Config` and the renderer can still only read those three.
+   * exemptions are actually running, and one names the access role — see
+   * `renderManual`. `ManualConfig` is a `Pick` of the four fields that decide,
+   * so this call hands over the whole `Config` and the renderer can still only
+   * read those four.
    *
    * ═══ AND ONE LINE WHEN THE ID IS UNSET, WHICH IS WHAT THIS FEATURE GOT WRONG ═══
    *
@@ -2548,14 +2553,29 @@ export function createClient(config: Config): Client {
   installIncidentLog(client, config, createDdb())
 
   /**
-   * MEMBERSHIP SCREENING — completing Discord's Rules screen grants the same
-   * access role as the Rules channel's any-message, any-reaction pairing.
+   * MEMBERSHIP SCREENING. Completing Discord's server rules screen grants
+   * `config.accessRoleId`, the same role the three-strike removal takes and the
+   * private Restore access button gives back. Nothing is looked up to find it.
    *
    * There is deliberately no startup reconciliation: restoring the role to
    * every already-screened member would immediately undo a rapid-offense access
    * reset. The private Rules thread's button is the guided recovery path.
    */
-  installRulesScreening(client, config, rulesDdb)
+  installRulesScreening(client, config)
+
+  /**
+   * THE ACCESS CHECK. Once the client is ready: the configured access role can be
+   * assigned, the configured Rules channel is a text channel in the guild, and
+   * that channel's legacy any-reaction pairing, if there is one, grants the same
+   * role. Each fault is one latched line in the status channel and another when
+   * it is fixed; see `installAccessCheck` in ./rules.ts.
+   *
+   * REGISTERED AFTER THE GUILD CHECK, like everything else here, and silent when
+   * the guild is not in the cache, because the halt line has already said the
+   * one thing that matters then. It shares `rulesDdb`: the pairing read is the
+   * one DynamoDB call it makes, a point read on the table #23 already holds.
+   */
+  installAccessCheck(client, config, rulesDdb.reactRoles)
 
   /**
    * REACTION ROLES — the desk `/reactrole` reaches for, and the two listeners
@@ -2589,15 +2609,9 @@ export function createClient(config: Config): Client {
     createDdb(),
     undefined,
     undefined,
-    async (userId, roleId, channelId, how) => {
-      // Only the Rules channel's canonical any-reaction pairing participates
-      // in recovery; unrelated reaction roles must not depend on #23 state.
-      const rulesChannelId =
-        client.guilds.cache.get(config.guildId)?.rulesChannelId ?? null
-      if (channelId !== rulesChannelId || how !== 'channel-any') return
-
-      await discipline.startProbationForRole(userId, roleId)
-    },
+    // Only the configured Rules channel's canonical any-reaction pairing takes
+    // part in recovery; unrelated reaction roles must not depend on #23 state.
+    legacyRulesRecovery(config, discipline),
   )
 
   return client
@@ -4331,17 +4345,20 @@ export async function readManual(path: string = botManualPath()): Promise<string
 export type ManualCondition = 'exempt-admins' | 'exempt-channels'
 
 /** What the manual may ask to have spelled out inline. */
-export type ManualValue = 'exempt-channels'
+export type ManualValue = 'exempt-channels' | 'access-role'
 
 /**
  * The configuration the document is rendered against.
  *
  * A `Pick` RATHER THAN THE WHOLE `Config`, like `watchMaintenance` takes
- * `Pick<Ddb, 'maintenance'>`: these three fields are the whole of what the
- * document can be conditional on, so a renderer that grew an opinion about the
- * bot token or the docs channel id would not compile.
+ * `Pick<Ddb, 'maintenance'>`: these four fields are the whole of what the
+ * document can be conditional on or spell out, so a renderer that grew an
+ * opinion about the bot token or the docs channel id would not compile.
  */
-export type ManualConfig = Pick<Config, 'adminRoleId' | 'exemptAdmins' | 'exemptChannelIds'>
+export type ManualConfig = Pick<
+  Config,
+  'adminRoleId' | 'exemptAdmins' | 'exemptChannelIds' | 'accessRoleId'
+>
 
 /**
  * Which passages belong in the document this configuration describes.
@@ -4393,10 +4410,15 @@ function conditionsFor(config: ManualConfig): Record<ManualCondition, boolean> {
  * typed, and sorting it would make the rendered document differ from the file
  * they can go and read — and, worse, would reorder itself under an edit that
  * only added one id, which is an edit to the channel for no visible reason.
+ *
+ * THE ACCESS ROLE IS A MENTION FOR THE SAME REASON, AND IS NEVER EMPTY.
+ * `BLITZ_ACCESS_ROLE_ID` has a default and cannot be blanked, and an operator
+ * who points it at another role gets a manual naming that role.
  */
 function valuesFor(config: ManualConfig): Record<ManualValue, string> {
   return {
     'exempt-channels': config.exemptChannelIds.map((id) => `<#${id}>`).join(', '),
+    'access-role': `<@&${config.accessRoleId}>`,
   }
 }
 

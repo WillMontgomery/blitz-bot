@@ -3,7 +3,7 @@ import { PermissionsBitField, type Client } from 'discord.js'
 import type { Config } from './config.ts'
 import type { Ddb } from './ddb.ts'
 import { log } from './log.ts'
-import { rulesRoleFor } from './rules.ts'
+import { accessFault, roleStanding } from './rules.ts'
 
 export const RAPID_OFFENSE_WINDOW_MS = 60_000
 export const RAPID_OFFENSE_COUNT = 3
@@ -40,16 +40,15 @@ export interface DisciplineOffense {
   readonly administrator: boolean | null
 }
 
+/**
+ * The access role and the Rules channel are both configured, so there is no
+ * "unconfigured" outcome: the role is removed, or Discord refused the edit.
+ */
 export type AccessReset =
   | {
       readonly did: 'removed'
       readonly roleId: string
       readonly rulesChannelId: string
-    }
-  | {
-      readonly did: 'unconfigured'
-      readonly why: 'no-rules-channel' | 'no-pairing' | 'mismatched-pairing'
-      readonly rulesChannelId: string | null
     }
   | {
       readonly did: 'failed'
@@ -538,9 +537,7 @@ export function createDiscipline(
     const accessSummary =
       access.did === 'removed'
         ? `access role <@&${access.roleId}> removed`
-        : access.did === 'unconfigured'
-          ? `access role not removed (${access.why})`
-          : 'access role removal failed'
+        : 'access role removal failed'
 
     const probationSummary =
       access.did === 'removed'
@@ -592,11 +589,14 @@ export interface DisciplineDelivery {
   report(line: string): Promise<void>
 }
 
-/** Build the Discord/DynamoDB side effects while leaving state in `createDiscipline`. */
+/**
+ * Build the Discord side effects while leaving state in `createDiscipline`. The
+ * role removed is `config.accessRoleId`, the one screening grants and the
+ * Restore access button gives back; nothing is looked up.
+ */
 export function discordDisciplineActions(
   client: Client,
   config: Config,
-  reads: Pick<Ddb['reactRoles'], 'get'>,
   delivery: DisciplineDelivery,
 ): DisciplineActions {
   return {
@@ -644,52 +644,29 @@ export function discordDisciplineActions(
         return { did: 'failed', rulesChannelId: null }
       }
 
-      const role = await rulesRoleFor(reads, config.guildId, guild.rulesChannelId)
-      if (!role.found) {
-        if (role.why === 'read') {
-          log('error', 'the Rules role could not be read during rapid-offense escalation', {
-            user: offense.userId,
-            channel: role.rulesChannelId,
-            failure: role.failure.kind,
-            detail: role.failure.message,
-          })
-          return { did: 'failed', rulesChannelId: role.rulesChannelId }
-        }
-
-        log('error', 'no usable Rules role is configured for rapid-offense escalation', {
-          user: offense.userId,
-          channel: role.rulesChannelId,
-          reason: role.why,
-        })
-
-        return {
-          did: 'unconfigured',
-          why: role.why,
-          rulesChannelId: role.rulesChannelId,
-        }
-      }
-
-      await beforeRemove(role.roleId)
+      const roleId = config.accessRoleId
+      await beforeRemove(roleId)
 
       try {
         await guild.members.removeRole({
           user: offense.userId,
-          role: role.roleId,
+          role: roleId,
           reason: DISCIPLINE_ACCESS_REASON,
         })
       } catch (error) {
         log('error', 'could not remove the access role during rapid-offense escalation', {
           user: offense.userId,
-          role: role.roleId,
+          role: roleId,
+          fault: accessFault(roleStanding(client, config.guildId, roleId)),
           error,
         })
-        return { did: 'failed', rulesChannelId: role.rulesChannelId }
+        return { did: 'failed', rulesChannelId: config.rulesChannelId }
       }
 
       return {
         did: 'removed',
-        roleId: role.roleId,
-        rulesChannelId: role.rulesChannelId,
+        roleId,
+        rulesChannelId: config.rulesChannelId,
       }
     },
 

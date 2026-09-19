@@ -10,12 +10,6 @@ import { afterEach, describe, expect, it, vi, type Mock } from 'vitest'
 
 import type { Config } from './config.ts'
 import {
-  reactRoleChannelKey,
-  REACT_ROLE_ANY,
-  type Ddb,
-  type ReactRolePairing,
-} from './ddb.ts'
-import {
   installRulesRecovery,
   RECOVERY_BUTTON_LABEL,
   RECOVERY_CLOSE_REASON,
@@ -28,6 +22,7 @@ import {
   recoveryReminder,
   recoveryTarget,
 } from './recovery.ts'
+import { ACCESS_ROLE_PROBLEM } from './rules.ts'
 
 const NOW = 1_800_000_000_000
 const GUILD = '111111111111111111'
@@ -37,6 +32,8 @@ const OTHER = '444444444444444444'
 const ROLE = '555555555555555555'
 const BOT = '666666666666666666'
 const THREAD = '777777777777777777'
+const ACCESS = '888888888888888888'
+const COMMUNITY_RULES = '999999999999999999'
 const PROBATION_UNTIL = NOW + 60 * 60_000
 
 afterEach(() => {
@@ -59,19 +56,9 @@ function config(over: Partial<Config> = {}): Config {
     commandSecret: null,
     ringmasterUrl: 'http://127.0.0.1:3000',
     gameBanRoleId: ROLE,
+    accessRoleId: ACCESS,
+    rulesChannelId: RULES,
     ...over,
-  }
-}
-
-function pairing(): ReactRolePairing {
-  return {
-    messageId: reactRoleChannelKey(RULES),
-    emoji: REACT_ROLE_ANY,
-    roleId: ROLE,
-    channelId: RULES,
-    guildId: GUILD,
-    createdAt: 1,
-    createdBy: USER,
   }
 }
 
@@ -122,7 +109,8 @@ function world(
     readonly addMemberRejects?: boolean
     readonly addRoleRejects?: boolean
     readonly startProbationRejects?: boolean
-    readonly roleRow?: ReactRolePairing | null
+    readonly botBelowAccess?: boolean
+    readonly threadParent?: string
   } = {},
 ): World {
   const listeners = new Map<string, ((payload: never) => void)[]>()
@@ -161,7 +149,7 @@ function world(
     type: ChannelType.PrivateThread as const,
     name: over.threadName ?? `rules-access-${USER}`,
     createdTimestamp: over.threadCreatedAt ?? NOW,
-    parentId: RULES,
+    parentId: over.threadParent ?? RULES,
     ownerId: BOT,
     members: { add: addMember },
     send,
@@ -211,20 +199,32 @@ function world(
   }
   const member = {
     roles: {
-      cache: new Map(over.hasRole === true ? [[ROLE, {}]] : []),
+      cache: new Map(over.hasRole === true ? [[ACCESS, {}]] : []),
     },
   }
+  const botPosition = over.botBelowAccess === true ? 1 : 10
+  // The Community Rules channel points somewhere else on purpose: nothing may read it.
   const guild = {
     id: GUILD,
-    rulesChannelId: RULES,
+    rulesChannelId: COMMUNITY_RULES,
+    roles: { cache: new Map([[ACCESS, { id: ACCESS, managed: false, position: 5 }]]) },
     members: {
       fetch: () => Promise.resolve(member),
       addRole,
+      me: {
+        permissions: { has: () => true },
+        roles: {
+          highest: {
+            position: botPosition,
+            comparePositionTo: (role: { position: number }) => botPosition - role.position,
+          },
+        },
+      },
     },
   }
   const client = {
     user: { id: BOT },
-    guilds: { fetch: () => Promise.resolve(guild) },
+    guilds: { fetch: () => Promise.resolve(guild), cache: new Map([[GUILD, guild]]) },
     channels: {
       fetch: (id: string) =>
         Promise.resolve(id === RULES ? rulesChannel : id === THREAD ? thread : null),
@@ -238,20 +238,10 @@ function world(
       return client
     },
   } as unknown as Client
-  const ddb: Pick<Ddb, 'reactRoles'> = {
-    reactRoles: {
-      get: () =>
-        Promise.resolve({
-          ok: true,
-          value: over.roleRow === undefined ? pairing() : over.roleRow,
-        }),
-      put: () => Promise.reject(new Error('not used')),
-    },
-  }
 
   return {
     client,
-    desk: installRulesRecovery(client, config(), ddb, {
+    desk: installRulesRecovery(client, config(), {
       now: () => NOW,
       startProbation,
       startProbationForRole,
@@ -281,7 +271,7 @@ function ready(): unknown {
   return {
     guilds: {
       cache: new Map([
-        [GUILD, { id: GUILD, rulesChannelId: RULES }],
+        [GUILD, { id: GUILD, rulesChannelId: COMMUNITY_RULES }],
       ]),
     },
     user: { id: BOT },
@@ -412,7 +402,7 @@ describe('the private Rules recovery thread', () => {
     await vi.advanceTimersByTimeAsync(RECOVERY_REMINDER_MS)
 
     expect(w.send).toHaveBeenCalledTimes(1)
-    expect(w.startProbationForRole).toHaveBeenCalledWith(USER, ROLE)
+    expect(w.startProbationForRole).toHaveBeenCalledWith(USER, ACCESS)
     expect(w.startProbation).not.toHaveBeenCalled()
     expect(w.editThread).toHaveBeenCalledWith({
       name: `rules-access-restored-${USER}`,
@@ -443,7 +433,7 @@ describe('the private Rules recovery thread', () => {
 })
 
 describe('the restore-access button', () => {
-  it('restores the current Rules role, confirms privately, and closes the thread', async () => {
+  it('restores the configured access role, confirms privately, and closes the thread', async () => {
     const w = world()
     const customId = recoveryButtonId(USER, THREAD)
     const clicked = button(customId)
@@ -457,7 +447,7 @@ describe('the restore-access button', () => {
     expect(clicked.deferReply).toHaveBeenCalledWith({ flags: MessageFlags.Ephemeral })
     expect(w.addRole).toHaveBeenCalledWith({
       user: USER,
-      role: ROLE,
+      role: ACCESS,
       reason: RECOVERY_ROLE_REASON,
     })
     expect(w.startProbation).toHaveBeenCalledWith(USER)
@@ -497,15 +487,29 @@ describe('the restore-access button', () => {
     expect(w.addRole).not.toHaveBeenCalled()
   })
 
-  it('keeps the thread open and points to admins when the role cannot be resolved', async () => {
-    const w = world({ roleRow: null })
+  /**
+   * The old version of this case was a missing `/reactrole` pairing. The role is
+   * configured now, so what can stop the button is a role the bot cannot assign,
+   * and it is refused before probation starts.
+   */
+  it('keeps the thread open and points to admins when the access role cannot be assigned', async () => {
+    const w = world({ botBelowAccess: true })
     const clicked = button(recoveryButtonId(USER, THREAD))
+    const written: string[] = []
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string) => {
+      written.push(chunk)
+      return true
+    }) as unknown as typeof process.stderr.write)
 
-    emit(w, Events.InteractionCreate, clicked.interaction)
+    try {
+      emit(w, Events.InteractionCreate, clicked.interaction)
 
-    await vi.waitFor(() => {
-      expect(clicked.editReply).toHaveBeenCalledTimes(1)
-    })
+      await vi.waitFor(() => {
+        expect(clicked.editReply).toHaveBeenCalledTimes(1)
+      })
+    } finally {
+      stderr.mockRestore()
+    }
 
     expect(clicked.editReply).toHaveBeenCalledWith({
       content: `I could not restore your access. Contact <@&${ROLE}>.`,
@@ -514,6 +518,36 @@ describe('the restore-access button', () => {
     expect(w.addRole).not.toHaveBeenCalled()
     expect(w.startProbation).not.toHaveBeenCalled()
     expect(w.editThread).not.toHaveBeenCalled()
+    expect(written.join('')).toContain(
+      `fault=${JSON.stringify(ACCESS_ROLE_PROBLEM['role-too-high'])}`,
+    )
+  })
+
+  /**
+   * REGRESSION. The thread was validated against the guild's Community Rules
+   * channel. A thread under the configured channel is the valid one, and one
+   * under the Community channel is not, whichever the guild object names.
+   */
+  it('validates the thread against the configured Rules channel only', async () => {
+    const valid = world()
+    const underCommunity = world({ threadParent: COMMUNITY_RULES })
+    const good = button(recoveryButtonId(USER, THREAD))
+    const stale = button(recoveryButtonId(USER, THREAD))
+
+    emit(valid, Events.InteractionCreate, good.interaction)
+    emit(underCommunity, Events.InteractionCreate, stale.interaction)
+
+    await vi.waitFor(() => {
+      expect(valid.addRole).toHaveBeenCalledTimes(1)
+      expect(stale.editReply).toHaveBeenCalledTimes(1)
+    })
+
+    expect(stale.editReply).toHaveBeenCalledWith({
+      content: 'This access button is no longer valid.',
+      allowedMentions: { parse: [] },
+    })
+    expect(underCommunity.addRole).not.toHaveBeenCalled()
+    expect(underCommunity.startProbation).not.toHaveBeenCalled()
   })
 
   it('does not restore the role when probation cannot be persisted', async () => {

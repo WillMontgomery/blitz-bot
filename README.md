@@ -41,15 +41,17 @@ gives that role and taking the reaction off takes it back; `/sticky` keeps a
 message at the bottom of a channel; and `docs/bot-manual.md` is published to a
 channel and reconciled at every start.
 
-Completing Discord Membership Screening grants the role stored in the Rules
-channel's channel-wide, any-reaction `/reactrole` pairing. The recovery button
-resolves that same pairing and grants its current role directly. Successful
+Completing Discord Membership Screening grants the members role,
+`BLITZ_ACCESS_ROLE_ID`, and the recovery button grants that same role back;
+neither looks anything up, and neither needs Discord's Community mode. Successful
 button validation persists the one-hour probation before restoring the role. A
-legacy Rules reaction that restores pending access persists the same probation
-before granting the role, so neither path can bypass it during a restart.
+legacy reaction in the Rules channel, `BLITZ_RULES_CHANNEL_ID`, restores pending
+access only when its `/reactrole` pairing grants the members role, and persists
+the same probation before granting it, so neither path can bypass it during a
+restart. The bot checks the role, the channel and that pairing when it starts.
 
 Behaviour is set entirely by the environment, and `.env.example` is the
-authority on it. All fourteen, in the order `src/config.ts` reads them:
+authority on it. All sixteen, in the order `src/config.ts` reads them:
 
 | Variable | |
 |---|---|
@@ -67,6 +69,8 @@ authority on it. All fourteen, in the order `src/config.ts` reads them:
 | `COMMAND_SECRET` | The secret the console's command routes want — the same value under the same name in the console's own dotenv file. Unset turns the live kick off and nothing else. |
 | `BLITZ_RINGMASTER_URL` | Where the console answers. Blank means its loopback origin, not "off". |
 | `BLITZ_GAME_BAN_ROLE_ID` | The role a game ban puts on somebody. Blank means the id in `src/config.ts`, not "no role". |
+| `BLITZ_ACCESS_ROLE_ID` | The members role: screening grants it, three rapid offenses remove it, **Restore access** gives it back. Blank means the id in `src/config.ts`, not "no role". |
+| `BLITZ_RULES_CHANNEL_ID` | The Rules channel the removal notice links and the private warning thread opens under. Blank means the id in `src/config.ts`. |
 
 The process refuses to start if either required variable is missing or blank,
 and names every problem at once rather than one per restart (`src/config.ts`).
@@ -108,7 +112,7 @@ Members** — and the bot needs to be in the guild, invited with the `bot` and
 `applications.commands` scopes, holding **Manage Messages**, **Manage Roles**,
 **Moderate Members**, **Ban Members**, **View Audit Log**, **Add Reactions**,
 **Create Private Threads**, **Send Messages in Threads** and **Manage Threads**,
-with its own role above the game-ban role, the Rules access role and any member
+with its own role above the game-ban role, the members role and any member
 it may timeout or ban. Miss an intent and the gateway closes with code 4014 and
 login fails on every attempt. Miss a scope or a permission and the process still
 starts and still looks healthy: no command is ever registered, every delete or

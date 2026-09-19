@@ -296,7 +296,7 @@ aws dynamodb create-table \
 It carries `{ id, value, updatedAt }` — the handful of things the bot has to
 remember across a restart. Most values are identifiers. Issue #23 also stores
 versioned JSON under `rapid-discipline:<discord-user-id>` with either
-`awaiting-recovery` plus the Rules role id, `probation` plus its absolute
+`awaiting-recovery` plus the access role id, `probation` plus its absolute
 deadline, or `idle`. These are point reads and unconditional writes; no scan,
 index, TTL or additional table is required.
 

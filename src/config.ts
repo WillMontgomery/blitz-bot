@@ -260,6 +260,43 @@ export interface Config {
    * skipped.
    */
   gameBanRoleId: string
+
+  /**
+   * The role that lets a member take part in the guild, which the owner calls
+   * the members role.
+   *
+   * ACCESS IN THE CODE AND NOT MEMBERS, BECAUSE ISSUE #23 NAMED IT FIRST. Every
+   * function, log line and document that grants, removes or restores it already
+   * calls it the access role, and a second word for one thing is how two halves
+   * of one feature end up meaning two different roles.
+   *
+   * THREE PATHS USE IT AND NOTHING ELSE DECIDES IT. Completing Discord's server
+   * rules screen grants it, three rapid removals take it away, and the private
+   * **Restore access** button gives it back. It used to be looked up from the
+   * `/reactrole` pairing on Discord's Community Rules channel, which a guild
+   * outside Community mode does not have, so the first member through the
+   * screen was left with no role and one error line.
+   *
+   * A DEFAULT IN THE SOURCE, AND UNBLANKABLE, FOR `gameBanRoleId`'S REASONS. The
+   * `.env` on the box predates this setting, and the deploy that ships it has to
+   * work with nothing added there.
+   */
+  accessRoleId: string
+
+  /**
+   * The Rules channel: where a removal notice points the member, and where the
+   * three-strike warning opens its private **Restore access** thread.
+   *
+   * CONFIGURATION RATHER THAN `guild.rulesChannelId`. That is Discord's Community
+   * "Rules or Guidelines Channel", which only exists in Community mode, and this
+   * guild does not use Community mode; its server rules screen is a separate
+   * setting that works without it. NOTHING READS THE COMMUNITY SETTING, NOT EVEN
+   * AS A FALLBACK. Two sources for one channel are two answers the day they
+   * disagree, and nothing would say which one a given path had used.
+   *
+   * DEFAULTED AND UNBLANKABLE for `accessRoleId`'s reason.
+   */
+  rulesChannelId: string
 }
 
 /**
@@ -518,6 +555,17 @@ const DEFAULT_RINGMASTER_URL = 'http://127.0.0.1:3000'
 const DEFAULT_GAME_BAN_ROLE_ID = '1542596612306505808'
 
 /**
+ * The members role and the Rules channel, as the owner supplied them. See
+ * `Config.accessRoleId` and `Config.rulesChannelId`.
+ *
+ * LITERALS FOR `DEFAULT_GAME_BAN_ROLE_ID`'S REASON: one guild, a settled
+ * decision, and a box whose `.env` must not need editing for the next deploy to
+ * grant, remove and restore member access.
+ */
+const DEFAULT_ACCESS_ROLE_ID = '1542596402180530257'
+const DEFAULT_RULES_CHANNEL_ID = '1542595815833604176'
+
+/**
  * `BLITZ_RINGMASTER_URL`: scheme, host, port, and nothing after them.
  *
  * ═══ IT IS ONE TRANSFORM AGAIN, AND THAT IS THE POINT ═══
@@ -594,7 +642,8 @@ const originUrl = z
   })
 
 /**
- * An id that has a default and cannot be blanked away. See `gameBanRoleId`.
+ * An id that has a default and cannot be blanked away. See `gameBanRoleId`,
+ * `accessRoleId` and `rulesChannelId`.
  */
 const idWithDefault = (fallback: string) =>
   z
@@ -635,6 +684,8 @@ const schema = z.object({
   COMMAND_SECRET: optionalSecret,
   BLITZ_RINGMASTER_URL: originUrl,
   BLITZ_GAME_BAN_ROLE_ID: idWithDefault(DEFAULT_GAME_BAN_ROLE_ID),
+  BLITZ_ACCESS_ROLE_ID: idWithDefault(DEFAULT_ACCESS_ROLE_ID),
+  BLITZ_RULES_CHANNEL_ID: idWithDefault(DEFAULT_RULES_CHANNEL_ID),
 })
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -664,6 +715,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     commandSecret: parsedEnv.COMMAND_SECRET,
     ringmasterUrl: parsedEnv.BLITZ_RINGMASTER_URL,
     gameBanRoleId: parsedEnv.BLITZ_GAME_BAN_ROLE_ID,
+    accessRoleId: parsedEnv.BLITZ_ACCESS_ROLE_ID,
+    rulesChannelId: parsedEnv.BLITZ_RULES_CHANNEL_ID,
   }
 }
 

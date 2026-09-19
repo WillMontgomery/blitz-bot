@@ -455,10 +455,11 @@ proof both intents are on.**
   - **Manage Messages** — deleting somebody else's message. Without it every
     delete fails and the bot otherwise looks perfectly healthy — see §12.2.
   - **Manage Roles** — putting the game-ban role on and taking it off
-    (`src/banrole.ts`), granting Rules access after Membership Screening, and
+    (`src/banrole.ts`), granting member access after Membership Screening, and
     removing that access after three rapid offenses or restoring it from the
-    private Rules button. Without it those role changes fail. The game-ban role
-    check is not silent; the Rules access edits report failures when they occur.
+    private Rules button. Without it those role changes fail. Neither is silent:
+    both roles are checked when the bot starts, and every failed access edit is
+    reported when it occurs.
   - **Moderate Members** — applying the ten-minute timeout after three
     qualifying removals in 60 seconds. Without it messages are still removed,
     but the escalation fails and is reported.
@@ -494,8 +495,8 @@ proof both intents are on.**
   and this document used to swap them** — see the box in §5. The docs channel
   also needs **Read Message History**, because the bot reconciles the manual it
   already posted there rather than posting a second copy.
-- It also needs **View Channel** and **Send Messages** in the Rules channel,
-  plus the three thread permissions above. The third-strike warning is created
+- It also needs **View Channel** and **Send Messages** in the Rules channel
+  (`BLITZ_RULES_CHANNEL_ID`), plus the three thread permissions above. The third-strike warning is created
   there as a non-invitable private thread, the sanctioned member is added, and
   only that member is pinged. It contains a **Restore access** button and tags
   the member once more after an hour if the role is still missing. The thread
@@ -509,21 +510,66 @@ role Discord created for the bot actually carries Manage Messages in the
 channels you care about — a channel-level override that denies it beats the
 guild-level grant, silently.
 
-**Then move the bot's role above the game-ban role, the Rules access role, and
+**Then move the bot's role above the game-ban role, the members role, and
 ordinary members.** Server Settings → Roles. Discord refuses a role edit unless
 the acting member's highest role is above the role being assigned, and refuses
 timeouts or bans against members at or above the bot. Manage Roles, Moderate
 Members and Ban Members are therefore not enough by themselves.
-`BLITZ_GAME_BAN_ROLE_ID` (§5) and the role in the Rules channel's
-any-message/any-reaction `/reactrole` pairing must sit below the bot.
-Administrators and the guild owner are deliberately excluded from the rapid
+`BLITZ_GAME_BAN_ROLE_ID` and `BLITZ_ACCESS_ROLE_ID` (§5) must both sit below the
+bot. Administrators and the guild owner are deliberately excluded from the rapid
 sanction window.
 
-Membership Screening does not add a second role setting. In Server Settings,
-make `#rules` the guild's Rules channel, then use `/reactrole` so **any reaction
-on any message in that channel** grants the member access role. Completing
-screening, reacting and the private recovery button all read that same DynamoDB
-pairing. A restart does not re-grant access to every already-screened member,
+**Member access is two settings, and both are built in.** Discord's server rules
+screen (Server Settings, People, Access) clears a joining member's pending flag
+when they accept the rules, and the bot answers by granting the members role.
+Three rapid offenses take that same role away, and the private **Restore access**
+button gives it back. All three use the one configured role; nothing is looked up.
+
+| Setting | Built-in value | What it is |
+|---|---|---|
+| `BLITZ_ACCESS_ROLE_ID` | `1542596402180530257` | The members role. Screening grants it, three rapid offenses remove it, **Restore access** gives it back. |
+| `BLITZ_RULES_CHANNEL_ID` | `1542595815833604176` | `#rules`. Removal notices link it, and the third-strike warning opens its private thread under it. |
+
+Both ids are defaults in `src/config.ts`, so **nothing on the box has to change**:
+an `.env` without either line gets these values, and so does a blank line. Set
+one only to point the bot at a different role or channel.
+
+**Community mode is not needed**, and the bot never reads Discord's Community
+"Rules or Guidelines Channel". An earlier copy of this guide said to set that
+channel and to pair the access role with it; neither does anything now.
+
+A `/reactrole` pairing in the Rules channel, any message and any reaction, is an
+optional backup. A member who reacts there gets the pairing's role, and if they
+are waiting to recover after three strikes, probation starts first, exactly as
+the button does it. That restores access only when the pairing's role **is** the
+members role. No pairing at all is fine.
+
+**The bot checks all of this once it is connected.** Nothing blocks the start.
+Each problem is one line in `#bot-status`, looked at again every five minutes
+while it lasts, and followed by one more line when it is fixed:
+
+- the members role does not exist, the bot lacks Manage Roles, or the role sits
+  at or above the bot's own role;
+- `BLITZ_RULES_CHANNEL_ID` is not a text channel in the guild;
+- the Rules channel's any-message, any-reaction pairing grants a different role
+  from `BLITZ_ACCESS_ROLE_ID`, which is a `warn` because the backup is optional.
+
+Role hierarchy is the likeliest of the three. It reads like this, and the second
+line follows within five minutes of dragging the bot's role above the members
+role:
+
+```
+2026-09-19T18:04:12.883Z level=error msg="the access role in BLITZ_ACCESS_ROLE_ID sits above the bot's own role, so screening, the three-strike removal and the Restore access button cannot change member access. Drag the bot's role above it in Server Settings, Roles" role="1542596402180530257"
+2026-09-19T18:09:12.901Z level=info msg="the access role in BLITZ_ACCESS_ROLE_ID can be assigned now, so screening, the three-strike removal and the Restore access button can change member access again" since="2026-09-19T18:04:12.883Z"
+```
+
+A start that says nothing about member access is a start where all three are
+fine. A pairing that DynamoDB could not return is not a misconfiguration and is
+reported as a read that failed, never as a disagreement.
+
+A member whose screening grant failed is not picked up again later. The journal
+line says the member has to be given the role by hand, and names the fault. A
+restart does not re-grant access to every already-screened member either,
 because doing so would undo a rapid-offense reset. Open recovery threads are
 rescheduled at startup so their one-hour reminders survive normal restarts.
 Awaiting recovery and active probation are point-read from
@@ -694,6 +740,8 @@ BLITZ_DRY_RUN=true
 COMMAND_SECRET=
 BLITZ_RINGMASTER_URL=
 BLITZ_GAME_BAN_ROLE_ID=
+BLITZ_ACCESS_ROLE_ID=
+BLITZ_RULES_CHANNEL_ID=
 EOF
 ```
 
@@ -735,9 +783,9 @@ shell and the differences are all silent:
   `src/config.ts` trims before it checks, so a stray space is not a
   one-character token.
 
-What the other twelve are set to, and why. **Blank does not mean the same thing
+What the other fourteen are set to, and why. **Blank does not mean the same thing
 in every row**, which is the reason this table is long: for some of them blank
-turns something off, and for three of them blank means a value that lives in
+turns something off, and for five of them blank means a value that lives in
 `src/config.ts` rather than in any file on this box. A default kept only in
 `.env.example` would be a default systemd never reads, so the source holds them.
 
@@ -755,6 +803,8 @@ turns something off, and for three of them blank means a value that lives in
 | `COMMAND_SECRET` | the console's | Filled in above. It is what the console's command routes want in the `x-ringmaster-service` header, and it is the only switch that turns the live kick off. Unset, the bans are still written and still enforced at the player's next connect; what is lost is dropping them from the match they are in, and every mirrored ban puts one warning in `#bot-status` saying so. |
 | `BLITZ_RINGMASTER_URL` | blank | **Blank is the console's loopback origin, not "off".** `src/config.ts` holds it; the bot is the second service on the console's own box and port 3000 is closed to the internet, which is the whole reason the relay goes over loopback rather than out through Cloudflare and back with the secret on it. Origin only — a stray path is refused at boot rather than becoming a 404 that reads like a console outage. |
 | `BLITZ_GAME_BAN_ROLE_ID` | blank | **Blank is the role the owner settled on, not "no role".** `src/config.ts` holds the id. It marks somebody banned in the game but not on Discord, so they keep limited access and can argue their case; lifting or expiring the ban takes it off. It needs Manage Roles and it needs the role to sit below the bot's own — §4.2. A malformed id stops the bot at boot. |
+| `BLITZ_ACCESS_ROLE_ID` | blank | **Blank is the members role, `1542596402180530257`, not "no role".** `src/config.ts` holds the id. Screening grants it, three rapid offenses remove it, and the **Restore access** button gives it back. It needs Manage Roles and it needs the role to sit below the bot's own, which the bot checks at startup (§4.2). A malformed id stops the bot at boot. |
+| `BLITZ_RULES_CHANNEL_ID` | blank | **Blank is `#rules`, `1542595815833604176`.** `src/config.ts` holds the id. Removal notices link it and the third-strike warning opens its private thread under it. It is not Discord's Community Rules channel, and Community mode is not needed (§4.2). A malformed id stops the bot at boot. |
 
 Confirm the file reads back the way you meant, without printing the token:
 
@@ -1407,8 +1457,8 @@ use one already linked to a FiveM identity so the resulting game ban can be
 observed and then cleaned up.
 
 1. Remove the member access role, join or reset the test account into
-   Membership Screening, and accept the Rules screen. The access role from the
-   Rules channel's any-message/any-reaction pairing must appear.
+   Membership Screening, and accept the Rules screen. The members role,
+   `BLITZ_ACCESS_ROLE_ID`, must appear.
 2. Post three different messages that each trigger one of the six removal rules,
    all within 60 seconds. All three must be deleted. On the third, Discord must
    apply a ten-minute timeout, remove the access role, post the escalation line

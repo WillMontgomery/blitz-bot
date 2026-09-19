@@ -56,6 +56,8 @@ const schemaVariables = [
   'COMMAND_SECRET',
   'BLITZ_RINGMASTER_URL',
   'BLITZ_GAME_BAN_ROLE_ID',
+  'BLITZ_ACCESS_ROLE_ID',
+  'BLITZ_RULES_CHANNEL_ID',
 ]
 
 /**
@@ -781,6 +783,69 @@ describe('loadConfig, on the console relay', () => {
     expect(template).toContain('Manage Roles')
     expect(template).toContain('Server Members Intent')
     expect(template).toContain('4014')
+  })
+})
+
+/**
+ * The members role and the Rules channel, which the owner supplied.
+ *
+ * THE LIVE FAILURE THESE REPLACE: every issue-#23 path took the Rules channel
+ * from Discord's Community "Rules or Guidelines Channel", and the role from a
+ * `/reactrole` pairing keyed on it. The guild does not use Community mode, so
+ * screening completed and granted nothing. Both are configuration now, with the
+ * owner's ids as defaults, because the `.env` on the box predates them and the
+ * deploy that ships them has to work with nothing added there.
+ */
+describe('loadConfig, on member access', () => {
+  const base = { DISCORD_BOT_TOKEN: 'token', DISCORD_GUILD_ID: 'guild' }
+
+  it('defaults to the members role and the Rules channel the owner supplied', () => {
+    const config = loadConfig(base)
+
+    expect(config.accessRoleId).toBe('1542596402180530257')
+    expect(config.rulesChannelId).toBe('1542595815833604176')
+  })
+
+  /** A blank line is what an unedited `.env` looks like, not "no role". */
+  it('keeps the defaults when the lines are blank', () => {
+    const config = loadConfig({ ...base, BLITZ_ACCESS_ROLE_ID: '  ', BLITZ_RULES_CHANNEL_ID: '' })
+
+    expect(config.accessRoleId).toBe('1542596402180530257')
+    expect(config.rulesChannelId).toBe('1542595815833604176')
+  })
+
+  it('takes an override for a second guild', () => {
+    const config = loadConfig({
+      ...base,
+      BLITZ_ACCESS_ROLE_ID: ' 1234 ',
+      BLITZ_RULES_CHANNEL_ID: '5678',
+    })
+
+    expect(config.accessRoleId).toBe('1234')
+    expect(config.rulesChannelId).toBe('5678')
+  })
+
+  it.each(['BLITZ_ACCESS_ROLE_ID', 'BLITZ_RULES_CHANNEL_ID'])(
+    'refuses a %s that is not a Discord id, and names it',
+    (variable) => {
+      let message = ''
+      try {
+        loadConfig({ ...base, [variable]: '#rules' })
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error)
+      }
+
+      expect(message).toContain(`${variable}: must be a Discord id, got "#rules"`)
+    },
+  )
+
+  it('is in the template operators copy, with the ids the owner supplied', () => {
+    const template = repoFile('.env.example')
+
+    expect(template).toContain('BLITZ_ACCESS_ROLE_ID=1542596402180530257')
+    expect(template).toContain('BLITZ_RULES_CHANNEL_ID=1542595815833604176')
+    expect(template).toContain('members role')
+    expect(template).toContain("BELOW THE BOT'S OWN ROLE")
   })
 })
 

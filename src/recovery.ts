@@ -14,11 +14,10 @@ import {
 } from 'discord.js'
 
 import type { Config } from './config.ts'
-import type { Ddb } from './ddb.ts'
 import type { ProbationStart } from './discipline.ts'
 import { launchInFlight } from './inflight.ts'
 import { log } from './log.ts'
-import { rulesRoleFor } from './rules.ts'
+import { ACCESS_ROLE_PROBLEM, accessFault, roleStanding } from './rules.ts'
 
 export const RECOVERY_REMINDER_MS = 60 * 60_000
 export const RECOVERY_RETRY_MS = 5 * 60_000
@@ -144,11 +143,12 @@ async function editPrivateReply(
 /**
  * Own the private Rules thread, its restore button and its one-hour reminder.
  * The open/reminded thread-name transition is the restart-safe reminder mark.
+ * The thread lives under `config.rulesChannelId` and the button restores
+ * `config.accessRoleId`, the role the three-strike removal took.
  */
 export function installRulesRecovery(
   client: Client,
   config: Config,
-  ddb: Pick<Ddb, 'reactRoles'>,
   options: RecoveryOptions,
 ): RulesRecoveryDesk {
   const now = options.now ?? Date.now
@@ -185,13 +185,10 @@ export function installRulesRecovery(
   ): Promise<boolean> {
     try {
       const guild = await client.guilds.fetch(config.guildId)
-      const role = await rulesRoleFor(ddb.reactRoles, config.guildId, guild.rulesChannelId)
-      if (!role.found) return false
-
       const member = await guild.members.fetch(userId)
-      if (!member.roles.cache.has(role.roleId)) return false
+      if (!member.roles.cache.has(config.accessRoleId)) return false
 
-      await options.startProbationForRole(userId, role.roleId)
+      await options.startProbationForRole(userId, config.accessRoleId)
       await close(thread, userId)
       return true
     } catch (error) {
@@ -301,7 +298,6 @@ export function installRulesRecovery(
 
     let access: {
       readonly guild: Guild
-      readonly roleId: string
       readonly thread: PrivateThreadChannel
     }
 
@@ -311,25 +307,28 @@ export function installRulesRecovery(
       if (
         channel === null ||
         channel.type !== ChannelType.PrivateThread ||
-        channel.parentId !== guild.rulesChannelId ||
+        channel.parentId !== config.rulesChannelId ||
         channel.ownerId !== client.user?.id
       ) {
         await editPrivateReply(interaction, 'This access button is no longer valid.')
         return
       }
 
-      const role = await rulesRoleFor(ddb.reactRoles, config.guildId, guild.rulesChannelId)
-      if (!role.found) {
-        log('error', 'the Rules access button could not resolve the access role', {
+      // Asked before probation starts, so a role the bot cannot assign never
+      // leaves the member in probation without their access back.
+      const standing = roleStanding(client, config.guildId, config.accessRoleId)
+      if (!standing.ok) {
+        log('error', 'the Rules access button did not restore access because the access role cannot be assigned', {
           user: target.userId,
           thread: target.threadId,
-          reason: role.why,
+          role: config.accessRoleId,
+          fault: ACCESS_ROLE_PROBLEM[standing.why],
         })
         await editPrivateReply(interaction, restoreFailure(config.adminRoleId))
         return
       }
 
-      access = { guild, roleId: role.roleId, thread: channel }
+      access = { guild, thread: channel }
     } catch (error) {
       log('error', 'the Rules access button could not restore member access', {
         user: target.userId,
@@ -356,13 +355,15 @@ export function installRulesRecovery(
     try {
       await access.guild.members.addRole({
         user: target.userId,
-        role: access.roleId,
+        role: config.accessRoleId,
         reason: RECOVERY_ROLE_REASON,
       })
     } catch (error) {
       log('error', 'probation started but the Rules access button could not restore access', {
         user: target.userId,
         thread: target.threadId,
+        role: config.accessRoleId,
+        fault: accessFault(roleStanding(client, config.guildId, config.accessRoleId)),
         error,
       })
       await editPrivateReply(interaction, restoreFailure(config.adminRoleId))
@@ -397,10 +398,9 @@ export function installRulesRecovery(
   client.once(Events.ClientReady, (ready) => {
     launchInFlight(() =>
       (async () => {
-        const guild = ready.guilds.cache.get(config.guildId)
-        if (guild === undefined || guild.rulesChannelId === null) return
+        if (!ready.guilds.cache.has(config.guildId)) return
 
-        const channel = await client.channels.fetch(guild.rulesChannelId)
+        const channel = await client.channels.fetch(config.rulesChannelId)
         if (channel === null || channel.type !== ChannelType.GuildText) return
 
         const active = await channel.threads.fetchActive()

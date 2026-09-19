@@ -36,7 +36,7 @@ The bot **DMs them**, names the rule, and points to Rules and the admin role. If
 
 ## Access and rapid offenses
 
-Membership Screening grants the Rules channel's any-reaction role. Reaction roles still work.
+Membership Screening grants {{access-role}}. Reaction roles still work.
 
 Three deletions in 60 seconds trigger a ten-minute timeout and remove access. The private Rules thread has a **Restore access** button and tags the member again after an hour if needed. It stays active for up to a week. Pressing the button starts one-hour probation, restores access, then locks and archives the thread. Another deletion during probation means a Discord and permanent FiveM ban. Dry run, failed deletes, bots, webhooks, the owner and admins do not count. Restart loses only an unfinished 60-second strike count; recovery, probation and the reminder survive.
 

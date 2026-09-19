@@ -21,13 +21,8 @@ import {
   type DisciplineTiming,
   type DurableDisciplineState,
 } from './discipline.ts'
-import {
-  reactRoleChannelKey,
-  REACT_ROLE_ANY,
-  type Ddb,
-  type ReactRolePairing,
-} from './ddb.ts'
 import type { Config } from './config.ts'
+import { ACCESS_ROLE_PROBLEM } from './rules.ts'
 import type { Client } from 'discord.js'
 
 const GUILD = '111111111111111111'
@@ -35,6 +30,9 @@ const CHANNEL = '222222222222222222'
 const USER = '333333333333333333'
 const ROLE = '444444444444444444'
 const ADMIN_ROLE = '555555555555555555'
+const RULES = '666666666666666666'
+const COMMUNITY_RULES = '777777777777777777'
+const OTHER_ACCESS = '888888888888888888'
 
 function offense(messageId: string, over: Partial<DisciplineOffense> = {}): DisciplineOffense {
   return {
@@ -571,52 +569,64 @@ function config(over: Partial<Config> = {}): Config {
     dryRun: false,
     commandSecret: null,
     ringmasterUrl: 'http://127.0.0.1:3000',
-    gameBanRoleId: ROLE,
+    gameBanRoleId: '1542596612306505808',
+    accessRoleId: ROLE,
+    rulesChannelId: RULES,
     ...over,
   }
 }
 
-function pairing(): ReactRolePairing {
-  return {
-    messageId: reactRoleChannelKey(CHANNEL),
-    emoji: REACT_ROLE_ANY,
-    roleId: ROLE,
-    channelId: CHANNEL,
-    guildId: GUILD,
-    createdAt: 1,
-    createdBy: USER,
+/**
+ * A client whose guild answers every call the adapter makes. The Community
+ * Rules channel is set to somewhere else on purpose: nothing may read it.
+ */
+function liveGuild(over: { removeRole?: () => Promise<void>; bot?: { position: number } } = {}) {
+  const timeout = vi.fn(() => Promise.resolve())
+  const removeRole = vi.fn(over.removeRole ?? (() => Promise.resolve()))
+  const ban = vi.fn(() => Promise.resolve())
+  const member = {
+    id: USER,
+    user: { bot: false },
+    moderatable: true,
+    permissions: { has: () => false },
+    roles: { cache: new Map<string, unknown>() },
+    timeout,
   }
+  const accessRole = { id: ROLE, managed: false, position: 5 }
+  const botPosition = over.bot?.position ?? 10
+  const guild = {
+    ownerId: '999999999999999999',
+    rulesChannelId: COMMUNITY_RULES,
+    roles: { cache: new Map([[ROLE, accessRole]]) },
+    members: {
+      fetch: vi.fn(() => Promise.resolve(member)),
+      removeRole,
+      ban,
+      me: {
+        permissions: { has: () => true },
+        roles: {
+          highest: {
+            position: botPosition,
+            comparePositionTo: (role: { position: number }) => botPosition - role.position,
+          },
+        },
+      },
+    },
+  }
+  const client = {
+    guilds: {
+      fetch: vi.fn(() => Promise.resolve(guild)),
+      cache: new Map([[GUILD, guild]]),
+    },
+  } as unknown as Client
+
+  return { client, timeout, removeRole, ban }
 }
 
 describe('the live Discord sanction adapter', () => {
   it('uses Discord timeout, role removal, and ban APIs with dedicated audit reasons', async () => {
-    const timeout = vi.fn(() => Promise.resolve())
-    const removeRole = vi.fn(() => Promise.resolve())
-    const ban = vi.fn(() => Promise.resolve())
-    const member = {
-      id: USER,
-      user: { bot: false },
-      moderatable: true,
-      permissions: { has: () => false },
-      roles: { cache: new Map<string, unknown>() },
-      timeout,
-    }
-    const guild = {
-      ownerId: '999999999999999999',
-      rulesChannelId: CHANNEL,
-      members: {
-        fetch: vi.fn(() => Promise.resolve(member)),
-        removeRole,
-        ban,
-      },
-    }
-    const client = {
-      guilds: { fetch: vi.fn(() => Promise.resolve(guild)) },
-    } as unknown as Client
-    const reads: Pick<Ddb['reactRoles'], 'get'> = {
-      get: () => Promise.resolve({ ok: true, value: pairing() }),
-    }
-    const actions = discordDisciplineActions(client, config(), reads, {
+    const { client, timeout, removeRole, ban } = liveGuild()
+    const actions = discordDisciplineActions(client, config(), {
       notifyTimeout: () => Promise.resolve(),
       report: () => Promise.resolve(),
     })
@@ -631,7 +641,7 @@ describe('the live Discord sanction adapter', () => {
     await expect(actions.resetAccess(event, beforeRemove)).resolves.toEqual({
       did: 'removed',
       roleId: ROLE,
-      rulesChannelId: CHANNEL,
+      rulesChannelId: RULES,
     })
     expect(beforeRemove).toHaveBeenCalledExactlyOnceWith(ROLE)
     expect(beforeRemove.mock.invocationCallOrder[0]).toBeLessThan(
@@ -648,5 +658,55 @@ describe('the live Discord sanction adapter', () => {
       deleteMessageSeconds: 0,
       reason: DISCIPLINE_BAN_REASON,
     })
+  })
+
+  /**
+   * REGRESSION. The role came from a `/reactrole` pairing keyed on the guild's
+   * Community Rules channel, so a guild outside Community mode timed a rapid
+   * offender out and left their access alone. The adapter now takes no
+   * DynamoDB reader at all; the configured role is the only one it can remove.
+   */
+  it('removes the configured access role with nothing looked up', async () => {
+    const { client, removeRole } = liveGuild()
+    const actions = discordDisciplineActions(
+      client,
+      config({ accessRoleId: OTHER_ACCESS }),
+      { notifyTimeout: () => Promise.resolve(), report: () => Promise.resolve() },
+    )
+
+    await expect(
+      actions.resetAccess(offense('m1'), () => Promise.resolve()),
+    ).resolves.toEqual({ did: 'removed', roleId: OTHER_ACCESS, rulesChannelId: RULES })
+    expect(removeRole).toHaveBeenCalledWith(expect.objectContaining({ role: OTHER_ACCESS }))
+    expect(discordDisciplineActions).toHaveLength(3)
+  })
+
+  it('names the role-hierarchy fault when Discord refuses the removal', async () => {
+    const { client } = liveGuild({
+      removeRole: () => Promise.reject(new Error('Missing Permissions')),
+      bot: { position: 1 },
+    })
+    const actions = discordDisciplineActions(client, config(), {
+      notifyTimeout: () => Promise.resolve(),
+      report: () => Promise.resolve(),
+    })
+    const written: string[] = []
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string) => {
+      written.push(chunk)
+      return true
+    }) as unknown as typeof process.stderr.write)
+
+    try {
+      await expect(
+        actions.resetAccess(offense('m1'), () => Promise.resolve()),
+      ).resolves.toEqual({ did: 'failed', rulesChannelId: RULES })
+    } finally {
+      stderr.mockRestore()
+    }
+
+    const line = written.join('')
+    expect(line).toContain('could not remove the access role during rapid-offense escalation')
+    expect(line).toContain(`fault=${JSON.stringify(ACCESS_ROLE_PROBLEM['role-too-high'])}`)
+    expect(line).not.toContain('no usable Rules role')
   })
 })

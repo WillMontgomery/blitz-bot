@@ -119,6 +119,8 @@ function cfg(over: Partial<Config> = {}): Config {
     commandSecret: 'a-shared-secret',
     ringmasterUrl: 'http://127.0.0.1:3000',
     gameBanRoleId: '1542596612306505808',
+    accessRoleId: '1542596402180530257',
+    rulesChannelId: '1542595815833604176',
     ...over,
   }
 }

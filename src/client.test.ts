@@ -186,11 +186,12 @@ const OUR_OTHER_IP = '18.222.244.205'
  * what keeps the next unconditional listener a one-line edit here instead of
  * three edits scattered through the file.
  *
- * FOUR TODAY: the guild check, the moderation mirror's boot replay, the
- * game-ban role sync's boot check and pollers (blitz-bot#2), and rescheduling
- * open Rules recovery threads.
+ * FIVE TODAY: the guild check, the moderation mirror's boot replay, the
+ * game-ban role sync's boot check and pollers (blitz-bot#2), rescheduling open
+ * Rules recovery threads, and the access check on the configured access role,
+ * Rules channel and legacy pairing.
  */
-const ALWAYS_READY = 4
+const ALWAYS_READY = 5
 
 function cfg(over: Partial<Config> = {}): Config {
   return {
@@ -208,6 +209,8 @@ function cfg(over: Partial<Config> = {}): Config {
     commandSecret: null,
     ringmasterUrl: 'http://127.0.0.1:3000',
     gameBanRoleId: '1542596612306505808',
+    accessRoleId: '1542596402180530257',
+    rulesChannelId: '1542595815833604176',
     ...over,
   }
 }
@@ -2654,7 +2657,6 @@ function guildWhere(fetch: (id: string) => Promise<LiveMember>): LiveGuild & {
 } {
   return {
     ownerId: '999999999999999999',
-    rulesChannelId: '121212121212121212',
     members: { fetch: vi.fn<(id: string) => Promise<LiveMember>>(fetch) },
   }
 }
@@ -2928,6 +2930,28 @@ describe('handleLive — from a gateway message to a removal', () => {
 
     expect(message.delete).toHaveBeenCalledTimes(1)
     expect(seam.dm).toHaveBeenCalledWith(AUTHOR, expect.stringContaining('foreign-ip'))
+  })
+
+  /**
+   * REGRESSION. The notice named `message.guild.rulesChannelId`, Discord's
+   * Community Rules channel, which is null outside Community mode, so every
+   * member was told to read "the server rules" with no channel to click. The
+   * configured channel is named now, whatever the guild object carries.
+   */
+  it('points the poster at the configured Rules channel, not the Community one', async () => {
+    const seam = notices()
+    const rules = '131313131313131313'
+    const community = { ...guildWhere(() => Promise.resolve(memberWith())), rulesChannelId: null }
+
+    await handleLive(
+      live({ content: 'come play at 5.6.7.8.', guild: community }),
+      null,
+      cfg({ rulesChannelId: rules }),
+      liveActions({ notices: seam }),
+    )
+
+    const [, sent] = seam.dm.mock.calls[0] ?? []
+    expect(sent).toContain(`Read <#${rules}> before posting again.`)
   })
 
   it('tells nobody anything when nothing was removed', async () => {
@@ -7268,7 +7292,7 @@ describe('the incident record — installed, and only when there is a channel', 
  * before anything else in the pipeline sees the document.
  *
  * NOTHING HERE TOUCHES DISCORD OR THE DISK. `renderManual` is a function of a
- * string and three fields of the config, which is why every awkward template
+ * string and four fields of the config, which is why every awkward template
  * below can be written out in the case that cares about it.
  *
  * WHAT IS PINNED IS THE MECHANISM AND NEVER THE WORDING. The prose in the file
@@ -7283,6 +7307,7 @@ describe('the manual — rendered against the configuration', () => {
     exemptChannelIds: [],
     exemptAdmins: true,
     adminRoleId: null,
+    accessRoleId: '444444444444444444',
   }
 
   /** A guild with both exemptions actually running. */
@@ -7290,6 +7315,7 @@ describe('the manual — rendered against the configuration', () => {
     exemptChannelIds: ['111111111111111111', '222222222222222222'],
     exemptAdmins: true,
     adminRoleId: '333333333333333333',
+    accessRoleId: '444444444444444444',
   }
 
   /**
@@ -7397,12 +7423,12 @@ describe('the manual — rendered against the configuration', () => {
 
     const bare = '# Blitz bot\n\n- Everything else.\n'
 
-    const on = { exemptAdmins: true, adminRoleId: '333333333333333333', exemptChannelIds: [] }
+    const on = { ...NOTHING, adminRoleId: '333333333333333333' }
 
     expect(renderManual(admins, on)).toContain('- Posts by admins.')
     expect(renderManual(admins, { ...on, exemptAdmins: false })).toBe(bare)
     expect(renderManual(admins, { ...on, adminRoleId: null })).toBe(bare)
-    expect(renderManual(admins, { exemptAdmins: false, adminRoleId: null, exemptChannelIds: [] })).toBe(bare)
+    expect(renderManual(admins, { ...NOTHING, exemptAdmins: false })).toBe(bare)
   })
 
   /**
@@ -7609,6 +7635,7 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
     exemptChannelIds: exempt(4),
     exemptAdmins: true,
     adminRoleId: '1542596612306505808',
+    accessRoleId: '1542596402180530257',
   }
 
   /** The file as this configuration renders it — what the channel would show. */
@@ -7914,7 +7941,7 @@ describe('docs/bot-manual.md — the document that actually ships', () => {
 
     // Neither passage is load-bearing for the other, and the section they share
     // survives losing both.
-    const neither = (await asEmbed({ exemptChannelIds: [], exemptAdmins: false, adminRoleId: null }))
+    const neither = (await asEmbed({ ...EVERYTHING, exemptChannelIds: [], exemptAdmins: false, adminRoleId: null }))
       .description
 
     expect(neither.length).toBeLessThan(noChannels.length)
