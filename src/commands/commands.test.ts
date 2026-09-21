@@ -119,6 +119,8 @@ function cfg(over: Partial<Config> = {}): Config {
     gameBanRoleId: '1542596612306505808',
     accessRoleId: '1542596402180530257',
     rulesChannelId: '1542595815833604176',
+    devInstanceId: 'i-0f79fdfbbe2506dca',
+    devRegion: 'us-east-2',
     ...over,
   }
 }
@@ -1139,6 +1141,7 @@ describe('registerCommands', () => {
    */
   it('registers every command this bot has', () => {
     expect(COMMANDS.map((one) => one.data.name)).toEqual([
+      'dev',
       'drain',
       'help',
       'profile',
@@ -1159,10 +1162,14 @@ describe('registerCommands', () => {
   })
 
   /**
-   * THE TWO UNCONDITIONALLY ADMIN COMMANDS ARE HIDDEN AS WELL AS GATED, and
+   * THE UNCONDITIONALLY ADMIN COMMANDS ARE HIDDEN AS WELL AS GATED, and
    * `commandData` derives the hiding from the gate so the two cannot disagree.
    * /help is open to everybody and must stay that way — it is the one command a
    * member runs.
+   *
+   * /dev IS ON THE LIST FOR /drain'S REASON. One half of it starts a game box
+   * and deploys onto it, which ends any match running there; the other names
+   * commits and unit states. Neither is a thing to offer a member in the picker.
    *
    * /profile IS NOT IN THIS LIST AND MUST NOT BE. Its gate is a predicate, so
    * it is registered visible: hiding it would leave a member unable to reach
@@ -1171,7 +1178,13 @@ describe('registerCommands', () => {
   it('hides exactly the unconditionally admin-only commands from the client', () => {
     const hidden = COMMANDS.filter((one) => commandData(one).defaultMemberPermissions === 0n)
 
-    expect(hidden.map((one) => one.data.name)).toEqual(['drain', 'reactrole', 'sticky', 'unsticky'])
+    expect(hidden.map((one) => one.data.name)).toEqual([
+      'dev',
+      'drain',
+      'reactrole',
+      'sticky',
+      'unsticky',
+    ])
     expect(hidden.every((one) => one.adminOnly === true)).toBe(true)
   })
 

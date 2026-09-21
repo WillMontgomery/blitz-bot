@@ -58,6 +58,8 @@ const schemaVariables = [
   'BLITZ_GAME_BAN_ROLE_ID',
   'BLITZ_ACCESS_ROLE_ID',
   'BLITZ_RULES_CHANNEL_ID',
+  'BLITZ_DEV_INSTANCE_ID',
+  'BLITZ_DEV_REGION',
 ]
 
 /**
@@ -846,6 +848,97 @@ describe('loadConfig, on member access', () => {
     expect(template).toContain('BLITZ_RULES_CHANNEL_ID=1542595815833604176')
     expect(template).toContain('members role')
     expect(template).toContain("BELOW THE BOT'S OWN ROLE")
+  })
+})
+
+/**
+ * The dev game box, which `/dev` acts on and which nothing else in this bot names.
+ *
+ * ═══ THE ONE SETTING IN THIS FILE WHERE A TYPO COSTS A LIVE SERVER ═══
+ *
+ * src/devbox.ts deliberately holds no instance id at all: it acts on whatever
+ * arrives from here, so this default IS the guard. The prod game box is an id of
+ * the same shape in the same region and the same account, and `/dev start` runs
+ * `systemctl start royale-deploy` on whatever it is pointed at — which ends with a
+ * restart of the game server, and therefore with every match on that box ending.
+ *
+ * SO THE CASES BELOW ARE ABOUT THE THREE WAYS A VALUE GETS THERE: the default when
+ * nobody said anything, an override for a second stack, and a refusal to boot on
+ * anything that is not an instance id. A blank falls back rather than meaning "no
+ * box", for `BLITZ_GAME_BAN_ROLE_ID`'s reason — a blank line is what an unedited
+ * template looks like.
+ */
+describe('loadConfig, on the dev game box', () => {
+  const base = { DISCORD_BOT_TOKEN: 'token', DISCORD_GUILD_ID: 'guild' }
+
+  it('defaults to the dev box and its region', () => {
+    const config = loadConfig(base)
+
+    expect(config.devInstanceId).toBe('i-0f79fdfbbe2506dca')
+    expect(config.devRegion).toBe('us-east-2')
+  })
+
+  it('keeps the defaults when the lines are blank', () => {
+    const config = loadConfig({ ...base, BLITZ_DEV_INSTANCE_ID: '  ', BLITZ_DEV_REGION: '' })
+
+    expect(config.devInstanceId).toBe('i-0f79fdfbbe2506dca')
+    expect(config.devRegion).toBe('us-east-2')
+  })
+
+  it('takes an override for a second stack, and trims it', () => {
+    const config = loadConfig({
+      ...base,
+      BLITZ_DEV_INSTANCE_ID: ' i-0123456789abcdef0 ',
+      BLITZ_DEV_REGION: 'eu-west-1',
+    })
+
+    expect(config.devInstanceId).toBe('i-0123456789abcdef0')
+    expect(config.devRegion).toBe('eu-west-1')
+  })
+
+  it('takes the short form of an instance id, which AWS still issues', () => {
+    expect(loadConfig({ ...base, BLITZ_DEV_INSTANCE_ID: 'i-1a2b3c4d' }).devInstanceId).toBe(
+      'i-1a2b3c4d',
+    )
+  })
+
+  /**
+   * HOW A HAND-FILLED `.env` ACTUALLY GOES WRONG: a console URL pasted whole, the
+   * `i-` left off, a smart quote carried in by a copy-paste, a region that is a
+   * word. Every one of them stops the bot with the variable named, which is where
+   * an operator can act — not eight AWS calls later as a box that does not exist.
+   */
+  it.each([
+    ['BLITZ_DEV_INSTANCE_ID', 'https://console.aws.amazon.com/ec2/#Instances', 'an EC2 instance id'],
+    ['BLITZ_DEV_INSTANCE_ID', '0f79fdfbbe2506dca', 'an EC2 instance id'],
+    ['BLITZ_DEV_INSTANCE_ID', 'i-0f79fdfbbe2506dca’', 'an EC2 instance id'],
+    ['BLITZ_DEV_INSTANCE_ID', 'i-0F79FDFBBE2506DCA', 'an EC2 instance id'],
+    ['BLITZ_DEV_REGION', 'ohio', 'an AWS region'],
+    ['BLITZ_DEV_REGION', 'us_east_2', 'an AWS region'],
+  ])('refuses a %s of "%s" and names it', (variable, value, what) => {
+    let message = ''
+    try {
+      loadConfig({ ...base, [variable]: value })
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+
+    expect(message).toContain(`${variable}: must be ${what}, got "${value}"`)
+  })
+
+  /**
+   * AND THE TEMPLATE SAYS WHAT THE BOT CANNOT: that the policy has to be attached
+   * before either half of `/dev` works, and that the prod box must never go on
+   * that line. Neither is a variable, so `.env.example` is the only place an
+   * operator meets them.
+   */
+  it('is in the template operators copy, with the dev box and the warning', () => {
+    const template = repoFile('.env.example')
+
+    expect(template).toContain('BLITZ_DEV_INSTANCE_ID=i-0f79fdfbbe2506dca')
+    expect(template).toContain('BLITZ_DEV_REGION=us-east-2')
+    expect(template).toContain('PROD GAME BOX MUST NEVER GO ON THIS LINE')
+    expect(template).toContain('ssm:SendCommand')
   })
 })
 

@@ -96,6 +96,8 @@ function config(over: Partial<Config> = {}): Config {
     gameBanRoleId: '1542596612306505808',
     accessRoleId: ACCESS,
     rulesChannelId: RULES,
+    devInstanceId: 'i-0f79fdfbbe2506dca',
+    devRegion: 'us-east-2',
     ...over,
   }
 }

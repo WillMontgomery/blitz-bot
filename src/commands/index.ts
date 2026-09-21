@@ -20,6 +20,7 @@ import {
   type Invocation,
   type Responder,
 } from './command.ts'
+import { devCommand, lazyDevBox, setDevNotice, type DevFields, type DevNotice } from './dev.ts'
 import {
   drainCommand,
   DRAIN_SERVER_OPTION,
@@ -67,8 +68,15 @@ import { sticky, STICKY_TEXT_OPTION, unsticky } from './sticky.ts'
  * fetches, the table it writes — is behind the desk `installReactionRoles` puts
  * in place in ../reactroles.ts, and it asks for that desk per invocation rather
  * than holding one. So nothing is constructed while this module is imported.
+ *
+ * `/dev` IS BOTH OF THOSE AT ONCE. `lazyDevBox()` is `/profile`'s argument for a
+ * pair of AWS clients — this module is imported offline — and the CHANNEL it
+ * posts a finished deploy to is behind a seam `installCommands` fills in below,
+ * for ../reactroles.ts's reason: a handler is handed an invocation and a config
+ * and can never be handed a client.
  */
 export const COMMANDS: readonly BotCommand[] = [
+  devCommand(lazyDevBox()),
   drainCommand(lazyDrainer(), lazyDevMaintenance()),
   help,
   profileCommand(lazyReadsFrom(() => createDdb())),
@@ -520,7 +528,7 @@ function subcommandOf(options: CommandSource['options']): string | null {
  */
 export function invocationOf(
   interaction: CommandSource,
-): Invocation & DrainFields & ReactRoleFields {
+): Invocation & DevFields & DrainFields & ReactRoleFields {
   const target = targetOf(interaction.options)
 
   return {
@@ -550,7 +558,8 @@ export function invocationOf(
 
     text: textOf(interaction.options),
 
-    // `/drain`'s, null for every other command. See `DrainFields`.
+    // `/drain`'s and `/dev`'s, null for every other command. See `DrainFields`
+    // and `DevFields`, which declare the same optional field for the same reason.
     subcommand: subcommandOf(interaction.options),
     server: serverOf(interaction.options),
 
@@ -723,6 +732,49 @@ export function responderFor(interaction: ReplyTarget): Responder {
 }
 
 /**
+ * Where `/dev start` posts a finished deploy.
+ *
+ * BUILT HERE FOR `responderFor`'S REASON: this is the half of the command
+ * foundation that is allowed to touch discord.js, and ./dev.ts is the half that
+ * has to stay buildable in a test. `installCommands` puts one in place below and
+ * the command asks for it per invocation.
+ *
+ * `channels.fetch` RATHER THAN A CHANNEL RESOLVED AT STARTUP, which is
+ * `announcer`'s argument in ../client.ts: fetch reads the cache first and only
+ * hits the API when it misses, so the steady-state cost is nothing — and unlike a
+ * channel captured at boot it survives the channel being recreated.
+ *
+ * IT THROWS ON AN UNUSABLE CHANNEL rather than returning quietly, because the
+ * caller is the only thing that can say so: ./dev.ts's `launchInFlight` catches
+ * it and writes one journal line naming the channel. There is no interaction left
+ * to answer on by then — that is the whole reason this post exists.
+ *
+ * THIS IS THE SECOND SEND IN THE BOT THAT DELIBERATELY NOTIFIES SOMEBODY, and it
+ * is narrowed to exactly one id the way `noticeChannel`'s fallback is:
+ * `{ parse: [], users: [userId], roles: [] }` allows the requester and nothing
+ * else, so no `@everyone`, no role ping and no second user can ever come out of
+ * this line whatever a later edit puts in the text. The mention is the point — an
+ * admin who ran `/dev start` ten minutes ago is not watching the channel — and
+ * `noMentions` above is deliberately not used here for exactly that reason.
+ */
+export function liveDevNotice(client: Client): DevNotice {
+  return {
+    post: async (channelId, userId, text) => {
+      const channel = await client.channels.fetch(channelId)
+
+      if (channel === null || !channel.isSendable()) {
+        throw new Error(`cannot post the dev box result in ${channelId}`)
+      }
+
+      await channel.send({
+        content: text,
+        allowedMentions: { parse: [], users: [userId], roles: [] },
+      })
+    },
+  }
+}
+
+/**
  * Register the commands at boot and answer them for the life of the process.
  *
  * REGISTRATION HAPPENS IN `clientReady` because it needs the guild, and the
@@ -744,6 +796,17 @@ export function responderFor(interaction: ReplyTarget): Responder {
  * respond".
  */
 export function installCommands(client: Client, config: Config): void {
+  /**
+   * `/dev start`'s channel, put in place before any interaction can arrive.
+   *
+   * NOT INSIDE `clientReady`. `channels.fetch` needs a logged-in client and not a
+   * ready one, the listener below is what could ever call this, and a start that
+   * arrived between ready and a second listener firing would refuse for a reason
+   * that was only ever about ordering. See `devNotice` in ./dev.ts for what null
+   * means and what an admin is told while it holds.
+   */
+  setDevNotice(liveDevNotice(client))
+
   client.once(Events.ClientReady, (ready) => {
     const guild = ready.guilds.cache.get(config.guildId)
 

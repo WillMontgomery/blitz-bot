@@ -12,7 +12,7 @@ match, and draining the server. See
 ## What it does today
 
 **It moderates messages, mirrors Discord's moderation into the game, and answers
-six slash commands.**
+seven slash commands.**
 
 Six rules remove a message, and nothing else does: an invite to another Discord
 server, more invite codes in one message than it will check, a
@@ -38,8 +38,9 @@ player here and takes it off again when it is lifted or expires; an incident
 becomes an embed in the moderation channel when it is filed and again when it is
 closed in the console; a reaction on a message an admin paired with `/reactrole`
 gives that role and taking the reaction off takes it back; `/sticky` keeps a
-message at the bottom of a channel; and `docs/bot-manual.md` is published to a
-channel and reconciled at every start.
+message at the bottom of a channel; `/dev` starts the dev game box, deploys the
+latest dev commit onto it over SSM and posts the commit it came up on; and
+`docs/bot-manual.md` is published to a channel and reconciled at every start.
 
 Completing Discord Membership Screening grants the members role,
 `BLITZ_ACCESS_ROLE_ID`, and the recovery button grants that same role back;
@@ -51,7 +52,7 @@ the same probation before granting it, so neither path can bypass it during a
 restart. The bot checks the role, the channel and that pairing when it starts.
 
 Behaviour is set entirely by the environment, and `.env.example` is the
-authority on it. All sixteen, in the order `src/config.ts` reads them:
+authority on it. All eighteen, in the order `src/config.ts` reads them:
 
 | Variable | |
 |---|---|
@@ -71,6 +72,8 @@ authority on it. All sixteen, in the order `src/config.ts` reads them:
 | `BLITZ_GAME_BAN_ROLE_ID` | The role a game ban puts on somebody. Blank means the id in `src/config.ts`, not "no role". |
 | `BLITZ_ACCESS_ROLE_ID` | The members role: screening grants it, three rapid offenses remove it, **Restore access** gives it back. Blank means the id in `src/config.ts`, not "no role". |
 | `BLITZ_RULES_CHANNEL_ID` | The Rules channel the removal notice links and the private warning thread opens under. Blank means the id in `src/config.ts`. |
+| `BLITZ_DEV_INSTANCE_ID` | The DEV game box `/dev` starts and deploys to. Blank means the id in `src/config.ts`, not "no box". The prod game box must never go here. |
+| `BLITZ_DEV_REGION` | The region that box is in. Blank means `us-east-2`. Never inherited from the instance the bot runs on. |
 
 The process refuses to start if either required variable is missing or blank,
 and names every problem at once rather than one per restart (`src/config.ts`).

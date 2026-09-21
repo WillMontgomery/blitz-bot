@@ -297,6 +297,42 @@ export interface Config {
    * DEFAULTED AND UNBLANKABLE for `accessRoleId`'s reason.
    */
   rulesChannelId: string
+
+  /**
+   * The DEV game box, and the region it is in. `/dev` acts on this instance and
+   * on no other one.
+   *
+   * ═══ THE ONE VALUE IN THIS FILE WHERE A TYPO COSTS A LIVE SERVER ═══
+   *
+   * The prod game box is an instance id of the same shape in the same region and
+   * the same account, and what `/dev start` does — `systemctl start
+   * royale-deploy`, which ends with a restart of the game server — would work
+   * perfectly well against it and end every match on it. Nothing downstream can
+   * tell the two apart: src/devbox.ts deliberately holds no instance id at all
+   * and acts on whatever arrives here.
+   *
+   * SO THE DEFAULT IS THE DEV BOX, IN THE SOURCE, AND IT CANNOT BE BLANKED AWAY.
+   * `gameBanRoleId`'s argument twice over: a value that lives only in
+   * `.env.example` is a value systemd's `EnvironmentFile=` never reads, and a
+   * blank line is what an unedited template looks like. The one thing "no
+   * instance" could mean is a command that does nothing, so a blank falls back to
+   * the dev box rather than to nothing.
+   *
+   * SHAPE-CHECKED, FOR `SNOWFLAKE`'S REASON AND HARDER. A hand-typed id with a
+   * smart quote or a stray space in it is refused at boot with the variable
+   * named, which is where an operator can act on it — not eight AWS calls later
+   * as an instance that does not exist.
+   */
+  devInstanceId: string
+
+  /**
+   * THE REGION IS NEVER INHERITED FROM THE BOX, which is src/ddb.ts's
+   * `DEFAULT_REGION` argument for a second pair of clients: unset, the SDK takes
+   * the region of the instance the bot is running on, and the bot's box and the
+   * game box are not required to be in the same one. When they differ every call
+   * fails as an instance that plainly exists and cannot be found.
+   */
+  devRegion: string
 }
 
 /**
@@ -566,6 +602,23 @@ const DEFAULT_ACCESS_ROLE_ID = '1542596402180530257'
 const DEFAULT_RULES_CHANNEL_ID = '1542595815833604176'
 
 /**
+ * The dev game box and its region. See `Config.devInstanceId`.
+ *
+ * THE DEV BOX, TAGGED `Env=dev`, AND THE ONLY INSTANCE THIS REPO NAMES. The
+ * policy the bot's role is getting scopes `ec2:StartInstances` and
+ * `ssm:SendCommand` to that tag, so this default and that policy agree on which
+ * box `/dev` can touch — and the prod game box is deliberately absent from this
+ * repo entirely, in the source, in the template and in the tests.
+ *
+ * THE REGION IS THE TABLES' REGION AND src/ddb.ts'S DEFAULT, said again here
+ * rather than imported from there. They are two different facts that happen to
+ * agree today: those are DynamoDB tables and this is an EC2 instance, and a
+ * second stack that moved one would not move the other.
+ */
+const DEFAULT_DEV_INSTANCE_ID = 'i-0f79fdfbbe2506dca'
+const DEFAULT_DEV_REGION = 'us-east-2'
+
+/**
  * `BLITZ_RINGMASTER_URL`: scheme, host, port, and nothing after them.
  *
  * ═══ IT IS ONE TRANSFORM AGAIN, AND THAT IS THE POINT ═══
@@ -662,6 +715,39 @@ const idWithDefault = (fallback: string) =>
     })
 
 /**
+ * An EC2 instance id and an AWS region.
+ *
+ * SHAPES RATHER THAN A LIST OF ALLOWED VALUES. An id is `i-` and eight or
+ * seventeen hex digits, and a region is what AWS's own ids look like — neither
+ * pattern can tell the dev box from the prod box, which is not what they are for.
+ * What they catch is the hand-typed fault `SNOWFLAKE` catches: a stray space, a
+ * smart quote, a pasted console URL, an `i-` left off. See `Config.devInstanceId`
+ * for the value that must not be wrong and why a default is in the source.
+ */
+const INSTANCE_ID = /^i-[0-9a-f]{8}([0-9a-f]{9})?$/
+const AWS_REGION = /^[a-z]{2}(-[a-z]+)+-[0-9]$/
+
+/**
+ * A value that has a default, cannot be blanked away, and has a shape. The same
+ * bargain `idWithDefault` makes, with the pattern and the noun handed in.
+ */
+const matchedWithDefault = (fallback: string, shape: RegExp, what: string) =>
+  z
+    .string()
+    .optional()
+    .transform((raw, ctx) => {
+      const value = raw?.trim()
+      if (value === undefined || value === '') return fallback
+      if (shape.test(value)) return value
+
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `must be ${what}, got "${value}"`,
+      })
+      return z.NEVER
+    })
+
+/**
  * Keys are the environment variable names verbatim, so zod's issue paths are
  * already the thing an operator has to go and edit. That is the only reason
  * the error assembly below can be three lines long.
@@ -686,6 +772,14 @@ const schema = z.object({
   BLITZ_GAME_BAN_ROLE_ID: idWithDefault(DEFAULT_GAME_BAN_ROLE_ID),
   BLITZ_ACCESS_ROLE_ID: idWithDefault(DEFAULT_ACCESS_ROLE_ID),
   BLITZ_RULES_CHANNEL_ID: idWithDefault(DEFAULT_RULES_CHANNEL_ID),
+
+  // `/dev`'s one instance and its region. See `Config.devInstanceId`.
+  BLITZ_DEV_INSTANCE_ID: matchedWithDefault(
+    DEFAULT_DEV_INSTANCE_ID,
+    INSTANCE_ID,
+    'an EC2 instance id',
+  ),
+  BLITZ_DEV_REGION: matchedWithDefault(DEFAULT_DEV_REGION, AWS_REGION, 'an AWS region'),
 })
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -717,6 +811,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     gameBanRoleId: parsedEnv.BLITZ_GAME_BAN_ROLE_ID,
     accessRoleId: parsedEnv.BLITZ_ACCESS_ROLE_ID,
     rulesChannelId: parsedEnv.BLITZ_RULES_CHANNEL_ID,
+    devInstanceId: parsedEnv.BLITZ_DEV_INSTANCE_ID,
+    devRegion: parsedEnv.BLITZ_DEV_REGION,
   }
 }
 

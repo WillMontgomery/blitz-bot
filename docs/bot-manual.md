@@ -64,8 +64,9 @@ React to a paired message to get its role; remove the reaction to lose it.
 
 ## The commands
 
-Six. **Admin** means holding the admin role.
+Seven. **Admin** means holding the admin role.
 
+- `/dev start`, `/dev status` — **admin**. Starts and deploys dev, or reports on it.
 - `/drain start [server]` — **admin**. Drains, updates and restarts `prod` or `dev`; defaults to `prod`. Private.
 - `/drain cancel [server]` — **admin**. Calls that window off. Private.
 - `/help [user]` — anyone. Links the player guide; public when aimed at somebody, private otherwise.
